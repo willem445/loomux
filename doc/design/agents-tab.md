@@ -395,3 +395,107 @@ there as an on-state, the same class as the task board's own filter chip.
 - **No keyboard chord.** Out of scope for this slice — a new chord needs the
   `agent-cli-reference` sweep `doc/design/side-dock.md` describes, and the two
   buttons plus the tablist cover the gesture.
+
+## Reveal, not focus (#2365)
+
+A row click used to be three steps — switch to the pane's tab, `Grid.setActive`,
+`Pane.focus()` — and all three are blind to the two states that make a pane
+invisible while its PTY stays bound.
+
+**Maximize.** `Grid.toggleMaximize` lifts the target's element out of the split
+tree into a top layer under `.grid-root` and `styles.css` hides everything else
+with `.grid-root.has-maximized > :not(.maximized) { display: none }`. So
+`setActive` on a pane behind a maximized sibling toggles a class inside a
+`display:none` subtree, and `term.focus()` on a hidden textarea is a browser
+no-op. The row click *ran*, correctly, and did nothing anyone could see.
+
+**The dock.** A minimized pane is out of the tree entirely, so the same two
+steps have no element to act on — and `toggleMaximize` refuses a docked pane
+outright (`if (!this.leaves.has(pane)) return`), which means a pane the blind
+`setActive` had made *active* from the dock could not even be maximized back
+into view.
+
+Every surface that says "go to this pane" was one of these three-step copies:
+the Agents row (`deps.focus`), `orch-focus` → `OrchWiring.focusPty`, and the
+Sessions tab's live-group copy, which said "focus its orchestrator pane instead
+of resuming it" and offered nothing to click at all. They are now one function,
+`revealPane` in `main.ts`, over one rule, `revealPlan` in `panefocus.ts`.
+
+### Where each half lives, and why
+
+The rule is DOM-free and in `panefocus.ts` — already the module that owns
+focus/maximize decisions — so all twelve crossings of
+`{tab active} × {docked} × {maximized: self | other | none}` are pinned under
+`node --test` rather than hand-validated. `Grid` executes the steps it owns (it
+is the holder of the dock and the lifted element); `main.ts` executes the tab
+step, because it is the only holder of `tabs`. No layer is crossed that is not
+crossed today.
+
+### Decision: reveal EXITS fullscreen rather than swapping it
+
+When a *different* pane is maximized, the reveal drops fullscreen and returns to
+the layout the human already knows. The alternative — swapping the fullscreen to
+the target — was rejected: it keeps the human in a mode they did not choose for
+this pane, and it hides whatever they *had* maximized with no visible cause,
+which is the same class of silent disappearance this issue is about. Exiting is
+one step back to a layout that is on screen and reversible with one
+`Ctrl+Shift+M`.
+
+Revealing the maximized pane **itself** leaves fullscreen alone
+(`maximized: "self"` emits no `exit-maximize`). A human who maximized a pane and
+then clicked its own Agents row is already looking at it; yanking them out would
+be a layout change nobody asked for. That is a negative control in the tests,
+not just a branch.
+
+A dock restore stands in for the exit: `Grid.restore` already exits fullscreen
+on its way in, so emitting both would be one redundant relayout — and under
+constraint 1 a redundant relayout is a redundant PTY fit.
+
+### Constraint 1: nothing here resizes a PTY that was not resized before
+
+`exitMaximize` and `restore` are the same discrete-human-click class as the
+header ⤢ button and the dock chip, and they go through the existing
+`resizeburst` coalescing unchanged. No new fit is added, no passive or
+continuous trigger reaches one, and the plain case — a visible pane in the tab
+already showing — touches no layout at all: its plan is exactly
+`["set-active", "focus"]`, which is what the app did before.
+
+### The maximize trigger is INFERRED, not observed
+
+This is the honest limit of the diagnosis. Nothing in the report or the logs
+records a maximize; what the reading establishes is that no frontend path
+reachable from a row click can *remove* a pane (`Grid.closePane(pane, false)`
+has three callers, none of them reachable from a click, and `captureLayout`
+walks every leaf), and that fullscreen is the app's **only** mechanism for
+hiding a pane while leaving its PTY bound. So maximize is the inferred trigger
+because it is the only candidate the code admits — not because anyone saw it
+happen.
+
+The fix does not depend on that inference being right. It makes every reveal
+path handle *both* hiding states, so whichever one was in play, the pane comes
+back. Deciding the next occurrence by log rather than by reading would need a
+`ui_breadcrumb` command recording maximize/minimize/close-without-kill; that is
+a new public command and was deliberately left out of this slice.
+
+### Deviation from the plan: `liveSessionAction` is role-gated
+
+The plan for this slice specified `liveSessionAction({ groupLive, paneInWindow })`
+and wired it into the Sessions **Mine**-row click for every orchestration-routed
+row. Implemented literally, that regresses a live worker rejoin: the backend
+refusal it stands in for is role-gated —
+`if record.role == "orchestrator" { if record.group_live { return Err(…) } }`
+in `src-tauri/src/orchestration/mod.rs` — so a worker or reviewer row in a live
+group is **rejoined**, not refused. With a 2-input rule, clicking a live
+worker's row would have revealed the group's *orchestrator* pane instead of
+rejoining that worker.
+
+So the rule takes a third input, `isOrchestratorRow`, and
+`groupLive && !isOrchestratorRow → "resume"`. The crossings go 4 → 8 and the
+live-worker case is pinned as a negative control over both pane placements. The
+rule stays in the pure module rather than becoming a condition at the `main.ts`
+call site, which is this slice's own boundary argument: a rule the backend
+enforces should not live in untested DOM glue.
+
+`explain` (a live group whose orchestrator pane is in no window here) exists so
+the app never calls into a refusal it can already predict — the round-trip could
+only come back with advice the human has no way to act on.
