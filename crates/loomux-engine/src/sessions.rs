@@ -667,7 +667,7 @@ pub fn pi_sessions_root() -> Option<PathBuf> {
 /// against a file name inside a directory this process did not choose — the same
 /// reason `find_claude_session_cwd`'s `format!` does.
 fn pi_file_suffix(session_id: &PathSegment) -> String {
-    format!("_{session_id}.jsonl")
+    format!("{session_id}.jsonl")
 }
 
 /// `find_session_cwd`'s pi half, taking the sessions root explicitly so it is
