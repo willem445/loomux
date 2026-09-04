@@ -28485,11 +28485,13 @@ impl OrchRegistry {
         // leave that task blocked on a question that no longer exists.
         // Delivery failure never fails the dismissal — the row is settled
         // durably and a cold orchestrator finds it through `list_questions`.
-        let _ = self.deliver_to_orchestrator(
-            group,
-            &humanq::dismiss_notice(&question.id, &tag, question.reason.as_deref()),
-            "human",
-        );
+        if let Some(r) = question.reason.as_deref() {
+            let _ = self.deliver_to_orchestrator(
+                group,
+                &humanq::dismiss_notice(&question.id, &tag, Some(r)),
+                "human",
+            );
+        }
         Ok(question)
     }
 
