@@ -11,7 +11,7 @@
 // task board, audit log, and group-lifecycle overlays all share, so it
 // exercises the identical z-order/clipping code path safely.
 import { test, expect } from "../fixtures";
-import { createTerminalPane, paneByName } from "../helpers";
+import { clickHeaderControl, createTerminalPane, paneByName } from "../helpers";
 
 test("the git-view overlay docks visibly over its pane and is interactive", async ({
   appPage: page,
@@ -22,7 +22,7 @@ test("the git-view overlay docks visibly over its pane and is interactive", asyn
   const overlay = pane.locator(".git-overlay");
   await expect(overlay).toBeHidden();
 
-  await pane.locator('.pane-btn[title^="Git view"]').click();
+  await clickHeaderControl(pane, '.pane-btn[title^="Git view"]');
   await expect(overlay).toBeVisible();
 
   // Docked *over* the terminal, not squeezed beside it or behind it: the
@@ -53,6 +53,6 @@ test("the git-view overlay docks visibly over its pane and is interactive", asyn
   await expect(secondRow).toHaveClass(/selected/);
   await expect(firstRow).not.toHaveClass(/selected/);
 
-  await pane.locator('.pane-btn[title^="Git view"]').click();
+  await clickHeaderControl(pane, '.pane-btn[title^="Git view"]');
   await expect(overlay).toBeHidden();
 });

@@ -860,8 +860,13 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 /* The one chip here that is allowed to SHRINK, and the label is ordered for it
    (rev finding 4). It carries ~18 characters where the other header chips carry
    1-3, and every `.pane-btn` beside it is `flex: none` — so on a narrow pane a
-   fixed-width chip would push the button cluster out rather than give way. It
-   ellipsises instead, and because the label leads with the count ("⇥ 3/8 queued
+   fixed-width chip would push the button cluster out rather than give way.
+   (#2191 narrowed how far that goes without making it wrong: below the overflow
+   threshold only two buttons are left in the row, so the pressure this chip is
+   giving way to is smaller. It still exists — the fold has a dead band, and the
+   chip is still the row's first shrinkable — and the `flex-shrink: 100` below,
+   which is about the DRAG HANDLE rather than about the buttons, is untouched.)
+   It ellipsises instead, and because the label leads with the count ("⇥ 3/8 queued
    · 12s") what survives the cut is the fact the badge exists for; the age is the
    first thing lost, and the *stalled* cue is not lost at all, since that one is
    carried by color and the pulse below rather than by the trailing word. */
@@ -1032,6 +1037,73 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane:hover .pane-btn:disabled, .pane-btn:disabled:focus-visible { opacity: 0.35; }
 .pane-btn:disabled { cursor: default; }
 .pane-btn:disabled:hover { background: none; color: var(--ink-dim); }
+
+/* ---------- header overflow (#2191) ---------- */
+/* When the header runs out of room, everything but minimize, maximize and the
+ * pane name folds into ONE ⋯ button whose menu floats over the terminal.
+ * src/paneheader.ts decides WHEN (from the header's own width, with a dead band
+ * so a divider dragged across the threshold settles instead of strobing);
+ * pane.ts moves the elements. doc/design/pane-header.md carries the argument.
+ *
+ * THE MENU IS AN OVERLAY, and that is hard constraint 1, not a style choice: a
+ * header that WRAPPED to a second row would grow `.pane-header`'s box, shrink
+ * `.pane-term`, and resize the PTY — a full repaint that pollutes the user's
+ * scrollback every time a pane crosses the threshold. `position: absolute` takes
+ * the strip out of flow entirely, so folding changes which items sit in the
+ * header row and nothing else. The header's height stays `--pane-header-h` at
+ * every width.
+ *
+ * CLOSED IS `visibility: hidden`, NEVER `display: none`, and that is load-bearing
+ * rather than a transition convenience: a `display: none` menu measures its
+ * buttons at zero width, so the overflow policy would read a NARROWER control set
+ * the moment it folded, decide there is room, unfold, re-measure wide, and fold
+ * again — a flap driven by the fix for the flap. Laid out but unpainted, a folded
+ * control reports the same width in both states, which is what makes the
+ * policy's input independent of its own output (see src/paneheader.ts's header).
+ * `visibility: hidden` also takes the strip out of the tab order and the
+ * accessibility tree, exactly as `display: none` would. */
+/* PLACED BY `transform`, NOT BY `left`, and that is a layout fact rather than an
+ * animation preference. An absolutely-positioned box with `width: auto` is
+ * shrink-to-fit against the space between its `left` and the containing block's
+ * right edge — so writing a computed `left` back onto the element CHANGES the
+ * width the computation was based on, and a strip placed near the right edge
+ * would wrap into rows it did not need. `left: 0` here fixes the width at
+ * "as much of the pane as the strip wants", measured once; pane.ts then slides
+ * it with `translateX`, which moves nothing in layout. */
+.pane-overflow-menu {
+  position: absolute; /* containing block: `.pane` (position: relative) */
+  top: var(--pane-header-h); left: 0; z-index: 30;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
+  max-width: calc(100% - 8px);
+  max-height: calc(100% - var(--pane-header-h) - 8px); overflow-y: auto;
+  padding: 4px 5px;
+  background: var(--surface-1);
+  border: 1px solid var(--line-strong); border-top: none;
+  border-radius: 0 0 8px 8px;
+  box-shadow: var(--shadow-card);
+  visibility: hidden; opacity: 0;
+  transition: opacity 0.12s var(--ease);
+}
+.pane-overflow-menu.open { visibility: visible; opacity: 1; }
+/* A folded control lives inside the menu, where `.pane:hover .pane-btn` is still
+   the rule that reveals it — but a menu the human has deliberately opened must
+   show its icons whether or not the pointer is over the pane (it can be over the
+   MENU, which overhangs the terminal). */
+.pane-overflow-menu .pane-btn { opacity: 1; }
+/* …but a DISABLED one still has to read as unavailable. The `.pane:hover`
+   variant above outranks the line above it on specificity, so this only covers
+   the case where the pane is not hovered and the menu is open anyway — a
+   keyboard-opened strip. */
+.pane-overflow-menu .pane-btn:disabled { opacity: 0.35; }
+/* The ⋯ button reads as the same cluster it replaces, but slightly wider — it is
+   the one button whose hit box has to be comfortable on a narrow pane, which is
+   the complaint this whole feature answers. */
+.pane-btn.pane-overflow { width: 25px; font-size: 14px; }
+.pane.header-folded .pane-btn.pane-overflow,
+.pane-btn.pane-overflow[aria-expanded="true"] { opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  .pane-overflow-menu { transition: none; }
+}
 
 /* Drag-suspend discipline (#361 user-demo finding): a docked/overlaid
    panel's OWN scrollable list is what's expensive to reflow on every

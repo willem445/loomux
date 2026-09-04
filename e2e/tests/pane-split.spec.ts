@@ -23,7 +23,7 @@
 // resizing every sibling every time — is what the assertions below are
 // written to witness. Don't relabel this spec as proof of the stronger one.
 import { test, expect } from "../fixtures";
-import { createTerminalPane, paneByName } from "../helpers";
+import { clickHeaderControl, createTerminalPane, paneByName } from "../helpers";
 
 /** One divider's outer main-axis footprint: `width: 6px` with `margin: 8px
  *  -1px` (src/styles.css), so 6 − 1 − 1 = 4px of the row. This is the entire
@@ -175,7 +175,7 @@ test("splitting a pane in a 3-wide row halves that pane and leaves its siblings'
   // Split pane A — the LEFTMOST, so both siblings sit downstream of the change
   // and would be pushed by any re-share of the row. Its own header button, so
   // this exercises the `onSplit` gesture wiring (src/main.ts `eventsFor`).
-  await paneA.locator('.pane-btn[title="Split right"]').click();
+  await clickHeaderControl(paneA, '.pane-btn[title="Split right"]');
   // The new pane opens on the welcome/setup form — wait for it to exist before
   // measuring anything, so no read races the relayout.
   const paneNew = page.locator(".pane", { has: page.locator(".welcome-form") });

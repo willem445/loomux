@@ -176,6 +176,14 @@ test("the queue badge yields its text rather than crowding a narrow header", asy
   // title instead), so however tight the header gets it gives up its own text
   // before it costs anyone else room, and what remains is only the box it
   // cannot shrink away.
+  //
+  // The ~217px figure above dates to #814 and is no longer what a narrow header
+  // measures: #2191 gave the header an overflow fold, so at these widths most of
+  // the button cluster is in the `⋯` menu and the row is not over-subscribed at
+  // all. The figure is kept because it is the reason these assertions are
+  // RELATIVE — the badge's own cost, badge-on against badge-off — and that
+  // reason survives the fold. Every number below is a delta measured in this
+  // run, so none of them depends on it.
   await createTerminalPane(page, { name: "Narrow A" });
   await page.locator("#btn-split-right").click();
   await createTerminalPane(page, { name: "Narrow B" });
@@ -183,13 +191,21 @@ test("the queue badge yields its text rather than crowding a narrow header", asy
   const pane = paneByName(page, "Narrow B");
   const header = pane.locator(".pane-header");
   const term = pane.locator(".pane-term");
-  const closeBtn = pane.locator("button.pane-btn.close");
+  // The rightmost control still IN the header row, whichever that is. It used to
+  // be spelled `button.pane-btn.close`, which stopped naming that control when
+  // #2191 gave a narrow header an overflow fold: below a threshold the ✕ moves
+  // into the `⋯` menu, which is `visibility: hidden` until opened, and
+  // `boundingBox()` answers null for it. The direct-child combinator keeps the
+  // menu's buttons (grandchildren) out, so this is the same QUESTION the name
+  // `closeOverhang` was asking — how far past its box does the header push its
+  // last control — asked of whatever control that now is.
+  const rightmostBtn = pane.locator(".pane-header > button.pane-btn:visible").last();
 
   const overflow = () => header.evaluate((el) => el.scrollWidth - el.clientWidth);
   /** How far the rightmost interactive control sits past the header's own box. */
   const closeOverhang = async (): Promise<number> => {
-    const [box, headerBox] = await Promise.all([closeBtn.boundingBox(), header.boundingBox()]);
-    if (!box || !headerBox) throw new Error("the close button or header lost its bounding box");
+    const [box, headerBox] = await Promise.all([rightmostBtn.boundingBox(), header.boundingBox()]);
+    if (!box || !headerBox) throw new Error("the rightmost header button or header lost its bounding box");
     return Math.round(box.x + box.width - (headerBox.x + headerBox.width));
   };
 
@@ -229,7 +245,7 @@ test("the queue badge yields its text rather than crowding a narrow header", asy
   const twoColOverhang = (await closeOverhang()) - overhangHeld;
   expect(
     twoColOverhang,
-    `at two columns the badge pushed the close button ${twoColOverhang}px further out ` +
+    `at two columns the badge pushed the header's last control ${twoColOverhang}px further out ` +
       `(overhang was ${overhangHeld}px without it)`
   ).toBeLessThanOrEqual(MAX_BADGE_COST_PX);
   // The drag-handle guard, and the reason it is stated as a floor RELATIVE to
@@ -264,7 +280,7 @@ test("the queue badge yields its text rather than crowding a narrow header", asy
 
   // 3. Three columns: the tight case. The badge's cost must stay bounded by the
   //    box it cannot shrink — i.e. its text yielded completely — and it must not
-  //    push the close button further out by more than that same box.
+  //    push the header's last control further out by more than that same box.
   await page.locator("#btn-split-right").click();
   await createTerminalPane(page, { name: "Narrow C" });
   await expect(pane.locator(".pane-queue")).toHaveCount(1);
@@ -288,7 +304,7 @@ test("the queue badge yields its text rather than crowding a narrow header", asy
   const overhangCost = tightOverhang - withoutOverhang;
   expect(
     overhangCost,
-    `the badge pushed the close button ${overhangCost}px further past the header's edge ` +
+    `the badge pushed the header's last control ${overhangCost}px further past the header's edge ` +
       `(${withoutOverhang}px without it, ${tightOverhang}px with it)`
   ).toBeLessThanOrEqual(MAX_BADGE_COST_PX);
 

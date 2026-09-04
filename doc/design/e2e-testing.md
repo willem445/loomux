@@ -272,8 +272,16 @@ first pane to exist before handing the test a `Page`. Five specs:
    pane's drag handle, while the pane's terminal box does not move a pixel
    (constraint 1, from the layout side, the same way `sessions-panel.spec.ts`
    checks it). It asserts the badge's CONTRIBUTION, not the header's absolute
-   fit: that header is already over-subscribed by chrome the badge did not add
-   (#894), so an absolute assertion would charge this feature for it. It is the
+   fit: that header was already over-subscribed by chrome the badge did not add
+   (#894), so an absolute assertion would charge this feature for it. Since
+   #2191 gave the header an overflow fold, it is no longer over-subscribed at
+   those widths at all — most of the cluster is in the `⋯` menu — but the
+   assertions were relative for the reason above and so survive the change
+   unaltered. What did have to move is the spec's overhang probe, which named
+   the ✕: below the fold threshold that control is in the menu, and
+   `boundingBox()` answers null for it. It now reads "the rightmost control
+   still in the header row", which is the question it was always asking. It is
+   the
    first
    spec to stand in for a human demo rather than for a bug class, which is why
    its header states exactly which half of the feature it proves.
