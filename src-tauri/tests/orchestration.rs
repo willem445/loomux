@@ -54630,9 +54630,24 @@ fn a_dismissed_question_reads_back_through_list_questions_after_a_restart() {
     let co2 = reg2.resolve_token(&orch2.token).unwrap();
     let out = q_call(&reg2, &co2, "list_questions", json!({}));
     let text = q_text(&out);
-    assert!(text.contains("\"status\": \"dismissed\""), "the wire says dismissed: {text}");
-    assert!(text.contains("moot now"), "…and carries the reason: {text}");
-    assert!(!text.contains("\"answer\""), "…and no answer key at all: {text}");
+    // PARSED, not substring-matched. An earlier draft asserted
+    // `"\"status\": \"dismissed\""` and went red on all three platforms because
+    // this tool serializes COMPACTLY (`"status":"dismissed"`) — the assertion
+    // was pinning a serializer's whitespace choice while claiming to be about
+    // the field. Parsing asks the question the test is named for, and the
+    // absence check below becomes a real absent-KEY check rather than a search
+    // for a quoted word that could appear inside any string on the row.
+    let wire: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("list_questions must return JSON ({e}): {text}"));
+    let row = &wire["questions"][0];
+    assert_eq!(row["status"], json!("dismissed"), "the wire says dismissed: {text}");
+    assert_eq!(row["reason"], json!("moot now"), "…and carries the reason: {text}");
+    assert_eq!(row["settled_by"], json!("webview"), "…and the provenance: {text}");
+    assert!(
+        row.get("answer").is_none(),
+        "…and no answer KEY at all — `skip_serializing_if` must keep a dismissal off the one \
+         field a reader checks for a decision: {text}"
+    );
 }
 
 /// The ITEM half, end to end. Two things are asserted that the question half
