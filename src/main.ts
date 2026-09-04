@@ -115,6 +115,75 @@ import {
   nextRestoreCardState,
   type RestoreCardState,
 } from "./restorecard";
+import { SessionLogStore } from "./sessionlog";
+import { openNotes } from "./notesdialog";
+import { noteTargetFor } from "./notesmodel";
+import { loadSessionLog, saveSessionLog } from "./pty";
+
+// ---------- per-session notes (#2116) ----------
+
+/** Orrerix's own sessions log: the pane name the human chose and the notes they
+ *  wrote, per harness session. ONE store for the whole window — the file is a
+ *  single multi-tenant blob, so a second handle on it would be a second thing
+ *  able to publish an unread map over everybody else's notes, which is exactly
+ *  what `SessionLogStore`'s read-before-write rule exists to prevent.
+ *
+ *  Constructed eagerly and read lazily: nothing loads the file until a pane is
+ *  recorded or a human opens the dialog, so a launch pays nothing for it. */
+const sessionLog = new SessionLogStore({ load: loadSessionLog, save: saveSessionLog });
+
+/** Every live pane, across every tab. */
+function everyPane(): Pane[] {
+  return tabs.tabs.flatMap((ws) => ws.grid.allPanes());
+}
+
+/** What this pane currently IS, for the sessions log. Read off `facts()` so
+ *  this and the Agents tab cannot disagree about the harness, and never
+ *  branched on a CLI name (#722/#841). */
+function sessionIdentityOf(pane: Pane): { cli: string; pane_name: string; cwd: string } {
+  const facts = pane.facts();
+  return {
+    cli: facts.harness ?? "",
+    pane_name: facts.name,
+    // `capture()` and not a second cwd accessor: it is already this repo's one
+    // answer to "what is this pane's working directory, for something durable",
+    // and the sessions log is something durable. It reads no geometry either,
+    // so it is safe on a hidden tab like everything else on this path. `null`
+    // for a welcome pane (nothing to capture) and for an SSH pane — neither of
+    // which reaches here, since both are filtered above on harness/session id.
+    cwd: pane.capture()?.cwd ?? "",
+  };
+}
+
+/** Record this pane's identity against its session, if it has one yet.
+ *
+ *  Safe to call on any pane at any time: a pane with no session id, or none
+ *  worth recording, is a no-op, and `record` itself writes nothing when nothing
+ *  changed — which is what makes calling it on every rename and every restore
+ *  cost a boot nothing. */
+function recordPaneSession(pane: Pane): void {
+  const facts = pane.facts();
+  if (facts.sessionId === null || facts.harness === null) return;
+  void sessionLog.record(facts.sessionId, sessionIdentityOf(pane), Date.now());
+}
+
+/** Record every live pane's identity. Idempotent and near-free: see the note on
+ *  the caller in `onGridChanged`. */
+function recordEveryPaneSession(): void {
+  for (const pane of everyPane()) recordPaneSession(pane);
+}
+
+/** Push the note count onto every pane's button. Cheap — `notesCount` is a map
+ *  lookup — and driven by the store's own change event, so a note added from
+ *  the sessions list updates the pane header too. */
+function refreshNoteCounts(): void {
+  for (const pane of everyPane()) {
+    const id = pane.facts().sessionId;
+    pane.setNotesCount(id === null ? sessionLog.pendingFor(pane.key).length : sessionLog.notesCount(id));
+  }
+}
+
+sessionLog.onChange(refreshNoteCounts);
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -168,6 +237,17 @@ let booting = true;
 function onGridChanged(): void {
   if (booting) return;
   tabs.notifyLayoutChanged();
+  // #2116: the one hook that fires whenever the set of panes, or a pane's
+  // persisted identity, changes — an open, a close, a rename, a re-root. That
+  // is exactly when the sessions log might owe a new record, so the sweep lives
+  // here rather than at the several places a pane can be started (a claude pane
+  // has its session id on its own launch line, so it never passes through
+  // `onSessionIdentified`).
+  //
+  // Cheap by construction, not by luck: `record` compares the three identity
+  // fields and writes NOTHING when they are unchanged, so re-sweeping twenty
+  // restored panes on every grid gesture costs twenty map lookups and no IPC.
+  recordEveryPaneSession();
 }
 
 const tabs = new TabManager<Workspace>((id) => {
@@ -308,13 +388,42 @@ function eventsFor(ws: Workspace): PaneEvents {
     },
     // A content pane re-rooted, or a pane was renamed: the persisted layout is stale
     // but no grid event fired, so nothing else would save it (#214).
-    onRecordChanged: () => onGridChanged(),
+    onRecordChanged: (pane) => {
+      onGridChanged();
+      // A rename is the other thing that changes what the sessions log should
+      // say about this pane (#2116). Deliberately here and NOT on
+      // `notifyExited`'s `setName(name + " · exited")`, which does not go
+      // through this event — the log records what the human called the pane,
+      // not a lifecycle suffix.
+      recordPaneSession(pane);
+    },
     // The connect gesture (#271): the pane can't build its own menu (needs the
     // cross-tab armed-connect state + backend wrappers), so it asks its host.
     onPaneContextMenu: (pane, x, y) => void showPaneConnectMenu(pane, x, y),
     // One-click disconnect from the channel chip itself (the "easy close"
     // requirement) — same destination as the pane menu's Disconnect item.
     onDisconnectChannel: (pane) => disconnectPaneChannel(pane),
+    // The Notes overlay (#2116). Keyed on the session id when there is one, and
+    // on the per-window pane key when there is not — the store holds those in
+    // memory until `onSessionIdentified` re-keys them.
+    onOpenNotes: (pane) => {
+      const facts = pane.facts();
+      void openNotes({
+        target: noteTargetFor(facts.sessionId, pane.key),
+        title: facts.name,
+        store: sessionLog,
+      }).then(() => pane.focus());
+    },
+    // A late-learned session id (#2116, doc/design/session-id-learning.md). Move
+    // any notes written against the pane onto the id FIRST, then record the
+    // identity: `rekey` creates the record if it is not there, and recording
+    // first would only mean two writes where one will do.
+    onSessionIdentified: (pane) => {
+      const facts = pane.facts();
+      if (facts.sessionId === null) return;
+      const sessionId = facts.sessionId;
+      void sessionLog.rekey(pane.key, sessionId, Date.now()).then(() => recordPaneSession(pane));
+    },
   };
 }
 
@@ -2983,6 +3092,11 @@ void (async () => {
 
   // Boot rebuild done: from here every pane open/close re-renders + re-persists.
   booting = false;
+  // The restore above ran entirely under the `booting` guard, so `onGridChanged`
+  // never fired for any of it — one sweep here is what records the pane names
+  // of a restored session (#2116). After this, the hook covers everything.
+  recordEveryPaneSession();
+  refreshNoteCounts();
   // Subscribe persistTabs AFTER restore so rebuilding the saved set doesn't
   // redundantly write it straight back.
   tabs.onChange(persistTabs);

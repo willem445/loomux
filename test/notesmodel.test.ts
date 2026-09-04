@@ -6,8 +6,10 @@ import {
   MAX_NOTE_LEN,
   NoteDrafts,
   noteDraftIsPristine,
+  noteTargetFor,
   noteWriteFeedback,
   normalizeNoteText,
+  notesApplyToPane,
   notesEmptyState,
   orderedNotes,
   targetKey,
@@ -150,6 +152,46 @@ test("the editor's seed and the pristine predicate answer the same question", ()
   // button enabled.
   const drafts = new NoteDrafts();
   assert.equal(noteDraftIsPristine(drafts.get({ sessionId: "fresh" })), true);
+});
+
+// ---- where the Notes control applies (#2116 slice D) ----
+
+test("an agent pane running a local CLI gets the Notes control", () => {
+  assert.equal(notesApplyToPane("claude", false), true);
+});
+
+test("a pane with no harness does not — there would be no session to key to", () => {
+  assert.equal(notesApplyToPane(null, false), false);
+});
+
+test("an SSH pane does NOT, even though it reports a harness", () => {
+  // The gate that is easy to get wrong, because `facts().harness` is non-null
+  // here: an SSH pane's CLI runs on the FAR END, so its session is not on this
+  // machine and `sessionlog.json` is per-local-machine. Same reason the store
+  // is not in a group dir.
+  assert.equal(notesApplyToPane("claude", true), false);
+});
+
+test("a CLI orrerix does not recognise reports null and is refused, not guessed", () => {
+  // The rule reads the harness, never branches on a CLI NAME (#722/#841): a
+  // fourth CLI shows up as itself or as null, and null is refused rather than
+  // inheriting some other CLI's answer.
+  assert.equal(notesApplyToPane("opencode", false), true);
+  assert.equal(notesApplyToPane("some-cli-nobody-has-written-yet", false), true);
+  assert.equal(notesApplyToPane(null, true), false);
+});
+
+test("a pane with no session id yet is keyed on its pane key, not on nothing", () => {
+  assert.deepEqual(noteTargetFor(null, "pane-7"), { paneKey: "pane-7" });
+  assert.deepEqual(noteTargetFor("sess-9", "pane-7"), { sessionId: "sess-9" });
+});
+
+test("the target a pane key produces is the one rekey later moves", () => {
+  // The two ends of the pending path have to agree on the key, and this is the
+  // assertion that fails if either side starts spelling it differently.
+  const pending = noteTargetFor(null, "pane-7");
+  assert.equal(targetKey(pending), targetKey({ paneKey: "pane-7" }));
+  assert.notEqual(targetKey(pending), targetKey(noteTargetFor("pane-7", "pane-7")));
 });
 
 // ---- what a write outcome owes the human ----

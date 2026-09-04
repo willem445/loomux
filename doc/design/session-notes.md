@@ -226,6 +226,45 @@ step succeeded, and nothing anywhere says a word. The text is only handed back
 if the human has not started typing something else in the meantime; their newer
 text outranks the one being restored.
 
+## Where the button is, and when a record is written
+
+**The Notes button** sits in the pane header, `pane-btn pty-only`, and shows on
+an agent pane only. Three gates, and only the first is a CSS class:
+
+1. `pty-only` — the stylesheet hides the class on `.is-content`, so files /
+   editor / git / workflow panes never show it.
+2. a **harness** must be running (`facts().harness !== null`). A plain shell has
+   no agent session, so a note would have no key at all.
+3. **not an SSH pane.** It may well have a CLI at the far end — `facts()`
+   reports one — but that session lives on the remote machine while this store
+   is per-local-machine. Same reason the store is not in a group dir.
+
+Gates 2 and 3 cannot be classes: both are read off the launch line and can
+change on a respawn, so `syncNotesBtn` re-reads them wherever `spawnCommand` is
+set. It reads through `facts()` rather than re-deriving the harness, so this and
+the Agents tab cannot disagree about what a pane is running.
+
+The pane does **not** hold the store. The button raises
+`PaneEvents.onOpenNotes` and the host opens the overlay — the same shape
+`onOpenEditorPane` uses, and for a sharper reason here: giving every `Pane` a
+handle on a single-file multi-tenant store is precisely the shape the
+read-before-write rule exists to protect against. The note COUNT is pushed the
+other way, `setNotesCount`, from the store's own change event.
+
+**When a record is written:**
+
+| Trigger | Why it is the right hook |
+| --- | --- |
+| `onGridChanged` (open, close, rename, re-root) | The one event that fires whenever the set of panes or a pane's persisted identity changes. This is what records a claude pane, whose session id is on its own launch line and so never passes through `adoptSessionId`. |
+| Once when `booting` flips false | The whole restore runs under the `booting` guard, so `onGridChanged` fires for none of it. One sweep is what gives a restored session its recorded pane names. |
+| `onRecordChanged` (a human rename) | Deliberately **not** `notifyExited`'s `setName(name + " · exited")`, which does not go through this event. The log records what the human called the pane, never a lifecycle suffix. |
+| `onSessionIdentified` (a late-learned id) | Re-key first, then record — `rekey` creates the record if it is absent, so recording first would be two writes where one does. |
+
+Sweeping every pane on every grid gesture is cheap *by construction, not by
+luck*: `record` compares the three identity fields and writes **nothing** when
+they are unchanged, so a boot that re-records twenty restored panes costs twenty
+map lookups and no IPC.
+
 ## The recorded pane name on a session row
 
 A session row already shows the transcript title. The recorded pane name is an
@@ -259,7 +298,7 @@ wrote rather than a guess at what they meant.
 | --- | --- | --- |
 | 1 | `sessionlog.json` — schema v1, key, cap, eviction tiers, passthrough | Landed (slice C) |
 | 2 | `load_session_log` / `save_session_log` — opaque string, quarantine on corrupt | Landed (slice C) |
-| 3 | `PaneEvents.onSessionIdentified` — *will* fire at most once per pane per adopted id, from `adoptSessionId` only (the spawn-time id path records directly and never fires it) | Slice D, not yet landed |
+| 3 | `PaneEvents.onSessionIdentified` — fires at most once per pane per adopted id, from `adoptSessionId` only (the spawn-time id path records directly and never fires it). `PaneEvents.onOpenNotes` alongside it. | Landed (slice D) |
 | 4 | `partitionSessions(sessions, roleOf, mode, showDelegates)` — internal; tests | Landed (slice E1) |
 | 5 | `localStorage` key `loomux.sessions.mode`, decoded totally, default `mine` | Landed (slice E1) |
 | 6 | `paneNameLine(paneName, title, source)` — internal; tests | Landed (slice E2's pure half) |
@@ -277,5 +316,5 @@ wrote rather than a guess at what they meant.
 | The notes overlay | `src/notesdialog.ts` | DOM wiring, hand-validated. Built on the `.launcher-overlay` / `.agent-dialog` kit, not on `modal()` — that is a button-confirm, and this needs a live list with a per-row delete. |
 | The unsubmitted draft | `NoteDrafts` in `src/notesmodel.ts` | DOM-free. The editor is a VIEW of the book, seeded on open and written on every `input`, so a re-render cannot eat what the human was typing. |
 | The pane-name line | `paneNameLine` in `src/sessionmeta.ts` | Pure. `test/sessionmeta.test.ts`. |
-| The Notes button, and the re-key wiring | `src/pane.ts`, `src/main.ts` | Slice D's other half — *will* land once #2122 slice A ships `Pane.facts()` and `Pane.key`. |
-| Pane name and notes chip ON a session row | `src/sessions.ts` | Slice E2's rendering — *will* land after #2122 slice B, which restructures this file. |
+| The Notes button, and the re-key wiring | `src/pane.ts`, `src/main.ts` | DOM wiring, hand-validated. Reads `Pane.facts()` / `Pane.key` from #2122 slice A. |
+| Pane name and notes chip ON a session row | `src/sessions.ts` | Slice E2's rendering — *will* land after #2122 slice B (#2122's Agents tab), which restructures this file. `paneNameLine` above is already in and unit-tested; only the rendering waits. |

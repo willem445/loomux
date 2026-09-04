@@ -1030,6 +1030,13 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane:hover .pane-btn, .pane-btn:focus-visible { opacity: 1; }
 .pane-btn:hover { background: var(--surface-2); color: var(--ink); }
 .pane-btn.close:hover { color: var(--state-danger); }
+/* #2116: a pane whose session already carries notes. The whole header button
+   row is hover-revealed (`opacity: 0` above), so this cannot be an
+   at-a-glance indicator and is not trying to be one — it tells you which
+   button to press once you are already looking at them. Full-strength ink
+   rather than a fill: a note count is not an attention signal, and the accent
+   as a GROUND is what #1340 asked to stop. The count itself is in the title. */
+.pane-btn.has-notes { color: var(--ink); }
 /* A docked view's overlay toggle is disabled outright (#361 user-demo
    finding — see embedtoggle.ts): dim it further than the plain hover-reveal
    opacity and drop the pointer cursor, so it reads as unavailable rather

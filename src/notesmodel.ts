@@ -141,6 +141,38 @@ export function noteWriteFeedback(outcome: NoteWriteOutcome): {
   }
 }
 
+/** Does the Notes control apply to a pane running `harness`?
+ *
+ *  Extracted from the button's own visibility check so the RULE is testable
+ *  rather than living only in DOM wiring this repo validates by hand. The two
+ *  arguments are the two facts it reads, deliberately not a whole `PaneFacts`:
+ *  that type belongs to #2122's `agentrows.ts`, and a notes module should not
+ *  depend on the Agents tab to answer a question about notes.
+ *
+ *  A pane qualifies when a harness is running AND it is local:
+ *
+ *   - no harness means no agent session, so a note would have no key at all;
+ *   - an SSH pane may well have a CLI at the far end — `facts().harness`
+ *     reports the profile's declared one — but that session lives on the
+ *     REMOTE machine, and `sessionlog.json` is per-local-machine. Same reason
+ *     the store is not in a group dir.
+ *
+ *  The third gate, "not a content pane", is the `pty-only` CSS class and is not
+ *  expressible here: it is a property of the pane's kind, not of its harness. */
+export function notesApplyToPane(harness: string | null, isSsh: boolean): boolean {
+  return harness !== null && !isSsh;
+}
+
+/** Which target a pane's notes belong to right now.
+ *
+ *  A pane whose session id orrerix has not learned yet is keyed on its
+ *  per-window `Pane.key`, and `SessionLogStore.rekey` moves those notes across
+ *  when the id arrives. Extracted for the same reason as above — it is a
+ *  decision, and it was previously a ternary inside DOM wiring. */
+export function noteTargetFor(sessionId: string | null, paneKey: string): NoteTarget {
+  return sessionId === null ? { paneKey } : { sessionId };
+}
+
 /** A stable string for a target, so a draft survives a close and reopen and two
  *  targets can never share one. It is a MAP KEY and is never joined onto a
  *  path — the `s:` / `p:` prefixes exist so a session id and a pane key that

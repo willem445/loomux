@@ -114,6 +114,7 @@ import { adoptableSessionId, hasForkSession, sessionCliFromCommand } from "./pan
 import type { Cli } from "./sessionreconcile";
 import { PaneActivity } from "./paneactivity.ts";
 import type { PaneFacts } from "./agentrows.ts";
+import { notesApplyToPane } from "./notesmodel.ts";
 
 // The header's icons, from the registry (#879 slice K). They were hand-drawn
 // inline here — inline so the toolbar renders identically regardless of
@@ -147,6 +148,13 @@ const EDITOR_ICON = icon("code-xml", ICON_BTN_PX);
 // File-editor overlay (#174): a page with a pencil, to read as "edit files"
 // distinct from the external-editor </> glyph above.
 const FILES_ICON = icon("file-pen", ICON_BTN_PX);
+// Per-session Notes (#2116): a page of writing. Deliberately `file-text` and
+// not `file-pen` — that one is already this header's file-EDITOR button, and
+// two buttons sharing a glyph in one row is worse than reusing a vendored
+// mark. Reuse rather than a new vendored entry: `test/icons.test.ts` refuses
+// an entry no surface asks for, and the `content` role this glyph carries —
+// "files you read rather than run" — is what a note is.
+const NOTES_ICON = icon("file-text", ICON_BTN_PX);
 // Attach affordance on the steering strip (#72): a paperclip.
 const PAPERCLIP_ICON = icon("paperclip", ICON_BTN_PX);
 // Voice-prompt push-to-talk button (#58): a microphone.
@@ -434,6 +442,22 @@ export interface PaneEvents {
   /** The pane's own channel chip was clicked (#271's "easy close" requirement: a
    *  one-click disconnect from the indicator itself, not just the menu). */
   onDisconnectChannel: (pane: Pane) => void;
+  /** The Notes button was clicked (#2116). Same shape and same reason as
+   *  `onOpenEditorPane`: the overlay reads and writes `sessionlog.json` through
+   *  a store the host owns, and a `Pane` must not hold one — it would give
+   *  every pane its own handle on a single-file multi-tenant store, which is
+   *  exactly the shape the store's read-before-write rule exists to protect. */
+  onOpenNotes: (pane: Pane) => void;
+  /** This pane just LEARNED its agent session id (#2116, and
+   *  `doc/design/session-id-learning.md`).
+   *
+   *  Fires from `adoptSessionId` and from nowhere else, at most once per pane
+   *  per adopted id — `adoptSessionId` refuses a second adoption, so this
+   *  inherits that. The spawn-time path (`--session-id` on the launch line,
+   *  which is claude's) never goes through `adoptSessionId` and so never fires
+   *  this; the host records that pane directly instead. The host's job here is
+   *  to re-key any notes written against the pane before the id existed. */
+  onSessionIdentified: (pane: Pane) => void;
 }
 
 /** Every view that can occupy a pane's embed-panel slot (#361) — a real flex
@@ -696,6 +720,13 @@ export class Pane implements VoiceTargetPane {
   private fileEditView: FileEditView | null = null;
   private fileEditOverlay: HTMLElement | null = null;
   private fileEditBtn: HTMLButtonElement;
+  /** The Notes button (#2116). Hidden until a launch line gives this pane a
+   *  harness — see `syncNotesBtn`. */
+  private notesBtn: HTMLButtonElement;
+  /** How many notes the host's store holds for this pane's session, as of the
+   *  last `setNotesCount`. Kept only to render the button's title; the store
+   *  is the truth and this pane never reads it. */
+  private notesCount = 0;
   /** Every view registered as embeddable so far (#361), keyed by kind. Built
    *  lazily — one entry per view, added the first time that view's own
    *  `ensureXView()` runs — so a pane that never opens (say) the group panel
@@ -1253,6 +1284,22 @@ export class Pane implements VoiceTargetPane {
       this.toggleFileEditView();
     });
     header.appendChild(this.fileEditBtn);
+
+    // Per-session Notes (#2116). `pty-only` takes the content panes (the CSS
+    // rule hides the class on `.is-content`); `syncNotesBtn` takes the other
+    // two gates, which are not expressible as a class — a harness must be
+    // running, and an SSH pane has no LOCAL session id to key a note to even
+    // when a CLI is running at the far end.
+    this.notesBtn = document.createElement("button");
+    this.notesBtn.className = "pane-btn pty-only";
+    this.notesBtn.innerHTML = NOTES_ICON;
+    this.notesBtn.hidden = true; // until a launch line says otherwise
+    this.notesBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.events.onOpenNotes(this);
+    });
+    header.appendChild(this.notesBtn);
+    this.setNotesCount(0);
 
     // Minimize / maximize live next to close: the same window-control cluster
     // users expect. Maximize keeps a stored ref so its glyph can flip to a
@@ -1874,6 +1921,7 @@ export class Pane implements VoiceTargetPane {
     // Retain the launch inputs for a later capture() into the persisted layout
     // (#194). Purely a record — the spawn below still reads them straight off opts.
     this.spawnCommand = opts.command ?? null;
+    this.syncNotesBtn();
     this.spawnArgv = opts.argv ?? null;
     this.spawnShellKind = opts.shellKind ?? null;
     this.refreshAgentMark();
@@ -2341,6 +2389,7 @@ export class Pane implements VoiceTargetPane {
     if (opts.name) this.setName(opts.name);
     this.launchedCommand = !!opts.command?.trim();
     this.spawnCommand = opts.command ?? null;
+    this.syncNotesBtn();
     this.spawnArgv = opts.argv ?? null;
     this.spawnShellKind = opts.shellKind ?? null;
     // A respawn can change the program outright — a dormant shell Started with a
@@ -4851,6 +4900,51 @@ export class Pane implements VoiceTargetPane {
   adoptSessionId(id: string): void {
     if (this.agentSessionId !== null) return;
     this.agentSessionId = id;
+    // #2116: the single choke point every LATE-learned id passes through, so it
+    // is the one place that can tell the host "whatever was written against
+    // this pane now has somewhere durable to live". Fired only on an adoption
+    // that actually happened — the early return above is what makes this at
+    // most once per pane per id, rather than a promise this line has to keep on
+    // its own.
+    this.events.onSessionIdentified(this);
+  }
+
+  /** Show the Notes button only where a note has something to be keyed to.
+   *
+   *  Three gates, and only one of them is a CSS class. `pty-only` hides the
+   *  button on a content pane (files/editor/git/workflow — the stylesheet rule
+   *  on `.is-content`). The other two cannot be classes because they are read
+   *  off the launch line and can change on a respawn:
+   *
+   *   - a HARNESS must be running. A plain shell has no agent session, so a
+   *     note would have no key at all.
+   *   - not an SSH pane. It may well have a CLI at the far end — `facts()`
+   *     reports one — but the session lives on the remote machine and this
+   *     store is per-LOCAL-machine, so there is nothing here to key to. That
+   *     is the same reason `sessionlog.json` is not in a group dir.
+   *
+   *  Read through `facts()` rather than by re-deriving the harness, so this and
+   *  the Agents tab cannot disagree about what a pane is running. */
+  private syncNotesBtn(): void {
+    this.notesBtn.hidden = !notesApplyToPane(this.facts().harness, this.isSshPane);
+  }
+
+  /** Tell this pane how many notes its session carries, so the button can say
+   *  so. Pushed by the host on every store change rather than pulled, because
+   *  the store is the host's (see `PaneEvents.onOpenNotes`).
+   *
+   *  The count is in the TITLE and not a badge on purpose: a note count is not
+   *  an attention signal, and the pane header already spends its visual budget
+   *  on things that are. */
+  setNotesCount(n: number): void {
+    this.notesCount = Math.max(0, n);
+    this.notesBtn.title =
+      this.notesCount === 0
+        ? "Notes for this session"
+        : this.notesCount === 1
+          ? "Notes for this session (1)"
+          : `Notes for this session (${this.notesCount})`;
+    this.notesBtn.classList.toggle("has-notes", this.notesCount > 0);
   }
 
   /** Whether this pane's process has emitted a single byte since it spawned
