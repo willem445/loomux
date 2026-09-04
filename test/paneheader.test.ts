@@ -539,6 +539,42 @@ test("hysteresis: a width oscillating around the minimal threshold never flaps",
   assert.equal(from, "squeezed");
 });
 
+test("a stage that has LEFT the ladder still measures the dead band from a rung", () => {
+  // rev-final round 2, premortem 2. A stage can leave the ladder while the
+  // header is perfectly well laid out: revealing or hiding a control changes
+  // which rungs are strictly narrower than their neighbour, so `folded` drops
+  // out the moment every remaining control is priority. Left unmapped, the pass
+  // that discovers this reads every rung as a sideways move, skips the dead band
+  // and jumps two rungs — a divider parked just above the unfold threshold flaps
+  // once, at the moment a chip lights.
+  const allPriority = CONTROLS.map((c) => ctl(c.id, c.width, true));
+  // `folded` really is off this pane's ladder: with nothing foldable it buys no
+  // room, so the rung is dropped and the ladder is full → squeezed → minimal.
+  assert.equal(fit({ headerWidth: 300, controls: allPriority }).stage, "squeezed");
+  assert.equal(fit({ headerWidth: 800, controls: allPriority }).stage, "full");
+
+  // FULL_W is where the full row stops fitting; UNFOLD_AT is a whole dead band
+  // above it. Carrying the now-absent `folded` at a width between the two must
+  // NOT jump to `full` — that jump is the flap.
+  const between = FULL_W + 11;
+  assert.ok(between > FULL_W && between < UNFOLD_AT, "the fixture width is inside the dead band");
+  assert.equal(
+    fit({ headerWidth: between, controls: allPriority, stage: "folded" }).stage,
+    "squeezed",
+    "an off-ladder stage must still pay the dead band on the way up"
+  );
+  // Discriminating half: past the dead band it DOES widen, so the assertion above
+  // is the hysteresis rather than "an off-ladder stage is pinned narrow".
+  assert.equal(
+    fit({ headerWidth: UNFOLD_AT, controls: allPriority, stage: "folded" }).stage,
+    "full"
+  );
+  // ...and the not-laid-out carry is deliberately NOT the same rule: it still
+  // drops to the widest rung, which is what keeps an overflow button from
+  // standing over an empty menu (`nothing-to-fold beats the not-laid-out carry`).
+  assert.equal(fit({ headerWidth: 0, controls: allPriority, stage: "folded" }).stage, "full");
+});
+
 test("an unlaid-out header carries EVERY rung, including the two new ones", () => {
   for (const stage of ["full", "folded", "squeezed", "minimal"] as const) {
     assert.equal(fit({ headerWidth: 0, stage }).stage, stage, `carry ${stage}`);

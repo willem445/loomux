@@ -214,6 +214,24 @@ function naturalWidth(el: HTMLElement): number {
   return Math.max(box, el.scrollWidth + (box - el.clientWidth));
 }
 
+/** The width a header child cannot give up, px: its border plus its padding.
+ *
+ *  `styles.css` gives every non-control header child `min-width: 0`, so its
+ *  CONTENT can be squeezed to nothing — but no `flex-shrink` touches a border or
+ *  a padding, so a lit chip keeps ~14px however narrow the pane gets. Assuming
+ *  that floor was zero is what let two lit chips push the `⋯` off an 80px pane
+ *  (`MIN_PANE_PX`), which is #2335 not fixed (rev-final round 2). A hidden child
+ *  costs nothing, matching `naturalWidth`'s reading of the same element. */
+function irreducibleWidth(el: HTMLElement): number {
+  if (el.hidden) return 0;
+  const cs = getComputedStyle(el);
+  const pad = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+  // `clientWidth` excludes borders and includes padding, so the difference is
+  // the borders (there is no scrollbar on a header chip).
+  const border = el.offsetWidth - el.clientWidth;
+  return Math.max(0, (Number.isFinite(pad) ? pad : 0) + (Number.isFinite(border) ? border : 0));
+}
+
 /** Pull image files out of a paste/drag `DataTransfer`. Returns only entries
  *  the browser tags as images, so a text or mixed paste yields []. */
 function imagesFromDataTransfer(dt: DataTransfer | null): File[] {
@@ -1109,7 +1127,12 @@ export class Pane implements VoiceTargetPane {
     // handler: the queue drains when the pane is free, and there is nothing a
     // click here could truthfully do about it.
     this.queueChip = document.createElement("span");
-    this.queueChip.className = "pane-queue";
+    // `chip-yields`: this chip declares a shrink weight of its own (100), and
+    // `styles.css`'s row-shrink rule must not overwrite it. A marker rather than
+    // a name in that rule's `:not()` list, because the third chip to want a
+    // heavy weight would otherwise be silently flattened to 1 (rev-final round 2
+    // finding 1, which is exactly what happened to `.pane-mail`).
+    this.queueChip.className = "pane-queue chip-yields";
     this.queueChip.hidden = true;
     header.appendChild(this.queueChip);
 
@@ -1121,7 +1144,7 @@ export class Pane implements VoiceTargetPane {
     // read" would be the app answering for the human on the one pane whose
     // whole contract is that it never does.
     this.mailChip = document.createElement("span");
-    this.mailChip.className = "pane-mail";
+    this.mailChip.className = "pane-mail chip-yields";
     this.mailChip.hidden = true;
     header.appendChild(this.mailChip);
 
@@ -1611,9 +1634,14 @@ export class Pane implements VoiceTargetPane {
       // this pane does not have, so it is not the policy's business.
       if (width > 0) controls.push({ id: c.id, width, priority: c.priority });
     }
+    // Two numbers, because the ladder needs both: what the chrome WANTS decides
+    // when to fold (folding is how the row buys it that room), and what it
+    // cannot give up decides the two rungs below the fold, which are what
+    // happens after it has already given way (#2335).
+    const chrome = this.measureHeaderFixed();
     const plan = planHeaderFit({
       headerWidth: this.headerContentW,
-      fixedWidth: this.measureHeaderFixed(),
+      fixedWidth: chrome.want,
       controls,
       // Measurable only while folded (it is `hidden` otherwise), so an unfolded
       // header uses the width the stylesheet gives it. That constant is
@@ -1621,12 +1649,7 @@ export class Pane implements VoiceTargetPane {
       // policy's "folding buys nothing" guard refuse to fold a header down to a
       // single control — a welcome pane, whose only control is its ✕.
       overflowWidth: naturalWidth(this.overflowBtn) || OVERFLOW_BTN_W,
-      // No `chromeFloorWidth`: the default of 0 is what `styles.css` makes true,
-      // since every header child that is not a control is `flex-shrink: 1;
-      // min-width: 0` and can be squeezed to nothing before a control loses a
-      // pixel. Pass a real floor here if that rule is ever narrowed — reading
-      // `fixedWidth` on the two rungs below the fold is what collapsed a roomy
-      // header to `minimal` because a queue label WANTED 180px (#2335).
+      chromeFloorWidth: chrome.floor,
       stage: this.headerStage,
     });
     // The strip is placed from the ⋯ button's rect, so a pane that resized under
@@ -1649,32 +1672,50 @@ export class Pane implements VoiceTargetPane {
     this.applyHeaderPlan(plan, want);
   }
 
-  /** Total width of the header items that are neither the pane name nor a
-   *  control: the CLI mark, the role badge, the four status chips, and the
-   *  folder/branch items. Walked off the header rather than listed, so a chip
-   *  added later is counted without anyone remembering to add it here.
+  /** The header items that are neither the pane name nor a control — the CLI
+   *  mark, the role badge, the status chips, and the folder/branch items —
+   *  measured twice over.
+   *
+   *   - `want` is each item at its natural, unshrunk width. That is what decides
+   *     when to FOLD, because folding is how the row buys the chrome the room it
+   *     is asking for.
+   *   - `floor` is what the same items cannot give up however hard flexbox
+   *     squeezes them. That is what prices the two rungs below the fold, which
+   *     are what happens after the chrome has already given way (#2335).
+   *
+   *  Walked off the header rather than listed, so a chip added later is counted
+   *  in both without anyone remembering to add it here.
    *
    *  Two children are skipped for the same reason — they GROW, so their rendered
    *  box is the row's leftover space rather than anything they need: the meta box
    *  (`flex: 1`, the header's spacer — its ITEMS are measured instead) and the
-   *  rename input that replaces the title while F2 is open (`flex: 1`). */
-  private measureHeaderFixed(): number {
-    let total = 0;
+   *  rename input that replaces the title while F2 is open (`flex: 1`). The meta
+   *  box contributes nothing to `floor`: it is `min-width: 0; overflow: hidden`,
+   *  so it clips its items rather than pushing the row wider. */
+  private measureHeaderFixed(): { want: number; floor: number } {
+    let want = 0;
+    let floor = 0;
     for (const child of Array.from(this.headerEl.children) as HTMLElement[]) {
       if (child === this.titleEl || child === this.overflowMenu) continue;
       if (child.classList.contains("pane-title-input")) continue;
       if (child === this.metaEl) {
         for (const item of Array.from(child.children) as HTMLElement[]) {
           const w = naturalWidth(item);
-          if (w > 0) total += w + META_GAP_W;
+          if (w > 0) want += w + META_GAP_W;
         }
         continue;
       }
       if (this.headerTail.includes(child)) continue;
       const w = naturalWidth(child);
-      if (w > 0) total += w + HEADER_GAP_W;
+      if (w > 0) {
+        want += w + HEADER_GAP_W;
+        // The gap is on the floor side too: `flex-shrink` scales children, never
+        // the row's `gap`, so an item that is present costs one whatever happens
+        // to its content.
+        floor += irreducibleWidth(child) + HEADER_GAP_W;
+      }
     }
-    return total;
+    return { want, floor };
   }
 
   /** Move the folded set into the menu (or back), preserving header order in

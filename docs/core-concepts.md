@@ -45,8 +45,11 @@ header and stays clickable at every width: the name goes first (out of the row
 entirely, rather than clipped to a character or two), and then minimize and
 maximize join everything else in the strip. At that point the strip's first row
 *is* the pane's name — press it to rename, exactly as double-clicking the name in
-the header does. So there is never a width at which a pane has no control you can
-reach.
+the header does. The status chips step aside at that point too, for the same
+reason the name does: at this width there is only room for one thing, and the
+button that reaches everything else is the one worth keeping. A pane that needs
+you still says so — the header itself takes the attention tint while its chip is
+away. So there is never a width at which a pane has no control you can reach.
 
 ### Pane kinds
 

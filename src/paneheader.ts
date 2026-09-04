@@ -78,7 +78,8 @@ export interface HeaderControl {
  *                title" means (#2335);
  *   - `minimal`  the terminal state: every control in the menu, the name gone
  *                from the row, and `⋯` the one thing left standing (#2335). */
-export type HeaderFitStage = "full" | "folded" | "squeezed" | "minimal";
+export const HEADER_FIT_STAGES = ["full", "folded", "squeezed", "minimal"] as const;
+export type HeaderFitStage = (typeof HEADER_FIT_STAGES)[number];
 
 /** How the pane name is treated in the row at a given stage. `"shrink"` is the
  *  same element with no reserved floor; `"hidden"` takes it out of the row
@@ -117,11 +118,17 @@ export interface HeaderFitInput {
    *  name vanishing at 620px because a chip WANTED 180 (#2335, caught by
    *  `queue-badge.spec.ts`'s drag-handle floor going to 0).
    *
-   *  Defaults to 0, which is what `styles.css` makes true: every header child
-   *  that is not a control is `flex-shrink: 1; min-width: 0`, so the chrome can
-   *  be squeezed to nothing before a control loses a pixel. That coupling is the
-   *  reason this default is safe, and it is the thing to revisit — by passing a
-   *  real floor here — if that rule is ever narrowed. */
+   *  It is NOT zero, and an earlier cut of this change defaulted it to zero on
+   *  the argument that `styles.css` makes every non-control header child
+   *  `flex-shrink: 1; min-width: 0`. That argument is wrong at the boundary:
+   *  `flex-shrink` scales a child's CONTENT and cannot touch its border, its
+   *  padding, or the row's own `gap`, so each lit chip keeps ~20px whatever the
+   *  width. Two of them were enough to push the `⋯` off an 80px pane — the
+   *  grid's own `MIN_PANE_PX` — which is #2335 not fixed (rev-final round 2).
+   *  `pane.ts`'s `measureHeaderFixed` now measures this per child and passes it.
+   *
+   *  The default of 0 survives only as the value for a caller that does not
+   *  measure, and it fails toward folding LATE rather than early. */
   chromeFloorWidth?: number;
   /** Current stage — the only input that makes this decision hysteretic. */
   stage: HeaderFitStage;
@@ -256,11 +263,31 @@ export function planHeaderFit(input: HeaderFitInput): HeaderFitPlan {
   rung("minimal", [], controls, 0, "hidden", true, floor);
 
   const headerWidth = px(input.headerWidth, -1);
-  const current = ladder.findIndex((r) => r.plan.stage === input.stage);
+  const exact = ladder.findIndex((r) => r.plan.stage === input.stage);
   if (headerWidth <= 0) {
     // Not laid out (or detached). Carry the current stage rather than inventing
-    // one; a stage this pane's ladder does not have falls back to the widest.
-    return ladder[current >= 0 ? current : 0].plan;
+    // one; a stage this pane's ladder does not have falls back to the widest,
+    // which is the "never an overflow button over an empty menu" case.
+    return ladder[exact >= 0 ? exact : 0].plan;
+  }
+
+  // Which rung the dead band is measured FROM. A stage can leave the ladder
+  // while the header is perfectly well laid out — revealing or hiding a control
+  // changes which rungs are strictly narrower than their neighbour, so `folded`
+  // or `squeezed` can drop out between two passes. Left as -1 that would make
+  // every rung look like a sideways move and skip the dead band for that pass,
+  // so a divider parked on a threshold flaps once at the moment a chip lights.
+  // Fall back to the nearest rung still on the ladder, NARROWER first: it is the
+  // closer row to the one being rendered, and erring narrow never clips.
+  let current = exact;
+  if (current < 0) {
+    const from = HEADER_FIT_STAGES.indexOf(input.stage);
+    for (let i = from + 1; i < HEADER_FIT_STAGES.length && current < 0; i++) {
+      current = ladder.findIndex((r) => r.plan.stage === HEADER_FIT_STAGES[i]);
+    }
+    for (let i = from - 1; i >= 0 && current < 0; i--) {
+      current = ladder.findIndex((r) => r.plan.stage === HEADER_FIT_STAGES[i]);
+    }
   }
 
   for (let i = 0; i < ladder.length; i++) {
