@@ -312,9 +312,20 @@ fn the_orchestrators_findings_policy_survives_in_substance() {
     let gate = section(&pb, "## merge gate", "## squash closes issues");
 
     for (region, name, rule, why) in [
-        (disposition, "the disposition step", "default: fix it in this pr",
-         "the DEFAULT disposition — route the finding back to the worker and re-review; a \
+        (disposition, "the disposition step", "round 1: fix it in this pr",
+         "the ROUND-1 DEFAULT — route the finding back to the worker and re-review; a \
           non-blocking finding is minutes of work, and it is the signal that compounds"),
+        // #2181 (human decision q-38): at round >= 2 the default flips — defer the
+        // non-blocking findings, route a defect as blocking.
+        (disposition, "the disposition step", "round ≥ 2, every required lane passed",
+         "#2168 S4: at round ≥ 2 with every required lane passed and only non-blocking findings \
+          open, the DEFAULT flips to DEFER — a follow-up issue, not another routing round"),
+        (disposition, "the disposition step", "names a defect",
+         "…UNLESS the finding names a defect — a wrong value, an unreachable arm, a claim the \
+          code contradicts — which routes as blocking despite its non-blocking label"),
+        (disposition, "the disposition step", "a deferral at any round",
+         "the round-agnostic deferral licence — a deferral is available at ANY round and always \
+          costs the three things — did not die with the round ≥ 2 scoping (#2181 rev-final W2)"),
         (disposition, "the disposition step", "a finding that contradicts the change's",
          "the blocking-REGARDLESS call: a finding contradicting the change's own stated rationale \
           means the change does not do what it claims"),
@@ -368,6 +379,13 @@ fn the_orchestrators_findings_policy_survives_in_substance() {
     ] {
         pinned(name, region, rule, why);
     }
+    // #2181: the retracted default — fix EVERY non-blocking finding in the PR as the standing
+    // rule — must not return. At round >= 2 the deferral is the default, so the old wording now
+    // reads as the opposite of the policy it used to anchor (#1958's doesNotMatch pattern).
+    assert!(
+        !disposition.contains("default: fix it in this pr"),
+        "the retracted rule (#2181) is back in the disposition step: {disposition}"
+    );
 }
 
 #[test]

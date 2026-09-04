@@ -51,9 +51,9 @@ memory of it — is the contract.
    outcome. **Ask with `ask_human` — never with your CLI's own interactive question dialog.**
    A dialog on your screen stops this pane taking *any* delivery, so it strands every agent
    reporting to you and not just the work you asked about (**Asking the human**).
-3. **An approval is not a disposition.** Every open finding is fixed in this PR (the default) or
-   deferred with a reason, a filed issue *and* a line to the human. A finding that contradicts
-   the change's own stated rationale is blocking whatever the reviewer labelled it.
+3. **An approval is not a disposition.** Every open finding is fixed in this PR (the round-1
+   default) or deferred with a reason, a filed issue *and* a line to the human. A finding that
+   contradicts the change's own stated rationale is blocking whatever the reviewer labelled it.
 4. **You own the architecture, not only the acceptance criteria.** Coupling, a duplicated
    mechanism, an unargued dependency, a public-contract change with no design note: each is
    grounds to reject a plan or bounce a PR.
@@ -448,9 +448,8 @@ When a worker reports a PR:
      input, or the sequence, that triggers it is dispositioned like any other finding, below;
      one that names neither is the reviewer's record of what it looked for, not a finding to
      route.
-   - **Default: fix it in this PR.** Route it back to the worker (resume its session) and
-     re-review. A non-blocking finding is usually minutes of work, and it is the signal that
-     compounds.
+   - **Round 1: fix it in this PR.** Route it back to the worker and re-review. A non-blocking
+     finding is minutes of work, and findings compound.
    - **Some "non-blocking" findings are blocking, and that call is yours.** A finding that
      contradicts the change's *own stated rationale* — the guard the issue asked for is
      bypassable, the error the PR promised to raise doesn't fire — means the change does not do
@@ -460,8 +459,10 @@ When a worker reports a PR:
      them, that is a recorded `fail`, not a `pass` with a note. Don't merge on it: treat the
      finding as blocking, send it back, and tell the reviewer its verdict didn't match its own
      findings.)
-   - **Deferring is the exception, and it is never silent.** It costs three things, and skipping
-     any one of them drops the finding:
+   - **Round ≥ 2, every required lane passed, only non-blocking findings open: DEFER them to a
+     follow-up issue, not another round** — UNLESS a finding names a defect (a wrong value, an
+     unreachable arm, a claim the code contradicts), which routes as blocking. A deferral at
+     any round costs three things, and a skipped cost drops the finding:
      1. **A reason naming why the fix doesn't belong in *this* PR** — it needs a decision you
         don't have; it is a refactor larger than the change under review. "Scope", "low value"
         and "the reviewer said non-blocking" are category words, not reasons; and "it would only
