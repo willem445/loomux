@@ -66,6 +66,9 @@ export class AgentsView {
   private listEl: HTMLElement;
   private emptyEl: HTMLElement;
   private rows = new Map<string, RowEls>();
+  /** One button per filter, keyed so it outlives a refresh — see
+   *  `renderChips`, which is why this is a map and not a rebuild. */
+  private chips = new Map<AgentFilter, HTMLButtonElement>();
   private open = false;
   private tickTimer: number | undefined;
   private gate: PollGate = new PollGate({
@@ -127,7 +130,24 @@ export class AgentsView {
    *  call while the tab is closed updates the badge and returns, so an
    *  attention flip still moves the number on a tab nobody is looking at
    *  without paying for a render. That is also what keeps the badge honest with
-   *  the ticker off — the count is what makes the tab useful unopened. */
+   *  the ticker off — the count is what makes the tab useful unopened.
+   *
+   *  WHAT A CLOSED-TAB CALL COSTS, since it is not zero (#2259 review,
+   *  rev-final premortem 2). It walks every pane of every tab and allocates one
+   *  `PaneFacts` plus one `ActivitySnapshot` each, to produce one integer. No
+   *  IPC, no geometry read, no DOM write beyond the badge — and it is driven
+   *  only by things that already moved (an attention pass that got through its
+   *  gate, a resolved strip read, a tab-set change, a rename), never by a
+   *  clock, because the ticker is disarmed while the tab is closed. It is
+   *  O(panes) with no ceiling stated, which is fine at the tens of panes a
+   *  window holds and is the honest bound rather than a claim of free.
+   *
+   *  IT CANNOT BE COUNTED OFF THE ATTENTION PAYLOAD INSTEAD, which is the
+   *  obvious cheaper shape: `needsYouCount` counts LADDER states, and the
+   *  ladder masks — a pane that is both held and blocked resolves to `held` and
+   *  must not count. Counting reasons out of `items` would be a second,
+   *  disagreeing rule for the same number, which is the divergence
+   *  `agentrows.ts` exists to prevent. */
   refresh(): void {
     const rows = this.deps.facts().map((f) => toAgentRow(f));
     this.deps.onCountChanged(needsYouCount(rows));
@@ -136,24 +156,55 @@ export class AgentsView {
     this.renderRows(visibleRows(rows, this.filter));
   }
 
+  /** Reconcile the chip strip, keyed by filter — NOT rebuilt.
+   *
+   *  An earlier draft opened with `replaceChildren()`, and `refresh()` is
+   *  driven by the 1 s ticker while this tab is open: removing the focused
+   *  element blurs it, so a keyboard user who tabbed onto a chip was returned
+   *  to `<body>` within a second, with the next `Tab` restarting traversal from
+   *  the top of the document. `leftpanel.ts` already states that hazard for the
+   *  tab buttons — "a tab strip that rebuilds its own buttons loses the focus
+   *  ring mid-keyboard-use" — and these are the same control class, rebuilt far
+   *  more often (#2259 review, rev-final N1).
+   *
+   *  So the chips get exactly what the rows get: the element for a given filter
+   *  outlives every refresh, only its text and its pressed state are written,
+   *  and a chip is created or removed only when its presence actually changes.
+   *  The selected chip is never one of the removed — `filterChips` keeps it
+   *  even at count 0, which is also what stops a filter becoming unclearable. */
   private renderChips(rows: readonly AgentRow[]): void {
-    // The chip strip IS rebuilt each refresh: it is a handful of buttons whose
-    // set changes as states appear and vanish, and it holds no animation for a
-    // rebuild to restart. The row list, which does, is diffed instead.
-    this.chipsEl.replaceChildren();
+    const seen = new Set<AgentFilter>();
+    let prev: HTMLElement | null = null;
     for (const chip of filterChips(rows, this.filter)) {
-      const btn = document.createElement("button");
-      btn.className = "agents-chip";
-      btn.type = "button";
+      seen.add(chip.filter);
+      let btn = this.chips.get(chip.filter);
+      if (btn === undefined) {
+        btn = document.createElement("button");
+        btn.className = "agents-chip";
+        btn.type = "button";
+        // The filter is captured from the KEY, so this handler stays correct
+        // for the life of the element — the chip for `held` is always the chip
+        // for `held`, whatever its count does.
+        const filter = chip.filter;
+        btn.addEventListener("click", () => {
+          this.filter = filter;
+          this.refresh();
+        });
+        this.chips.set(chip.filter, btn);
+      }
+      const label = `${chip.label} ${chip.count}`;
+      if (btn.textContent !== label) btn.textContent = label;
       btn.classList.toggle("active", chip.selected);
-      btn.setAttribute("aria-pressed", String(chip.selected));
-      if (chip.filter !== "all") btn.classList.add(`state-${chip.filter}`);
-      btn.textContent = `${chip.label} ${chip.count}`;
-      btn.addEventListener("click", () => {
-        this.filter = chip.filter;
-        this.refresh();
-      });
-      this.chipsEl.appendChild(btn);
+      const pressed = String(chip.selected);
+      if (btn.getAttribute("aria-pressed") !== pressed) btn.setAttribute("aria-pressed", pressed);
+      const want: ChildNode | null = prev === null ? this.chipsEl.firstChild : prev.nextSibling;
+      if (want !== btn) this.chipsEl.insertBefore(btn, want);
+      prev = btn;
+    }
+    for (const [filter, btn] of [...this.chips]) {
+      if (seen.has(filter)) continue;
+      btn.remove();
+      this.chips.delete(filter);
     }
   }
 
