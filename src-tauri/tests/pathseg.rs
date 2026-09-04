@@ -414,6 +414,26 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
             "find_claude_session_cwd(root, &PathSegment) — parsed in find_session_cwd",
             "fn find_claude_session_cwd(root: &Path, session_id: &PathSegment)",
         ),
+        // #2126 P2, and the one row here whose argument is NOT "the join is
+        // safe because the binding is validated" — it is that there is no join.
+        // `pi_file_suffix` builds a SUFFIX that `find_pi_session_cwd` compares
+        // against file names it read out of `read_dir` (`name.ends_with(&suffix)`);
+        // the value never becomes a path component, so it cannot walk out of the
+        // root however it is spelled. It takes a `PathSegment` anyway, so that
+        // the two halves of the pi lookup cannot disagree about what a session id
+        // may be, and that is what the proof string below pins.
+        //
+        // The scan cannot tell a suffix from a join — its trigger is the SHAPE,
+        // an interpolation plus an extension literal inside a `format!` template
+        // — and that is correct: a later edit that DID join this value would be
+        // covered by the same row, so the argument is written for the site, not
+        // for today's caller. If that ever happens, this row's argument is the
+        // one to re-derive rather than to carry forward.
+        (
+            "format!(\"_{session_id}.jsonl\")",
+            "pi_file_suffix(&PathSegment) — compared with ends_with, never joined",
+            "fn pi_file_suffix(session_id: &PathSegment) -> String {",
+        ),
         // The site the NAME-BASED version of this scan could not see, because
         // this PR renamed the parameter `session_id` -> `session` (rev-lead B2).
         // It is the declared assembly point for a claude transcript path, so a
