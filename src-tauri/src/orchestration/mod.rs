@@ -2267,10 +2267,27 @@ if [ -f "$ORX_GD/merge_gate" ]; then
           # The delegation. This pass is at an EARLIER body, and it is accepted
           # only because a required reviewer verified the body as it stands while
           # this pass stayed bound to the head that would merge — so the code it
-          # approved has not moved. An empty digest is still refused: a pass that
-          # cannot say which body it read is not one a verification can be said
-          # to have superseded.
-          if [ "$b_verified" = "1" ] && [ -n "$b_vd" ]; then
+          # approved has not moved.
+          #
+          # **A pass with no READABLE digest is refused, and "non-empty" was not
+          # that test** (#2308 review 4, W1). A verdict file written before #565
+          # has SUMMARY PROSE on line 5, so `${b_l5%% *}` is a word — non-empty,
+          # and the old guard let it through, while `mergeq::body_unchanged`
+          # refused the same file because `sanitize_digest` returns empty for
+          # anything that is not 64 hex characters. The two halves of one gate
+          # disagreed, and in the LOOSE direction on the half that actually
+          # refuses the merge: a pre-#565 pass rode in on somebody else's
+          # verification. So the shim reproduces `sanitize_digest`'s test rather
+          # than approximating it — 64 characters, all lowercase hex, which is
+          # what the tool writes and what `b_now` is compared against two lines
+          # up. Agreement is executed, not asserted:
+          # `the_shim_and_the_gate_agree_about_which_passes_a_verification_covers`.
+          b_ok=0
+          case "$b_vd" in
+            *[!0-9a-f]*) : ;;
+            *) [ ${#b_vd} -eq 64 ] && b_ok=1 ;;
+          esac
+          if [ "$b_verified" = "1" ] && [ "$b_ok" = "1" ]; then
             continue
           fi
           b_bad="$b_bad $b_r"

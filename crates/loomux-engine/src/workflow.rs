@@ -3522,8 +3522,13 @@ impl ReviewVerdict {
 /// (`reviewdrive::first_stale_lane`) and the `gh` shim's `body-unchanged` loop
 /// all have to reach the same answer, or a drive reports `satisfied` on a merge
 /// the shim then refuses. The shim is the one that cannot call this; it
-/// reproduces it in POSIX shell, and `the_shim_and_the_gate_agree_*` is what
-/// keeps the two honest.
+/// reproduces it in POSIX shell, and
+/// `the_shim_and_the_gate_agree_about_which_passes_a_verification_covers`
+/// (`src-tauri/tests/orchestration.rs`) is what keeps the two honest: it walks
+/// one set of verdict files past both halves and asserts they answer alike.
+/// A glob was cited here before that test existed (#2308 review 4, R1), and a
+/// citation to a name nothing answers to is worse than none — it reads as
+/// coverage.
 ///
 /// The caller passes the reviewers the **gate requires** — the routed list, not
 /// every verdict on disk. A block the gate does not name has no standing to

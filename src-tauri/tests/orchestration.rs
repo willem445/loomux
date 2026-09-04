@@ -42593,6 +42593,132 @@ fn the_shim_takes_a_body_verification_pass_for_the_lanes_it_supersedes() {
     assert!(err.contains("rev-tests"), "and it names the lane still owed a re-read: {err}");
 }
 
+/// **The shim and the gate agree about which passes a verification covers** —
+/// the test `workflow::body_verified`'s doc cites, executed rather than named
+/// (#2308 review 4, W1 + R1).
+///
+/// `body-unchanged` has two implementations by construction: `mergeq::body_unchanged`
+/// in Rust, and a POSIX reproduction of it in the `gh` shim, which is the half
+/// that actually refuses a merge. Nothing about them makes them agree — and on
+/// the #2168 E2 delegation arm they did not. The shim accepted a superseded pass
+/// whenever `${b_l5%% *}` was **non-empty**; a verdict file written before #565
+/// has summary PROSE on line 5, so its first field is a word, and that file was
+/// accepted by the shim while `sanitize_digest` made the Rust half refuse it.
+/// Loose on the enforcing half, which is the worst direction for a gate.
+///
+/// So this walks the same four verdict files past both halves and asserts they
+/// reach the same verdict on each. The **pre-#565 row is the one that was
+/// broken**; the others are what keep it from passing vacuously.
+#[test]
+fn the_shim_and_the_gate_agree_about_which_passes_a_verification_covers() {
+    if !have_sh() {
+        eprintln!("SKIP the_shim_and_the_gate_agree_about_which_passes_a_verification_covers: no POSIX sh");
+        return;
+    }
+    const BODY: &str = "the body as it stands\n";
+    let now = workflow::body_digest(BODY);
+    let then = workflow::body_digest("an earlier body\n");
+
+    // Each row is what `rev-tests` has on file, beside a `rev-security` that
+    // HAS verified the current body. The gate's answer is whether the merge is
+    // allowed; the question is only ever whether rev-tests' pass is covered.
+    let rows: Vec<(&str, String, bool)> = vec![
+        (
+            "an earlier body, digest readable — the delegation covers it",
+            format!("pass\n{HEAD}\n1\nrev-9\n{then}\nfine\n"),
+            true,
+        ),
+        (
+            "PRE-#565: line 5 is summary prose, so no digest was ever recorded",
+            format!("pass\n{HEAD}\n1\nrev-9\nlooks good to me\nand nothing else\n"),
+            false,
+        ),
+        (
+            "a digest field that is not 64 hex — unreadable, so uncovered",
+            format!("pass\n{HEAD}\n1\nrev-9\ndeadbeef\nfine\n"),
+            false,
+        ),
+        (
+            "the current body itself — covered without any delegation",
+            format!("pass\n{HEAD}\n1\nrev-9\n{now}\nfine\n"),
+            true,
+        ),
+    ];
+
+    let (reg, d, _repo, gid) = gated_group("    also: [body-unchanged]\n");
+    let group_dir = d.path().join(gid.as_str());
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    reg.set_pr_body_override(Some(BODY.into()));
+
+    // rev-security's verification pass, written by the real tool from a real
+    // drive record — the same construction the end-to-end shim test uses, so
+    // the mark is not hand-planted here either.
+    let sec = reviewer_caller(&reg, &gid, "rev-security");
+    let _tests = reviewer_caller(&reg, &gid, "rev-tests");
+    let mut entry = reviewdrive::DriveEntry::new(
+        7,
+        "sess-full",
+        "orch-1",
+        reviewdrive::Counters::default(),
+        1_000,
+    );
+    entry.advance(reviewdrive::DriveState::ReviewWait, None, None, 1_000).unwrap();
+    entry.head = HEAD.into();
+    entry.open_lane("rev-security", "s1", "rev-1", HEAD, Some(&now), 1_500, true);
+    let mut state = reviewdrive::ReviewDrivesState::default();
+    state.entries.push(entry);
+    reviewdrive::store_state(&group_dir, &state).unwrap();
+    recorded(&reg, &sec, "7", "pass", "verification-only round: the body as it stands is sound");
+
+    let vf = group_dir.join("verdicts").join("pr-7").join("rev-tests");
+    for (label, text, covered) in rows {
+        fs::write(&vf, &text).unwrap();
+
+        // The Rust half, asked of the clause directly so the reviewer half's
+        // own staleness check is not what is answering.
+        let verdicts: std::collections::BTreeMap<String, workflow::ReviewVerdict> =
+            reg.verdicts(&gid, 7).into_iter().map(|v| (v.block.clone(), v)).collect();
+        let gate = reg.merge_gate(&gid).expect("the fixture declares a gate");
+        let rust_ok = mergeq::recheck_gate(
+            &mergeq::GateSpec::Declared(gate),
+            &verdicts,
+            Some(HEAD),
+            &mergeq::PrObservation {
+                body_digest: Some(now.clone()),
+                ci_green: Some(true),
+                ..Default::default()
+            },
+        )
+        .passed();
+
+        // The shim half, run for real.
+        reg.grant_merge(&gid, "7", None, "human").unwrap();
+        let out = std::process::Command::new("sh")
+            .arg(&shim)
+            .args(["pr", "merge", "7"])
+            .env("LOOMUX_GROUP_DIR", &group_dir)
+            .env("FAKE_BASE", "main")
+            .env("FAKE_HEAD", HEAD)
+            .env("FAKE_CHECKS", "0")
+            .env("FAKE_BODY", BODY)
+            .output()
+            .expect("run shim");
+        let shim_ok = out.status.success();
+
+        assert_eq!(
+            rust_ok, shim_ok,
+            "{label}: the two halves of one gate must reach the same answer — \
+             rust={rust_ok} shim={shim_ok}. Shim said: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            shim_ok, covered,
+            "{label}: and the agreed answer must be the strict one"
+        );
+    }
+}
+
 /// …and it is **opt-in**: the identical drift on a repo that does not declare the
 /// condition merges, because there the PR body is discussion, not history. Baking
 /// it in would be baking one repo's merge habit into a generic tool (constraint 8).
