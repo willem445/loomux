@@ -361,9 +361,29 @@ Instrumented lifecycle events (ids and flags only):
 | `panic` | `obs.rs` hook | thread + location |
 | `pty-open` / `pty-exit` | `pty.rs` | id, size / exit code |
 | `pty-resize-fail` | `pty.rs` | id + error (successes intentionally omitted) |
+| `shutdown kill` | `pty.rs` `kill_all` | id per drained handle, written synchronously before each kill |
 | `agent-spawn` / `agent-bind` / `agent-dead` | `orchestration/mod.rs` | agent/pty ids, role |
 | `delivery` | `orchestration/mod.rs` | agent/pty, outcome, timing |
 | `mcp-auth-fail` / `mcp-tool-fail` | `orchestration/mcp.rs` | method / tool name |
+
+#### The shutdown sweep records itself before it kills (#2365)
+
+`kill_all` — the `Destroyed` window-event path at shutdown — drains the
+backend map and kills every pty. The per-pty `pty-exit … expected=false` line
+above is written by each pty's **waiter thread**, after `child.wait()` returns,
+and `kill_all` neither joins those threads nor waits on the children, so the
+process can exit before a slow child finishes dying. A real shutdown lost
+exactly that way: two live ptys (12 and 14) left no `pty-exit` line at all,
+because the sweep raced its own evidence — "absent from the shutdown sweep"
+was never evidence of removal. `kill_all` therefore writes a synchronous
+`shutdown kill id=N` breadcrumb per drained handle **before** `killer.kill()`,
+on the calling thread, so the sweep's enumeration is on record independent of
+the waiter race. The event name carries a space deliberately — it names the
+whole line, `shutdown kill id=N`, in the shape the issue's shutdown log reads —
+where every other event is one hyphenated token. `expected=false` on the
+still-racy `pty-exit` lines is unchanged: unlike `PtyManager::kill`, `kill_all`
+does not insert into `expected_exits` — which is exactly why the synchronous
+sweep line is the record to read after an unclean exit.
 
 **Privacy + size constraint.** Breadcrumbs never carry prompt or output
 *content*. Prompt text already lives in the audit log (`audit.jsonl`), which is
