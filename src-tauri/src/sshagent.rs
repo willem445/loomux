@@ -632,15 +632,27 @@ mod tests {
 
     #[test]
     fn ssh_add_sits_beside_the_ssh_that_was_resolved() {
+        // Separators are NATIVE on both sides. A Windows-spelled literal has no
+        // `parent()` on a unix host — `\` is not a separator there — so hardcoding
+        // one turns this into a test about backslashes that fails on two of the
+        // three CI platforms while saying nothing about the layout rule.
+        let dir = Path::new("OpenSSH");
+        assert_eq!(ssh_add_beside(&dir.join("ssh.exe")), Some(dir.join("ssh-add.exe")));
+        // The suffix comes from the ssh path, not from a cfg: an extensionless
+        // ssh yields an extensionless ssh-add.
+        assert_eq!(ssh_add_beside(&dir.join("ssh")), Some(dir.join("ssh-add")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_inbox_openssh_layout_resolves_as_spelled() {
+        // The production spelling, pinned where `Path` actually parses it: this
+        // is the directory `find_ssh` resolves on the Windows 10 baseline, and
+        // the pair being in ONE directory is what keeps the client and the agent
+        // the same OpenSSH.
         assert_eq!(
             ssh_add_beside(Path::new(r"C:\Windows\System32\OpenSSH\ssh.exe")),
             Some(PathBuf::from(r"C:\Windows\System32\OpenSSH\ssh-add.exe"))
-        );
-        // The suffix comes from the ssh path, not from a cfg: an extensionless
-        // ssh yields an extensionless ssh-add.
-        assert_eq!(
-            ssh_add_beside(Path::new("/usr/bin/ssh")),
-            Some(PathBuf::from("/usr/bin/ssh-add"))
         );
     }
 
