@@ -4,6 +4,7 @@
 //!
 //! Claude Code:    `~/.claude/projects/<encoded-path>/<uuid>.jsonl`
 //! Copilot CLI:    `~/.copilot/session-state/<uuid>/workspace.yaml`
+//! pi:             `~/.pi/agent/sessions/--<encoded-path>--/<ts>_<uuid>.jsonl`
 //!
 //! Everything here is best-effort in the same sense the whole scanner is:
 //! unreadable or malformed entries are skipped, and a missing tool simply
@@ -95,8 +96,15 @@ fn mtime_ms(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Extract plain text from a Claude message `content` field, which is
-/// either a string or an array of {type:"text"} blocks.
+/// Extract plain text from a message `content` field, which is either a
+/// string or an array of {type:"text"} blocks.
+///
+/// Read by BOTH transcript scanners (#2126): claude and pi disagree about every
+/// other part of their line format, and agree exactly here — pi's `TextContent`
+/// is `{ type: "text"; text: string }` and its user content is
+/// `string | (TextContent | ImageContent)[]` (`DOCS` `session-format.md`), which
+/// is this function's domain unchanged. An image block yields `None` on both,
+/// so a picture-only turn is not mistaken for a title.
 fn content_text(content: &Value) -> Option<String> {
     match content {
         Value::String(s) => Some(s.clone()),
@@ -465,6 +473,18 @@ pub fn find_session_cwd(source: &str, session_id: &str) -> Result<Option<String>
             None => Ok(None),
         };
     }
+    // #2126 P2. Named BEFORE the claude fallback, and that ordering is the
+    // whole defect this arm fixes: the dispatch used to be "copilot, else
+    // claude", so a `pi` id — a UUID, indistinguishable from a claude one by
+    // shape — was probed for in `~/.claude/projects`, where it can only ever
+    // miss. A miss reads as `Ok(None)`, i.e. "no such session", so the wrong
+    // store was consulted with nothing red to say so.
+    if source == "pi" {
+        return match pi_sessions_root() {
+            Some(root) => find_pi_session_cwd(&root, &session),
+            None => Ok(None),
+        };
+    }
     match claude_projects_root() {
         Some(root) => find_claude_session_cwd(&root, &session),
         None => Ok(None),
@@ -550,6 +570,248 @@ thread_local! {
 #[doc(hidden)] // pub for integration tests
 pub fn set_copilot_session_state_root_for_test(root: Option<PathBuf>) {
     COPILOT_SESSION_STATE_ROOT_OVERRIDE.with(|c| *c.borrow_mut() = root);
+}
+
+// ---------- pi (#2126 P2) ----------
+//
+// pi keeps one JSONL file per session under a per-cwd directory whose name is
+// the working directory with every path separator and colon replaced by `-`,
+// wrapped in `--`:
+//
+//     ~/.pi/agent/sessions/--C-Projects-loomux--/<timestamp>_<uuid>.jsonl
+//
+// So the layout is claude-shaped (a file per session, one directory level
+// down) with one difference that matters here: the file NAME is not the id, it
+// is `<timestamp>_<uuid>`. Everything below therefore matches on the `_<id>`
+// SUFFIX rather than on the stem, and never on a prefix — see
+// `find_pi_session_cwd`.
+//
+// Facts pinned against `earendil-works/pi@b79e4cc8` (= tag `v0.84.4`),
+// `packages/coding-agent/docs/session-format.md` §File Location and its
+// SessionHeader / SessionMessageEntry shapes; quoted in `doc/design/pi.md`.
+
+thread_local! {
+    /// Test seam for `pi_sessions_root()`, same thread-scoping rationale as
+    /// `CLAUDE_PROJECTS_ROOT_OVERRIDE`. Checked BEFORE the environment, for the
+    /// same reason the copilot seam is: `PI_CODING_AGENT_SESSION_DIR` is a real
+    /// production override a developer may have set, and a test must still win
+    /// over it.
+    static PI_SESSIONS_ROOT_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only seam: fixture the directory `find_session_cwd`'s pi half scans,
+/// for the calling thread only. See `set_claude_projects_root_for_test` for why
+/// this is a real `pub` function rather than `#[cfg(test)]`.
+#[doc(hidden)] // pub for integration tests
+pub fn set_pi_sessions_root_for_test(root: Option<PathBuf>) {
+    PI_SESSIONS_ROOT_OVERRIDE.with(|c| *c.borrow_mut() = root);
+}
+
+/// The sessions root a `pi` launched from THIS process's environment would
+/// write to, as a pure function of the three inputs the vendor's own resolution
+/// reads — so every branch is testable without `std::env::set_var`, which is
+/// unsynchronized mutation racing every other test thread in the binary (the
+/// same argument `opencode_store_from` makes).
+///
+/// `PI_CODING_AGENT_SESSION_DIR` names the sessions directory itself and wins;
+/// otherwise sessions live under `<PI_CODING_AGENT_DIR or ~/.pi/agent>/sessions`
+/// (`DOCS` `environment-variables.md`, `session-format.md` §File Location).
+///
+/// **The `sessionDir` SETTINGS key is deliberately not read**, and that is a
+/// disclosed residual rather than an oversight: pi resolves `--session-dir` >
+/// `PI_CODING_AGENT_SESSION_DIR` > settings `sessionDir` (`DOCS`
+/// `settings.md` §Sessions), and reading the third would mean parsing
+/// `~/.pi/agent/settings.json` — a second vendor file whose schema loomux would
+/// then be pinned to. A human who has moved their store that way sees no pi
+/// rows in the Sessions tab; they see no WRONG rows, which is the failure mode
+/// that matters. `doc/design/pi.md` records it.
+#[doc(hidden)] // pub for integration tests
+pub fn pi_sessions_root_from(
+    env_session_dir: Option<&str>,
+    env_agent_dir: Option<&str>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let named = |v: Option<&str>| v.map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from);
+    if let Some(dir) = named(env_session_dir) {
+        return Some(dir);
+    }
+    let agent = match named(env_agent_dir) {
+        Some(d) => d,
+        None => home?.join(".pi").join("agent"),
+    };
+    Some(agent.join("sessions"))
+}
+
+/// `pub`: `collect_pi_candidates` stayed in `src-tauri` and routes through this
+/// same testable root lookup rather than a second, untestable `dirs::home_dir()`
+/// inline — the gap #457 closed for claude, not reopened for pi.
+pub fn pi_sessions_root() -> Option<PathBuf> {
+    if let Some(r) = PI_SESSIONS_ROOT_OVERRIDE.with(|c| c.borrow().clone()) {
+        return Some(r);
+    }
+    pi_sessions_root_from(
+        std::env::var("PI_CODING_AGENT_SESSION_DIR").ok().as_deref(),
+        std::env::var("PI_CODING_AGENT_DIR").ok().as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+/// The file-name suffix that names one pi session: `_<id>.jsonl`.
+///
+/// **Suffix, never prefix, and the leading `_` is load-bearing.** pi's file name
+/// is `<timestamp>_<uuid>`, so the id sits at the end; matching `<id>.jsonl`
+/// without the separator would let a session whose id merely ENDS with another's
+/// answer for it, and a bare `contains` would match an id embedded in the
+/// timestamp half. Takes a [`PathSegment`] because the result is compared
+/// against a file name inside a directory this process did not choose — the same
+/// reason `find_claude_session_cwd`'s `format!` does.
+fn pi_file_suffix(session_id: &PathSegment) -> String {
+    format!("_{session_id}.jsonl")
+}
+
+/// `find_session_cwd`'s pi half, taking the sessions root explicitly so it is
+/// testable against a temp directory instead of the real `~/.pi`.
+///
+/// Same `Ok(Some(""))` vs `Ok(None)` distinction as the claude half, for the
+/// same reason: a session whose header carries no `cwd` is FOUND with an unknown
+/// workspace, not absent, and `resolve_resume_cwd` has a distinct tag for that.
+///
+/// **A never-prompted session has no file at all.** pi defers file creation to
+/// the first assistant response (`SOURCE` `session-manager.ts`), so an id this
+/// returns `Ok(None)` for may still be a live pane's — the same "no transcript
+/// until prompted" fact `doc/design/session-id-learning.md` records for claude.
+fn find_pi_session_cwd(root: &Path, session_id: &PathSegment) -> Result<Option<String>, String> {
+    if !root.exists() {
+        return Ok(None); // pi has never run here — nothing recorded, not an error
+    }
+    let suffix = pi_file_suffix(session_id);
+    let entries = fs::read_dir(root).map_err(|e| format!("cannot read {}: {e}", root.display()))?;
+    for project in entries.flatten() {
+        let Ok(files) = fs::read_dir(project.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if name.ends_with(&suffix) {
+                return Ok(Some(scan_pi_jsonl(&path).cwd));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// What one pi session file's head-scan yielded.
+///
+/// A named struct rather than [`scan_claude_jsonl`]'s tuple because pi's scan
+/// answers FOUR questions, not three — it also recovers the header's own `id`,
+/// which is the value a `pi --session <id>` resume is matched against — and a
+/// four-tuple of `String, String, String, Option<…>` is three positions any
+/// caller can transpose with nothing red to say so.
+///
+/// Every field is `pub`: `parse_candidate` stayed in `src-tauri` and reads all
+/// four. `id`/`cwd`/`title` are empty strings, never `Option`, matching what the
+/// claude scanner already returns for the same absences — "found, but the file
+/// does not say" is a real answer here (see [`find_pi_session_cwd`]'s
+/// `Ok(Some(""))` note) and a distinct one from "no such session".
+pub struct PiSessionHead {
+    /// The `id` on the header line, or empty when the file carries none.
+    pub id: String,
+    /// First non-meta user prompt, tidied — or `(no prompt)`.
+    pub title: String,
+    /// The header's `cwd`, or empty.
+    pub cwd: String,
+    /// Orchestration role + group scraped from a kickoff or notice.
+    pub orch: Option<(String, Option<String>)>,
+}
+
+/// Pull id/title/cwd/orchestration-identity out of a pi session jsonl by scanning
+/// its head — the pi counterpart of [`scan_claude_jsonl`], and deliberately not
+/// a generalisation of it: the two formats agree on the ONE sub-object this
+/// needs (`message.content`, a string or an array of `{type:"text",text}`
+/// blocks, which is why [`content_text`] is reused verbatim) and on nothing
+/// else. claude tags each line with a top-level `type` of `user`/`summary` and
+/// carries `cwd` on every entry; pi tags every conversation line `message` and
+/// puts the role INSIDE `message`, with `cwd` on the header line alone.
+///
+/// `cwd` comes from the header, which pi writes as the first line
+/// (`DOCS` `session-format.md`: "First line of the file. Metadata only") — but
+/// this looks for it on any of the first 60 lines rather than line 1 only, so a
+/// leading blank or a partially-flushed line costs the row its cwd instead of
+/// costing it the whole scan.
+///
+/// **No summary fallback.** pi's `branch_summary` entry is a compaction
+/// artefact, not a session title, so an unprompted session titles itself
+/// "(no prompt)" exactly as a claude one does rather than borrowing text the
+/// human never wrote.
+///
+/// `pub` for the same reason as [`tidy_title`]: `parse_candidate` stayed in
+/// `src-tauri` and this is how it reads a pi row.
+pub fn scan_pi_jsonl(path: &Path) -> PiSessionHead {
+    let mut id = String::new();
+    let mut title = String::new();
+    let mut cwd = String::new();
+    let mut orch: Option<(String, Option<String>)> = None;
+
+    let Ok(file) = fs::File::open(path) else {
+        return PiSessionHead { id, title, cwd, orch };
+    };
+    for line in BufReader::new(file).lines().take(60).map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("session") => {
+                if cwd.is_empty() {
+                    if let Some(c) = v.get("cwd").and_then(Value::as_str) {
+                        cwd = c.to_string();
+                    }
+                }
+                if id.is_empty() {
+                    if let Some(i) = v.get("id").and_then(Value::as_str) {
+                        id = i.to_string();
+                    }
+                }
+            }
+            Some("message") => {
+                let Some(msg) = v.get("message") else { continue };
+                if msg.get("role").and_then(Value::as_str) != Some("user") {
+                    continue;
+                }
+                let Some(text) = msg.get("content").and_then(content_text) else {
+                    continue;
+                };
+                // Same precedence as the claude scanner: a kickoff (role AND
+                // group) beats a bare `[orrerix]`-notice match (role only).
+                if orch.as_ref().map_or(true, |(_, g)| g.is_none()) {
+                    if let Some((role, gid)) = detect_orch_signature(&text) {
+                        if orch.is_none() || gid.is_some() {
+                            orch = Some((role.to_string(), gid));
+                        }
+                    }
+                }
+                if !title.is_empty() {
+                    continue;
+                }
+                let trimmed = text.trim();
+                // Skip injected command/caveat wrappers, as the claude scanner
+                // does — pi has no `isMeta` flag to consult, so the `<` test is
+                // the whole of it here.
+                if !trimmed.is_empty() && !trimmed.starts_with('<') {
+                    title = tidy_title(trimmed, 90);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if title.is_empty() {
+        title = "(no prompt)".to_string();
+    }
+    PiSessionHead { id, title, cwd, orch }
 }
 
 /// `find_session_cwd`'s copilot half, taking the session-state root

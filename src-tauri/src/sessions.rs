@@ -3,17 +3,20 @@
 //! Claude Code:    ~/.claude/projects/<encoded-path>/<uuid>.jsonl
 //! Copilot CLI:    ~/.copilot/session-state/<uuid>/workspace.yaml
 //! OpenCode:       <xdg-data>/opencode/opencode.db (one SQLite store, #722)
+//! pi:             ~/.pi/agent/sessions/--<encoded-path>--/<ts>_<uuid>.jsonl (#2126)
 //!
 //! Every scanner is best-effort: unreadable or malformed entries are
 //! skipped, and a missing tool simply yields an empty list. New agent
 //! sources can be added by implementing another `scan_*` function and
 //! extending `list_sessions`.
 //!
-//! Two of the three enumerate FILES, one queries a DATABASE, and that shows
+//! Three of the four enumerate FILES, one queries a DATABASE, and that shows
 //! up in the shape of the scan below: the candidate/`session-index.json`
 //! machinery (#493) exists to avoid re-reading the head of a file that hasn't
 //! changed, which is a cost opencode's store simply doesn't have — see
-//! `scan_opencode`.
+//! `scan_opencode`. pi is on the file side, so it is one
+//! `collect_pi_candidates` plus one `parse_candidate` arm and gets the index
+//! for free.
 //!
 //! **The pure discovery core lives in [`loomux_engine::sessions`]** (#888 slice
 //! A4, batch 14) — store roots, one session's record, and the by-id cwd
@@ -50,10 +53,13 @@ use std::time::UNIX_EPOCH;
 // that crate's manifest); it is stated rather than papered over, per
 // `loomux-engine/src/model.rs`'s standing correction.
 
-// Reach unchanged: these four were already `pub` here.
+// Reach unchanged: these were already `pub` here. `set_pi_sessions_root_for_test`
+// (#2126 P2) joins them for the same reason its three siblings are here — a
+// `tests/*.rs` integration test cannot reach a `#[cfg(test)]` hook, and the pi
+// scan tests must never read the developer's own `~/.pi`.
 pub use loomux_engine::sessions::{
     detect_orch_signature, find_session_cwd, set_claude_projects_root_for_test,
-    set_copilot_session_state_root_for_test,
+    set_copilot_session_state_root_for_test, set_pi_sessions_root_for_test,
 };
 
 // Was `pub(crate)`: `opencodedb`'s `norm_path` comparison, `digest`'s
@@ -67,14 +73,20 @@ pub(crate) use loomux_engine::sessions::{
 // Was module-private: only the scan machinery below calls these, so a bare
 // `use` keeps them reachable from nowhere else, exactly as before.
 use loomux_engine::sessions::{
-    read_copilot_session, scan_claude_jsonl, tidy_title,
+    pi_sessions_root, read_copilot_session, scan_claude_jsonl, scan_pi_jsonl, tidy_title,
 };
+
+// `pi_sessions_root_from` is the pure resolver behind `pi_sessions_root`; the
+// scan machinery never calls it, but `tests/pisessions.rs` pins each of its
+// three branches, and a test binary can only reach it through this crate.
+#[doc(hidden)] // pub for integration tests
+pub use loomux_engine::sessions::pi_sessions_root_from;
 
 #[derive(Serialize)]
 pub struct SessionInfo {
     /// Session id understood by the agent's `--resume` flag.
     pub id: String,
-    /// Which agent owns the session: "claude" | "copilot" | "opencode".
+    /// Which agent owns the session: "claude" | "copilot" | "opencode" | "pi".
     ///
     /// The frontend declares this same set as a union type
     /// (`SessionInfo["source"]` in `src/pty.ts`), and nothing checks the two
@@ -111,13 +123,21 @@ pub struct SessionInfo {
 /// 300 since long before this change.
 struct Candidate {
     /// The file whose `(mtime, len)` both keys and validates this session's
-    /// index entry: claude's `<id>.jsonl`, copilot's `workspace.yaml`.
+    /// index entry: claude's `<id>.jsonl`, copilot's `workspace.yaml`, pi's
+    /// `<timestamp>_<id>.jsonl`.
     path: PathBuf,
-    /// "claude" | "copilot" — which parser this candidate needs.
+    /// "claude" | "copilot" | "pi" — which parser this candidate needs.
     source: &'static str,
     /// Claude's filename IS the session id, so it's free at collection time;
     /// copilot's only authoritative id lives inside `workspace.yaml` (see
     /// `parse_candidate`), so it stays `None` until the file is parsed.
+    ///
+    /// pi's filename CARRIES the id (after the last `_`) and its header line
+    /// also states it. Both are filled in: the filename half here, so a file
+    /// whose head cannot be read still yields a row rather than vanishing, and
+    /// the header half in `parse_candidate`, which OVERRIDES it — the header is
+    /// what `--session <id>` is matched against, and a file someone renamed
+    /// would otherwise hand the resume command an id pi has never heard of.
     id: Option<String>,
     modified_ms: u64,
     len: u64,
@@ -203,6 +223,68 @@ fn collect_copilot_candidates(out: &mut Vec<Candidate>) {
             continue;
         };
         out.push(Candidate { path: ws, source: "copilot", id: None, modified_ms, len });
+    }
+}
+
+/// Every pi session file in the human's OWN store, as metadata-only candidates
+/// (#2126 P2).
+///
+/// **Which store is the whole question, exactly as it is for opencode.** loomux
+/// points a GROUP's pi panes at `<group dir>/pi/sessions` with `--session-dir`,
+/// and a solo pane — the only kind this tab can offer to reopen — is launched
+/// with no such flag, so it writes where an unadorned `pi` writes. That is the
+/// one enumerated here; a group's sessions are reopened THROUGH the group, with
+/// its roster, board and MCP identity (`resumeOrchSession`), never as a bare
+/// `--session` pane.
+///
+/// Routes through the engine's testable `pi_sessions_root()` rather than a
+/// second `dirs::home_dir()` inline — the #457 gap, not reopened.
+///
+/// Two directory levels, like claude: `<root>/--<encoded cwd>--/<file>.jsonl`.
+/// A file whose metadata cannot be read is skipped (#493), and a `.jsonl` whose
+/// name carries no `_` is skipped too: it cannot be one of pi's, whose names are
+/// always `<timestamp>_<uuid>`.
+fn collect_pi_candidates(out: &mut Vec<Candidate>) {
+    let Some(root) = pi_sessions_root() else {
+        return;
+    };
+    let Ok(projects) = fs::read_dir(&root) else {
+        return;
+    };
+    for project in projects.flatten() {
+        let Ok(files) = fs::read_dir(project.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // The id is everything after the LAST `_` — `rsplit_once`, not
+            // `split_once`: pi's timestamp segment contains no `_` today, but a
+            // left split would silently start returning the timestamp if it ever
+            // did, and an id is the one field a resume command cannot be wrong
+            // about.
+            let Some((_, id)) = stem.rsplit_once('_') else {
+                continue;
+            };
+            if id.is_empty() {
+                continue;
+            }
+            let Some((modified_ms, len)) = candidate_meta(&path) else {
+                continue;
+            };
+            out.push(Candidate {
+                path,
+                source: "pi",
+                id: Some(id.to_string()),
+                modified_ms,
+                len,
+            });
+        }
     }
 }
 
@@ -819,6 +901,29 @@ fn build_resume_command(cli: &str, session_id: &str, cwd: &str, store: &LaunchIn
         // emitting `claude --resume ses_…`, i.e. the WRONG CLI handed an id
         // belonging to another vendor's store.
         "opencode" => format!("opencode --session {session_id}"),
+        // #2126 P2. `--session <id>` CONTINUES an existing session, matching a
+        // stored file by exact id or a partial UUID (`DOCS` `sessions.md`), and
+        // it is the right flag here even though pi ALSO has `--session-id`,
+        // which opens-or-CREATES. This string reopens a session the human
+        // already has: `--session` fails honestly on a file they have deleted,
+        // where `--session-id` would silently mint an empty conversation
+        // wearing the id of the one they asked for — a pane that looks resumed
+        // and has lost their history. (The group path is the other case and
+        // takes the other flag: `build_agent_command`'s pi arm emits
+        // `--session-id` precisely because it may be resuming a pane that was
+        // never prompted, so the file may legitimately not exist yet.)
+        //
+        // No `--session-dir`: this row came out of the human's OWN store, which
+        // is where an unadorned `pi` looks. No posture arm either, and that is
+        // #460's rule rather than an omission — nothing records a launch intent
+        // for a pi pane, and pi has no unattended flags to grant anyway
+        // (`PI_UNATTENDED_FLAGS` is empty: it has no permission prompts to
+        // bypass).
+        //
+        // Without this arm the `_` fallback below would answer for pi —
+        // emitting `claude --resume <id>`, i.e. the WRONG CLI handed an id
+        // belonging to another vendor's store.
+        "pi" => format!("pi --session {session_id}"),
         _ => {
             let base = format!("claude --resume {session_id}");
             if claude_posture_in(store, session_id) == Some(true) {
@@ -971,6 +1076,27 @@ fn parse_candidate(c: &Candidate) -> Option<Parsed> {
         };
         return Some(Parsed { id: c.id.clone()?, title, cwd, orch_role, orch_gid });
     }
+    if c.source == "pi" {
+        let head = scan_pi_jsonl(&c.path);
+        let (orch_role, orch_gid) = match head.orch {
+            Some((role, gid)) => (Some(role), gid),
+            None => (None, None),
+        };
+        // The header's id WINS over the one collection read off the filename,
+        // and falls back to it when the header carries none (a file whose first
+        // line was truncated mid-write). The filename is a convenience; the
+        // header is what pi itself matched `--session <id>` against when it
+        // wrote the file, so a renamed or hand-copied file yields a resume
+        // command that works rather than one that names a session pi has never
+        // heard of. A row with NEITHER is dropped, like a copilot directory
+        // whose `workspace.yaml` carries no `id`.
+        let id = match (head.id.is_empty(), c.id.clone()) {
+            (false, _) => head.id,
+            (true, Some(from_name)) => from_name,
+            (true, None) => return None,
+        };
+        return Some(Parsed { id, title: head.title, cwd: head.cwd, orch_role, orch_gid });
+    }
     let s = read_copilot_session(c.path.parent()?)?;
     Some(Parsed {
         id: s.id,
@@ -1070,7 +1196,7 @@ fn to_session_info(source: &str, e: &IndexEntry, intent: &LaunchIntentStore) -> 
 /// `Unavailable` degrades to no rows: an absent store (opencode has never run
 /// here) reads exactly like a missing `~/.claude/projects`, and a drifted
 /// schema is a vendor's internal detail moving under us, never a reason to
-/// fail a scan that has two other sources to report.
+/// fail a scan that has three other sources to report.
 fn scan_opencode(limit: usize, intent: &LaunchIntentStore) -> Vec<SessionInfo> {
     let Some(db) = opencode_store_path() else {
         return Vec::new();
@@ -1127,9 +1253,9 @@ pub struct ScanStats {
     pub opencode: usize,
 }
 
-/// Scan of every session this machine has recorded — claude's and copilot's
-/// files, plus opencode's store (#722 slice C2, merged at the end) — with the
-/// file half bounded two ways (#493).
+/// Scan of every session this machine has recorded — claude's, copilot's and
+/// pi's files, plus opencode's store (#722 slice C2, merged at the end) — with
+/// the file half bounded two ways (#493).
 ///
 /// The cost this replaces (issue #342, measured in #493): a machine with a long
 /// orchestration history accumulates thousands of `.claude/projects/**/*.jsonl`
@@ -1161,6 +1287,7 @@ fn scan_sessions() -> (Vec<SessionInfo>, ScanStats) {
     let mut candidates = Vec::new();
     collect_claude_candidates(&mut candidates);
     collect_copilot_candidates(&mut candidates);
+    collect_pi_candidates(&mut candidates);
     let files_seen = candidates.len();
     candidates.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
     candidates.truncate(LIST_LIMIT);
