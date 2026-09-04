@@ -2287,7 +2287,7 @@ if [ -f "$ORX_GD/merge_gate" ]; then
             *[!0-9a-f]*) : ;;
             *) [ ${#b_vd} -eq 64 ] && b_ok=1 ;;
           esac
-          if [ "$b_verified" = "1" ] && [ "$b_ok" = "1" ]; then
+          if [ "$b_verified" = "1" ] && [ -n "$b_vd" ]; then
             continue
           fi
           b_bad="$b_bad $b_r"
