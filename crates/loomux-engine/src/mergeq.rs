@@ -992,7 +992,7 @@ fn body_unchanged(
         // refuses — and `pass_covers_body` refuses it under the delegation too,
         // because a pass that cannot say which body it read is not a pass the
         // verification lane can be said to have superseded.
-        if !v.pass_covers_body(head, Some(now), verified) {
+        if v.body_digest != now {
             bad.push(r.clone());
         }
     }
