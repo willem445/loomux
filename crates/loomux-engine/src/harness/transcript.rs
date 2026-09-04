@@ -175,6 +175,7 @@ impl Renderer {
     /// A loomux annotation: its own line, dimmed, wrapped.
     fn meta(&mut self, out: &mut String, s: &str) {
         self.newline(out);
+        out.push_str("\x1b[K");
         out.push_str(DIM);
         self.wrapped(out, s);
         out.push_str(RESET);
