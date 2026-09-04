@@ -1382,6 +1382,15 @@ export class Pane implements VoiceTargetPane {
       { id: "issues", el: this.issuesBtn, priority: false },
       { id: "git", el: this.gitBtn, priority: false },
       { id: "file-edit", el: this.fileEditBtn, priority: false },
+      // #2116's Notes button folds like every other view toggle. Registered
+      // rather than merely appended: the registry is what `headerTail` is
+      // filtered from, so an unregistered control is not replayed by
+      // `applyHeaderFold` and drifts out of DOM order the first time the header
+      // folds — as well as never folding at all, which is the whole point of
+      // #2191. It is `hidden` on any pane without a local harness, and
+      // `syncHeaderOverflow` reads a zero natural width as "a control this pane
+      // does not have", so a plain shell's header is unaffected.
+      { id: "notes", el: this.notesBtn, priority: false },
       { id: "split-right", el: clusterBtns["split-right"], priority: false },
       { id: "split-down", el: clusterBtns["split-down"], priority: false },
       { id: "minimize", el: clusterBtns["minimize"], priority: true },
@@ -4926,7 +4935,16 @@ export class Pane implements VoiceTargetPane {
    *  Read through `facts()` rather than by re-deriving the harness, so this and
    *  the Agents tab cannot disagree about what a pane is running. */
   private syncNotesBtn(): void {
-    this.notesBtn.hidden = !notesApplyToPane(this.facts().harness, this.isSshPane);
+    const hide = !notesApplyToPane(this.facts().harness, this.isSshPane);
+    if (this.notesBtn.hidden === hide) return;
+    this.notesBtn.hidden = hide;
+    // Revealing a control changes the set the overflow policy has to fit
+    // (#2191). The `misplaced` check in `syncHeaderOverflow` is written for
+    // exactly this case — a control un-hidden while the header is ALREADY
+    // folded — but it only runs when a pass runs, and this reveal happens on
+    // `start()`, which need not coincide with a resize. Scheduling one is
+    // coalesced and touches no PTY.
+    this.scheduleHeaderSync();
   }
 
   /** Tell this pane how many notes its session carries, so the button can say

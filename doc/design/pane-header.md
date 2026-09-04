@@ -29,7 +29,14 @@ Inline at every width:
 
 Everything else folds, in header order: the six orchestration toggles (tasks,
 needs-you, audit, timeline, group, fold-group), open-in-editor, the three overlay
-toggles (issues, git, file editor), both splits, and **close**.
+toggles (issues, git, file editor), per-session notes (#2116), both splits, and
+**close**.
+
+A control that only some panes have — notes is the first — is registered like
+any other and left `hidden` where it does not apply. `syncHeaderOverflow` reads
+a zero natural width as "a control this pane does not have", so it never
+reaches the policy, and the pane that reveals one schedules a pass rather than
+waiting for a resize to notice.
 
 **Close folding is deliberate and it is the one judgment call here.** The ask
 named exactly three things as always-visible and put everything else in the
