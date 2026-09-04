@@ -80,6 +80,41 @@ plan. Locating the file is a scan of the project folders for `<session>.jsonl`
 (`set_claude_projects_dir`) so tests point at a fixture tree without touching
 global state (safe under parallel execution).
 
+### pi — transcript token records, priced by pi (#2126)
+
+pi writes a JSONL session file per pane too, but into the GROUP's own store
+(`<group state dir>/pi/sessions/<timestamp>_<session>.jsonl`, pointed at with
+`--session-dir`) rather than a per-user tree keyed on an encoded cwd. The fold
+is `usage::PiFold`: `input`/`output`/`cacheRead`/`cacheWrite` off every entry
+that carries a `usage` — an `assistant` message, a `toolResult` that called a
+model of its own, a `compaction`, a `branch_summary` — plus pi's own
+`cost.total`.
+
+**The dollars are REPORTED, not estimated.** pi prices each turn against its own
+provider table, so no `price_for` lookup happens and `estimated` is `false` —
+the same posture as OpenCode, for the same reason. `source` is
+`pi-transcript`.
+
+**Two mapping decisions**, both argued at length in [pi.md](pi.md), §Usage and cost:
+`cacheWrite` maps to `cache_creation_tokens` (the same quantity under two
+vendors' names), and `reasoning` is deliberately NOT folded into
+`output_tokens` — pi documents it as a subset of `output`, so folding it would
+double-count. That is the opposite of the OpenCode mapping, whose fifth bucket
+is genuinely disjoint.
+
+**Limits.** The fold is over the FILE, so a branch the current leaf has
+navigated away from still counts (the tokens were bought). There is no
+message-id dedupe — pi's entries each get a fresh id, and the cursor's guards
+are what stop the same bytes being folded twice; pi's `_rewriteFile` truncates
+and rewrites, so a rewrite that DROPS entries shortens the file and the
+`len < self.len` arm resets the cursor, while a same-length or growing one
+reaches `Extend` and is caught by the 64-byte anchor instead. Naming only the
+length arm would describe the narrower half: pi is the only harness here that
+ships a whole-file rewriter, which is also what makes `ANCHOR_BYTES`' documented
+residual (an edit below the anchor window on a still-appending file, bounded by
+`CURSOR_REVALIDATE_AFTER`) reachable for pi where it is close to theoretical for
+claude. The id is preminted, so unlike OpenCode this source is live from spawn.
+
 ### Copilot CLI — no readable token record today (fallback only)
 
 Copilot keeps only `session-state/<id>/workspace.yaml`, which records no token
@@ -160,8 +195,8 @@ panes actually running. See doc/design/polled-payload-shapes.md §1. Each total'
 is `estimated` (all token-derived), `reported` (all CLI statusline), `mixed`, or
 `null` — so a total that blends estimated and reported dollars is never hidden
 under one label. Each agent row carries its token breakdown, `source`
-(`transcript`/`statusline`/`none`), `model`, `cost_usd`, and an `estimated`
-flag.
+(`transcript`/`pi-transcript`/`session-db`/`statusline`/`none`), `model`,
+`cost_usd`, and an `estimated` flag.
 
 `transcript-backfill` is a FOURTH `source` value, and loomux never writes it:
 it exists only in `scripts/orch-scorecard.cjs`'s in-memory copy of a row it
@@ -187,14 +222,15 @@ this loop.
 
 ### What a cursor holds
 
-`usage::TranscriptCursors` keeps one `TranscriptCursor` per `(projects root,
-session id)`:
+`usage::TranscriptCursors` keeps one `TranscriptCursor` per `(harness, store
+root, session id)`:
 
 - the **byte offset** consumed so far, which always sits immediately after a
   `\n`;
-- the **fold** resumed from there — `TranscriptFold`, holding the four token
-  totals, the accrued cost, the best-priced model, and the message-id dedupe
-  set;
+- the **fold** resumed from there — a `TranscriptFolder`, which is the one
+  per-CLI piece: `TranscriptFold` for claude (four token totals, accrued cost,
+  best-priced model, message-id dedupe set) or `PiFold` for pi (four totals,
+  pi's own summed `cost.total`, the last assistant turn's `provider/model`);
 - the **stat** it last acted on (`len`, mtime, and creation time where the
   platform reports one);
 - a 64-byte **anchor**: the tail of the region already folded.

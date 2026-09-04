@@ -1463,10 +1463,11 @@ export interface AgentUsage {
   /** Whether this agent is currently live (vs a recycled/killed one that still
    *  counts toward the lifetime total). */
   live: boolean;
-  /** `transcript` (token-derived), `session-db` (opencode's own session row,
-   *  which carries its dollar figure too), `statusline` (last-resort CLI
-   *  parse), or `none` (nothing available yet). */
-  source: "transcript" | "session-db" | "statusline" | "none";
+  /** `transcript` (token-derived), `pi-transcript` (pi's own session file —
+   *  exact tokens AND pi's own dollar figure, #2126), `session-db` (opencode's
+   *  own session row, which carries its dollar figure too), `statusline`
+   *  (last-resort CLI parse), or `none` (nothing available yet). */
+  source: "transcript" | "pi-transcript" | "session-db" | "statusline" | "none";
   /** Model the cost was priced against, or null. */
   model: string | null;
   /** Dollar cost, or null when only tokens are known (unknown model / no data). */

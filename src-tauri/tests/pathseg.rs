@@ -427,16 +427,37 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
         ),
         // pi's session lookup (#2126). Not a path JOIN — the interpolation
         // builds a SUFFIX that filenames read out of `read_dir` are matched
-        // against, so nothing built from `seg` is ever handed to the
+        // against, so nothing built from `session` is ever handed to the
         // filesystem. The proof is nonetheless the same one every row above
-        // rests on, and it is the right one to demand: `seg` is the binding
-        // from `PathSegment::parse(session_id)` a few lines up, so the
-        // interpolation cannot be handed a raw string even by a caller that
-        // passes `../x` (which is `Ok(None)`, not a lookup).
+        // rests on, and it is the right one to demand.
+        //
+        // The row's trigger line and proof both moved when #2126 P3 gave this
+        // lookup a name of its own: `pi_session_file_in_dir` is now the single
+        // declared assembly point for a pi session file, shared by the resume
+        // path (`pi_session_cwd_in_dir`) and the usage meter
+        // (`usage::pi_session_usage_in`), and it demands the type at its
+        // signature instead of parsing inside one caller.
+        //
+        // **What is stronger is the CODE ARRANGEMENT, not automatically this
+        // row's third field** — and the first draft of this row got that wrong
+        // in a way worth recording, because it is the exact failure this
+        // allowlist's own doc warns about. It named `"pub fn
+        // pi_session_file_in_dir("` as the proof. The signature is wrapped
+        // across four lines, so that header line carries no type: revert
+        // `session: &PathSegment` to `session: &str` and the trigger line and
+        // that proof are both byte-identical, the row still resolves, and the
+        // scan stays green with the property gone — which is precisely the
+        // revert this field exists to notice (rev-final round 2, W2).
+        //
+        // So the proof names the TYPE, as all six sibling rows do. It occurs
+        // exactly once in `mod.rs`, which is what makes it unambiguous under
+        // the file-scoped `contains` check; `claude_transcript_path`'s row can
+        // name its whole single-line signature only because that signature
+        // fits on one line.
         (
-            "let suffix = format!(\"_{seg}.jsonl\");",
-            "pi_session_cwd_in_dir(dir, &str) — parsed to a PathSegment at the top of the fn",
-            "let Ok(seg) = PathSegment::parse(session_id) else { return Ok(None) };",
+            "let suffix = format!(\"_{session}.jsonl\");",
+            "pi_session_file_in_dir(dir, &PathSegment) — the declared assembly point",
+            "session: &PathSegment,",
         ),
         // Not an identifier family at all: `write_shim`/`write_refusal_shim`
         // take `program: &str`, and every call site passes a string LITERAL —

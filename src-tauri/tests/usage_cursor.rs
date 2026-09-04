@@ -19,7 +19,7 @@
 //! unit-test binary linking the full lib misses the comctl32-v6 manifest
 //! `build.rs` embeds only for integration-test targets.
 
-use loomux_lib::usage::{parse_claude_transcript, TranscriptCursors};
+use loomux_lib::usage::{parse_claude_transcript, TranscriptCursors, TranscriptKind};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -142,7 +142,7 @@ fn appended_lines_fold_onto_the_cursor_and_reach_a_full_reparse_answer() {
     let cursors = TranscriptCursors::default();
 
     let (first, w1) = cursors
-        .session_usage_measured(t.root(), &t.session)
+        .session_usage_measured(TranscriptKind::Claude, t.root(), &t.session)
         .expect("the transcript is found and parsed");
     assert_eq!(first.tokens.input_tokens, 50, "5 lines at 10 input tokens each");
     assert!(w1.bytes_read >= t.len(), "a first tick reads the whole file");
@@ -156,7 +156,7 @@ fn appended_lines_fold_onto_the_cursor_and_reach_a_full_reparse_answer() {
     t.append(&line("s1", "claude-sonnet-5", 7, 900));
 
     let (second, w2) = cursors
-        .session_usage_measured(t.root(), &t.session)
+        .session_usage_measured(TranscriptKind::Claude, t.root(), &t.session)
         .expect("still found");
     assert!(!w2.reset, "an append is an extend, never a reset");
 
@@ -198,7 +198,7 @@ fn a_tick_reads_the_appended_bytes_and_not_the_file() {
     );
 
     let (_, first) = cursors
-        .session_usage_measured(t.root(), &t.session)
+        .session_usage_measured(TranscriptKind::Claude, t.root(), &t.session)
         .expect("first read");
     assert!(
         first.bytes_read >= file_len,
@@ -215,7 +215,7 @@ fn a_tick_reads_the_appended_bytes_and_not_the_file() {
     assert!(appended > 0, "positive control: the append actually landed");
 
     let (usage, second) = cursors
-        .session_usage_measured(t.root(), &t.session)
+        .session_usage_measured(TranscriptKind::Claude, t.root(), &t.session)
         .expect("second read");
 
     // The bound. Slack covers the 64-byte anchor re-read and nothing else;
@@ -240,10 +240,10 @@ fn an_unchanged_transcript_is_not_read_at_all() {
     let t = Transcript::new("sess-idle", &body("i", 20));
     let cursors = TranscriptCursors::default();
 
-    let (first, w1) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    let (first, w1) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("first");
     assert!(w1.bytes_read > 0, "positive control: the first tick did read the file");
 
-    let (second, w2) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    let (second, w2) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("second");
     assert_eq!(w2.bytes_read, 0, "an idle transcript costs one stat and no read");
     assert!(w2.served_cached, "the totals came from the cursor");
     assert_eq!(second.tokens, first.tokens, "and they are the same totals");
@@ -258,7 +258,7 @@ fn a_truncated_transcript_resets_the_cursor_and_re_reads_from_zero() {
     let t = Transcript::new("sess-trunc", &body("t", 40));
     let cursors = TranscriptCursors::default();
 
-    let (first, _) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    let (first, _) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("first");
     assert_eq!(first.tokens.input_tokens, 400, "positive control: 40 lines were folded");
 
     // Rewritten shorter — a rotation, or the file replaced by a different
@@ -266,7 +266,7 @@ fn a_truncated_transcript_resets_the_cursor_and_re_reads_from_zero() {
     // there onto totals that describe content no longer in the file.
     t.replace(&body("z", 3));
 
-    let (after, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    let (after, w) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("second");
     assert!(w.reset, "a shrink must throw the cursor away");
     assert_eq!(
         after.tokens,
@@ -286,7 +286,7 @@ fn a_same_length_rewrite_resets_the_cursor_too() {
     let t = Transcript::new("sess-samelen", &body("p", 12));
     let cursors = TranscriptCursors::default();
 
-    let (first, _) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    let (first, _) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("first");
     assert_eq!(first.tokens.input_tokens, 120);
     let was = t.len();
 
@@ -296,7 +296,7 @@ fn a_same_length_rewrite_resets_the_cursor_too() {
     t.bump_mtime();
     assert_eq!(t.len(), was, "the fixture must actually be the same length to test this");
 
-    let (after, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    let (after, w) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("second");
     assert!(w.reset, "a same-length rewrite must still throw the cursor away");
     assert_eq!(
         after.tokens.input_tokens, 240,
@@ -325,7 +325,7 @@ fn a_half_written_line_is_not_consumed_until_its_newline_arrives() {
     t.append(record);
 
     let cursors = TranscriptCursors::default();
-    let (before, _) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    let (before, _) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("first");
     assert_eq!(
         before.tokens.input_tokens, 20,
         "only the two newline-terminated lines are folded; the unterminated tail waits"
@@ -333,7 +333,7 @@ fn a_half_written_line_is_not_consumed_until_its_newline_arrives() {
 
     t.append(newline);
 
-    let (after, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    let (after, w) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("second");
     assert!(!w.reset, "the newline arriving is an ordinary append");
     assert_eq!(
         after.tokens.input_tokens,
@@ -377,14 +377,14 @@ fn an_edit_below_the_anchor_window_is_not_detected_by_any_guard() {
     let t = Transcript::new("sess-blind", &body("b", 40));
     let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
 
-    let (first, _) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    let (first, _) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("first");
     assert_eq!(first.tokens.input_tokens, 400, "positive control: 40 lines folded");
 
     let delta = edit_an_early_consumed_line(&t);
     t.bump_mtime();
     t.append(&line("b-new", "claude-opus-4-8", 1, 1));
 
-    let (after, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    let (after, w) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("second");
     assert!(!w.reset, "no guard fires: len grew, mtime moved forward, anchor intact");
 
     let full = parse_claude_transcript(&t.text());
@@ -407,14 +407,14 @@ fn the_revalidation_timer_bounds_that_blind_spot() {
     let t = Transcript::new("sess-reval", &body("r", 40));
     let cursors = TranscriptCursors::with_revalidate_after(Duration::ZERO);
 
-    let (first, _) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    let (first, _) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("first");
     assert_eq!(first.tokens.input_tokens, 400);
 
     let delta = edit_an_early_consumed_line(&t);
     t.bump_mtime();
     t.append(&line("r-new", "claude-opus-4-8", 1, 1));
 
-    let (after, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    let (after, w) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("second");
     assert!(w.revalidated, "the age check, not a guard, is what discarded the cursor");
     assert!(w.reset, "and a revalidation IS a reset — `revalidated` only says why");
     assert_eq!(
@@ -433,10 +433,10 @@ fn an_unexpired_cursor_is_not_revalidated() {
     let t = Transcript::new("sess-noreval", &body("n", 4));
     let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
 
-    cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("first");
     t.append(&line("n-new", "claude-opus-4-8", 1, 1));
 
-    let (_, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    let (_, w) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("second");
     assert!(!w.revalidated, "well inside the interval, the cursor keeps folding");
     assert!(!w.reset);
 }
@@ -453,7 +453,7 @@ fn an_mtime_that_moved_backwards_resets_the_cursor() {
     let t = Transcript::new("sess-backwards", &body("m", 6));
     let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
 
-    let (first, _) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    let (first, _) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("first");
     assert_eq!(first.tokens.input_tokens, 60, "positive control: 6 lines folded");
 
     let was = fs::metadata(&t.path).expect("stat").modified().expect("mtime");
@@ -462,7 +462,7 @@ fn an_mtime_that_moved_backwards_resets_the_cursor() {
         .expect("set mtime backwards");
     drop(f);
 
-    let (after, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    let (after, w) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("second");
     assert!(w.reset, "an mtime that moved backwards must throw the cursor away");
     assert!(!w.revalidated, "and it is a GUARD firing, not the timer");
     assert_eq!(after.tokens, first.tokens, "the content did not change, so the answer does not");
@@ -486,7 +486,7 @@ fn a_replaced_file_with_identical_content_resets_on_its_creation_time() {
     let t = Transcript::new("sess-rotate", &body("c", 6));
     let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
 
-    let (first, _) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    let (first, _) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("first");
     assert_eq!(first.tokens.input_tokens, 60, "positive control: 6 lines folded");
 
     let before = fs::metadata(&t.path).expect("stat").created().ok();
@@ -517,7 +517,7 @@ fn a_replaced_file_with_identical_content_resets_on_its_creation_time() {
     t.bump_mtime();
 
     let distinct = matches!((before, after_created), (Some(a), Some(b)) if a != b);
-    let (after, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    let (after, w) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("second");
 
     // EVERY path below asserts something. An early `return` here would report
     // `ok` while evidencing nothing, and cargo hides a passing test's output,
@@ -565,7 +565,7 @@ fn a_transcript_that_moves_project_folder_is_rescanned_and_reset() {
     let t = Transcript::new("sess-moved", &body("v", 5));
     let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
 
-    let (first, w1) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    let (first, w1) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("first");
     assert_eq!(first.tokens.input_tokens, 50, "positive control: 5 lines folded");
     assert!(w1.scanned_root, "the first tick resolves the path by scanning");
 
@@ -573,7 +573,7 @@ fn a_transcript_that_moves_project_folder_is_rescanned_and_reset() {
     fs::create_dir_all(&moved).expect("create the new project folder");
     fs::rename(&t.path, moved.join(format!("{}.jsonl", t.session))).expect("move it");
 
-    let (after, w2) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    let (after, w2) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("second");
     assert!(w2.scanned_root, "the remembered path stopped being a file, so rescan");
     assert!(
         w2.reset,
@@ -602,7 +602,7 @@ fn a_line_that_is_not_utf8_is_skipped_rather_than_ending_the_parse() {
     fs::write(&t.path, &raw).expect("write");
 
     let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
-    let (usage, _) = cursors.session_usage_measured(t.root(), &t.session).expect("read");
+    let (usage, _) = cursors.session_usage_measured(TranscriptKind::Claude, t.root(), &t.session).expect("read");
 
     assert_eq!(
         usage.tokens.input_tokens,

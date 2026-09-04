@@ -37566,6 +37566,14 @@ fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
         ("prompts.rs", 1),       // test_registry
         ("perf_leaflocks.rs", 1), // test_registry
         ("opencodeusage.rs", 1), // test_registry
+        // #2126 P3, the pi twin of the opencode row above. Same reason it is its
+        // own binary (helpers do not cross integration-test targets), and it
+        // carries the #1778 row convention rather than the older bare one: its
+        // own `its_registry_helper_applies_every_override_this_allowlist_row_assumes`
+        // asserts the helper really applies all four agent/hook dir overrides,
+        // so this row's premise fails loudly in that binary if the helper ever
+        // stops.
+        ("piusage.rs", 1),       // test_registry (#2126 P3) — proof test above
         ("opencodesessions.rs", 1), // registry_at
         ("opencodedigest.rs", 1), // test_registry
         ("rootreg.rs", 1),        // registry_at

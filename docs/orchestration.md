@@ -1393,10 +1393,11 @@ agent's state, and running session cost with a group total.
 record of the session, never scraped off the pane. Dollars depend on the CLI. For
 Claude Code, orrerix prices the tokens itself against a dated table, so the figure is
 an **estimate** — and on a subscription/Max account the real marginal cost is $0
-regardless, which is why tokens are the honest metric there. OpenCode prices its own
-sessions, so orrerix **reports** its number instead of guessing one (including a
-genuine $0.00 on a free model, which is an answer, not a blank). Each total is
-labelled accordingly — *estimated*, *reported*, or *mixed* for a group running both.
+regardless, which is why tokens are the honest metric there. OpenCode and pi price
+their own sessions, so orrerix **reports** their numbers instead of guessing one
+(including a genuine $0.00 on a free model, which is an answer, not a blank). Each
+total is labelled accordingly — *estimated*, *reported*, or *mixed* for a group
+running both kinds.
 A CLI with no readable record falls back to whatever dollar figure it prints in its
 own statusline, which disappears when the pane does.
 
@@ -2200,6 +2201,11 @@ and two of its omissions change what an orrerix block on it means:
   creates the session if it is missing, so orrerix mints the id up front
   rather than learning it after boot — no watcher, and a resume is the same
   flag as a fresh start.
+- **Its cost figures are pi's own.** Tokens come from the session file the same
+  way claude's do, and the dollars are the ones pi computed against its own
+  provider table — *reported*, not orrerix's estimate. A group mixing pi with
+  claude shows its total as *mixed*, because half of it is a guess and half is
+  not.
 - **Its orrerix tools ride a community extension, and that extension is not
   optional.** pi ships no MCP support of its own by design. orrerix writes a
   per-agent MCP config and names it with `--mcp-config`, which the

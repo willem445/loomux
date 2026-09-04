@@ -286,7 +286,10 @@ the default layout cwd-keyed. So one flat directory per group holds
 `<timestamp>_<uuid>.jsonl` for every pane in it.
 
 A lookup by id is therefore an **exact `_<id>.jsonl` filename-suffix match**
-(`pi_session_cwd_in_dir`), never a prefix or a `contains`: loomux's ids are
+(`pi_session_file_in_dir`, the one declared assembly point for a pi session
+file — the resume lookup and the usage meter both go through it, and it takes a
+`PathSegment` so an unvalidated id cannot reach the filename it builds), never a
+prefix or a `contains`: loomux's ids are
 UUIDs, so a loose match is harmless today and wrong the first time one id ends
 with another, and the leading `_` is what disambiguates a real id from a
 timestamp that happens to end in the same digits. The cwd comes from the first
@@ -323,6 +326,123 @@ for the same cause — not because anything downstream needs it.
 `StoreIndex` (#1592): that index amortises ONE enumeration of a big per-user
 store across many groups, and a group-local store is already O(1) per group
 with nothing to share.
+
+## Usage and cost: a transcript fold with pi's own dollars (#2126 P3)
+
+pi's session file is the usage record, so a pi pane is read the way a claude
+one is — the totals are folded off the JSONL — and **not** the way an opencode
+one is. What differs from claude is where the dollars come from:
+`usage::PiFold` sums the `cost.total` pi wrote on each entry, so the figure is
+**reported**, not estimated, and no `price_for` lookup happens. The mechanics
+and the cursor contract live in
+[group-cost-tracking.md](group-cost-tracking.md); what is pi-specific is here.
+
+**Four entry shapes carry spend**, per pi's session-entry union
+(`SOURCE` `core/session-manager.d.ts`, `pi-ai` `types.d.ts`):
+
+| record | where the `usage` sits | why it counts |
+| --- | --- | --- |
+| `message` / `role: assistant` | `message.usage` | the ordinary turn |
+| `message` / `role: toolResult` | `message.usage` (optional) | a tool that called a model of its own — pi's own comment says it is *"Not part of main LLM context accounting"*, but it is money spent under this session |
+| `compaction` | entry-level `usage` (optional) | *"Usage from the LLM call(s) that generated this summary"* |
+| `branch_summary` | entry-level `usage` (optional) | the same, for a branch |
+
+Everything else — the header, `model_change`, `thinking_level_change`,
+`custom`, `label`, user messages — contributes nothing.
+
+**The fold is over the FILE, not the active path.** pi's session file is a
+tree, and `/tree` navigation can leave whole branches off the current leaf. The
+tokens on an abandoned branch were still bought, so they are still counted;
+`a_branch_the_leaf_has_navigated_away_from_still_counts_because_the_tokens_were_bought`
+pins that against a fixture where the two answers differ.
+
+**`reasoning` is NOT folded into `output_tokens` — the opposite of what the
+opencode mapping does with the same-named field.** pi's `Usage` documents it as
+*"a subset of `output`: `output` already includes these tokens"*, and pi agrees
+with itself elsewhere: `totalTokens` is `input + output + cacheRead +
+cacheWrite`, and `calculateCost` prices exactly those four. Folding it in would
+double-count. OpenCode's fifth bucket is genuinely disjoint from its `output`,
+which is why that mapping folds and this one must not.
+
+One observation is recorded rather than smoothed over, because it contradicts
+that invariant: on the maintainer's own install, real `openrouter` transcripts
+carry turns where `reasoning` EXCEEDS `output` (for example `output: 104`,
+`reasoning: 110` on `moonshotai/kimi-k2.6`), which a subset cannot do. Whichever
+way that provider's numbers are wrong, taking pi's documented contract and pi's
+own cost basis is what keeps loomux's tokens and loomux's dollars describing the
+same spend. If pi ever moves `reasoning` out of `output`, this is the paragraph
+to re-derive.
+
+**No message-id dedupe**, unlike claude's fold. claude's exists because
+`--resume` re-emits assistant messages that are already on disk; pi opens the
+same file by id and appends, and re-folding the same bytes is prevented by the
+cursor's guards rather than by a set in the fold.
+
+**pi ships a whole-file rewriter and claude does not, so name BOTH halves of
+what catches it.** `_rewriteFile` — what a `/tree` navigation or a label edit
+runs — opens the session file with mode `"w"`, a truncate, and writes every
+entry back. Two shapes come out of that, and only one is caught by the arm it
+is tempting to name alone:
+
+- **A rewrite that DROPS entries shortens the file**, so `stat_verdict`'s
+  `len < self.len` arm resets the cursor before any byte is read
+  (`a_rewritten_pi_file_refolds_from_scratch_rather_than_folding_onto_a_stale_position`).
+- **A rewrite that keeps the length or GROWS reaches `Extend` instead**, and
+  what catches it is the 64-byte anchor: the consumed region's tail is re-read
+  through the same handle before anything is folded onto it, and a mismatch
+  discards the cursor
+  (`a_non_shrinking_pi_rewrite_is_caught_by_the_anchor_not_by_the_length_arm`).
+
+That second half matters more here than it does for claude, and the reason is
+the residual on `ANCHOR_BYTES` (#1361 B1): an in-place edit to a consumed byte
+EARLIER than `offset - ANCHOR_BYTES`, on a file that goes on being appended to,
+is seen by no stat arm and no anchor, and is bounded only by
+`CURSOR_REVALIDATE_AFTER` throwing the cursor away on a timer. For claude that
+residual is close to theoretical — nothing rewrites a claude transcript. For pi
+it is reachable by an ordinary `/tree` navigation on a long session, so the
+honest statement is "wrong for at most one revalidation interval", not "cannot
+happen".
+
+**`source: "pi-transcript"`, `estimated: false`.** The snapshot arm keys on
+`pi_sessions_dir(group)` plus the pane's session id, which pi premints
+(`CliCaps::premints_session_id`), so unlike opencode the arm never sits idle
+waiting for the pane to announce a session. Two things follow that are worth
+saying next to [#2167](https://github.com/willem445/orrerix/issues/2167):
+
+- the CLI this arm is reached with comes from `Guardrails::cli_for_block`
+  (live poll) and `cli_for_agent` (`mark_dead`), so a pi pane in a roster's
+  SECOND pi block is read as pi rather than as its class's default — the fix
+  is shared, not re-implemented here, and
+  `a_pi_pane_in_a_second_block_of_its_class_is_read_as_pi_not_as_the_class_default`
+  pins both callers;
+- the file's LOCATION involves no cwd slug at all. The store is the group's
+  own directory and the id is loomux's, so the slug-shaped half of #2167's
+  original suspicion has no surface on pi.
+
+**Two residuals, stated rather than left to be found.**
+
+*A SOLO pi pane has no usage source.* `compute_usage_snapshot` keys the arm on
+`pi_sessions_dir(entry.group)`, and a solo pane's group is `__solo__` — a
+directory a solo pane never writes to, because loomux passes `--session-dir`
+only on a spawned pane's launch line. A solo pi pane's session lives in the
+human's own `~/.pi` store, which loomux deliberately does not read. The arm
+therefore finds nothing and the pane falls through to the statusline, which is
+the same shape the opencode arm already has for the same reason (`__solo__` has
+no `OPENCODE_DB` either). Reading a human's own store to price a solo pane is a
+change of policy, not a missing line, so it is a follow-up rather than a gap
+this slice left silently open.
+
+*A store-level read error reads as "no usage", with no audit line.* pi's
+locator returns `Ok(None)` for an absent directory and `Err` only for a real IO
+fault on the group's own state directory; the usage reader collapses both into
+its existing `None`. That is deliberately unlike opencode, which writes one
+audit line per degrade episode (`note_opencode_db_degrade`) because a drifted
+SQLite schema and a never-booted pane are otherwise indistinguishable. pi has no
+such ambiguity to resolve — its ordinary "nothing written yet" case is already
+`Ok(None)`, and the residual `Err` is an unreadable group directory, which the
+spawn itself already fails loudly on (`fs::create_dir_all` is an error there,
+not a best-effort mkdir). If that ever stops being true, the opencode shape is
+the one to copy.
 
 ## Knobs (#687)
 
