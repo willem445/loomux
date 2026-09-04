@@ -457,6 +457,27 @@ impl Decoder {
     /// `--replay-user-messages` would move the boundary to the true start and
     /// give [`AgentPane::send`] a real acknowledgement at the same time; that is
     /// an R2 decision, because it changes the launch line the note contracts.
+    ///
+    /// # Residual: subagent output is attributed to the turn that spawned it
+    ///
+    /// Messages from a subagent "appear in the stream as `assistant` and `user`
+    /// messages whose `parent_tool_use_id` field is the ID of the tool call that
+    /// spawned the subagent", while "messages from the main conversation carry
+    /// `null` in that field"
+    /// (<https://code.claude.com/docs/en/headless#follow-subagent-messages>).
+    /// **R1's decoder does not read that field**, so a subagent's text and tool
+    /// calls are reported on the enclosing turn — rendered in the pane as the
+    /// main agent's, and audit-logged as its `ToolCall`s.
+    ///
+    /// That is a *stated* residual and not an oversight, on two grounds. It is
+    /// unreachable in R1, which nothing calls; and distinguishing the two would
+    /// mean adding a field to [`HarnessEvent`], whose shape §1 of the note
+    /// contracts — an amendment to a merged note, not a decoder change. R2 wires
+    /// the renderer, so R2 is where it has to be decided: either carry
+    /// `parent_tool_use_id` on the event, or filter non-null lines out of the
+    /// transcript. `a_subagent_line_is_attributed_to_the_enclosing_turn` pins
+    /// today's behaviour so that decision starts from a fact rather than a
+    /// reading, and R1's fixtures all carry `null` in the field.
     fn ensure_turn(&mut self, out: &mut Vec<Decoded>) -> TurnId {
         if let Some(t) = self.open_turn {
             return t;
@@ -615,6 +636,16 @@ pub fn interrupt_unavailable() -> String {
 /// A send failure ends the pump: the receiver is gone, so there is nobody left
 /// to publish to, and continuing would be a loop that reads a whole session into
 /// a dropped channel.
+///
+/// **Memory is bounded by ONE line, not by the log's 4 KiB cap.** `lines()`
+/// allocates each line whole, and [`EventLog::record_unknown`]'s cap bounds only
+/// the copy kept on disk — a large assistant message or a tool result echoing a
+/// big file reaches the event, and the ring, at full size. That is the honest
+/// resource statement rather than a defect: peak is one line, because nothing
+/// accumulates across lines, and the bound is therefore the CLI's own maximum
+/// line length rather than the session's length. If a future harness turns out
+/// to emit unbounded single lines, the fix is a capped reader here, not a
+/// bigger buffer.
 pub fn pump<R: BufRead>(
     reader: R,
     decoder: &mut Decoder,
@@ -995,6 +1026,74 @@ mod tests {
         // not turn-scoped content.
         let out = d.decode_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#);
         assert_eq!(out[0], Decoded::Event(HarnessEvent::TurnStarted { turn: TurnId(0) }));
+    }
+
+    #[test]
+    fn a_compact_boundary_carries_its_trigger_and_its_pre_token_count() {
+        // The decoder row §8.1 names and the one no other test reaches: the
+        // fixture has no `compact_boundary` line, and nothing else in this
+        // module constructs one. Both branches of `trigger` are driven, and
+        // `pre_tokens` is driven present AND absent — an absent count must be
+        // `None`, never a zero standing in for one (the module header's rule 1).
+        let mut d = Decoder::new();
+        let out = d.decode_line(
+            r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":12000}}"#,
+        );
+        assert_eq!(
+            out,
+            vec![Decoded::Event(HarnessEvent::Compacted {
+                trigger: CompactTrigger::Manual,
+                pre_tokens: Some(12000),
+            })]
+        );
+
+        // Anything that is not "manual" is auto, including a value this build
+        // has not heard of — a compaction that happened is a fact, and refusing
+        // to report it because its reason is unfamiliar would lose the event.
+        for trigger in ["auto", "a_trigger_from_a_later_cli"] {
+            let out = d.decode_line(&format!(
+                r#"{{"type":"system","subtype":"compact_boundary","compact_metadata":{{"trigger":"{trigger}"}}}}"#
+            ));
+            assert_eq!(
+                out,
+                vec![Decoded::Event(HarnessEvent::Compacted {
+                    trigger: CompactTrigger::Auto,
+                    pre_tokens: None,
+                })],
+                "trigger {trigger:?} must decode as an auto compaction with no count"
+            );
+        }
+
+        // And it is NOT turn-scoped: a compaction between turns must not open
+        // one, or every compaction would invent a turn nobody took.
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, Decoded::Event(HarnessEvent::TurnStarted { .. }))),
+            "a compact boundary must not open a turn: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_subagent_line_is_attributed_to_the_enclosing_turn() {
+        // Pins the RESIDUAL documented on `ensure_turn`, so R2 starts from a
+        // fact rather than a reading: R1's decoder does not read
+        // `parent_tool_use_id`, so a subagent's output is reported on the turn
+        // that spawned it. This test asserts today's behaviour and says so; it
+        // is not an endorsement, and it is what will go red when R2 decides to
+        // carry the field or filter the line.
+        let mut d = Decoder::new();
+        d.decode_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"main"}]},"parent_tool_use_id":null}"#);
+        let out = d.decode_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"from the subagent"}]},"parent_tool_use_id":"toolu_agent_1"}"#,
+        );
+        assert_eq!(
+            out,
+            vec![Decoded::Event(HarnessEvent::Text {
+                turn: TurnId(0),
+                delta: "from the subagent".into()
+            })],
+            "R1 attributes subagent text to the enclosing turn — the documented residual"
+        );
     }
 
     #[test]

@@ -210,9 +210,17 @@ pub enum DecisionSource {
 pub struct Usage {
     pub call_cumulative: Tokens,
     pub this_turn_main_loop: Option<Tokens>,
-    /// Per-model breakdown of `call_cumulative`, in the stream's own order of
-    /// appearance. Kept because a pane can switch models mid-session and a
-    /// single total then attributes spend to whichever model it happens to be on.
+    /// Per-model breakdown of `call_cumulative`, **sorted by model id**. Kept
+    /// because a pane can switch models mid-session and a single total then
+    /// attributes spend to whichever model it happens to be on.
+    ///
+    /// Sorted rather than in the stream's order because the stream's order is
+    /// not available: `serde_json`'s map is a `BTreeMap` without the
+    /// `preserve_order` feature, which this workspace does not enable. An
+    /// earlier version of this line claimed "the stream's own order of
+    /// appearance" — a claim the only producer
+    /// ([`claude::usage_from_result`](super::harness::claude::usage_from_result))
+    /// contradicts one line after it sorts.
     pub per_model: Vec<ModelTokens>,
 }
 

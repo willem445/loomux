@@ -35,11 +35,18 @@ note's §9. Until then, treat a green decoder suite as "matches the docs", not a
   `tool_result` (`is_error: true` — the branch an all-success capture never
   reaches), an `api_retry` (a real message that is not a pane event), a message
   type no build knows (which must be kept as evidence, not dropped), an unknown
-  `capabilities` entry (an open set), and **two** models in `modelUsage` (so a
-  reader that folds only the first is caught).
+  `capabilities` entry (an open set), a `compact_boundary` (a decoder row the
+  contract names, which no other test in the module reaches), and **two** models
+  in `modelUsage` (so a reader that folds only the first is caught).
+- **Every line carries `parent_tool_use_id: null`**, so nothing here exercises a
+  subagent. That is a limit rather than a property: R1's decoder does not read
+  the field, so a subagent's output is attributed to the enclosing turn, and a
+  capture containing a real subagent turn is one of the things a live recording
+  would surface. The residual is stated on `claude::Decoder::ensure_turn` and
+  pinned by `a_subagent_line_is_attributed_to_the_enclosing_turn`.
 
 ## Files
 
 | file | what it is |
 | --- | --- |
-| `one-turn.jsonl` | one complete turn: init → streamed text → text + tool call → failing tool result → retry → unknown message → text → result |
+| `one-turn.jsonl` | one complete turn: init → streamed text → text + tool call → failing tool result → retry → unknown message → text → compaction → result |
