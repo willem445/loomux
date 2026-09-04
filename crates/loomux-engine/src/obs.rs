@@ -1741,8 +1741,11 @@ fn newest_crash_log_since(dir: &Path, since: Option<SystemTime>) -> Option<PathB
 mod tests {
     use super::*;
 
-    /// Serializes the few tests that install the global panic hook / use the
-    /// log-dir override, so parallel execution can't cross their global state.
+    /// Serializes the tests that install the global panic hook / use the
+    /// log-dir override — and the planted-panic tests, because a panic runs
+    /// the global hook wherever it is installed and the override then routes
+    /// the record into whichever tempdir is set (#2366) — so parallel
+    /// execution can't cross their global state.
     ///
     /// **Always locked with `lock_safe`, never `.lock().unwrap()`.** A test that
     /// fails while holding this poisons it, and every later `.unwrap()` on it
@@ -1770,6 +1773,29 @@ mod tests {
         *LOG_DIR_OVERRIDE.lock_safe() = Some(dir.to_path_buf());
         let _restore = LogDirOverride;
         f()
+    }
+
+    /// Restores the previous panic hook on the way out, **however the scope
+    /// ends** — the hook twin of `LogDirOverride` above. The bare
+    /// `set_hook(prev)` this replaces sat after the join, so a failure between
+    /// install and restore (exactly where #2366's flake turned the test red)
+    /// skipped it on the unwind and left the crash hook installed for the REST
+    /// of the suite, writing records wherever `LOG_DIR_OVERRIDE` still
+    /// pointed — or into the real data dir once it cleared.
+    struct PrevPanicHook(Option<Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send>>);
+
+    impl PrevPanicHook {
+        fn take_previous() -> Self {
+            Self(Some(std::panic::take_hook()))
+        }
+    }
+
+    impl Drop for PrevPanicHook {
+        fn drop(&mut self) {
+            if let Some(prev) = self.0.take() {
+                std::panic::set_hook(prev);
+            }
+        }
     }
 
     #[test]
@@ -2807,7 +2833,21 @@ mod tests {
         let _serial = SERIAL.lock_safe();
         let tmp = tempfile::tempdir().unwrap();
         with_log_dir(tmp.path(), || {
-            let prev = std::panic::take_hook();
+            // #2366: the override and the hook are both process-global, so a
+            // concurrent planted panic — other tests in this same binary, e.g.
+            // budget.rs's `a real panic`, which hold no SERIAL — used to drop
+            // a foreign `crash-*.log` into THIS tempdir, and the old
+            // first-match `find` below handed back whichever entry the OS
+            // enumerated first. Plant one so that scenario is exercised on
+            // every run instead of on a random CI attempt.
+            fs::write(
+                tmp.path().join("crash-19990101-000000.log"),
+                "loomux crash log\nversion: 0.0.0-foreign\ntime:    19990101-000000\n\
+                 thread:  budget-thread\npanic:   a real panic\nat:      src/budget.rs:1:1\n",
+            )
+            .unwrap();
+
+            let _hook = PrevPanicHook::take_previous();
             install_panic_hook("9.9.9-test");
             // Panic on a *named background* thread — the acceptance criterion.
             let h = std::thread::Builder::new()
@@ -2815,21 +2855,35 @@ mod tests {
                 .spawn(|| panic!("synthetic background crash"))
                 .unwrap();
             assert!(h.join().is_err(), "thread must have panicked");
-            std::panic::set_hook(prev); // restore before releasing the serial lock
+            drop(_hook); // restore before the assertions and before releasing the serial lock
 
-            let dir = fs::read_dir(tmp.path()).unwrap();
-            let crash = dir
+            // Select THIS panic's own record by content, never by enumeration
+            // order: the planted record above is a legitimate member of the
+            // directory's `crash-*` set, so the old first-match `find` could
+            // return it. The message is the selector — the assertions below
+            // pin the thread name and the host version, which the foreign
+            // record does not carry, so the selection cannot make them
+            // vacuous. A MISSING record still fails at the `expect`.
+            let crash = fs::read_dir(tmp.path())
+                .unwrap()
                 .flatten()
                 .map(|e| e.path())
-                .find(|p| {
+                .filter(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
                         .is_some_and(|n| n.starts_with("crash-"))
                 })
-                .expect("a crash log must exist");
+                .find(|p| {
+                    fs::read_to_string(p).is_ok_and(|b| b.contains("synthetic background crash"))
+                })
+                .expect("this panic's own crash log must exist");
             let body = fs::read_to_string(&crash).unwrap();
             assert!(body.contains("crash-test-worker"), "captures the thread name");
-            assert!(body.contains("synthetic background crash"), "captures the message");
+            assert!(
+                body.contains("panic:   synthetic background crash"),
+                "the message must land in the record's own panic field, not just \
+                 somewhere in the file — got:\n{body}"
+            );
             // The version the host handed `install_panic_hook` survives the
             // whole path — closure capture, `catch_unwind`, `write_crash_log`,
             // `write_crash_log_in`, `record_crash_first_phase` — and lands in
@@ -2911,6 +2965,12 @@ mod tests {
 
     #[test]
     fn lock_safe_recovers_a_poisoned_mutex() {
+        // #2366: the planted panic below runs the process-global panic hook
+        // whenever another test has it installed, and that test's
+        // LOG_DIR_OVERRIDE then routes a foreign crash-*.log into ITS tempdir.
+        // Hold the same serial lock the hook installers hold, so this panic
+        // cannot fire inside one of their windows.
+        let _serial = SERIAL.lock_safe();
         let m = std::sync::Arc::new(Mutex::new(vec![1, 2, 3]));
         let m2 = m.clone();
         // Poison the mutex: mutate then panic while still holding the guard.
