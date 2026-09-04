@@ -41240,12 +41240,11 @@ impl OrchRegistry {
                     &dir,
                     sid,
                 ) {
-                    // Same guard as the claude and opencode arms: a session
-                    // file that exists but has counted nothing yet (pi writes
-                    // the header before the first assistant turn) must not
-                    // overwrite history with zeros, nor pre-empt the statusline
-                    // fallback.
-                    if u.tokens.total() > 0 {
+                    // SCRATCH MUTATION M5 (#2126 P3 red-before-green): the
+                    // zero guard is removed, so a header-only session file — a
+                    // pane spawned and never prompted — publishes a
+                    // `pi-transcript` row of four zeros. Never merged.
+                    if true {
                         snap.source = "pi-transcript".to_string();
                         snap.input_tokens = u.tokens.input_tokens;
                         snap.output_tokens = u.tokens.output_tokens;
