@@ -3221,7 +3221,9 @@ fn decide_fix_receipts(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLim
         // records.
         WorkerSignal::Done => DriveStep::to(DriveState::ReviewWait),
         WorkerSignal::Silent => {
-            if entry.state_elapsed_ms(facts.now_ms) >= minutes_ms(limits.fix_timeout_minutes) {
+            if facts.now_ms.saturating_sub(entry.fix_handback_ms)
+                >= minutes_ms(limits.fix_timeout_minutes)
+            {
                 DriveStep::held(HeldReason::FixStalled)
             } else {
                 DriveStep::Wait
