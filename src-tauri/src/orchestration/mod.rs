@@ -28762,15 +28762,6 @@ impl OrchRegistry {
         // caller, which hard-codes `Webview`; the guard is what keeps
         // `is_dismissal`'s "the two cannot disagree" a fact rather than an
         // intention.
-        if source.is_dismissal() {
-            self.audit(group, "human", "needs-you-reject", json!({
-                "id": id, "source": tag, "op": "resolve", "reason": "wrong-source",
-            }));
-            return Err(format!(
-                "{tag} is a dismissal source — resolving records that the human LOOKED, so it \
-                 cannot be settled with it; call dismiss_needs_you instead"
-            ));
-        }
         // Validated before the lock, and a bad note settles nothing: the audit
         // records what was turned away rather than half-resolving a row.
         let note = match note.map(str::trim).filter(|n| !n.is_empty()) {
