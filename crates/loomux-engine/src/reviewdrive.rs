@@ -3464,12 +3464,7 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
     // (or `first_stale_lane` would have returned `required.len()`), so the digest
     // is the only axis left. Re-deriving that here would be a second
     // implementation of `first_stale_lane`'s answer, and the two could drift.
-    let verify = digest.is_some()
-        && required.iter().all(|l| {
-            l.verdict.as_ref().is_some_and(|v| {
-                v.verdict == Verdict::Pass && v.reviewed(&facts.head)
-            })
-        });
+    let verify = digest.is_some();
     // **A verdict decides only if it was recorded about THIS revision**, and the
     // currency test is asked here rather than inside the arms so no future word
     // can be added below without it (#1871 B1).
