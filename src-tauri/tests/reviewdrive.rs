@@ -1330,33 +1330,41 @@ fn no_placeholder_survives_into_a_brief_and_none_names_a_disposition() {
 /// round 3, W1 + R1).
 ///
 /// The grant is `LaneRecord::briefed_verify`, which `record_verdict` turns into
-/// the mark that discharges `body-unchanged` for the lanes this pass
-/// supersedes. The brief is where the reviewer is told that its pass will be
-/// read that way — `rd_lane_brief`'s own doc argues the sentence's existence in
-/// those words — so a path that stamps the grant and renders the ordinary brief
-/// makes that a false claim on a permanent surface.
+/// the mark that discharges `body-unchanged` for the lanes a pass supersedes.
+/// The brief is where the reviewer is told its pass will be read that way —
+/// `rd_lane_brief`'s own doc argues the sentence's existence in those words — so
+/// a path that stamps the grant and renders the ordinary brief makes that a
+/// false claim on a permanent surface.
 ///
 /// **The path that did exactly that, and it is the ordinary one.** The sentence
-/// used to live inside the delta arm, reached only when the lane already had a
-/// record carrying an `at_head`. A PR reviewed by hand and then handed to
-/// `drive_review` after a body edit — the undriven-to-driven transition, which
-/// is the situation #2168 is about — arrives with `lanes: []`, so
-/// `entry.lane(block)` is `None`, the first-round template renders, and
-/// `open_lane` stamps the grant anyway. `rd_open_lane` renders the brief BEFORE
-/// it writes the record, so the record can never be what decides.
+/// used to live inside the delta arm, reached only when
+/// `entry.lane(block).filter(|l| !l.at_head.is_empty())` yielded `Some`. A PR
+/// reviewed by hand and then handed to `drive_review` after a body edit — the
+/// undriven-to-driven transition, which is the situation #2168 is about — has no
+/// `at_head` on any lane, so the first-round template rendered and `open_lane`
+/// stamped the grant anyway. `rd_open_lane` renders the brief BEFORE it writes
+/// the record, so the record can never be what decides.
 ///
-/// Four crossings of {the lane has a record} x {`verify`}, asserting the marker
-/// is present **exactly** when the stamped grant is — read off
-/// `review_drives.json` rather than inferred, so neither half is assumed.
+/// Four crossings of {the lane has answered at this head} x {the body moved},
+/// asserting the marker is present **exactly** when the stamped grant is — read
+/// off `review_drives.json` rather than inferred, so neither half is assumed.
+///
+/// **Each crossing builds its own drive**, and that is not tidiness: a shared
+/// one cannot express them. The control tick (nothing moved) advances a
+/// single-lane drive out of `review-wait` to `gate-check`, so a later tick in
+/// the same fixture opens no lane at all — which is how the first cut of this
+/// test failed, at `39a4d575`, on `has_record=true` with no brief to assert
+/// about.
 #[test]
 fn a_verification_brief_announces_itself_on_every_path_that_grants_it() {
     const REVIEWED: &str = "the body every lane passed";
     const EDITED: &str = "the body somebody edited afterwards";
 
-    // `(lane already has a record, the body moved under the passes)`; the
-    // marker is owed exactly when the second is true, on both values of the
-    // first — which is the whole point.
-    for has_record in [false, true] {
+    // (has the lane answered at this head, has the body moved under that pass).
+    // The marker is owed exactly on the second, whatever the first — which is
+    // the whole finding.
+    for (answered, body_moved) in [(false, false), (false, true), (true, false), (true, true)] {
+        let label = format!("answered={answered} body_moved={body_moved}");
         let dir = tempfile::tempdir().unwrap();
         let reg = relaunch_registry(dir.path());
         let repo = Repo::new();
@@ -1368,12 +1376,14 @@ fn a_verification_brief_announces_itself_on_every_path_that_grants_it() {
         let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
         with_pane(&reg, &orch.id, 7101);
 
-        // Open lane 0 and let it PASS at (HEAD_A, REVIEWED). That both
-        // satisfies `verify`'s precondition below and — when `has_record` —
-        // gives the lane an `at_head`, which is the axis this test varies.
+        // Every crossing needs lane 0's PASS on file: it is `verify`'s
+        // precondition (`decide_review_wait` reads the verdict FILES, not the
+        // drive's records). So open the lane, record, and then shape the two
+        // axes around it.
         reg.rd_drive_group_with(&group, &gh, 10_000);
         let report = reg.rd_drive_group_with(&group, &gh, 20_000);
         let (_pr, _block, lane) = report.lanes_opened.first().cloned().expect("lane 0 opens");
+        let first_brief = lane_brief(&reg, &lane);
         let caller = Caller {
             agent_id: lane.clone(),
             group: group.clone(),
@@ -1388,77 +1398,76 @@ fn a_verification_brief_announces_itself_on_every_path_that_grants_it() {
                 "pr": "1758", "verdict": "pass", "summary": "read the diff and the body" } }),
         )
         .expect("the lane records its pass");
-        if !has_record {
-            // The undriven-to-driven shape, reached the way the drive itself
-            // reaches it: a re-drive replaces the terminal entry, and the
-            // brief is then rendered with `entry.lane(block)` failing
-            // `rd_lane_brief`'s filter while the verdict FILE still carries the
-            // pass.
-            //
-            // **The axis is `at_head`, not the presence of a record**, and the
-            // first cut of this fixture asserted the wrong one (CI read at
-            // `ac7e413e`: `left: 1, right: 0`). #2153 carries each lane's
-            // CONVERSATION across a re-drive — `reseeded` keeps the session and
-            // clears every per-revision field — so the new entry has a record
-            // whose `at_head` is empty, which is what
-            // `.filter(|l| !l.at_head.is_empty())` rejects. Same branch, same
-            // defect; only the fixture's spelling of the precondition was off.
+
+        if !answered {
+            // Drop the lane's `at_head` the way the product does: a re-drive
+            // replaces the terminal entry, and #2153's `reseeded` keeps the
+            // lane's CONVERSATION while clearing every per-revision field. The
+            // verdict FILE survives, so `verify`'s precondition still holds
+            // while `rd_lane_brief`'s filter now yields `None`.
             let session = driven_worker_session(&reg, &group);
             reg.cancel_review_drive(&group, 1758, "test");
             reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 30_000);
-            assert!(
-                live_lanes(&reg, &group)
-                    .iter()
-                    .all(|l| l["at_head"].as_str().unwrap_or_default().is_empty()),
-                "the fixture must reach the shape where `rd_lane_brief`'s filter yields None, \
-                 or this row proves nothing: {:?}",
-                live_lanes(&reg, &group)
+            // A re-drive starts in `ci-wait`; one tick on green takes arc 2
+            // back to `review-wait` so the tick under test is the one that
+            // decides about lanes rather than the one that gets there.
+            reg.rd_drive_group_with(&group, &gh, 35_000);
+            assert_eq!(
+                status_state(&reg, &group),
+                "review-wait",
+                "{label}: the re-driven fixture must be back in review-wait"
             );
+        }
+        assert_eq!(
+            live_lanes(&reg, &group)
+                .iter()
+                .any(|l| !l["at_head"].as_str().unwrap_or_default().is_empty()),
+            answered,
+            "{label}: the fixture must reach the shape it names, or the row proves nothing"
+        );
+
+        if body_moved {
+            gh.set_body(EDITED);
+            reg.set_pr_body_override(Some(EDITED.to_string()));
         }
 
-        for body_moved in [false, true] {
-            if body_moved {
-                gh.set_body(EDITED);
-                reg.set_pr_body_override(Some(EDITED.to_string()));
+        // The brief under test. With the body moved, `review-wait` re-briefs
+        // lane 0; with nothing moved there is no new brief, and the one to
+        // examine is the first-round brief already delivered above — which is a
+        // genuine `verify: false` rendering rather than an absence.
+        let report = reg.rd_drive_group_with(&group, &gh, 40_000);
+        let text = match report.lanes_opened.first().cloned() {
+            Some((_pr, _block, agent)) => lane_brief(&reg, &agent),
+            None => {
+                assert!(!body_moved, "{label}: a moved body must re-brief a lane");
+                first_brief.clone()
             }
-            let report = reg.rd_drive_group_with(&group, &gh, 40_000 + u64::from(body_moved) * 10_000);
-            let Some((_pr, _block, agent)) = report.lanes_opened.first().cloned() else {
-                assert!(
-                    !body_moved,
-                    "{has_record}/{body_moved}: a moved body must re-brief a lane, or there is \
-                     no brief to make this assertion about"
-                );
-                continue;
-            };
-            let text = lane_brief(&reg, &agent);
-            let granted = live_lanes(&reg, &group)
-                .first()
-                .and_then(|l| l["briefed_verify"].as_bool())
-                .unwrap_or(false);
-            let announced = text.contains("VERIFICATION-ONLY");
-            assert_eq!(
-                granted, announced,
-                "has_record={has_record} body_moved={body_moved}: the grant and the sentence \
-                 announcing it must be one decision — granted={granted}, announced={announced}. \
-                 Brief was: {text}"
+        };
+        let granted = live_lanes(&reg, &group)
+            .first()
+            .and_then(|l| l["briefed_verify"].as_bool())
+            .unwrap_or(false);
+        let announced = text.contains("VERIFICATION-ONLY");
+        assert_eq!(
+            granted, announced,
+            "{label}: the grant and the sentence announcing it must be ONE decision — \
+             granted={granted}, announced={announced}. Brief was: {text}"
+        );
+        assert_eq!(
+            announced, body_moved,
+            "{label}: the marker is owed exactly when the body moved under passes that \
+             already cover this head"
+        );
+        // The shape pin CLAUDE.md mandates for a user-facing message, on the
+        // literal this slice added: one paragraph, no source indentation left
+        // behind by a collapsed line continuation.
+        for line in text.lines() {
+            assert!(
+                !line.contains("          "),
+                "{label}: a brief line leaks source indentation: {line:?}"
             );
-            assert_eq!(
-                announced, body_moved,
-                "has_record={has_record}: the marker is owed exactly when the body moved under \
-                 passes that already cover this head"
-            );
-            // The shape pin CLAUDE.md mandates for a user-facing message, on
-            // the literal this slice added: one paragraph, no leaked source
-            // indentation from a collapsed `\` continuation.
-            for line in text.lines() {
-                assert!(
-                    !line.contains("          "),
-                    "has_record={has_record} body_moved={body_moved}: a brief line leaks source \
-                     indentation: {line:?}"
-                );
-            }
-            assert!(!text.contains("{{"), "an unregistered placeholder survived: {text}");
         }
+        assert!(!text.contains("{{"), "{label}: an unregistered placeholder survived: {text}");
     }
 }
 
