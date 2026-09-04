@@ -125,18 +125,21 @@ function cmdQuoteCwd(token: string): string {
  *  — sshd(8): "the client either requests an interactive shell or execution of
  *  a non-interactive command, which sshd will execute via the user's shell
  *  using its -c option" — which is neither a login shell nor an interactive
- *  one, so the files that put a user-installed CLI on `PATH` (nvm's export,
- *  `~/.local/bin`, `~/.npm-global/bin`, pnpm/volta/bun shims) are never
- *  sourced. A CLI in `/usr/bin` works; the ones agents actually install do
- *  not. Re-entering the account's own shell as a login+interactive one gets
- *  the same `PATH` the human sees at a prompt.
+ *  one, so it reads neither the login files (`/etc/profile`, `~/.profile`,
+ *  `~/.zprofile`) nor the interactive ones (`~/.bashrc`, `~/.zshrc`). Those
+ *  are where a user-installed CLI gets onto `PATH`: nvm's export,
+ *  `~/.local/bin`, `~/.npm-global/bin`, the pnpm/volta/bun shims. A CLI in
+ *  `/usr/bin` works; the ones agents actually install do not. Re-entering the
+ *  account's own shell as a login+interactive one gets the same `PATH` the
+ *  human sees at a prompt.
  *
  *  Both flags are load-bearing, and neither alone fixes it:
  *  - `-l` alone misses nvm on Ubuntu, because that export lives in `~/.bashrc`
  *    past its `case $- in *i*) ;; *) return;; esac` early return, which a
  *    non-interactive shell takes.
- *  - `-i` alone misses `~/.profile`, which is where a login shell (and only a
- *    login shell) picks up `~/.local/bin` and `~/.npm-global/bin`.
+ *  - `-i` alone misses `~/.profile` — bash reads it for a LOGIN shell, and an
+ *    interactive non-login shell goes to `~/.bashrc` instead — which is where
+ *    `~/.local/bin` and `~/.npm-global/bin` are usually added.
  *
  *  `"$SHELL"` rather than a literal `bash`: the account's shell may be zsh or
  *  fish, and `bash -lic` would then source the wrong files entirely — the same
