@@ -159,3 +159,39 @@ test("every role has a default on every CLI — a role can never be left unresol
     }
   }
 });
+test("pi is a CLI a group can be launched on, pinning no model on any role (#2126)", () => {
+  const ids = ORCH_CLIS.map((c) => c.id);
+  assert.ok(ids.includes("pi"), `pi must be offered in orchestrator mode: ${ids.join(", ")}`);
+  assert.equal(orchCliFor("pi").id, "pi");
+  // Not the fallback row: `orchCliFor` returns ORCH_CLIS[0] for anything it does
+  // not know, so a typo'd id must not silently become pi.
+  assert.notEqual(ORCH_CLIS[0]!.id, "pi");
+
+  // Failure mode 2 in this file's header, on a third CLI. pi's ids are
+  // `provider/id` (optionally `:<thinking>`) across every provider the human has
+  // authed, so there is no vendor-neutral alias to default to and any pick would
+  // silently override the `defaultModel` in their own ~/.pi/agent/settings.json.
+  // The backend's `default_model("pi", _)` returns the same nothing.
+  const pi = orchCliFor("pi");
+  // Every key of the record, not a list of role names typed here: `defaults` is
+  // `Record<OrchRole, …>`, so this iterates exactly the capability classes that
+  // exist — `manager` included, which is not in `ORCH_ROLES` (it renders no
+  // launcher field) and is precisely the one a hand-written list would miss.
+  const roles = Object.keys(pi.defaults) as (keyof typeof pi.defaults)[];
+  assert.ok(roles.length >= 5, `only ${roles.length} capability classes seen`);
+  for (const role of roles) {
+    assert.equal(
+      pi.defaults[role],
+      INHERIT_MODEL,
+      `pi's ${role} default must inherit, not pin a model loomux chose`
+    );
+  }
+  // The inherit row is OFFERED, not merely defaulted to — a role that inherits
+  // must have something selectable saying so, or the form reads as unset.
+  assert.ok(pi.models.includes(INHERIT_MODEL));
+  // And nothing else is curated: something on the machine answers for pi
+  // (`pi --list-models` lists exactly the models whose auth is configured), and
+  // `mergeModelOptions` puts that reply in front of this list — so a curated
+  // shortcut here could only ever be a staler copy of a live one (#329).
+  assert.deepEqual(pi.models, [INHERIT_MODEL]);
+});

@@ -184,3 +184,38 @@ test("dormantResumeCandidate is case/separator-insensitive on cwd, same as the a
   );
   assert.equal(out?.id, "s1");
 });
+test("a pi pane adopts a pi session, and never one of another CLI's (#2126)", () => {
+  // pi joined `Cli` with #2126 P2. Leaving it out would have made every pi pane
+  // unadoptable while the sidebar listed the very session it should have
+  // adopted — the same silent hole opencode's row was added to close.
+  const out = planSessionAdoption(
+    [pane({ cli: "pi" })],
+    [session({ id: "pi-1", cli: "pi", resumeCommand: "pi --session pi-1" })],
+    new Set()
+  );
+  assert.deepEqual(out, [{ key: "p1", sessionId: "pi-1" }]);
+
+  // THE FIXTURE THAT MAKES THAT FAIL-ABLE: the two candidates COLLIDE on
+  // everything the matcher reads except the CLI — same cwd, same window, both
+  // eligible — so a matcher that ignored `cli` would see an ambiguity and refuse
+  // BOTH, and one that crossed CLIs would adopt the wrong id. Only a matcher
+  // that separates them by CLI returns exactly this.
+  const both = planSessionAdoption(
+    [pane({ key: "pane-pi", cli: "pi" }), pane({ key: "pane-claude", cli: "claude" })],
+    [session({ id: "pi-1", cli: "pi" }), session({ id: "cl-1", cli: "claude" })],
+    new Set()
+  );
+  assert.deepEqual(
+    [...both].sort((a, b) => a.key.localeCompare(b.key)),
+    [
+      { key: "pane-claude", sessionId: "cl-1" },
+      { key: "pane-pi", sessionId: "pi-1" },
+    ]
+  );
+
+  // And a pi pane with only another CLI's session in the folder adopts nothing.
+  assert.deepEqual(
+    planSessionAdoption([pane({ cli: "pi" })], [session({ id: "cl-1", cli: "claude" })], new Set()),
+    []
+  );
+});

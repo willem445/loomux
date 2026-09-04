@@ -163,3 +163,20 @@ test("sessionBadgeLabel names the row's own CLI, whichever it is", () => {
   // resume command underneath it named another.
   assert.equal(sessionBadgeLabel("opencode"), "OPENCODE");
 });
+test("a fourth source names itself, on the badge and on the restored pane (#2126)", () => {
+  // Both functions read the row's `source` rather than branching on it, so a new
+  // scanner is named correctly on ARRIVAL. This test exists because the shape
+  // they replaced — `s.source === "claude" ? … : "COPILOT"` — was correct only
+  // while there were exactly two, and #2126 P2 found the LAST copy of it still
+  // live in main.ts's dormant card.
+  assert.equal(sessionBadgeLabel("pi"), "PI");
+  assert.equal(restoredPaneName("pi", "fix the login bug"), "pi · fix the login bug");
+
+  // The property, not the row: every source the wire can carry labels itself,
+  // and no two collapse onto one label. Written as a loop over the union's own
+  // members so a fifth source has to be added HERE, not discovered in the UI.
+  const sources = ["claude", "copilot", "opencode", "pi"];
+  const labels = sources.map(sessionBadgeLabel);
+  assert.deepEqual(labels, ["CLAUDE", "COPILOT", "OPENCODE", "PI"]);
+  assert.equal(new Set(labels).size, sources.length, "two sources share one badge label");
+});

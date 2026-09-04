@@ -19,6 +19,8 @@ import {
   programFromRestore,
   normalizeAgentProgram,
   sessionCliFromCommand,
+  SOLO_MCP_CLIS,
+  isSoloMcpCli,
   shouldWatchCopilotOnRestore,
   AUTO_RESUME_AGENTS,
   type RestoreAction,
@@ -1505,4 +1507,156 @@ test("a recorded ssh command line is NOT carried into the restore action", () =>
   assert.ok(!serialized.includes("--session-id"), `no captured command line may ride along: ${serialized}`);
   assert.ok(!serialized.includes("ssh host"), `…nor the captured command string: ${serialized}`);
   assert.ok(!serialized.includes("\"-t\""), `…nor a captured argv token: ${serialized}`);
+});
+// ---------- #2126 P2: pi names a session with a flag that opens OR creates ----------
+//
+// pi has BOTH spellings and they are not synonyms:
+//   `--session-id <id>`  opens the named session, CREATING it with that id if it
+//                        does not exist (`SOURCE` main.ts's `createSessionManager`:
+//                        `findLocalSessionByExactId(id, …)` … else
+//                        `SessionManager.create(cwd, dir, { id })`);
+//   `--session <path|id>` continues an EXISTING one, and fails if there is none.
+// pi refuses the two together (`validateSessionIdFlags`).
+//
+// That one fact decides every assertion below, and it is the reason pi's resume
+// and fresh commands are IDENTICAL where claude's and copilot's differ.
+
+test("a pi line is recognised, and its id is read from either spelling (#2126)", () => {
+  assert.equal(sessionCliFromCommand("pi --session-id abc"), "pi");
+  assert.equal(sessionCliFromCommand("pi"), "pi");
+  // Path-qualified and `.exe`-suffixed forms normalize, like every other CLI.
+  assert.equal(sessionCliFromCommand("C:\\tools\\pi.exe --session-id abc"), "pi");
+  assert.equal(sessionCliFromCommand("/usr/local/bin/pi"), "pi");
+
+  // `--session-id` is the flag loomux emits, on a fresh launch and a resume.
+  assert.equal(sessionIdFromCommand("pi --session-id abc", null), "abc");
+  assert.equal(sessionIdFromCommand("pi --session-id=abc", null), "abc");
+  assert.equal(sessionIdFromCommand(null, ["pi", "--session-id", "abc"]), "abc");
+  // `--session` is the flag the SESSIONS TAB's own `resume_command` emits
+  // (`pi --session <id>`, straight from the backend's scanner), so a pane opened
+  // from that tab must still yield its id here — without this the pane's next
+  // restore would record `sessionId: null` and its Resume card would have
+  // nothing to resume, the exact #1563 A1 failure opencode had.
+  assert.equal(sessionIdFromCommand("pi --session abc", null), "abc");
+  assert.equal(sessionIdFromCommand("pi --session=abc", null), "abc");
+
+  // …and ONLY on a pi line. `--session` on a claude or copilot line is a flag
+  // this project has never established the meaning of, so it is not read as
+  // identity there — the same per-CLI restriction `OPENCODE_SESSION_FLAG_NAMES`
+  // carries. (Positive control for that negative: the same line with
+  // `--session-id` DOES yield an id, so the null below is the flag-name rule and
+  // not a broken fixture.)
+  assert.equal(sessionIdFromCommand("claude --session abc", null), null);
+  assert.equal(sessionIdFromCommand("claude --session-id abc", null), "abc");
+});
+
+test("pi resumes and starts fresh with the SAME flag, because that flag does both (#2126)", () => {
+  // Resume: `--session-id`, not claude's `--resume` (pi has no such flag) and
+  // not `--session` (which requires the file to exist — and a pi session file is
+  // not created until the first assistant response, so a pane killed before it
+  // was ever prompted has a real pre-minted id and no file at all).
+  assert.deepEqual(agentResumeCommand("pi", null, "s1"), { command: "pi --session-id s1" });
+  assert.deepEqual(agentFreshCommand("pi", null, "s1"), { command: "pi --session-id s1" });
+
+  // Every other flag on the line survives — the resumed pane matches how it was
+  // launched (#442's guarantee).
+  assert.deepEqual(agentResumeCommand("pi --model anthropic/claude-sonnet-5 --thinking high", null, "s2"), {
+    command: "pi --model anthropic/claude-sonnet-5 --thinking high --session-id s2",
+  });
+
+  // A stale id is DROPPED rather than doubled, in every spelling and both
+  // representations — including a `--session` recorded by the Sessions tab,
+  // which pi would refuse alongside `--session-id`.
+  assert.deepEqual(agentResumeCommand("pi --session-id old", null, "new"), { command: "pi --session-id new" });
+  assert.deepEqual(agentResumeCommand("pi --session old", null, "new"), { command: "pi --session-id new" });
+  assert.deepEqual(agentResumeCommand("pi --session=old --model m", null, "new"), {
+    command: "pi --model m --session-id new",
+  });
+  assert.deepEqual(agentResumeCommand(null, ["pi", "--session", "old"], "new"), {
+    argv: ["pi", "--session-id", "new"],
+  });
+  assert.deepEqual(agentFreshCommand(null, ["pi", "--session-id", "old"], "new"), {
+    argv: ["pi", "--session-id", "new"],
+  });
+  // The FRESH path has to excise `--session` too, not just `--session-id`: a
+  // pane opened from the Sessions tab is recorded with `pi --session <id>`, and
+  // pi refuses that flag alongside the `--session-id` this appends.
+  assert.deepEqual(agentFreshCommand("pi --session old --model m", null, "new"), {
+    command: "pi --model m --session-id new",
+  });
+  assert.deepEqual(agentFreshCommand(null, ["pi", "--session", "old"], "new"), {
+    argv: ["pi", "--session-id", "new"],
+  });
+
+  // THE POINT OF THE PAIR BEING EQUAL, pinned so it reads as a decision rather
+  // than a copy-paste: opencode's fresh command DROPS its identity because no
+  // opencode flag can pre-assign one, and pi's keeps it because `--session-id`
+  // is exactly such a flag. Same rule, opposite answers, one vendor fact apart.
+  assert.deepEqual(agentFreshCommand("opencode --session old", null, "new"), { command: "opencode" });
+  assert.notDeepEqual(agentFreshCommand("pi --session old", null, "new"), { command: "pi" });
+});
+
+test("a solo pi pane's stale MCP flag is excised — and only on a pi line (#2126)", () => {
+  // pi's solo identity is ONE flag and its value: `--mcp-config <path>`, with no
+  // allow-list token after it (pi has no permission surface to name one to, and
+  // exclusivity rides on PI_MCP_CONFIG_MODE in the pane env). The path is
+  // deleted at agent exit like claude's, so replaying it boots a pane with no
+  // orrerix tools at all.
+  const cfg = 'C:\\Users\\Will H\\AppData\\Roaming\\loomux\\orchestration\\__solo__\\configs\\solo-3.json';
+  assert.deepEqual(stripSoloMcpFlags(`pi --session-id s1 --mcp-config "${cfg}"`, null), {
+    cli: "pi",
+    command: "pi --session-id s1",
+  });
+  assert.deepEqual(stripSoloMcpFlags(null, ["pi", "--session-id", "s1", "--mcp-config", cfg]), {
+    cli: "pi",
+    argv: ["pi", "--session-id", "s1"],
+  });
+
+  // THE REASON THAT BRANCH IS PROGRAM-GATED. `--mcp-config <path>` is also the
+  // leading half of claude's group and a flag a human may reasonably have typed;
+  // an ungated match would classify this line as pi's and delete the human's own
+  // flag on every restore. It must come back untouched, byte for byte.
+  const handTyped = "claude --mcp-config ./my-servers.json";
+  assert.deepEqual(stripSoloMcpFlags(handTyped, null), { cli: null, command: handTyped });
+  assert.deepEqual(stripSoloMcpFlags(null, ["claude", "--mcp-config", "./my-servers.json"]), {
+    cli: null,
+    argv: ["claude", "--mcp-config", "./my-servers.json"],
+  });
+
+  // And claude's own FULL group is still claude's — the anchored patterns get
+  // first refusal, so widening this function did not steal a claude line.
+  assert.equal(
+    stripSoloMcpFlags(`claude --mcp-config "${cfg}" --strict-mcp-config --allowedTools mcp__orrerix`, null).cli,
+    "claude"
+  );
+});
+
+test("the argv-seam CLI set is one list, not three hand-typed copies (#2126)", () => {
+  // `applyChannelTools` (the toggle's visibility), the launcher's mint gate and
+  // `stripSoloMcpFlags`'s excision all have to agree about which CLIs can be
+  // handed a channel identity on a command line. They used to carry two copies
+  // of the pair and a third implicit answer; missing one is silent — a CLI
+  // offered the toggle but never minted for, or minted for with the toggle
+  // hidden.
+  assert.deepEqual([...SOLO_MCP_CLIS].sort(), ["claude", "copilot", "pi"]);
+  assert.ok(isSoloMcpCli("pi"));
+  assert.ok(isSoloMcpCli("claude"));
+  assert.ok(isSoloMcpCli("copilot"));
+  // Everything else stays lazy — adopted delivery-only on the human's first
+  // Connect gesture, never eagerly minted.
+  for (const other of ["opencode", "gemini", "codex", "custom", "", null, undefined]) {
+    assert.ok(!isSoloMcpCli(other), `${other} must not be offered an eager solo identity`);
+  }
+
+  // Every member is a CLI `stripSoloMcpFlags` can actually recognise — the list
+  // and the excision cannot drift apart into a CLI that is minted for and never
+  // cleaned up.
+  const minted: Record<string, string> = {
+    claude: 'claude --mcp-config "c.json" --strict-mcp-config --allowedTools mcp__orrerix',
+    copilot: 'copilot --additional-mcp-config "@c.json" --allow-tool orrerix',
+    pi: 'pi --mcp-config "c.json"',
+  };
+  for (const cli of SOLO_MCP_CLIS) {
+    assert.equal(stripSoloMcpFlags(minted[cli], null).cli, cli, `${cli}'s minted flags are not excised`);
+  }
 });
