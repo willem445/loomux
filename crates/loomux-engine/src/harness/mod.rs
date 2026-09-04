@@ -539,7 +539,7 @@ impl EventLog {
         if let Some(&top) = existing.last() {
             log.segment = top;
             log.written = fs::metadata(log.segment_path(top))?.len();
-            log.seq = last_seq_in(&log.segment_path(top))?.map_or(0, |s| s + 1);
+            log.seq = 0;
         }
         Ok(log)
     }
