@@ -402,6 +402,19 @@ engine binding).
   mysteriously on the fourth frame.
 - The compatibility window is stated in the user docs when D-track ships.
 
+**Structured panes are the first additive users of that rule (#84).** A pane
+driven through a harness adapter rather than a PTY emits no PTY frames at all:
+orrerix renders its event stream into that pane’s ring, and the wire carries two
+new *event* frames — `orch-pane-transcript` and `orch-pane-request` — under the
+existing `{"t":"ev","name":...}` shape, plus a `pane_kind` field on the roster.
+No new frame kind, no field repurposed, and a client that does not know either
+name discards it. Two consequences for this note: `write_pty` and `resize_pty`
+against a structured pane are typed `invalid_argument` refusals rather than
+silent successes — both sit on §5.4’s wire roster, so a client will call them —
+and §10’s H4 reattach ceiling — the live screen plus a 256 KiB
+tail — is a **PTY** fact: a structured pane replays from its own per-pane event
+log instead, to a stated 32 MiB ceiling. See `doc/design/harness-adapters.md`.
+
 ### 4.5 Error taxonomy
 
 One closed set of codes. The point of a closed set is that the client can branch
