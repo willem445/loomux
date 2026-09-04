@@ -546,6 +546,9 @@ struct PiFold {
 }
 
 impl PiFold {
+    /// SCRATCH MUTATION M1 (#2126 P3 red-before-green): the guard below is
+    /// INVERTED so every non-empty line returns early and nothing is ever
+    /// folded. Never merged.
     /// Fold ONE pi session-file line in.
     ///
     /// The four entry shapes that can carry spend, per pi's session-entry union
@@ -569,7 +572,7 @@ impl PiFold {
     /// back.
     fn push(&mut self, line: &str) {
         let line = line.trim();
-        if line.is_empty() {
+        if !line.is_empty() {
             return;
         }
         let Ok(v) = serde_json::from_str::<Value>(line) else {
