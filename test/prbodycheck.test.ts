@@ -166,6 +166,68 @@ test('a blob further than the binding window is not that figure subject', () => 
   assert.equal(n[0].severity, 'MISMATCH');
 });
 
+test('binding is indentation-invariant at BOTH sites (rev-final round 3, W1c)', () => {
+  // The defect: the boundary was scanned in `text` (trimmed) using indices taken against
+  // the untrimmed line, so the scanned span was shifted right by the indent — it dropped
+  // the leading W characters of the true span and read W characters past its end. Once W
+  // exceeded the token's own length the DROPPED prefix held the boundary, and a blob the
+  // rule excludes became the nearest candidate: a false MISMATCH, the refusing direction,
+  // on a tool whose contract is that MISMATCH means a real defect.
+  //
+  // The corpus could not have caught it — no body in it carries a prose line indented that
+  // far — so the pin is this loop over the axis, not a single probe. It also retires the
+  // reviewer's premortem 2: nothing here depends on a threshold, so a body that later
+  // indents a receipt under a nested bullet cannot start reporting.
+  // The figure must NOT match the blob it would wrongly bind to, or binding cannot change
+  // the verdict and the loop is silent under every implementation — a fixture that cannot
+  // discriminate (#1182), which is what the mutation round caught in the first draft of
+  // this test. 325,375 is `61855f9c`'s size, not `728f7407`'s.
+  const FIG = 'blob `728f7407`. figure 325,375 bytes';
+  const RUN = 'run 33791843349. Separately `7396a0bd` is the round-1 head';
+  for (const indent of [0, 1, 2, 4, 8, 9, 10, 12, 14, 20, 30, 41]) {
+    const pad = ' '.repeat(indent);
+    const fig = (pbc.analyze(pad + FIG, FACTS) as Result).findings.filter((f) => f.check === 'byte-figure');
+    assert.deepEqual(fig, [], `byte figure at indent ${indent}: the "." ends the binding at every indent`);
+    const run = (pbc.analyze(pad + RUN, FACTS) as Result).findings.filter((f) => f.check === 'run');
+    assert.deepEqual(run, [], `run/SHA at indent ${indent}: the "." ends the binding at every indent`);
+  }
+
+  // Positive controls, so the twelve silences above are the boundary rule and not a
+  // checker that has stopped reading indented lines at all. Same sentences, boundary
+  // removed, at an indent the defect used to fire at.
+  const boundFig = (pbc.analyze(`${' '.repeat(14)}blob \`728f7407\` at 300,527 bytes`, FACTS) as Result).findings.filter((f) => f.check === 'byte-figure');
+  assert.equal(boundFig.length, 0, 'bound and matching -> silent');
+  const badFig = (pbc.analyze(`${' '.repeat(14)}blob \`728f7407\` at 300,528 bytes`, FACTS) as Result).findings.filter((f) => f.check === 'byte-figure');
+  assert.equal(badFig.length, 1);
+  assert.equal(badFig[0].severity, 'MISMATCH');
+  const badRun = (pbc.analyze(`${' '.repeat(14)}run 33791843349 at \`7396a0bd\``, FACTS) as Result).findings.filter((f) => f.check === 'run');
+  assert.equal(badRun.length, 1);
+  assert.equal(badRun[0].severity, 'MISMATCH');
+});
+
+test('arm 3 is silent because there is no subject to measure (rev-final round 3, W1b)', () => {
+  // The comment above `analyze`'s byte-figure block promises what happens here, and an
+  // earlier draft promised an instrument table and a CHECK. It does not do that, and
+  // should not: a figure naming no measured file has no subject to tabulate, and a line
+  // naming several is the per-file table shape that the `per-file` check reads instead.
+  // Pinned so the correction cannot go false quietly (the documented-escape-hatch rule).
+  const none = pbc.analyze('One 135-char prose line was re-wrapped.', SMALL) as Result;
+  assert.deepEqual(of(none, 'byte-figure'), [], 'zero measured paths named -> silent');
+
+  // "Measured" means present in `facts.files`, not merely named in the numstat — so the
+  // two paths here are two the fixture really measures.
+  const several = pbc.analyze('`CLAUDE.md` and `.orrerix/lessons.md` are 4,211 bytes between them.', FACTS) as Result;
+  assert.deepEqual(of(several, 'byte-figure'), [], 'several measured paths named -> silent');
+
+  // Positive control: arm 2 on the same facts DOES speak, so the two silences are arm 3's
+  // fall-through rather than a check that never ran.
+  const one = pbc.analyze('`doc/design/a.md` is 4,211 bytes.', SMALL) as Result;
+  const o = of(one, 'byte-figure');
+  assert.equal(o.length, 1);
+  assert.equal(o[0].severity, 'MISMATCH');
+  assert.match(o[0].message, /blob 100 bytes .* 98 chars .* 10 lines/);
+});
+
 test('an arrow separates an append proof into two claims, each bound to its own blob', () => {
   // `base X N bytes -> head Y M bytes` is two claims, and binding across the arrow makes
   // the head figure a candidate for the base blob. Both halves are correct here and both

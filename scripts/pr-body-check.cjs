@@ -219,7 +219,7 @@ function extract(body) {
 
     for (const m of l.text.matchAll(RE.byteFigure)) {
       const unit = m[2].toLowerCase().replace(/s$/, '').replace('character', 'char');
-      claims.byteFigures.push({ line: l.n, index: m.index, text: l.text.trim(), value: num(m[1]), unit, paths: pathsOn(l.text) });
+      claims.byteFigures.push({ line: l.n, index: m.index, raw: l.text, text: l.text.trim(), value: num(m[1]), unit, paths: pathsOn(l.text) });
     }
 
     for (const m of l.text.matchAll(RE.backtick)) {
@@ -237,7 +237,7 @@ function extract(body) {
   for (const l of lines) {
     for (const m of l.text.matchAll(RE_LINECITE)) claims.lineCites.push({ line: l.n, path: m[1], cited: Number(m[2]), fence: l.fence, text: l.text.trim() });
     const seenRun = new Set();
-    for (const m of l.text.matchAll(RE.runUrl)) { seenRun.add(m[1]); claims.runs.push({ line: l.n, index: m.index, id: m[1], fence: l.fence, text: l.text.trim() }); }
+    for (const m of l.text.matchAll(RE.runUrl)) { seenRun.add(m[1]); claims.runs.push({ line: l.n, index: m.index, raw: l.text, id: m[1], fence: l.fence, text: l.text.trim() }); }
     for (const m of l.text.matchAll(RE.runBare)) {
       if (seenRun.has(m[1])) continue;
       // A bare 9-12 digit number is a run id only where its own sentence says so. Without
@@ -245,12 +245,12 @@ function extract(body) {
       // exist" — five false blocks on #1758 alone.
       if (!RE_RUN_CONTEXT.test(l.text.slice(Math.max(0, m.index - 40), m.index))) continue;
       seenRun.add(m[1]);
-      claims.runs.push({ line: l.n, index: m.index, id: m[1], fence: l.fence, text: l.text.trim() });
+      claims.runs.push({ line: l.n, index: m.index, raw: l.text, id: m[1], fence: l.fence, text: l.text.trim() });
     }
     for (const m of l.text.matchAll(RE.hex)) {
       if (/^\d+$/.test(m[1])) continue;                      // all digits: a number, not a SHA
       const before = l.text.slice(Math.max(0, m.index - 80), m.index);
-      claims.shas.push({ line: l.n, index: m.index, sha: m[1], role: classifySha(before), fence: l.fence, before: before.trim(), text: l.text.trim() });
+      claims.shas.push({ line: l.n, index: m.index, raw: l.text, sha: m[1], role: classifySha(before), fence: l.fence, before: before.trim(), text: l.text.trim() });
     }
   }
 
@@ -361,16 +361,25 @@ function analyze(body, facts) {
   // broad, because a byte figure in a body routinely describes something other than the
   // file at head — the BASE blob of an append proof, the blob of an earlier round:
   //
-  //   1. the nearest BLOB HASH to the left on the same line. A blob hash is the one
-  //      citation a rebase cannot invalidate (CLAUDE.md's #1470 B1 bullet), and `git
-  //      cat-file -s` settles the figure outright. `base 728f7407 300,527 bytes -> head
-  //      61855f9c 325,375 bytes` resolves to two different blobs and both check clean;
-  //      the round-3 defect on #2140 was 324,776 written beside the head blob, and against
-  //      that blob it is a MISMATCH.
-  //   2. failing that, a line naming exactly ONE measured path and carrying exactly ONE
-  //      figure of that unit — then head's four instruments decide.
-  //   3. otherwise the script reports the instrument table and lets the worker decide. A
-  //      figure whose subject is ambiguous is a CHECK, never a MISMATCH.
+  //   1. a BLOB HASH bound to the figure — see `candidates` below, which reads BOTH sides
+  //      of the figure within a window and stops at a boundary. Not "the nearest to the
+  //      left": a receipt writes the blob on either side ("blob `X` grew to N bytes",
+  //      "N bytes at blob `X`"), and the shipped test for the straddle case expects a
+  //      right-hand blob to be a candidate. A blob hash is the one citation a rebase cannot
+  //      invalidate (CLAUDE.md's #1470 B1 bullet) and `git cat-file -s` settles the figure
+  //      outright: the round-3 defect on #2140 was 324,776 written beside the head blob,
+  //      and against that blob it is a MISMATCH.
+  //   2. failing that, a line naming exactly ONE measured path. Head's four instruments
+  //      decide: the right instrument is silent, a different one is a CHECK naming which
+  //      matched, none is a MISMATCH when the line states only this one figure and a CHECK
+  //      with the full table when it states several.
+  //   3. otherwise — no bound blob AND zero or several measured paths — the figure is
+  //      SILENT. Not a CHECK: there is no subject to print a table against, which is a
+  //      different thing from an ambiguous one. A prose figure naming no file ("one
+  //      135-char line") has nothing to measure, and a line naming several measured files
+  //      is the per-file table shape, which the `per-file` check below reads instead.
+  //      `arm_3_is_silent_because_there_is_no_subject_to_measure` pins it, so the
+  //      disclosure cannot go false quietly.
   const figuresOnLine = new Map();
   for (const b of claims.byteFigures) figuresOnLine.set(b.line, (figuresOnLine.get(b.line) || 0) + 1);
   for (const b of claims.byteFigures) {
@@ -397,7 +406,7 @@ function analyze(body, facts) {
     const candidates = claims.shas
       .filter((s) => s.line === b.line && (f.blobs || {})[s.sha]
         && Math.abs(s.index - b.index) <= BLOB_BIND_CHARS
-        && !BIND_BOUNDARY.test(b.text.slice(Math.min(s.index, b.index), Math.max(s.index, b.index))))
+        && !BIND_BOUNDARY.test(b.raw.slice(Math.min(s.index, b.index), Math.max(s.index, b.index))))
       .sort((x, y) => Math.abs(x.index - b.index) - Math.abs(y.index - b.index));
     if (candidates.length) {
       const sizeOf = (bl) => (b.unit === 'char' ? bl.chars : b.unit === 'line' ? bl.lines : bl.bytes);
@@ -523,7 +532,7 @@ function analyze(body, facts) {
       const bound = onLine.filter((s) => {
         if (Math.abs(s.index - r.index) > 40) return false;
         const a = Math.min(s.index, r.index); const b = Math.max(s.index, r.index);
-        return !/[.;|—]/.test(r.text.slice(a, b));
+        return !BIND_BOUNDARY.test(r.raw.slice(a, b));
       })[0];
       if (bound) add('MISMATCH', 'run', r.line, `run ${r.id} ran at ${short(info.headSha)}, but the SHA bound to it on the line is \`${bound.sha}\``, r.text);
     }
@@ -675,6 +684,10 @@ function gather(pr, opts) {
   shq('git', ['fetch', 'origin', baseBranch]);
   const refOk = shq('git', ['rev-parse', '--verify', ref]).ok;
   const headish = refOk ? ref : head;
+  // Whether the working tree is at the commit being measured, which is what makes the
+  // on-disk instrument meaningful (see `diskBytes` below).
+  const wt = shq('git', ['rev-parse', 'HEAD']);
+  const worktreeIsHead = wt.ok && wt.out.trim() === String(head);
   const mb = shq('git', ['merge-base', headish, `origin/${baseBranch}`]);
   const mergeBase = mb.ok ? mb.out.trim() : null;
 
@@ -714,8 +727,15 @@ function gather(pr, opts) {
     const rows = text.split('\n');
     const lineAt = {};
     for (const c of claims.lineCites) if (c.path === p && rows[c.cited - 1] !== undefined) lineAt[c.cited] = rows[c.cited - 1];
+    // On-disk bytes are read from the WORKING TREE, which is the same file as `headish`
+    // only when the worktree is actually at that commit. A reviewer running this from a
+    // detached checkout of some other ref would otherwise be handed a CRLF-vs-LF figure
+    // measured at whatever they have checked out, labelled as if it belonged to head. So
+    // the instrument is reported only when it is the same file, and `n/a` otherwise —
+    // an absent instrument is honest, a mislabelled one is the #1764 r7/r9 defect again
+    // (rev-final round 3, non-blocking).
     let diskBytes = null;
-    try { diskBytes = fs.statSync(p).size; } catch (e) { diskBytes = null; }
+    if (worktreeIsHead) { try { diskBytes = fs.statSync(p).size; } catch (e) { diskBytes = null; } }
     facts.files[p] = {
       blob: blob.out.trim(), blobBytes: buf.length, blobChars: Array.from(text).length,
       blobLines: text.endsWith('\n') ? rows.length - 1 : rows.length, diskBytes, lineAt,
