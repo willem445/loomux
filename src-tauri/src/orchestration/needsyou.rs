@@ -394,7 +394,7 @@ impl ResolveSource {
     pub fn tag(&self) -> String {
         match self {
             ResolveSource::Webview => "webview".to_string(),
-            ResolveSource::WebviewDismiss => "dismissed:webview".to_string(),
+            ResolveSource::WebviewDismiss => "webview".to_string(),
         }
     }
 
