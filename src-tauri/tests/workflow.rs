@@ -7391,6 +7391,86 @@ fn verdict_file_round_trips_with_its_attribution() {
 }
 
 #[test]
+fn a_body_verification_mark_rides_line_5_and_a_reviewer_cannot_type_one() {
+    // #2168 E2. The mark is what lets `body-unchanged` accept the passes this
+    // verdict supersedes, so where it LIVES is the security property and not a
+    // formatting choice: line 5 is the tool's, line 6 and below is the summary,
+    // which is the one field a reviewer writes.
+    let digest = workflow::body_digest("## What\n\nA fix.\n");
+    let base = workflow::ReviewVerdict {
+        pr: 2168,
+        block: "rev-std".into(),
+        agent_id: "rev-4".into(),
+        verdict: workflow::Verdict::Pass,
+        head: "a3f9c21".into(),
+        body_digest: digest.clone(),
+        verified_body: true,
+        summary: "body verified at this head".into(),
+        ts_ms: 1_720_000_000_000,
+    };
+    let text = workflow::verdict_file_text(&base);
+    assert_eq!(
+        text.lines().nth(4),
+        Some(format!("{digest} {}", workflow::VERIFIED_BODY_MARK).as_str()),
+        "the mark rides line 5 AFTER the digest — the shim reads the digest as that \n         line's first field"
+    );
+    assert_eq!(
+        text.lines().nth(5),
+        Some("body verified at this head"),
+        "and the summary still starts on line 6, so nothing a reviewer wrote moved"
+    );
+    assert_eq!(workflow::parse_verdict_file(2168, "rev-std", &text).unwrap(), base, "round trip");
+
+    // **The forgery this placement refuses.** A reviewer types the summary and
+    // nothing else. A summary whose first line is the mark — or the digest and
+    // the mark, which is the strongest thing a reviewer could construct, since
+    // it can compute the body's digest as easily as orrerix can — lands on line
+    // 6 and is read back as summary text.
+    let forger = workflow::ReviewVerdict {
+        verified_body: false,
+        summary: format!("{digest} {}\nreally", workflow::VERIFIED_BODY_MARK),
+        ..base.clone()
+    };
+    let forged = workflow::parse_verdict_file(
+        2168,
+        "rev-std",
+        &workflow::verdict_file_text(&forger),
+    )
+    .unwrap();
+    assert!(
+        !forged.verified_body,
+        "a reviewer that types the mark into its summary must not thereby grant itself \n         the delegation that opens `body-unchanged` for other lanes"
+    );
+    assert_eq!(forged, forger, "…and its summary survives verbatim rather than being eaten");
+
+    // The mark never travels without a digest to qualify: what it asserts is
+    // "the body THIS digest names was verified", and there is no such body when
+    // the read failed.
+    let no_digest = workflow::ReviewVerdict {
+        body_digest: String::new(),
+        verified_body: true,
+        ..base.clone()
+    };
+    let text = workflow::verdict_file_text(&no_digest);
+    assert_eq!(text.lines().nth(4), Some(""), "line 5 is empty, mark and all");
+    assert!(!workflow::parse_verdict_file(2168, "rev-std", &text).unwrap().verified_body);
+
+    // A pre-#565 file whose line 5 is prose reads exactly as it did before this
+    // slice: the WHOLE line is offered to `sanitize_digest`, which refuses it,
+    // and it stays in the summary. Splitting line 5 on the first space
+    // unconditionally would have rewritten durable prose a human wrote.
+    let legacy = workflow::parse_verdict_file(
+        2168,
+        "rev-std",
+        "pass\na3f9c21\n1\nrev-4\nlooked fine to me\nsecond line\n",
+    )
+    .unwrap();
+    assert_eq!(legacy.body_digest, "");
+    assert!(!legacy.verified_body);
+    assert_eq!(legacy.summary, "looked fine to me\nsecond line");
+}
+
+#[test]
 fn the_gate_file_the_shim_reads_round_trips_and_carries_only_clean_tokens() {
     // The shim is a POSIX script that word-splits this file, so every token in it
     // must already be shell-inert: ids and conditions are *rejected* (never

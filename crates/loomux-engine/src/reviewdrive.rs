@@ -4874,6 +4874,17 @@ mod tests {
         }
     }
 
+    /// [`lane_fact`] whose `pass` is the driver's body-VERIFICATION delta
+    /// (#2168 E2) — the mark `review_verdict` writes for a lane the driver
+    /// briefed because only the body had moved.
+    fn verified_lane_fact(block: &str, at_head: &str, digest: &str) -> LaneFact {
+        let mut l = lane_fact(block, Some(Verdict::Pass), at_head, digest);
+        if let Some(v) = l.verdict.as_mut() {
+            v.verified_body = true;
+        }
+        l
+    }
+
     #[test]
     fn the_tick_never_advances_a_parked_or_terminal_drive() {
         // §2.1's `held` row: "nothing; the tick does not advance it". If the
@@ -6198,6 +6209,154 @@ mod tests {
         // bound to this head, so nothing about the code is outstanding and the
         // brief about to go out is a body-verification delta.
         assert_eq!(decide(&e, &facts, &limits), DriveStep::OpenLane { index: 0, verify: true });
+    }
+
+    #[test]
+    fn a_body_only_move_re_briefs_one_lane_and_the_verification_settles_the_rest() {
+        // #2168 E2, the driver half. Two required lanes, both passed at
+        // (head-a, d1); the worker edits the PR body and nothing else.
+        let limits = DriveLimits::default();
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-a".into();
+        let with = |lanes: Vec<LaneFact>| DriveFacts {
+            required_lanes: Some(lanes),
+            body_digest: Some("d2".into()),
+            ..facts_at("head-a")
+        };
+        let stale = vec![
+            lane_fact("rev-std", Some(Verdict::Pass), "head-a", "d1"),
+            lane_fact("rev-final", Some(Verdict::Pass), "head-a", "d1"),
+        ];
+
+        // ONE lane is briefed — the first in the gate's order — and the brief
+        // is a verification delta, which is what makes the verdict it produces
+        // able to discharge the clause for the other.
+        assert_eq!(
+            decide(&e, &with(stale.clone()), &limits),
+            DriveStep::OpenLane { index: 0, verify: true }
+        );
+
+        // S3 sends it; the drive waits rather than moving on to lane 1. That is
+        // the whole saving: before #2168 E2 the second lane's turn came next.
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d2"), 1_500, true);
+        assert_eq!(decide(&e, &with(stale.clone()), &limits), DriveStep::Wait);
+
+        // rev-std records the verification pass. rev-final's pass at d1 settles
+        // again, so the drive goes to the gate instead of briefing lane 1.
+        let answered = vec![
+            verified_lane_fact("rev-std", "head-a", "d2"),
+            lane_fact("rev-final", Some(Verdict::Pass), "head-a", "d1"),
+        ];
+        assert_eq!(
+            decide(&e, &with(answered), &limits),
+            DriveStep::to(DriveState::GateCheck)
+        );
+
+        // **The control on the one axis that carries it.** The same round with
+        // rev-std's pass recorded WITHOUT the mark — an ordinary re-review that
+        // happens to sit at the current digest — still owes lane 1 a brief. An
+        // implementation that accepted any newer pass would answer `gate-check`
+        // here too, and would have weakened `body-unchanged` for every repo.
+        let unmarked = vec![
+            lane_fact("rev-std", Some(Verdict::Pass), "head-a", "d2"),
+            lane_fact("rev-final", Some(Verdict::Pass), "head-a", "d1"),
+        ];
+        assert_eq!(
+            decide(&e, &with(unmarked), &limits),
+            DriveStep::OpenLane { index: 1, verify: false }
+        );
+
+        // And the delegation is bounded by the HEAD it was granted at: once the
+        // code moves, a body verification settles nothing and arc 6 takes the
+        // drive back to `ci-wait`.
+        let pushed = DriveFacts {
+            required_lanes: Some(vec![
+                verified_lane_fact("rev-std", "head-a", "d2"),
+                lane_fact("rev-final", Some(Verdict::Pass), "head-a", "d1"),
+            ]),
+            body_digest: Some("d2".into()),
+            ..facts_at("head-b")
+        };
+        assert_eq!(decide(&e, &pushed, &limits), DriveStep::to(DriveState::CiWait));
+    }
+
+    #[test]
+    fn a_verification_delta_is_only_briefed_when_nothing_about_the_code_is_outstanding() {
+        // #2168 E2's precondition, one crossing per way it can fail. The grant
+        // the brief carries is what lets the gate stop asking the other lanes,
+        // so it is issued only when EVERY required lane has a pass bound to the
+        // head that would merge — anything else and this is an ordinary round.
+        let limits = DriveLimits::default();
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-a".into();
+        let with = |lanes: Vec<LaneFact>, digest: Option<&str>| DriveFacts {
+            required_lanes: Some(lanes),
+            body_digest: digest.map(|d| d.to_string()),
+            ..facts_at("head-a")
+        };
+        let std_pass = lane_fact("rev-std", Some(Verdict::Pass), "head-a", "d1");
+
+        // A lane that has never answered: the code is still outstanding. Lane 0
+        // is still the one briefed — its own pass staled with the digest — but
+        // the brief is an ORDINARY one, and the verdict it produces will not
+        // discharge anything for lane 1.
+        assert_eq!(
+            decide(
+                &e,
+                &with(vec![std_pass.clone(), lane_fact("rev-final", None, "", "")], Some("d2")),
+                &limits
+            ),
+            DriveStep::OpenLane { index: 0, verify: false }
+        );
+
+        // A lane whose pass is bound to a head the branch has left reads as
+        // absent (#1871 B1) — and "absent" is exactly what must not be granted
+        // over, because the code that lane approved is not the code in front of
+        // the drive.
+        assert_eq!(
+            decide(
+                &e,
+                &with(
+                    vec![
+                        std_pass.clone(),
+                        lane_fact("rev-final", Some(Verdict::Pass), "head-OLD", "d1")
+                    ],
+                    Some("d2")
+                ),
+                &limits
+            ),
+            DriveStep::OpenLane { index: 0, verify: false }
+        );
+
+        // A body orrerix could not read grants nothing: the verdict this brief
+        // produces would carry no digest, so there would be no body for the
+        // mark to be ABOUT. (An unknown digest does not stale a pass either, so
+        // lane 1 here is outstanding for its own reason — no verdict at all.)
+        assert_eq!(
+            decide(
+                &e,
+                &with(vec![std_pass.clone(), lane_fact("rev-final", None, "", "")], None),
+                &limits
+            ),
+            DriveStep::OpenLane { index: 1, verify: false }
+        );
+
+        // The positive control, so the three rows above are the precondition
+        // deciding and not a constant.
+        assert_eq!(
+            decide(
+                &e,
+                &with(
+                    vec![
+                        std_pass,
+                        lane_fact("rev-final", Some(Verdict::Pass), "head-a", "d1")
+                    ],
+                    Some("d2")
+                ),
+                &limits
+            ),
+            DriveStep::OpenLane { index: 0, verify: true }
+        );
     }
 
     #[test]

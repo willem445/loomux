@@ -23,6 +23,7 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::queue;
 use loomux_lib::orchestration::report;
+use loomux_lib::orchestration::reviewdrive;
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::GroupId;
 use loomux_lib::orchestration::{
@@ -42470,6 +42471,107 @@ fn the_shim_refuses_a_merge_whose_body_moved_after_the_pass_when_the_repo_opts_i
 
     let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
     assert!(audit.contains("\"reason\":\"body-changed\""), "audited, never silent: {audit}");
+}
+
+/// **#2168 E2: a body-VERIFICATION pass discharges the clause for the passes it
+/// supersedes — and the shim agrees with the Rust half about it.**
+///
+/// The re-record cascade this removes is measured on #2168: five other-lane
+/// re-records at one head on #1764, three on #1751, every one of them a
+/// reviewer re-reading a diff it had already passed so that a digest would
+/// match. Here `rev-security` is re-briefed by the driver as a verification
+/// delta and passes the body as it stands; `rev-tests` is never asked again.
+///
+/// **The second executed cross-check on this file format**, beside the digest
+/// one above: the mark is written by `workflow::verdict_file_text` as line 5's
+/// second field and read by the shim as `${b_l5%% *}` plus a full-line compare,
+/// and nothing but running both can show those agree. The FINAL row is what
+/// makes it a test rather than a demonstration — the same two verdicts with the
+/// mark stripped are refused, so the merge above is the mark deciding.
+#[test]
+fn the_shim_takes_a_body_verification_pass_for_the_lanes_it_supersedes() {
+    if !have_sh() {
+        eprintln!("SKIP the_shim_takes_a_body_verification_pass_for_the_lanes_it_supersedes: no POSIX sh");
+        return;
+    }
+    const REVIEWED: &str = "## Summary  \r\n\r\nEvery lane passed THIS body — see §6c.\r\n\r\n";
+    const EDITED: &str = "## Summary  \r\n\r\nEvery lane passed an EARLIER body — see §6d.\r\n\r\n";
+
+    let (reg, d, _repo, gid) = gated_group("    also: [body-unchanged]\n");
+    let group_dir = d.path().join(gid.as_str());
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    reg.set_pr_body_override(Some(REVIEWED.into()));
+    let sec = reviewer_caller(&reg, &gid, "rev-security");
+    let tests = reviewer_caller(&reg, &gid, "rev-tests");
+    for c in [&sec, &tests] {
+        recorded(&reg, c, "7", "pass", "read the diff and the body; both are fine");
+    }
+    let regrant = || reg.grant_merge(&gid, "7", None, "human").unwrap();
+    let merge_body = |body: &str| -> (bool, String) {
+        let out = std::process::Command::new("sh")
+            .arg(&shim).args(["pr", "merge", "7"])
+            .env("LOOMUX_GROUP_DIR", &group_dir)
+            .env("FAKE_BASE", "main").env("FAKE_HEAD", HEAD).env("FAKE_CHECKS", "0")
+            .env("FAKE_BODY", body)
+            .output().expect("run shim");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+
+    // The control: the body moves and BOTH stale passes are refused. Without
+    // this row the merge below could be a clause that had stopped checking.
+    regrant();
+    let (ok, err) = merge_body(EDITED);
+    assert!(!ok, "a body edited after the passes must not merge on its own");
+    assert!(err.contains("rev-security") && err.contains("rev-tests"), "{err}");
+
+    // The driver re-briefs ONE lane as a verification delta at the edited body.
+    // Written as a real drive entry, because that record is what
+    // `record_verdict` consults and a hand-written verdict file would prove
+    // nothing about the grant being un-forgeable.
+    let edited_digest = workflow::body_digest(EDITED);
+    let mut entry = reviewdrive::DriveEntry::new(
+        7,
+        "sess-full",
+        "orch-1",
+        reviewdrive::Counters::default(),
+        1_000,
+    );
+    entry.advance(reviewdrive::DriveState::ReviewWait, None, None, 1_000).unwrap();
+    entry.head = HEAD.into();
+    entry.open_lane("rev-security", "s1", "rev-1", HEAD, Some(&edited_digest), 1_500, true);
+    let mut state = reviewdrive::ReviewDrivesState::default();
+    state.entries.push(entry);
+    reviewdrive::store_state(&group_dir, &state).unwrap();
+
+    // It reads the body as it stands and passes. `rev-tests` is NOT asked.
+    reg.set_pr_body_override(Some(EDITED.into()));
+    recorded(&reg, &sec, "7", "pass", "verification-only round: the body as it stands is sound");
+    let vf = group_dir.join("verdicts").join("pr-7").join("rev-security");
+    let text = fs::read_to_string(&vf).unwrap();
+    assert_eq!(
+        text.lines().nth(4),
+        Some(format!("{edited_digest} {}", workflow::VERIFIED_BODY_MARK).as_str()),
+        "the tool must have marked it from the DRIVE's lane record, not from anything \n         the reviewer said: {text}"
+    );
+
+    regrant();
+    let (ok, err) = merge_body(EDITED);
+    assert!(
+        ok,
+        "one verification pass covers the body, and rev-tests' pass is bound to the same \n         head — if this refuses, the shim and workflow::verdict_file_text disagree about \n         where the mark lives: {err}"
+    );
+
+    // **The mark is what carried it.** Same two verdicts, line 5 rewritten as
+    // the bare digest — which is exactly what an ordinary re-review would have
+    // written — and the merge is refused again, naming the lane that was never
+    // asked. This is the mutation that separates this delegation from "any
+    // newer pass covers the rest".
+    fs::write(&vf, text.replace(&format!("{edited_digest} {}", workflow::VERIFIED_BODY_MARK), &edited_digest)).unwrap();
+    regrant();
+    let (ok, err) = merge_body(EDITED);
+    assert!(!ok, "without the mark the stale pass is refused as it always was");
+    assert!(err.contains("rev-tests"), "and it names the lane still owed a re-read: {err}");
 }
 
 /// …and it is **opt-in**: the identical drift on a repo that does not declare the

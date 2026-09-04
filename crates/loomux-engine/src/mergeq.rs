@@ -1715,6 +1715,121 @@ mod tests {
         assert_eq!(body_unchanged(&g, &v, Some("NEW"), Some(&now)), None);
     }
 
+    #[test]
+    fn a_body_verification_pass_discharges_the_clause_for_the_passes_it_supersedes() {
+        // #2168 E2, the whole of the delegation, asked of the CLAUSE rather
+        // than through `recheck_gate` for `the_body_digest_asymmetry`'s reason:
+        // the reviewer half is satisfied in every row here, so routing through
+        // `recheck_gate` would leave the assertions resting on nothing if the
+        // clause stopped consulting the mark.
+        let now = body_digest("the body as it stands");
+        let then = body_digest("the body every lane passed");
+        let g = gate(&["rev-std", "rev-final"], &["body-unchanged"]);
+
+        // The control, and it is the state this slice starts from: both lanes
+        // passed at (HEAD, then), the body has moved, and BOTH are reported —
+        // which is the five-lane re-record cascade #2168 measured.
+        let stale: BTreeMap<_, _> = [
+            verdict("rev-std", Verdict::Pass, "HEAD", &then),
+            verdict("rev-final", Verdict::Pass, "HEAD", &then),
+        ]
+        .into();
+        assert_eq!(
+            body_unchanged(&g, &stale, Some("HEAD"), Some(&now)),
+            Some(ConditionRefusal::BodyChanged {
+                reviewers: vec!["rev-std".into(), "rev-final".into()]
+            }),
+            "before the verification pass exists, every stale pass is still reported"
+        );
+
+        // rev-std is re-briefed as a verification delta and passes at the body
+        // as it stands. rev-final's pass stays where it was — and is accepted,
+        // because the head it is bound to has not moved.
+        let verified: BTreeMap<_, _> = [
+            verify_verdict("rev-std", "HEAD", &now),
+            verdict("rev-final", Verdict::Pass, "HEAD", &then),
+        ]
+        .into();
+        assert_eq!(body_unchanged(&g, &verified, Some("HEAD"), Some(&now)), None);
+
+        // **The mark is what does it, not the newer digest.** Same two
+        // verdicts, rev-std's pass recorded WITHOUT the mark: refused. This is
+        // the row that separates this design from "any newer pass covers the
+        // rest", which would have weakened the clause for every repo including
+        // one that runs no driver at all.
+        let unmarked: BTreeMap<_, _> = [
+            verdict("rev-std", Verdict::Pass, "HEAD", &now),
+            verdict("rev-final", Verdict::Pass, "HEAD", &then),
+        ]
+        .into();
+        assert_eq!(
+            body_unchanged(&g, &unmarked, Some("HEAD"), Some(&now)),
+            Some(ConditionRefusal::BodyChanged { reviewers: vec!["rev-final".into()] })
+        );
+
+        // A verification of a body that has since moved AGAIN is spent: it says
+        // nothing about the bytes that would now be committed.
+        let later = body_digest("a third body");
+        assert_eq!(
+            body_unchanged(&g, &verified, Some("HEAD"), Some(&later)),
+            Some(ConditionRefusal::BodyChanged {
+                reviewers: vec!["rev-std".into(), "rev-final".into()]
+            })
+        );
+
+        // The delegation never reaches across a head. rev-final's pass is bound
+        // to a commit the branch has left, so the code it approved is not the
+        // code that would land — and no body review of any kind repairs that.
+        // (Asked of the clause, so the reviewer half's own staleness check is
+        // not what is answering.)
+        let moved_head: BTreeMap<_, _> = [
+            verify_verdict("rev-std", "HEAD", &now),
+            verdict("rev-final", Verdict::Pass, "OLD", &then),
+        ]
+        .into();
+        assert_eq!(
+            body_unchanged(&g, &moved_head, Some("HEAD"), Some(&now)),
+            None,
+            "a pass at another head is skipped by this clause, as it always was — the \n             REVIEWER half is what refuses it"
+        );
+        assert!(
+            !evaluate_merge_gate(&g, &moved_head, Some("HEAD")).satisfied(),
+            "…and it does refuse it, so the row above is not a hole"
+        );
+
+        // A superseded pass carrying NO digest is still refused. "This reviewer
+        // approved something, we cannot say what" is not a claim a verification
+        // of one specific body can stand in for.
+        let no_digest: BTreeMap<_, _> = [
+            verify_verdict("rev-std", "HEAD", &now),
+            verdict("rev-final", Verdict::Pass, "HEAD", ""),
+        ]
+        .into();
+        assert_eq!(
+            body_unchanged(&g, &no_digest, Some("HEAD"), Some(&now)),
+            Some(ConditionRefusal::BodyChanged { reviewers: vec!["rev-final".into()] })
+        );
+
+        // A verification recorded by a block the gate does not NAME discharges
+        // nothing — the loop reads the gate's own reviewer list, which after
+        // routing is the required set.
+        let outsider = gate(&["rev-final"], &["body-unchanged"]);
+        assert_eq!(
+            body_unchanged(&outsider, &verified, Some("HEAD"), Some(&now)),
+            Some(ConditionRefusal::BodyChanged { reviewers: vec!["rev-final".into()] })
+        );
+
+        // And a verification recorded as a FAIL is not an approval of anything.
+        let mut failed = verify_verdict("rev-std", "HEAD", &now);
+        failed.1.verdict = Verdict::Fail;
+        let blocking: BTreeMap<_, _> =
+            [failed, verdict("rev-final", Verdict::Pass, "HEAD", &then)].into();
+        assert_eq!(
+            body_unchanged(&g, &blocking, Some("HEAD"), Some(&now)),
+            Some(ConditionRefusal::BodyChanged { reviewers: vec!["rev-final".into()] })
+        );
+    }
+
     /// A gate whose declared list is `rev-a` and which routes `rev-ui` for
     /// `src/**` (#1176), built through the gate-FILE reader so this suite reads
     /// the same bytes the shim does.
