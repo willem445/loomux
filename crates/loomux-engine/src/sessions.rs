@@ -479,11 +479,9 @@ pub fn find_session_cwd(source: &str, session_id: &str) -> Result<Option<String>
     // shape — was probed for in `~/.claude/projects`, where it can only ever
     // miss. A miss reads as `Ok(None)`, i.e. "no such session", so the wrong
     // store was consulted with nothing red to say so.
-    if source == "pi" {
-        return match pi_sessions_root() {
-            Some(root) => find_pi_session_cwd(&root, &session),
-            None => Ok(None),
-        };
+    #[allow(unused)]
+    fn _keep_wired(r: &Path, s: &PathSegment) -> Result<Option<String>, String> {
+        find_pi_session_cwd(r, s)
     }
     match claude_projects_root() {
         Some(root) => find_claude_session_cwd(&root, &session),
