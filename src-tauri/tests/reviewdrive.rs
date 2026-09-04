@@ -3046,12 +3046,34 @@ fn a_fix_at_a_new_head_re_opens_the_lane_instead_of_re_routing_the_stale_verdict
     );
     assert_eq!(review_rounds(&reg, &group), 1, "arc 5 spends exactly one round");
     assert_eq!(routed.handbacks.len(), 1, "…and hands the findings back once");
+    let (_pr, worker) = routed.handbacks.first().cloned().expect("the hand-back names a pane");
+    with_pane(&reg, &worker, 7002);
 
     // The worker fixes and pushes. CI stays green, as it was on #1870.
     gh.set_facts("OPEN", HEAD_B);
     reg.set_pr_head_override(Some(HEAD_B.to_string()));
     reg.rd_drive_group_with(&group, &gh, 40_000); // arc 7: the head moved
-    reg.rd_drive_group_with(&group, &gh, 50_000); // arc 2: green again
+
+    // …and then it finishes the round it was handed, which since #2168 E1 is
+    // what arc 2 waits for on a head that arrived by arc 7. The report is part
+    // of the fixture rather than a concession to it: `driver-fix.md` tells the
+    // worker to push AND report, so a fixture that pushed and went silent was
+    // modelling half a round — and under E1 that half is `held(fix-stalled)`,
+    // which is a different subject from the one this test is about.
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: worker.clone(),
+            group: group.clone(),
+            role: Role::Worker,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "done", "note": "fixed and pushed", "ref": "#1758" } }),
+    )
+    .expect("the driven worker reports its fix finished");
+    reg.rd_drive_group_with(&group, &gh, 50_000); // arc 2: green, and reported
 
     // THE ARC RAN. Everything below is a statement about a drive that really is
     // back in `review-wait` looking at the new head.
