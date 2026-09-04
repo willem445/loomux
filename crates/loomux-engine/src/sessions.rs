@@ -633,12 +633,12 @@ pub fn pi_sessions_root_from(
     home: Option<&Path>,
 ) -> Option<PathBuf> {
     let named = |v: Option<&str>| v.map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from);
-    if let Some(dir) = named(env_session_dir) {
-        return Some(dir);
-    }
     let agent = match named(env_agent_dir) {
         Some(d) => d,
-        None => home?.join(".pi").join("agent"),
+        None => match named(env_session_dir) {
+            Some(d) => return Some(d),
+            None => home?.join(".pi").join("agent"),
+        },
     };
     Some(agent.join("sessions"))
 }
