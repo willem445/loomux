@@ -1,0 +1,258 @@
+// The human's notes about a harness session (#2116) — the pure rules, with no
+// DOM and no IO. `sessionlog.ts` owns where a note is STORED; this owns what a
+// note may BE and how a list of them reads.
+//
+// Split out rather than inlined because both ends need the same answers: the
+// store validates on the way in, and the dialog (`notesdialog.ts`) has to say
+// the same thing about an over-long note BEFORE the store refuses it. One
+// module means the two can never disagree about the cap.
+
+/** Where a note is being written: a known harness session, or a pane whose
+ *  session id orrerix has not learned yet.
+ *
+ *  It lives here rather than in `sessionlog.ts` because it is a NOTES concept —
+ *  the store, the dialog and the draft book all take one, and putting it in the
+ *  store would make this module depend on the thing that depends on it. */
+export type NoteTarget = { sessionId: string } | { paneKey: string };
+
+/** A note as stored. `unknown` carries per-note keys a FUTURE build wrote that
+ *  this one cannot interpret, kept verbatim so a downgrade that deletes a
+ *  sibling note does not silently strip them from the survivors. */
+export interface SessionNote {
+  id: string;
+  text: string;
+  created_ms: number;
+  unknown: Record<string, unknown>;
+}
+
+/** Longest note text kept. Generous enough for a paragraph of context — this
+ *  is a reminder to a human, not a document — and bounded because the whole
+ *  log is one file republished on every write.
+ *
+ *  Measured in UTF-16 code units (`String.length`), which is what both the
+ *  dialog's counter and this check read, so the number the human is shown is
+ *  the number that is enforced. */
+export const MAX_NOTE_LEN = 2000;
+
+/** What a caller's raw note text becomes, or `null` when it is not a note at
+ *  all. Trims first — a textarea submitted with a stray newline is empty, not
+ *  a blank note — then truncates rather than refusing, so a paste of something
+ *  long keeps its opening instead of vanishing. */
+export function normalizeNoteText(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  return trimmed.length > MAX_NOTE_LEN ? trimmed.slice(0, MAX_NOTE_LEN) : trimmed;
+}
+
+/** Is this draft untouched — nothing the human would be sorry to lose?
+ *
+ *  ONE predicate, reading the ONE field the note editor has, and it is the same
+ *  question `normalizeNoteText` answers on the way in: a draft is pristine
+ *  exactly when it would not become a note. Written as its own function rather
+ *  than as `!raw` at each site because there are three of them — seeding the
+ *  editor, enabling the Add button, and pruning the draft map — and a
+ *  whitespace-only box is pristine to the store while `!raw` calls it dirty
+ *  (CLAUDE.md: the renderer's seed and the predicate's default are one question
+ *  asked twice).
+ *
+ *  If the editor ever grows a second field, it is added HERE, not beside a
+ *  caller. */
+export function noteDraftIsPristine(raw: string): boolean {
+  return normalizeNoteText(raw) === null;
+}
+
+/** Chronological, oldest first — the order the human wrote them, which is the
+ *  order they read as a running log. Never mutates its input; ties keep input
+ *  order (`sort` is stable since ES2019), so two notes added in the same
+ *  millisecond stay in the order they were added. */
+export function orderedNotes(notes: readonly SessionNote[]): SessionNote[] {
+  return notes.slice().sort((a, b) => a.created_ms - b.created_ms);
+}
+
+/** What the notes list says when it has nothing to show.
+ *
+ *  Two genuinely different situations, so two sentences. A session orrerix has
+ *  an id for will keep what the human writes; a pane whose id is not known yet
+ *  will not, until it is learned — and that is a residual worth stating rather
+ *  than hiding, because an app restart in between loses those notes
+ *  (`doc/design/session-notes.md`). `null` for a session id means "we are not
+ *  keyed on a session yet", never "there are no notes". */
+export function notesEmptyState(sessionId: string | null): string {
+  return sessionId === null
+    ? "No notes yet. Notes on this pane live in this window only until orrerix learns its session id — they attach to the session then, and are lost if the app restarts first."
+    : "No notes yet for this session.";
+}
+
+/** What a note write did. Declared here rather than in `sessionlog.ts` for the
+ *  same reason `NoteTarget` is: the store returns one and the dialog has to
+ *  react to one, so a single definition keeps them from drifting.
+ *
+ *  `declined-unread` is the one that matters most to a human: the store refused
+ *  to publish because it has never successfully read the file, so **nothing was
+ *  recorded anywhere** — not on disk, not in memory. `failed` is the opposite
+ *  shape: the note IS in memory and on screen, but the save did not land. */
+export type NoteWriteOutcome =
+  | "saved"
+  | "unchanged"
+  | "pending"
+  | "declined-unread"
+  | "failed"
+  /** The store's promise REJECTED rather than resolving with an outcome —
+   *  something threw on a path that has no other answer. Distinct from `failed`
+   *  because `failed` knows the note is in memory and on screen, and this does
+   *  not know anything (#2116 review premortem 1). */
+  | "threw";
+
+/** What the dialog must tell the human, and whether it owes them their text
+ *  back.
+ *
+ *  WHY THIS EXISTS. The obvious wiring — clear the box, fire the write, ignore
+ *  the result — loses a note outright on `declined-unread`: the store returns
+ *  before it mutates anything, so the note reaches neither disk nor the list,
+ *  and the box the human typed it into has already been emptied. Every
+ *  individual step succeeds and nothing anywhere says a word. So the outcome is
+ *  read, and the two failure shapes are told apart:
+ *
+ *   - `declined-unread` — nothing was recorded. Give the text back, so the
+ *     human can try again without retyping it.
+ *   - `failed` — the note IS in memory and on screen; only the save missed.
+ *     Giving the text back would duplicate a note they can see. Say so instead;
+ *     the store keeps the newer value, so the next write re-offers it.
+ *
+ *  `saved`, `pending` and `unchanged` are silent: the first two are success (a
+ *  pending note is held deliberately and the empty state already explains it),
+ *  and `unchanged` is unreachable from a non-pristine draft — it is listed so
+ *  the union is exhaustive rather than defaulted. */
+export function noteWriteFeedback(outcome: NoteWriteOutcome): {
+  message: string | null;
+  restoreDraft: boolean;
+} {
+  switch (outcome) {
+    case "declined-unread":
+      return {
+        message:
+          "Could not read the notes file, so nothing was saved — your text is back in the box. Try again.",
+        restoreDraft: true,
+      };
+    case "failed":
+      return {
+        message: "Could not write the notes file. This note is here for now, but is not saved yet.",
+        restoreDraft: false,
+      };
+    case "threw":
+      // Nothing is known about what landed, so this errs toward the recoverable
+      // side. Handing the text back can at worst leave the human looking at a
+      // note AND its text — visible, and one Escape from fixed. NOT handing it
+      // back can lose the note outright, which is silent. The list beside the
+      // box is what tells them which happened.
+      return {
+        message:
+          "Something went wrong saving that note. Your text is back in the box — check the list above before adding it again.",
+        restoreDraft: true,
+      };
+    case "saved":
+    case "pending":
+    case "unchanged":
+      return { message: null, restoreDraft: false };
+  }
+}
+
+/** Does the Notes control apply to a pane running `harness`?
+ *
+ *  Extracted from the button's own visibility check so the RULE is testable
+ *  rather than living only in DOM wiring this repo validates by hand. The two
+ *  arguments are the two facts it reads, deliberately not a whole `PaneFacts`:
+ *  that type belongs to #2122's `agentrows.ts`, and a notes module should not
+ *  depend on the Agents tab to answer a question about notes.
+ *
+ *  A pane qualifies when a harness is running AND it is local:
+ *
+ *   - no harness means no agent session, so a note would have no key at all;
+ *   - an SSH pane may well have a CLI at the far end — `facts().harness`
+ *     reports the profile's declared one — but that session lives on the
+ *     REMOTE machine, and `sessionlog.json` is per-local-machine. Same reason
+ *     the store is not in a group dir.
+ *
+ *  The third gate, "not a content pane", is the `pty-only` CSS class and is not
+ *  expressible here: it is a property of the pane's kind, not of its harness. */
+export function notesApplyToPane(harness: string | null, isSsh: boolean): boolean {
+  return harness !== null && !isSsh;
+}
+
+/** Which target a pane's notes belong to right now.
+ *
+ *  A pane whose session id orrerix has not learned yet is keyed on its
+ *  per-window `Pane.key`, and `SessionLogStore.rekey` moves those notes across
+ *  when the id arrives. Extracted for the same reason as above — it is a
+ *  decision, and it was previously a ternary inside DOM wiring. */
+export function noteTargetFor(sessionId: string | null, paneKey: string): NoteTarget {
+  return sessionId === null ? { paneKey } : { sessionId };
+}
+
+/** A stable string for a target, so a draft survives a close and reopen and two
+ *  targets can never share one. It is a MAP KEY and is never joined onto a
+ *  path — the `s:` / `p:` prefixes exist so a session id and a pane key that
+ *  happen to spell the same thing cannot collide, not to name a directory. */
+export function targetKey(target: NoteTarget): string {
+  return "sessionId" in target ? `s:${target.sessionId}` : `p:${target.paneKey}`;
+}
+
+/** Unsubmitted note text, per target.
+ *
+ *  THE EDITOR IS A VIEW OF THIS, NEVER THE OTHER WAY ROUND (CLAUDE.md's
+ *  in-list-editor rule). The notes list re-renders on every store change — a
+ *  note added on another surface, a re-key landing, a rename — and a textarea
+ *  whose value is only read at submit loses whatever the human was half-way
+ *  through. So the draft is written on every `input`, the editor is SEEDED from
+ *  here on open, and the pristine question is asked by one predicate that reads
+ *  every field the editor has.
+ *
+ *  A pristine draft is DELETED rather than stored as `""`, so `size` is the
+ *  number of things the human is actually part-way through, and the book cannot
+ *  grow one entry per session ever looked at. */
+export class NoteDrafts {
+  private drafts = new Map<string, string>();
+
+  /** What the editor opens with. `""` for a target nothing is held for — which
+   *  is the same thing as pristine, by construction. */
+  get(target: NoteTarget): string {
+    return this.drafts.get(targetKey(target)) ?? "";
+  }
+
+  /** Record what is in the editor right now. */
+  set(target: NoteTarget, text: string): void {
+    const key = targetKey(target);
+    if (noteDraftIsPristine(text)) this.drafts.delete(key);
+    else this.drafts.set(key, text);
+  }
+
+  /** Forget a target's draft outright — what a successful submit does. */
+  clear(target: NoteTarget): void {
+    this.drafts.delete(targetKey(target));
+  }
+
+  /** Move a draft from one target to another, for the one thing that changes a
+   *  target under a live editor: a pane's session id being learned while the
+   *  overlay is open (#2116 review B1).
+   *
+   *  The book is keyed on the target, so a re-key that was not mirrored here
+   *  would silently blank a half-typed note — the very loss `NoteDrafts` exists
+   *  to prevent, arrived at from the other direction. A no-op when there is
+   *  nothing held, and it never overwrites a draft the destination already has:
+   *  the destination's own text is the newer of the two, since the human can
+   *  only have typed it after the target moved. */
+  migrate(from: NoteTarget, to: NoteTarget): void {
+    const fromKey = targetKey(from);
+    const toKey = targetKey(to);
+    if (fromKey === toKey) return;
+    const held = this.drafts.get(fromKey);
+    if (held === undefined) return;
+    this.drafts.delete(fromKey);
+    if (!this.drafts.has(toKey)) this.drafts.set(toKey, held);
+  }
+
+  /** How many targets have something unsubmitted. */
+  get size(): number {
+    return this.drafts.size;
+  }
+}

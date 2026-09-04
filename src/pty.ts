@@ -263,6 +263,20 @@ export const loadBoardPrefs = (): Promise<string | null> =>
 export const saveBoardPrefs = (contents: string): Promise<void> =>
   invoke("save_board_prefs", { contents });
 
+/** Load orrerix's own sessions log (#2116) — the pane name and the human's
+ *  notes, per harness session — or null on first run / after a corrupt file was
+ *  quarantined backend-side (the caller then shows every row at its transcript
+ *  title, with no notes). Opaque JSON: `sessionlog.ts` owns the schema, and
+ *  nothing in it comes from, or goes to, a harness's own session files. */
+export const loadSessionLog = (): Promise<string | null> =>
+  invoke<string | null>("load_session_log");
+
+/** Persist orrerix's sessions log atomically. Same best-effort contract as
+ *  `saveUiTabs`: a failed write just means the last note or rename is not
+ *  durable until the next one. */
+export const saveSessionLog = (contents: string): Promise<void> =>
+  invoke("save_session_log", { contents });
+
 // ---------- window lifecycle (#219) ----------
 
 /** This build's version, as declared in `tauri.conf.json` / `package.json`.

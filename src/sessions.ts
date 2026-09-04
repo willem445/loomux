@@ -11,7 +11,19 @@ import { orchRows, type OrchRow } from "./orchlist";
 import { taskSummary, repoBranchLine, prLabel, sessionBadgeLabel } from "./sessionmeta";
 import { RefreshGate } from "./refreshgate";
 import { SessionStore } from "./sessionstore";
-import { delegateToggleLabel, partitionSessions } from "./sessionfilter";
+import {
+  DEFAULT_SESSION_MODE,
+  decodeSessionMode,
+  delegateToggleLabel,
+  partitionSessions,
+  type SessionMode,
+} from "./sessionfilter";
+
+/** Where the human's normal ⇄ orchestration choice is remembered (#2116).
+ *  `loomux.*` is this app's UI-chrome convention, and `localStorage` is the
+ *  right home for it for the reason `agents.ts` gives: it is a per-viewer
+ *  reading preference, not durable state anything else reads. */
+const MODE_KEY = "loomux.sessions.mode";
 
 const ROLE_CHIPS: Record<string, string> = {
   orchestrator: "ORCH",
@@ -71,6 +83,19 @@ export class SessionBrowser {
    *  Nothing here bounds the SCAN — #1592's hang was a backend scaling defect
    *  and is fixed there; this changes only what a human has to read. */
   private showDelegates = false;
+  /** Whose sessions the list is showing (#2116) — the human's own panes, or an
+   *  orchestration's. Remembered per viewer, unlike `showDelegates`: the human
+   *  asked for an explicit control over which world they are looking at, and a
+   *  control that resets on every launch is not one.
+   *
+   *  Decoded totally (`decodeSessionMode`), so a hand-edited or future value in
+   *  `localStorage` opens the default view rather than a state no control can
+   *  name. */
+  private mode: SessionMode = DEFAULT_SESSION_MODE;
+  /** The Mine ⇄ Orchestration segmented control. Its own element for the same
+   *  reason the delegate toggle is: the list is emptied and rebuilt on every
+   *  render and this must survive that with its state intact. */
+  private modeEl: HTMLElement;
 
   constructor(
     private el: HTMLElement,
@@ -100,6 +125,16 @@ export class SessionBrowser {
     this.searchEl.placeholder = "Filter sessions…";
     this.searchEl.addEventListener("input", () => this.render());
 
+    this.mode = decodeSessionMode(localStorage.getItem(MODE_KEY));
+    this.modeEl = document.createElement("div");
+    this.modeEl.className = "sessions-mode";
+    this.modeEl.setAttribute("role", "tablist");
+    this.modeEl.setAttribute("aria-label", "Which sessions to list");
+    this.modeEl.append(
+      this.modeTab("mine", "Mine", "Sessions you started yourself"),
+      this.modeTab("orchestration", "Orchestration", "Sessions an orchestration group minted")
+    );
+
     this.orchEl = document.createElement("div");
     this.orchEl.className = "orch-list";
 
@@ -117,8 +152,33 @@ export class SessionBrowser {
     // sidebar's width animates open/closed.
     const inner = document.createElement("div");
     inner.className = "sessions-inner";
-    inner.append(head, this.searchEl, this.orchEl, this.listEl, this.toggleEl);
+    inner.append(head, this.searchEl, this.modeEl, this.orchEl, this.listEl, this.toggleEl);
     this.el.appendChild(inner);
+  }
+
+  /** One tab of the mode control. A `<button role="tab">` with `aria-selected`,
+   *  the same shape the side dock's tablist uses — the two tabs are one control
+   *  the human arrows through, not two independent toggles. */
+  private modeTab(mode: SessionMode, label: string, title: string): HTMLButtonElement {
+    const b = document.createElement("button");
+    b.className = "sessions-mode-tab";
+    b.dataset.mode = mode;
+    b.type = "button";
+    b.setAttribute("role", "tab");
+    b.textContent = label;
+    b.title = title;
+    b.addEventListener("click", () => this.setMode(mode));
+    return b;
+  }
+
+  /** Switch the view. Nothing here touches the panel's WIDTH: the mode control
+   *  lives inside `.sessions-inner`, which is a fixed-width column, so a click
+   *  moves no layout column and reaches no PTY resize (hard constraint 1). */
+  private setMode(mode: SessionMode): void {
+    if (this.mode === mode) return;
+    this.mode = mode;
+    localStorage.setItem(MODE_KEY, mode);
+    this.render();
   }
 
   get visible(): boolean {
@@ -304,7 +364,18 @@ export class SessionBrowser {
 
   private render(): void {
     const q = this.searchEl.value.trim().toLowerCase();
-    this.renderOrchestrations(q);
+    for (const tab of this.modeEl.querySelectorAll<HTMLElement>(".sessions-mode-tab")) {
+      const on = tab.dataset.mode === this.mode;
+      tab.classList.toggle("on", on);
+      tab.setAttribute("aria-selected", on ? "true" : "false");
+    }
+    // The Orchestrations section is the primary restart surface for a recorded
+    // GROUP (#1563), so it belongs with the orchestration sessions rather than
+    // in a view the human asked to be "my own". `renderOrchestrations` empties
+    // the element itself, so `mine` simply clears it — never a stale list left
+    // behind by the previous mode.
+    if (this.mode === "orchestration") this.renderOrchestrations(q);
+    else this.orchEl.replaceChildren();
     const matching = this.store.cached.filter(
       (s) =>
         !q ||
@@ -318,10 +389,11 @@ export class SessionBrowser {
     const { shown, hidden } = partitionSessions(
       matching,
       (s) => this.roleFor(s),
+      this.mode,
       this.showDelegates
     );
 
-    const toggleLabel = delegateToggleLabel(hidden, this.showDelegates);
+    const toggleLabel = delegateToggleLabel(hidden, this.showDelegates, this.mode);
     this.toggleEl.textContent = toggleLabel ?? "";
     this.toggleEl.classList.toggle("hidden", toggleLabel === null);
 
@@ -334,12 +406,19 @@ export class SessionBrowser {
       // at all. Collapsing the middle one into "no sessions match" would tell
       // a human their search failed while the rows sit behind the toggle
       // right below it.
+      // Four genuinely different situations, so four sentences. Each names the
+      // MODE, because the commonest reason a list looks empty is now that the
+      // rows are in the other one — an unqualified "no sessions match" would
+      // tell a human their search failed while the rows sit one click away.
+      const noun = this.mode === "orchestration" ? "orchestration sessions" : "sessions of your own";
       empty.textContent =
         hidden > 0
-          ? "Only agent sessions here — use the button below to show them."
+          ? "Only delegate sessions here — use the button below to show them."
           : q
-            ? "No sessions match."
-            : "No agent sessions found on this machine.";
+            ? `No ${noun} match.`
+            : this.mode === "orchestration"
+              ? "No orchestration sessions found on this machine."
+              : "No sessions of your own found on this machine.";
       this.listEl.appendChild(empty);
       return;
     }

@@ -1030,6 +1030,13 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane:hover .pane-btn, .pane-btn:focus-visible { opacity: 1; }
 .pane-btn:hover { background: var(--surface-2); color: var(--ink); }
 .pane-btn.close:hover { color: var(--state-danger); }
+/* #2116: a pane whose session already carries notes. The whole header button
+   row is hover-revealed (`opacity: 0` above), so this cannot be an
+   at-a-glance indicator and is not trying to be one — it tells you which
+   button to press once you are already looking at them. Full-strength ink
+   rather than a fill: a note count is not an attention signal, and the accent
+   as a GROUND is what #1340 asked to stop. The count itself is in the title. */
+.pane-btn.has-notes { color: var(--ink); }
 /* A docked view's overlay toggle is disabled outright (#361 user-demo
    finding — see embedtoggle.ts): dim it further than the plain hover-reveal
    opacity and drop the pointer cursor, so it reads as unavailable rather
@@ -2116,6 +2123,58 @@ button.orch-item:active { transform: translateX(2px) scale(0.995); }
   cursor: pointer; accent-color: var(--accent);
 }
 .editor-dialog { width: 400px; }
+
+/* ---------- #2116: the per-session Notes overlay ----------
+   The same `.launcher-overlay` / `.agent-dialog` kit every other dialog uses —
+   an OVERLAY, never an in-flow panel, so nothing here can reach a PTY resize
+   (hard constraint 1). Wider than the 440px default because a note is prose,
+   and the list scrolls INTERNALLY so a session with thirty notes cannot push
+   the textarea and its buttons off-screen. */
+.notes-dialog { width: 560px; }
+.notes-subtitle {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--ink);
+}
+.notes-list {
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 46vh; overflow-y: auto;
+  padding-right: 2px;
+}
+.notes-empty {
+  font-size: 11.5px; line-height: 1.5; color: var(--ink-faint);
+  padding: 10px 2px;
+}
+.notes-row {
+  display: grid; grid-template-columns: 1fr auto auto; align-items: start; gap: 8px;
+  background: var(--surface-0);
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 10px;
+}
+.notes-text {
+  font-size: 12.5px; line-height: 1.5; color: var(--ink);
+  white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;
+}
+.notes-when {
+  font-size: 10.5px; color: var(--ink-faint); white-space: nowrap;
+  font-variant-numeric: tabular-nums; padding-top: 2px;
+}
+.notes-del {
+  background: none; border: none; cursor: pointer;
+  color: var(--ink-faint); font: inherit; font-size: 14px; line-height: 1;
+  padding: 0 2px;
+}
+.notes-del:hover { color: var(--state-danger); }
+.notes-input { resize: vertical; min-height: 56px; line-height: 1.5; }
+/* Only present near the cap — a counter on an empty box is noise. `flex: 1`
+   pushes the buttons right whether or not it has text, so they do not shift
+   position as the counter appears. */
+.notes-counter {
+  flex: 1; align-self: center;
+  font-size: 10.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums;
+  visibility: hidden;
+}
+.notes-counter.visible { visibility: visible; }
+
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
 .dlg-btn {
   background: var(--surface-2); color: var(--ink-dim);
@@ -2406,19 +2465,27 @@ button.orch-item:active { transform: translateX(2px) scale(0.995); }
 .issues-form-body { min-height: 120px; resize: vertical; line-height: 1.5; }
 .issues-form-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
-/* -- Issues ⇄ PRs segmented toggle in the header -- */
-.issues-mode {
+/* -- Issues ⇄ PRs segmented toggle in the header, and the sessions sidebar's
+   Mine ⇄ Orchestration one (#2116) -- one visual language for "two views of
+   one list, pick one", so the two selectors share every rule and the sessions
+   one adds only the placement it needs (it sits in a padded column, not a
+   header row). -- */
+.issues-mode, .sessions-mode {
   flex: none; display: flex; border: 1px solid var(--line); border-radius: 6px;
   overflow: hidden;
 }
-.issues-mode-tab {
+.sessions-mode { margin: 0 12px 10px; }
+.issues-mode-tab, .sessions-mode-tab {
   background: var(--surface-0); border: none; color: var(--ink-dim);
   font: inherit; font-size: 11.5px; font-weight: 600;
   padding: 3px 10px; cursor: pointer;
 }
-.issues-mode-tab + .issues-mode-tab { border-left: 1px solid var(--line); }
-.issues-mode-tab:hover:not(.on) { color: var(--ink); }
-.issues-mode-tab.on { background: var(--accent); color: var(--surface-0); }
+.sessions-mode-tab { flex: 1 1 0; padding: 5px 10px; }
+.issues-mode-tab + .issues-mode-tab,
+.sessions-mode-tab + .sessions-mode-tab { border-left: 1px solid var(--line); }
+.issues-mode-tab:hover:not(.on),
+.sessions-mode-tab:hover:not(.on) { color: var(--ink); }
+.issues-mode-tab.on, .sessions-mode-tab.on { background: var(--accent); color: var(--surface-0); }
 
 /* PR head-branch chip in a row's meta line. */
 .issues-branch {

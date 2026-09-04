@@ -2,7 +2,14 @@
 // `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { taskSummary, repoBranchLine, prLabel, restoredPaneName, sessionBadgeLabel } from "../src/sessionmeta.ts";
+import {
+  taskSummary,
+  repoBranchLine,
+  paneNameLine,
+  prLabel,
+  restoredPaneName,
+  sessionBadgeLabel,
+} from "../src/sessionmeta.ts";
 import type { SessionRoleInfo } from "../src/orchestration.ts";
 
 const role = (over: Partial<SessionRoleInfo> = {}): SessionRoleInfo => ({
@@ -94,6 +101,58 @@ test("restoredPaneName cuts a long title with an ellipsis, keeping the CLI prefi
 test("restoredPaneName leaves a title that fits exactly alone — no ellipsis on a non-cut", () => {
   const exact = "z".repeat(34);
   assert.equal(restoredPaneName("claude", exact), `claude · ${exact}`);
+});
+
+// ---- paneNameLine (#2116) ----
+
+test("a name the human chose is shown", () => {
+  assert.equal(paneNameLine("w: #2116 notes", "Fix the login bug", "claude"), "w: #2116 notes");
+});
+
+test("nothing recorded shows no line — the row's own title IS the fallback", () => {
+  // Never a placeholder and never an empty line: the caller renders nothing at
+  // all, and the title the row already shows is what the human reads.
+  assert.equal(paneNameLine(undefined, "Fix the login bug", "claude"), null);
+  assert.equal(paneNameLine("", "Fix the login bug", "claude"), null);
+  assert.equal(paneNameLine("   ", "Fix the login bug", "claude"), null);
+});
+
+test("a name equal to the title is not printed twice", () => {
+  assert.equal(paneNameLine("Fix the login bug", "Fix the login bug", "claude"), null);
+  assert.equal(paneNameLine("  Fix the login bug  ", "Fix the login bug", "claude"), null);
+});
+
+test("the auto-name a restore MINTS is not a name the human chose", () => {
+  // The row this matters most for is the commonest one on the page: a pane
+  // opened by clicking this very list is auto-named `<cli> · <title>`, so
+  // without this clause every such row grows a second line restating its own
+  // title with a CLI prefix.
+  //
+  // Built by CALLING restoredPaneName rather than by spelling the format out,
+  // so a change to the auto-name cannot leave this test asserting the old one
+  // while the rows go noisy.
+  const title = "Fix the login bug";
+  assert.equal(paneNameLine(restoredPaneName("claude", title), title, "claude"), null);
+  // Including the truncating case, where the auto-name is not a prefix-plus-
+  // title at all.
+  const long = "y".repeat(200);
+  assert.equal(paneNameLine(restoredPaneName("opencode", long), long, "opencode"), null);
+});
+
+test("the auto-name of a DIFFERENT cli is still a name worth showing", () => {
+  // The negative control for the clause above: it must suppress THIS row's
+  // auto-name, not every string that happens to look like one. A pane named
+  // after another CLI is a fact about the pane, not noise.
+  const title = "Fix the login bug";
+  assert.equal(
+    paneNameLine(restoredPaneName("copilot", title), title, "claude"),
+    `copilot · ${title}`
+  );
+});
+
+test("a rename that only changes case is a rename", () => {
+  // This is a report of what the human wrote, not a guess at what they meant.
+  assert.equal(paneNameLine("WORKER", "worker", "claude"), "WORKER");
 });
 
 test("sessionBadgeLabel names the row's own CLI, whichever it is", () => {

@@ -74,6 +74,33 @@ can also name **Gemini CLI** for a reviewer lane (see
 [cross-model reviewers](orchestration.html#setting-up-a-cross-model-reviewer))
 — it just isn't one of the launcher's own dropdown options.
 
+### Notes on an agent pane
+
+With a wall of agents open it is easy to lose track of what each one is for.
+An agent pane's header carries a **Notes** button: click it for an overlay
+where you can add, read and delete your own notes about that session.
+
+Notes are tied to the **agent CLI's session**, not to the pane. So they follow
+the session when you resume it in a new pane, and you can read them later from
+the [session browser](features/session-browser.html) without opening the
+session at all. Orrerix keeps them in its own file beside your other settings —
+it never writes to the CLI's own transcripts.
+
+The button appears only where a note has something to be tied to: an agent pane
+running a CLI orrerix recognises. A plain shell has no session, and an SSH
+pane's session lives on the far-end machine.
+
+Renaming the pane updates the name recorded against the session, so the session
+browser shows what you called it.
+
+**One thing worth knowing.** Some agent CLIs get their session id the moment
+they start, because orrerix puts it on the command line — Claude Code and pi do
+this. Others mint their own a little later, on their first turn; Copilot CLI
+and OpenCode are the ones that do that today. A note you write on one of the
+latter *before* its first prompt is held in memory and attached as soon as
+orrerix learns the id — but if you restart the app in that window, that note is
+lost. The overlay says so while it applies.
+
 ### The file editor and git panes
 
 The `Alt+F` editor and the `Alt+G` git view are **overlays**: they float over a

@@ -1267,7 +1267,7 @@ test("the accent paints marks, never grounds — every gold background is argued
     ".wf-btn-primary": "primary action in the workflow editor",
     // --- on-states: the human turned this on, and the fill is the answer to "is it on?".
     ".issues-toggle.on": "filter toggle, on",
-    ".issues-mode-tab.on": "mode tab, on",
+    ".issues-mode-tab.on, .sessions-mode-tab.on": "mode tab, on (Issues/PRs, and #2116's Mine/Orchestration)",
     ".tasks-head .pane-btn.sprint-lens.on": "sprint lens, on",
     ".tasks-filter .pane-btn.filter-chip.on": "board filter chip, on",
     ".audit-follow.on": "follow-the-tail, on",
