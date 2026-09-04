@@ -20,11 +20,10 @@
 // COORDINATION (#2168 S2/S3, never two scans). S2 (`personas/2168-worker-prereport`)
 // pins the three worker personas against the same script. Whoever merges first owns
 // this one file: S2 lands first → S3 rebases and extends it; S3 landed first → S2
-// extends this file. Never a second persona-scan test file. RESOLVED on this branch
-// the second way: S3's scan was cherry-picked here (its commit carries the reviewer
-// persona edits) and the S2 worker scan below extends it — one file, both halves.
-// PR #2236 carries BOTH the cherry-pick and the extension, so whichever of #2234 /
-// #2236 merges second rebases onto main and its diff for this file collapses.
+// extends this file. Never a second persona-scan test file. RESOLVED the second way:
+// #2234 merged first (S3's scan is main's), so S2 rebased onto main and EXTENDS THIS
+// FILE — the reviewer half above is main's, the worker half below is S2's. One file,
+// both halves.
 //
 // Every assertion below reads the file that ships, not a fixture: a test fixture could
 // pass while the shipped persona drifted, which is exactly the drift the pin exists
