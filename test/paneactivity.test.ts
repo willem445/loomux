@@ -116,6 +116,91 @@ test("sub-floor chunks inside ONE window do accumulate past the floor", () => {
   assert.equal(s.atPrompt, false);
 });
 
+test("repaints at a JUST-UNDER-the-bound cadence do accumulate — the (0, 4 s) band", () => {
+  // #2195 review, rev-std finding 1. The two accumulation tests above use 100 ms
+  // and WINDOW+1; the whole band between them was untested, and the doc's old
+  // "one window" wording denied that this case accumulates at all. It does, and
+  // that is the intended reading: `ACTIVITY_WINDOW_MS` bounds the GAP between
+  // chunks, not the age of the burst, so a pane repainting without pause is not
+  // parked however long it keeps going.
+  const a = parked();
+  let t = T0;
+  const CADENCE = ACTIVITY_WINDOW_MS - 100; // 3.9 s — inside the bound
+  const needed = Math.ceil(ACTIVITY_FLOOR_BYTES / 164);
+  for (let i = 0; i < needed - 1; i++) {
+    t += CADENCE;
+    a.noteOutput(164, t);
+    assert.equal(a.snapshot(t).atPrompt, true, `still under the floor after ${i + 1} repaints`);
+  }
+  t += CADENCE;
+  a.noteOutput(164, t);
+  const s = a.snapshot(t);
+  assert.equal(s.bytesInWindow, needed * 164);
+  assert.ok(s.bytesInWindow >= ACTIVITY_FLOOR_BYTES);
+  assert.equal(s.atPrompt, false, "crossing the floor clears the latch however slowly it was crossed");
+});
+
+test("exactly the bound is still one burst; one ms past it is not", () => {
+  // The boundary itself, in both directions — an off-by-one here silently
+  // reclassifies every chunk that lands on the tick.
+  const onBound = new PaneActivity();
+  onBound.noteOutput(100, T0);
+  onBound.noteOutput(100, T0 + ACTIVITY_WINDOW_MS);
+  assert.equal(onBound.snapshot(T0 + ACTIVITY_WINDOW_MS).bytesInWindow, 200);
+  const pastBound = new PaneActivity();
+  pastBound.noteOutput(100, T0);
+  pastBound.noteOutput(100, T0 + ACTIVITY_WINDOW_MS + 1);
+  assert.equal(pastBound.snapshot(T0 + ACTIVITY_WINDOW_MS + 1).bytesInWindow, 100);
+});
+
+test("a clock that jumps BACKWARDS ends the burst rather than extending it", () => {
+  // #2195 review premortem 1. `Pane` feeds this reducer `Date.now()`, so an NTP
+  // correction or a laptop resume can move it backwards. A plain
+  // `now - last > BOUND` reads that as a NEGATIVE gap — "still the same burst" —
+  // and sub-floor repaints would then accumulate across the jump until they
+  // crossed the floor and cleared a latch that should have held.
+  const a = parked();
+  a.noteOutput(1000, T0);
+  assert.equal(a.snapshot(T0).bytesInWindow, 1000, "control: the pre-jump burst is real");
+  // The clock steps back an hour. 1000 + 1500 would cross the floor if this
+  // counted as one burst; it must not.
+  const jumped = T0 - 3_600_000;
+  a.noteOutput(1500, jumped);
+  const s = a.snapshot(jumped);
+  assert.equal(s.bytesInWindow, 1500, "the jump starts a new burst");
+  assert.equal(s.atPrompt, true, "and the latch is held, which is the safe direction");
+});
+
+test("a snapshot read across a backward jump reports no bytes, not a stale burst", () => {
+  // `snapshot` must ask "is this still one burst" by the same rule `noteOutput`
+  // does — asking it twice by two expressions is how the two drift apart.
+  const a = new PaneActivity();
+  a.noteOutput(1000, T0);
+  assert.equal(a.snapshot(T0).bytesInWindow, 1000, "control: readable before the jump");
+  assert.equal(a.snapshot(T0 - 3_600_000).bytesInWindow, 0);
+});
+
+test("a clock that jumps FORWARD ends the burst, like any long gap", () => {
+  const a = parked();
+  a.noteOutput(1000, T0);
+  a.noteOutput(1500, T0 + 3_600_000);
+  const s = a.snapshot(T0 + 3_600_000);
+  assert.equal(s.bytesInWindow, 1500);
+  assert.equal(s.atPrompt, true);
+});
+
+test("a respawned pane's boot repaint is what clears a latch carried across it", () => {
+  // #2195 review premortem 2. Nothing resets the reducer on respawn, by design
+  // (`lastHumanInputMs` is a pane fact, not a process one) — so the bound on a
+  // latch surviving a respawn is clear (2), and this pins that it really is one:
+  // an agent CLI's boot repaint is far above the floor.
+  const a = parked();
+  // ... the process dies and a new one is spawned over the same PaneActivity.
+  assert.equal(a.snapshot(T0).atPrompt, true, "control: the latch really did survive");
+  a.noteOutput(ACTIVITY_FLOOR_BYTES * 4, T0 + 60_000);
+  assert.equal(a.snapshot(T0 + 60_000).atPrompt, false);
+});
+
 test("a lapsed window reports no bytes even with nothing new arriving", () => {
   const a = new PaneActivity();
   a.noteOutput(500, T0);

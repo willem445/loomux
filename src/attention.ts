@@ -41,10 +41,32 @@ const LABELS: Record<string, string> = {
   gate: "⚑ your call",
 };
 
+/** Every reason this module knows a label for — the population the
+ *  classification partition below is checked over. Read off `LABELS` rather
+ *  than re-listed, so a reason added there cannot be missing from the guard
+ *  that is supposed to notice it (#2122 slice A). */
+export const KNOWN_ATTENTION_REASONS: readonly string[] = Object.keys(LABELS);
+
 /** Attention reasons rendered as urgent (red, not amber): the pane is stuck
  *  and will not un-stick itself. Kept as a set so adding a reason is one edit
  *  — `tabroute.ts` mirrors this rule (see its note on why it can't import). */
 const URGENT: ReadonlySet<string> = new Set(["held-dialog", "blocked", "stranded"]);
+
+/** Attention reasons that are a DECISION waiting on the human's own pace rather
+ *  than a wedged pane — amber, not red, and the ones a "needs you" count is
+ *  really about (#2122 slice A). Exported because `agentrows.ts` needs exactly
+ *  this class for its `question` rung, and a hand-maintained second copy over
+ *  there means a reason added HERE renders a chip while silently missing that
+ *  rung and undercounting the badge (#2195 review, rev-std finding 2).
+ *
+ *  Deliberately not derivable as "the complement of `URGENT`": `waiting` is
+ *  non-urgent too and is emphatically NOT a decision — it is a finished turn,
+ *  which the ladder reads on its own `turn-done` rung. The three classes are
+ *  independent, which is why `every reason in LABELS is classified exactly
+ *  once` in `test/attention.test.ts` pins the partition rather than one set:
+ *  adding a reason to `LABELS` without deciding which class it is fails there,
+ *  loudly, instead of defaulting into the quietest answer. */
+export const DECISION_REASONS: ReadonlySet<string> = new Set(["question", "gate", "report"]);
 
 /** Whether a fresh `(reason, detail)` reading differs from the one currently
  *  applied to a pane — the identity check `Pane.setAttention` gates its DOM

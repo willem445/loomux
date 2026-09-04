@@ -12,7 +12,7 @@
 // this module decides what it MEANS. The split is the point: `pane.ts` owns
 // where the facts come from, this module owns what they add up to.
 
-import { attentionPresentation } from "./attention.ts";
+import { attentionPresentation, DECISION_REASONS } from "./attention.ts";
 import { ACTIVITY_FLOOR_BYTES, type ActivitySnapshot } from "./paneactivity.ts";
 
 /** One pane's whole reading, as plain data. Produced by `Pane.facts()`.
@@ -76,11 +76,14 @@ export type AgentState =
   | "idle"
   | "working";
 
-/** The non-urgent "this is on you" attention reasons — a decision waiting on
- *  the human's own pace rather than a wedged pane. The urgent set is NOT
- *  re-listed here: `attentionPresentation(reason).urgent` is the one answer,
- *  imported from `attention.ts` so adding a reason there stays one edit. */
-const QUESTION_REASONS: ReadonlySet<string> = new Set(["question", "gate", "report"]);
+// Neither reason class is re-listed here, and that is the whole point:
+// `attentionPresentation(reason).urgent` and `DECISION_REASONS` both come from
+// `attention.ts`, so adding a reason there stays ONE edit. An earlier draft kept
+// a hand-maintained copy of the decision set in this module, which meant a
+// reason added over there would render a chip while silently missing the
+// `question` rung and undercounting the badge (#2195 review, rev-std finding 2).
+// `test/attention.test.ts` pins that every known reason is classified exactly
+// once, so a new reason cannot default quietly into the wrong rung either.
 
 /** Precedence for `sortRows` — most-wants-you first. Index in this array IS
  *  the ladder's own order, so a state added to `AgentState` without a rung
@@ -121,21 +124,29 @@ export function deriveAgentState(facts: PaneFacts): AgentState {
   //    own line: urgent means wedged and it will not un-wedge itself.
   const reason = facts.attention?.reason ?? null;
   if (reason !== null && attentionPresentation(reason).urgent) return "attention";
-  if (reason !== null && QUESTION_REASONS.has(reason)) return "question";
+  if (reason !== null && DECISION_REASONS.has(reason)) return "question";
   // 6. Turn done: either the scan says `waiting` right now, or it said so at
   //    some point and nothing has since disproved it (the latch — see
   //    `paneactivity.ts` for why the focus ack must not disprove it).
   if (reason === "waiting" || facts.activity.atPrompt) return "turn-done";
-  // 7. Idle, and the evidence differs by pane kind because the available
-  //    evidence differs. An orchestration pane has the roster's own reading
-  //    ("the reaper would call this idle"), which is only trustworthy while
-  //    the pane is not simultaneously painting real output. A pane the roster
-  //    does not cover has exactly one idleness fact available: nobody has ever
-  //    prompted it, so it cannot be mid-turn.
-  if (facts.orch !== null) {
-    if (facts.activity.rosterIdle === true && facts.activity.bytesInWindow < ACTIVITY_FLOOR_BYTES) return "idle";
-  } else if (facts.activity.lastHumanInputMs === null) {
-    return "idle";
+  // 7. Idle. TWO conditions, and the first is common to every pane kind on
+  //    purpose (#2195 review B1). A pane painting above the floor is not idle,
+  //    whatever else is true of it — hoisted out of the branches rather than
+  //    repeated inside one of them, because a guard that reads a signal on one
+  //    arm and not its sibling is a bypass exactly the width of that asymmetry
+  //    (CLAUDE.md: a guard reads every one of its inputs by one rule). The
+  //    first draft read it on the orch arm alone, and an unattended
+  //    non-orchestration agent pane — `main.ts`'s resume-agent / fresh-agent /
+  //    plain-session-restore all open one with a command and no orchGroup —
+  //    therefore read `idle` for its entire working run.
+  if (facts.activity.bytesInWindow < ACTIVITY_FLOOR_BYTES) {
+    //  The SECOND condition is what differs, because the available evidence
+    //  differs. An orchestration pane has the roster's own reading ("the reaper
+    //  would call this idle"). A pane the roster does not cover has one fact
+    //  left once the floor above has been applied: nobody has ever prompted it.
+    const quietlyIdle =
+      facts.orch !== null ? facts.activity.rosterIdle === true : facts.activity.lastHumanInputMs === null;
+    if (quietlyIdle) return "idle";
   }
   // 8. Working is the DEFAULT, and the honest reading of it is "no evidence of
   //    a prompt" rather than "measured to be busy". The docs say so.

@@ -17,15 +17,21 @@
 // `plain_pane_attention` raise it when output has been quiet for
 // `ATTENTION_QUIET_MS`, a prompt shape is on the masked tail, and no keystroke
 // landed inside `ATTENTION_RECENT_INPUT_MS`. But that reason is ACKED ON FOCUS
-// (`Pane.ackAttention` -> `attn_waiting_ack`), so reading it directly would
+// (`Pane.acknowledgeAttention` -> `attn_waiting_ack`), so reading it directly would
 // flip a still-parked pane back to "working" the instant the human clicks it —
 // the click is not evidence the agent resumed. So a `waiting` sighting LATCHES
 // here, and the latch clears only on evidence that is independent of the
 // signal that set it:
 //
 //   1. human input (`noteHumanInput`) — the human typed, so the turn is theirs;
-//   2. at least `ACTIVITY_FLOOR_BYTES` of output inside one window — the pane
-//      is painting something bigger than an idle repaint.
+//   2. at least `ACTIVITY_FLOOR_BYTES` of output inside one contiguous BURST —
+//      the pane is painting something bigger than an idle repaint. A burst is
+//      chunks arriving less than `ACTIVITY_WINDOW_MS` apart: they keep topping
+//      up one count, and the first chunk after a longer gap starts over. It is
+//      deliberately NOT a fixed window, so a pane repainting steadily at, say,
+//      3.9 s intervals does eventually cross the floor — a terminal painting
+//      without pause for a minute is not a parked one, and the direction that
+//      reading fails in is `working`, never a false turn-done.
 //
 // Both clears are bounded and signal-independent, which is what
 // `.orrerix/lessons.md` requires of any suppression driven by a fallible
@@ -40,8 +46,8 @@
 // prompt is correctly still `atPrompt`. Nothing stays latched without the pane
 // genuinely being parked.
 
-/** Bytes of output inside one window that count as "this pane is doing work",
- *  rather than repainting an idle input box.
+/** Bytes of output inside one contiguous burst (see `ACTIVITY_WINDOW_MS`) that
+ *  count as "this pane is doing work", rather than repainting an idle input box.
  *
  *  DUPLICATED from the backend's `DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES`
  *  (`src-tauri/src/orchestration/mod.rs`), where the number was measured: a
@@ -63,17 +69,27 @@
  *  claim that is not true. */
 export const ACTIVITY_FLOOR_BYTES = 2048;
 
-/** How long a burst of output stays one "window" for the floor above. A pane
- *  quiet for longer than this has finished whatever it was painting, so the
- *  next chunk opens a fresh window rather than topping up a stale total —
- *  otherwise a pane dribbling 200 bytes a minute would eventually cross the
- *  floor and read as work.
+/** The longest gap between two chunks that still counts as ONE burst of output
+ *  for the floor above. A pane quiet for longer than this has finished whatever
+ *  it was painting, so the next chunk starts the count over rather than topping
+ *  up a stale total — otherwise a pane dribbling 200 bytes a minute would
+ *  eventually cross the floor and read as work.
+ *
+ *  This is a gap bound, not a fixed window: chunks arriving closer together than
+ *  this keep accumulating for as long as they keep coming, so a pane repainting
+ *  steadily just under the bound DOES cross the floor eventually. That is the
+ *  intended reading — a terminal painting without pause is not parked — and it
+ *  fails toward `working`, never toward a turn-done claim that is not true
+ *  (#2195 review, rev-std finding 1, which is why this doc says so explicitly).
  *
  *  4000 ms is the backend's own definition of "this pane has gone quiet"
  *  (`ATTENTION_QUIET_MS`, `mod.rs`) — the same threshold that decides a
- *  `waiting` sighting is worth raising at all, so the window this latch is
- *  cleared over is the window it was set over. Pinned against that Rust
- *  literal too. */
+ *  `waiting` sighting is worth raising at all, so the gap this latch is cleared
+ *  over is the gap it was set over. Pinned against that Rust literal too.
+ *
+ *  It is NOT the backend's own floor rule, which is a different instrument for a
+ *  different job: `idle_output_is_activity` compares total growth between two
+ *  scan ticks. Named here so a reader does not assume the two are one mechanism. */
 export const ACTIVITY_WINDOW_MS = 4000;
 
 /** The plain-data reading `PaneFacts.activity` carries — resolved AT `nowMs`,
@@ -82,7 +98,10 @@ export const ACTIVITY_WINDOW_MS = 4000;
 export interface ActivitySnapshot {
   /** When output last arrived, or null if none ever has. */
   readonly lastOutputMs: number | null;
-  /** Output bytes inside the CURRENT window; 0 once the window has lapsed. */
+  /** Output bytes accumulated in the CURRENT burst — chunks less than
+   *  `ACTIVITY_WINDOW_MS` apart — and 0 once that burst has ended. Named
+   *  `bytesInWindow` for the plan's field list; the bound is a gap between
+   *  chunks, not a fixed window, and `ACTIVITY_WINDOW_MS` says why. */
   readonly bytesInWindow: number;
   /** When the human last typed/pasted into this pane, or null if they never
    *  have. Never set by program-generated data — see `noteHumanInput`. */
@@ -95,6 +114,30 @@ export interface ActivitySnapshot {
    *  the first strip poll lands). Explicitly NOT "at a prompt" (#2089): it
    *  feeds the `idle` rung only, never `turn-done`. */
   readonly rosterIdle: boolean | null;
+}
+
+/** Are two output timestamps close enough to be the same burst?
+ *
+ *  THE CLOCK CAN GO BACKWARDS, and this is the one place that matters. `Pane`
+ *  feeds this reducer `Date.now()` — wall-clock, so an NTP correction or a
+ *  laptop resume moves it, unlike the `performance.now()` the render throttle
+ *  uses. `Date.now()` is nonetheless the right source here, because
+ *  `lastOutputMs` and `lastHumanInputMs` are reported to consumers and must be
+ *  comparable with `firstInputMs`, which is wall-clock throughout `pane.ts`.
+ *  What is NOT acceptable is letting a jump decide the burst: a plain
+ *  `now - last > BOUND` reads a backward jump as a NEGATIVE gap, i.e. "still
+ *  the same burst", so sub-floor repaints would accumulate across the jump and
+ *  eventually clear a latch that should have held.
+ *
+ *  So a non-monotonic reading is treated as a burst BOUNDARY, not a
+ *  continuation. That fails toward holding the latch — the pane keeps reading
+ *  `turn-done`, which is the state the human is being asked about — rather than
+ *  toward silently declaring work that never happened (#2195 review premortem).
+ *  A forward jump needs no special case: it simply ends the burst, which is
+ *  what a long gap means anyway. */
+function withinBurst(lastMs: number, nowMs: number): boolean {
+  const gap = nowMs - lastMs;
+  return gap >= 0 && gap <= ACTIVITY_WINDOW_MS;
 }
 
 /** One pane's activity state machine. Owned by `Pane`, fed from the sites
@@ -111,9 +154,9 @@ export class PaneActivity {
    *  nothing here allocates or touches the DOM. */
   noteOutput(bytes: number, nowMs: number): void {
     if (bytes <= 0) return;
-    // A gap longer than the window means the previous burst is over, so this
-    // chunk opens a new one rather than topping up a stale total.
-    if (this.lastOutputMs === null || nowMs - this.lastOutputMs > ACTIVITY_WINDOW_MS) {
+    // A gap longer than the bound means the previous burst is over, so this
+    // chunk starts the count over rather than topping up a stale total.
+    if (this.lastOutputMs === null || !withinBurst(this.lastOutputMs, nowMs)) {
       this.bytesSinceWindowStart = 0;
     }
     this.lastOutputMs = nowMs;
@@ -155,10 +198,13 @@ export class PaneActivity {
 
   /** The reading at `nowMs`, with the window arithmetic already resolved. */
   snapshot(nowMs: number): ActivitySnapshot {
-    const lapsed = this.lastOutputMs === null || nowMs - this.lastOutputMs > ACTIVITY_WINDOW_MS;
+    // Same burst rule as `noteOutput`, through the same function — asking "is
+    // this still one burst" by two expressions is how the two drift apart, and
+    // a reader must not see a byte count the next chunk would have discarded.
+    const ended = this.lastOutputMs === null || !withinBurst(this.lastOutputMs, nowMs);
     return {
       lastOutputMs: this.lastOutputMs,
-      bytesInWindow: lapsed ? 0 : this.bytesSinceWindowStart,
+      bytesInWindow: ended ? 0 : this.bytesSinceWindowStart,
       lastHumanInputMs: this.lastHumanInputMs,
       atPrompt: this.atPrompt,
       rosterIdle: this.rosterIdle,

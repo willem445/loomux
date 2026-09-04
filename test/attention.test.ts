@@ -7,6 +7,8 @@ import {
   dockChipAttention,
   attentionDismiss,
   attentionChanged,
+  DECISION_REASONS,
+  KNOWN_ATTENTION_REASONS,
 } from "../src/attention.ts";
 
 test("each known reason maps to its label", () => {
@@ -185,4 +187,47 @@ test("attentionChanged treats a fresh reason and a clear as changes too", () => 
   assert.equal(attentionChanged(null, null, "question", "1 pending question — needs your answer"), true);
   assert.equal(attentionChanged("question", "1 pending question — needs your answer", null, null), true);
   assert.equal(attentionChanged(null, null, null, null), false, "clear-on-clear is still a no-op");
+});
+
+test("every known attention reason is classified exactly once", () => {
+  // #2122 slice A / #2195 review, rev-std finding 2. Three independent classes
+  // consume this module: URGENT (via `attentionPresentation().urgent`, the red
+  // chips), DECISION_REASONS (a call waiting on the human's own pace), and
+  // `waiting` — which is non-urgent and emphatically NOT a decision: it is a
+  // finished turn, read on `agentrows.ts`'s own `turn-done` rung.
+  //
+  // The partition is what is pinned, not any one set. A reason added to LABELS
+  // without being classified renders a chip and then falls through every rung
+  // that matters: no red badge, no `question` row, no `needsYouCount` — the
+  // quietest possible wrong answer. This fails instead, naming the reason.
+  const unclassified: string[] = [];
+  const doubled: string[] = [];
+  for (const reason of KNOWN_ATTENTION_REASONS) {
+    const classes = [
+      attentionPresentation(reason).urgent && "urgent",
+      DECISION_REASONS.has(reason) && "decision",
+      reason === "waiting" && "waiting",
+    ].filter(Boolean);
+    if (classes.length === 0) unclassified.push(reason);
+    if (classes.length > 1) doubled.push(`${reason} (${classes.join(" + ")})`);
+  }
+  assert.deepEqual(unclassified, [], "reason(s) in LABELS that no consumer class claims");
+  assert.deepEqual(doubled, [], "reason(s) claimed by more than one class");
+  // Non-vacuity: the loop must have SEEN the population, and seen every class
+  // in it. An empty or one-class LABELS would satisfy both assertions above.
+  assert.ok(KNOWN_ATTENTION_REASONS.length >= 7, `only ${KNOWN_ATTENTION_REASONS.length} reasons scanned`);
+  assert.ok(KNOWN_ATTENTION_REASONS.some((r) => attentionPresentation(r).urgent));
+  assert.ok(KNOWN_ATTENTION_REASONS.some((r) => DECISION_REASONS.has(r)));
+  assert.ok(KNOWN_ATTENTION_REASONS.includes("waiting"));
+});
+
+test("the classification guard is not vacuous — an unclassified reason is visible to it", () => {
+  // The positive control for the loop above: a reason NOT in any class really
+  // does read as unclassified, so the empty list up there is the guard working
+  // rather than the guard looking at nothing.
+  const invented = "brand-new-reason-nobody-classified";
+  assert.equal(KNOWN_ATTENTION_REASONS.includes(invented), false);
+  assert.equal(attentionPresentation(invented).urgent, false);
+  assert.equal(DECISION_REASONS.has(invented), false);
+  assert.notEqual(invented, "waiting");
 });

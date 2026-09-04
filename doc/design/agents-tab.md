@@ -54,7 +54,7 @@ reason already means "parked at a prompt": `attention_tick` /
 `plain_pane_attention` raise it when output has been quiet for
 `ATTENTION_QUIET_MS`, a prompt shape sits on the masked tail, and no keystroke
 landed inside `ATTENTION_RECENT_INPUT_MS`. It covers plain panes too, keyed
-`pty:N`. But it is **acked on focus** (`Pane.ackAttention` →
+`pty:N`. But it is **acked on focus** (`Pane.acknowledgeAttention` →
 `attn_waiting_ack`), so reading it directly would flip a still-parked pane back
 to `working` the instant the human clicks it — and a click is not evidence that
 the agent resumed.
@@ -63,8 +63,10 @@ So a `waiting` sighting latches, and the latch clears only on evidence
 independent of the signal that set it:
 
 1. **human input** — the human typed, so the turn is theirs;
-2. **at least `ACTIVITY_FLOOR_BYTES` of output inside one window** — the pane is
-   painting something bigger than an idle repaint.
+2. **at least `ACTIVITY_FLOOR_BYTES` of output inside one contiguous burst** —
+   the pane is painting something bigger than an idle repaint. A burst is chunks
+   arriving less than `ACTIVITY_WINDOW_MS` apart; the first chunk after a longer
+   gap starts the count over.
 
 Both clears are bounded and signal-independent, which is what
 `.orrerix/lessons.md` requires of any suppression driven by a fallible signal:
@@ -75,11 +77,34 @@ be held on by the scan going quiet.
 `DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES`, where the number was measured (a full idle
 Claude Code input-box repaint is ~164 bytes —
 `src-tauri/tests/fixtures/attention/idle-input-box.txt`). `ACTIVITY_WINDOW_MS`
-is **4000**, the backend's own `ATTENTION_QUIET_MS` — so the window the latch is
-cleared over is the window it was set over. Both are duplicated rather than
+is **4000**, the backend's own `ATTENTION_QUIET_MS` — so the gap the latch is
+cleared over is the gap it was set over. Both are duplicated rather than
 plumbed for the reason `DOCK_TERM_RESERVE_PX` is, and both are pinned against
 the Rust literals by `test/paneactivity.test.ts`, which reads the sources off
 disk so the copies cannot drift silently.
+
+**`ACTIVITY_WINDOW_MS` is a gap bound, not a fixed window**, and the difference
+is worth being exact about. Chunks arriving closer together than 4 s keep
+topping up one count for as long as they keep coming, so a pane repainting
+steadily at, say, 3.9 s intervals *does* cross the floor after enough repaints
+and clears the latch. That is the intended reading — a terminal painting without
+pause for a minute is not a parked one — and it fails toward `working`, never
+toward a turn-done claim that is not true. It is also **not** the backend's own
+floor rule, which is a different instrument for a different job:
+`idle_output_is_activity` compares total growth between two scan ticks. The two
+are named together here so a reader does not take them for one mechanism.
+
+**The clock can go backwards, and the burst rule handles it explicitly.** `Pane`
+feeds the reducer `Date.now()` — wall-clock, so an NTP correction or a laptop
+resume moves it. That source is deliberate: `lastOutputMs` and
+`lastHumanInputMs` are reported to consumers and must stay comparable with
+`firstInputMs`, which is wall-clock throughout `pane.ts`. What a plain
+`now - last > BOUND` would do, though, is read a *backward* jump as a negative
+gap — "still the same burst" — so sub-floor repaints would accumulate across the
+jump and eventually clear a latch that should have held. So a non-monotonic
+reading is treated as a burst **boundary** instead, which fails toward holding
+the latch: the pane keeps reading `turn-done`, the state the human is being
+asked about, rather than silently declaring work that never happened.
 
 **Residual on the floor, because the Rust side is not a bare const.** The
 backend's floor is a live-tunable guardrail knob
@@ -117,9 +142,9 @@ wins, and each rung is a strictly more urgent claim than the one below it.
 | 2 | `dormant` | a restore placeholder |
 | 3 | `held` | `held !== null` — loomux is withholding a delivery (#246) |
 | 4 | `attention` | the reason is urgent per `attention.ts` (`held-dialog`, `blocked`, `stranded`) |
-| 5 | `question` | the reason is `question`, `gate` or `report` |
+| 5 | `question` | the reason is in `attention.ts`'s `DECISION_REASONS` (`question`, `gate`, `report`) |
 | 6 | `turn-done` | the reason is `waiting` **or** the latch is set |
-| 7 | `idle` | orch pane: the roster says idle and output is under the floor. Other panes: never prompted this process |
+| 7 | `idle` | output under the floor, AND — orch pane: the roster says idle; other panes: never prompted, ever |
 | 8 | `working` | everything else |
 
 It takes **no clock**. Everything time-dependent — whether the output window has
@@ -145,14 +170,25 @@ pane and calls every content pane dead. `facts()` reads `kind` and `alive` from
 one `tabPaneInfo()` call for that reason: two rules asking one question is how
 the two drift apart.
 
-**`idle` reads different evidence per pane kind, because different evidence
-exists.** An orchestration pane has the roster's `idle_since_ms`, which means
-"the reaper would call this idle / it holds no assignment" — explicitly *not*
-"parked at a prompt" (#2089), which is why it feeds this rung and never
-`turn-done`. It is trusted only while the pane is not simultaneously painting
-above the floor, since a roster claim about assignments says nothing about the
-terminal. A pane the roster does not cover has exactly one idleness fact
-available: nobody has ever prompted it, so it cannot be mid-turn. Applying the
+**`idle` is one shared condition plus one that differs by pane kind.** The
+shared half is the floor: **a pane painting above `ACTIVITY_FLOOR_BYTES` is not
+idle, whatever else is true of it.** It is hoisted out of both branches rather
+than written into one, because a guard that reads a signal on one arm and not
+its sibling is a bypass exactly the width of that asymmetry — the first draft of
+this rung read the floor on the orchestration arm alone, and an unattended
+non-orchestration agent pane (`main.ts`'s resume-agent, fresh-agent and
+plain-session-restore all open one with a command and no `orchGroup`) therefore
+read `idle` for its entire working run. That was #2195 review finding B1.
+
+The half that differs does so because the available evidence differs. An
+orchestration pane has the roster's `idle_since_ms`, which means "the reaper
+would call this idle / it holds no assignment" — explicitly *not* "parked at a
+prompt" (#2089), which is why it feeds this rung and never `turn-done`. A pane
+the roster does not cover has one fact left once the floor has been applied:
+nobody has ever prompted it. That is a **pane-lifetime** fact, not a per-process
+one — `PaneActivity` is constructed once per `Pane` and `respawnFresh` resets
+`firstInputMs` while deliberately leaving `lastHumanInputMs` alone — so the rule
+is "never prompted, ever", not "never prompted this process". Applying that
 basic rule to an orchestration pane would report every unattended worker as
 idle, which is the normal case.
 

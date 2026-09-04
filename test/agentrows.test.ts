@@ -122,6 +122,26 @@ const LADDER: { why: string; state: AgentState; facts: PaneFacts }[] = [
     facts: facts({ activity: { rosterIdle: true, bytesInWindow: 0 } }),
   },
   {
+    // #2195 review B1 / N1. This is the crossing nothing discriminated before:
+    // a non-orchestration pane the human has never typed into, PAINTING. The
+    // first draft read the floor on the orch arm only, so this fixture returned
+    // `idle` — an autopilot-restored solo agent pane reported idle for its whole
+    // working run. The ten-axis pin could not see it: `bytesInWindow` varied
+    // across the corpus, but only on the branch that already read it.
+    why: "a non-orch pane nobody has prompted is WORKING while it paints",
+    state: "working",
+    facts: facts({
+      kind: "agent",
+      orch: null,
+      harness: "copilot",
+      activity: {
+        lastHumanInputMs: null,
+        rosterIdle: null,
+        bytesInWindow: ACTIVITY_FLOOR_BYTES,
+      },
+    }),
+  },
+  {
     why: "a basic pane nobody has ever prompted",
     state: "idle",
     facts: facts({
@@ -272,6 +292,33 @@ test("an orch pane the roster calls idle is still working while it paints", () =
   // The floor is the line, so one byte under it reads the other way.
   const quiet = facts({ activity: { rosterIdle: true, bytesInWindow: ACTIVITY_FLOOR_BYTES - 1 } });
   assert.equal(deriveAgentState(quiet), "idle");
+});
+
+test("the floor guard applies to BOTH idle branches, not just the orch one", () => {
+  // #2195 review B1. The four crossings of {orch, non-orch} x {painting, quiet},
+  // asserted together so neither arm can lose the floor on its own. Building
+  // them from one base means the reading is about those two axes and nothing
+  // else — the disjoint-literal failure #1300 names is what this avoids.
+  const at = (orch: PaneFacts["orch"], bytes: number): AgentState =>
+    deriveAgentState(
+      facts({
+        orch,
+        activity: {
+          bytesInWindow: bytes,
+          // Both idleness signals say "idle" on both arms, so the ONLY thing
+          // that can move the answer below is the floor.
+          rosterIdle: true,
+          lastHumanInputMs: null,
+        },
+      }),
+    );
+  const ORCH = { group: "g", agentId: "w-1", role: "worker" };
+  const QUIET = ACTIVITY_FLOOR_BYTES - 1;
+  const PAINTING = ACTIVITY_FLOOR_BYTES;
+  assert.equal(at(ORCH, QUIET), "idle");
+  assert.equal(at(null, QUIET), "idle");
+  assert.equal(at(ORCH, PAINTING), "working");
+  assert.equal(at(null, PAINTING), "working", "the non-orch arm must read the floor too (B1)");
 });
 
 test("a basic pane that HAS been prompted is working, not idle", () => {
