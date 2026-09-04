@@ -359,10 +359,32 @@ fn zero_secret(buf: &mut [u8]) {
 /// `PtyManager`, never streamed anywhere, and dropped on return. Nothing about
 /// this conversation is visible in a pane.
 pub fn drive_ssh_add(argv: &[String], passphrase: &[u8], timeout: Duration) -> SshAddOutcome {
+    drive_ssh_add_with_transcript(argv, passphrase, timeout).0
+}
+
+/// [`drive_ssh_add`], returning the raw pty transcript beside the outcome.
+///
+/// A seam, not a second implementation — the same idiom as
+/// `capture_raw_with_failing_wait_for_test`. Production takes `.0` and the
+/// transcript is dropped; the transcript never reaches a log, a breadcrumb or
+/// the wire, because it is the one buffer that can carry an echoed passphrase
+/// (see [`scrub_secret`]).
+///
+/// It is `pub` for one reason: when this conversation fails on a platform no
+/// agent may run it on, "it timed out" is not a diagnosis. What the child
+/// actually printed — nothing at all, or a prompt spelled differently than the
+/// classifier expects — is the difference between a read bug and a match bug,
+/// and CI's log is the only place either can be seen.
+#[doc(hidden)] // pub for the integration test: the transcript is the diagnostic
+pub fn drive_ssh_add_with_transcript(
+    argv: &[String],
+    passphrase: &[u8],
+    timeout: Duration,
+) -> (SshAddOutcome, String) {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
     let Some((program, args)) = argv.split_first() else {
-        return SshAddOutcome::Failed { detail: "no ssh-add command to run".to_string() };
+        return (SshAddOutcome::Failed { detail: "no ssh-add command to run".to_string() }, String::new());
     };
     let pair = match native_pty_system().openpty(PtySize {
         rows: 24,
@@ -371,7 +393,9 @@ pub fn drive_ssh_add(argv: &[String], passphrase: &[u8], timeout: Duration) -> S
         pixel_height: 0,
     }) {
         Ok(p) => p,
-        Err(e) => return SshAddOutcome::Failed { detail: format!("could not open a console: {e}") },
+        Err(e) => {
+            return (SshAddOutcome::Failed { detail: format!("could not open a console: {e}") }, String::new())
+        }
     };
     let mut builder = CommandBuilder::new(program);
     for a in args {
@@ -379,7 +403,9 @@ pub fn drive_ssh_add(argv: &[String], passphrase: &[u8], timeout: Duration) -> S
     }
     let child = match pair.slave.spawn_command(builder) {
         Ok(c) => c,
-        Err(e) => return SshAddOutcome::Failed { detail: format!("could not run ssh-add: {e}") },
+        Err(e) => {
+            return (SshAddOutcome::Failed { detail: format!("could not run ssh-add: {e}") }, String::new())
+        }
     };
     drop(pair.slave);
 
@@ -389,14 +415,20 @@ pub fn drive_ssh_add(argv: &[String], passphrase: &[u8], timeout: Duration) -> S
         Ok(w) => w,
         Err(e) => {
             let _ = killer.kill();
-            return SshAddOutcome::Failed { detail: format!("could not write to the console: {e}") };
+            return (
+                SshAddOutcome::Failed { detail: format!("could not write to the console: {e}") },
+                String::new(),
+            );
         }
     };
     let reader = match pair.master.try_clone_reader() {
         Ok(r) => r,
         Err(e) => {
             let _ = killer.kill();
-            return SshAddOutcome::Failed { detail: format!("could not read the console: {e}") };
+            return (
+                SshAddOutcome::Failed { detail: format!("could not read the console: {e}") },
+                String::new(),
+            );
         }
     };
 
@@ -430,7 +462,7 @@ pub fn drive_ssh_add(argv: &[String], passphrase: &[u8], timeout: Duration) -> S
         if now >= deadline {
             let _ = killer.kill();
             let _ = child.wait();
-            return SshAddOutcome::Timeout;
+            return (SshAddOutcome::Timeout, seen);
         }
         let chunk = match rx.recv_timeout(deadline - now) {
             Ok(c) => c,
@@ -440,7 +472,7 @@ pub fn drive_ssh_add(argv: &[String], passphrase: &[u8], timeout: Duration) -> S
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let _ = killer.kill();
                 let _ = child.wait();
-                return SshAddOutcome::Timeout;
+                return (SshAddOutcome::Timeout, seen);
             }
         };
         seen.push_str(&String::from_utf8_lossy(&chunk));
@@ -476,11 +508,12 @@ pub fn drive_ssh_add(argv: &[String], passphrase: &[u8], timeout: Duration) -> S
     let _ = child.wait();
     let secret = String::from_utf8_lossy(passphrase).into_owned();
     let detail = scrub_secret(last_meaningful_line(&seen), &secret);
-    match terminal {
+    let outcome = match terminal {
         Some(other) => other,
         None if gave_up => SshAddOutcome::BadPassphrase { detail },
         None => SshAddOutcome::Failed { detail },
-    }
+    };
+    (outcome, seen)
 }
 
 /// The last non-blank line of a transcript — what a human reading the console

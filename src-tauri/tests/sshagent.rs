@@ -16,9 +16,15 @@
 //! `.bat` and `cmd.exe`'s `set /p` is what gives us a program that blocks on a
 //! console read. `drive_ssh_add` itself compiles and runs everywhere — it is the
 //! *fixture* that is Windows-shaped, not the code under test.
+//!
+//! **Every assertion prints the pty transcript on failure.** No agent may run
+//! `cargo` locally (CLAUDE.md), so a red here is read once, in a CI log, by
+//! someone who cannot reproduce it — and "it timed out" is not a diagnosis. The
+//! transcript separates a driver that saw nothing from one that saw a prompt it
+//! did not recognise, which are different bugs with different fixes.
 #![cfg(windows)]
 
-use loomux_lib::sshagent::{drive_ssh_add, SshAddOutcome};
+use loomux_lib::sshagent::{drive_ssh_add_with_transcript, SshAddOutcome};
 use std::time::{Duration, Instant};
 
 /// Write one fake `ssh-add` and return the argv that runs it.
@@ -33,10 +39,26 @@ fn fake_ssh_add(dir: &std::path::Path, name: &str, body: &str) -> Vec<String> {
     vec![comspec, "/C".to_string(), bat.to_string_lossy().into_owned()]
 }
 
+/// Every fixture opens with this, on its own line.
+///
+/// It is the discriminator the module doc promises: if a failing transcript
+/// carries the banner but no prompt, the pty is delivering output and the ask
+/// is the problem; if it carries neither, nothing is being read at all. Both are
+/// invisible in the `Timeout` verdict on its own. Classified as `Other`, so it
+/// changes no conversation.
+const BANNER: &str = "fake-ssh-add-running";
+
+/// Render a transcript for a panic message: escapes are literal, so a control
+/// sequence cannot rewrite the log line it is being reported in.
+fn show(transcript: &str) -> String {
+    format!("{:?}", transcript)
+}
+
 /// The happy path's fixture: ask once, accept `hunter2`, report success in the
 /// vendor's own words.
 const ACCEPTS: &str = concat!(
     "@echo off\n",
+    "echo fake-ssh-add-running\n",
     "set /p p=Enter passphrase for C:\\keys\\id_ed25519: \n",
     "if not \"%p%\"==\"hunter2\" goto bad\n",
     "echo Identity added: C:\\keys\\id_ed25519 test-key\n",
@@ -51,12 +73,18 @@ fn the_right_passphrase_is_answered_and_the_key_is_added() {
     let dir = tempfile::tempdir().unwrap();
     let argv = fake_ssh_add(dir.path(), "accepts.bat", ACCEPTS);
 
-    let outcome = drive_ssh_add(&argv, b"hunter2", Duration::from_secs(20));
+    let (outcome, seen) = drive_ssh_add_with_transcript(&argv, b"hunter2", Duration::from_secs(20));
 
     assert_eq!(
         outcome,
         SshAddOutcome::Added,
-        "the driver must recognise the prompt, answer it, and read `Identity added`"
+        "the driver must recognise the prompt, answer it, and read `Identity added`\n\
+         banner seen: {}   prompt seen: {}   bytes: {}\n\
+         transcript: {}",
+        seen.contains(BANNER),
+        seen.contains("Enter passphrase for"),
+        seen.len(),
+        show(&seen)
     );
 }
 
@@ -72,21 +100,23 @@ fn a_wrong_passphrase_gives_up_the_way_ssh_add_documents() {
 
     let bound = Duration::from_secs(20);
     let started = Instant::now();
-    let outcome = drive_ssh_add(&argv, b"wrong-one", bound);
+    let (outcome, seen) = drive_ssh_add_with_transcript(&argv, b"wrong-one", bound);
     let elapsed = started.elapsed();
 
     match &outcome {
         SshAddOutcome::BadPassphrase { detail } => {
             assert!(
                 detail.contains("Bad passphrase"),
-                "the refusal must quote ssh-add's own words, got: {detail}"
+                "the refusal must quote ssh-add's own words, got: {detail}\ntranscript: {}",
+                show(&seen)
             );
         }
-        other => panic!("expected BadPassphrase, got {other:?}"),
+        other => panic!("expected BadPassphrase, got {other:?}\ntranscript: {}", show(&seen)),
     }
     assert!(
         elapsed < bound / 2,
-        "the give-up must end the run, not the timeout — took {elapsed:?} of {bound:?}"
+        "the give-up must end the run, not the timeout — took {elapsed:?} of {bound:?}\ntranscript: {}",
+        show(&seen)
     );
 }
 
@@ -101,18 +131,27 @@ fn a_program_that_never_prompts_is_bounded_rather_than_waited_on() {
     let argv = fake_ssh_add(
         dir.path(),
         "silent.bat",
-        "@echo off\necho working\nset /p never=\n",
+        "@echo off\necho fake-ssh-add-running\nset /p never=\n",
     );
 
-    let bound = Duration::from_secs(2);
+    let bound = Duration::from_secs(4);
     let started = Instant::now();
-    let outcome = drive_ssh_add(&argv, b"hunter2", bound);
+    let (outcome, seen) = drive_ssh_add_with_transcript(&argv, b"hunter2", bound);
     let elapsed = started.elapsed();
 
-    assert_eq!(outcome, SshAddOutcome::Timeout);
+    assert_eq!(outcome, SshAddOutcome::Timeout, "transcript: {}", show(&seen));
     assert!(
         elapsed < bound * 5,
         "the bound must actually bound: took {elapsed:?} for a {bound:?} deadline"
+    );
+    // The vacuity control for this whole file, and the reason the banner exists:
+    // a `Timeout` verdict is what a driver that reads NOTHING returns for every
+    // fixture, so without this the test above would pass against a driver whose
+    // reader thread never ran — and so would this one, for the wrong reason.
+    assert!(
+        seen.contains(BANNER),
+        "the driver must actually be reading the child's output; transcript: {}",
+        show(&seen)
     );
 }
 
@@ -129,13 +168,15 @@ fn a_program_that_echoes_the_passphrase_back_cannot_leak_it_through_detail() {
         "leaks.bat",
         concat!(
             "@echo off\n",
+            "echo fake-ssh-add-running\n",
             "set /p p=Enter passphrase for C:\\keys\\id_ed25519: \n",
             "echo Bad passphrase, try again for %p%\n",
             "exit /b 1\n",
         ),
     );
 
-    let outcome = drive_ssh_add(&argv, b"correcthorsebatterystaple", Duration::from_secs(20));
+    let (outcome, seen) =
+        drive_ssh_add_with_transcript(&argv, b"correcthorsebatterystaple", Duration::from_secs(20));
 
     match &outcome {
         SshAddOutcome::BadPassphrase { detail } => {
@@ -149,9 +190,10 @@ fn a_program_that_echoes_the_passphrase_back_cannot_leak_it_through_detail() {
             // a driver that reported nothing at all.
             assert!(
                 detail.contains("Bad passphrase"),
-                "the rest of the line must survive the scrub, got: {detail}"
+                "the rest of the line must survive the scrub, got: {detail}\ntranscript: {}",
+                show(&seen)
             );
         }
-        other => panic!("expected BadPassphrase, got {other:?}"),
+        other => panic!("expected BadPassphrase, got {other:?}\ntranscript: {}", show(&seen)),
     }
 }
