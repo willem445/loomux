@@ -268,7 +268,7 @@ impl Decoder {
             Some("user") => self.user(&v),
             Some("stream_event") => self.stream_event(&v),
             Some("result") => self.result(&v),
-            _ => vec![Decoded::Unknown(line.to_string())],
+            _ => Vec::new(),
         }
     }
 
