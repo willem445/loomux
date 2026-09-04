@@ -291,8 +291,8 @@ tool even reaches `--permission-prompt-tool` is undocumented — §9.
 
 ### 4.1 Path and shape
 
-`<group dir>/panes/<agent-id>.events.jsonl` — one JSON object per line, append
-only.
+`<group dir>/panes/<agent-id>.events.<n>.jsonl` — one JSON object per line,
+append only, `n` a monotonically increasing segment number (§4.2).
 
 `<agent-id>` is interpolated into a **file name**, so it is inside the
 `src-tauri/tests/pathseg.rs` scan's trigger shape (an interpolation plus a
@@ -309,11 +309,31 @@ emitted.
 4 KiB, under an `unknown` kind. A silently discarded message is a message nobody
 can add support for later.
 
-### 4.2 Rotation
+### 4.2 Rotation — what is contracted, and what is R2's to build
 
-Size-based: **8 MiB per segment, 4 segments retained** (`.events.jsonl`,
-`.events.1.jsonl`, …), oldest dropped — a 32 MiB per-pane ceiling. Deleted with
-the group directory; there is no separate retention policy and no compaction.
+Two things are contracted here. The rest of the mechanics are R2's, and this
+section deliberately does not pretend otherwise.
+
+**Contracted — the ceiling.** Size-based: **8 MiB per segment, 4 segments
+retained**, so a 32 MiB per-pane ceiling. Deleted with the group directory; no
+separate retention policy and no compaction. §4.4's "stronger than H4" claim is
+scoped to exactly this ceiling.
+
+**Contracted — a segment is never renamed.** Segments are
+`<agent-id>.events.<n>.jsonl` with a monotonically increasing `n`; the live
+segment is the highest `n`, rotation *starts a new one*, and retention *deletes
+the lowest*. This is a contract rather than an implementation note because the
+obvious alternative — shifting `.1` → `.2` on each rotation, the logrotate shape
+— renames a file while an append-only writer at `producer` rate holds it open and
+a C5 replay reader may be reading it. On this project's Windows baseline that is
+the classic sharing-violation shape, and it would appear only under the exact load
+this feature creates. Numbering the segments removes the question instead of
+answering it: a reader names a segment by `n`, so nothing it holds ever moves
+underneath it.
+
+**Not contracted, and R2's to decide with its own note:** when the rotation check
+runs relative to the append, how a reader learns a new segment exists, and what a
+reader does when the segment it is replaying is deleted by retention mid-read.
 
 ### 4.3 What the audit log gets, and what stays here
 
@@ -472,14 +492,26 @@ effect, so the pane is not the session orrerix believes it is, and every
 downstream record — usage, resume, transcript — would key on the wrong one. Fail
 closed; do not reconcile.
 
+**And the comparison is CANONICALIZED, not a string compare.** cli-reference says
+`--session-id` "must be a valid UUID"; **no page states the textual form
+`system/init` echoes back**, so a literal `==` would kill every structured pane
+at spawn on any build that answers in a different case or spelling — a total
+outage produced by the safety check, not by the failure it guards. Both sides are
+parsed as a UUID and compared as 128 bits; a value that does not parse at all is
+itself a mismatch, so the relaxation does not open a hole. The exact form the CLI
+reports is a §9 item (6), and until it is measured this rule is the reason the
+gap is not load-bearing.
+
 ### 6.3 Resume
 
-`--resume <session-id>` resumes by id. The docs are explicit that a `-p` session
-is out of the picker and out of `--continue` but "You can still resume one by
-passing its session ID to `claude --resume <session-id>`", and that the search
-covers "the current project directory and its git worktrees, then every other
+`--resume <session-id>` resumes by id. A `-p` session is out of the picker and
+out of `--continue`, but "You can still resume one by passing its session ID to
+`claude --resume <session-id>`"
+([sessions](https://code.claude.com/docs/en/sessions#resume-a-session)); the
+search order is on the flag's own row — "When you pass a session ID, Claude Code
+searches the current project directory and its git worktrees, then every other
 project on this machine"
-([sessions](https://code.claude.com/docs/en/sessions#resume-a-session)).
+([cli-reference](https://code.claude.com/docs/en/cli-reference)).
 
 **Three resume facts, and they are the whole reason this section exists:**
 
@@ -506,9 +538,10 @@ project on this machine"
    roster's single-owner rule already enforces that; the consequence of breaking
    it is a corrupted transcript, so it is stated rather than assumed.
 
-`--fork-session` ("When resuming, create a new session ID instead of reusing the
-original") is the documented way to branch, and is **not** used by R2: a forked id
-is a different pane identity, and orrerix's identity is the minted one.
+`--fork-session` — "When resuming, create a new session ID instead of reusing the
+original" ([cli-reference](https://code.claude.com/docs/en/cli-reference)) — is
+the documented way to branch, and is **not** used by R2: a forked id is a
+different pane identity, and orrerix's identity is the minted one.
 
 ### 6.4 Termination
 
@@ -663,15 +696,19 @@ same PR.** That is what makes R0 worth reviewing before R1 exists.
 
 **Behavioural-silence bar, inherited from the extraction note:** the existing
 integration suite green with **zero test edits** for everything that is not a
-structured pane. A group with no `driver:` key is byte-for-byte what it is today,
-`default_roster_command_lines_match_legacy` and the `pre222` pins included.
+structured pane. A group with no `driver:` key is byte-for-byte what it is today
+— `default_roster_command_lines_now_carry_the_durable_contract_via_a_generated_claude_agent_file`
+(`src-tauri/tests/workflow.rs`) is the pin that says so, and the `pre222` fixture
+pins are the other half.
 
 ---
 
 ## 9. Live-validation items for the human
 
-Each is a fact the official docs do **not** settle. None is guessed anywhere
-above; R1 depends on none of them, and R2 depends on 1 to 3.
+Each is a fact the official docs do **not** settle, with the pages searched named
+beside it. None is guessed anywhere above; **R1 depends on none of them**, and R2
+depends on 1, 2, 3 and 6 — item 4 is R2's teardown path and item 5 is a policy
+read rather than a measurement.
 
 1. **The `--permission-prompt-tool` wire contract.** The docs state that the flag
    "specif[ies] an MCP tool to handle permission prompts in non-interactive mode"
@@ -716,3 +753,11 @@ above; R1 depends on none of them, and R2 depends on 1 to 3.
    the user's own login, exactly as the PTY path does today. Whether that sits
    inside or outside that sentence is the human's read. Nothing in R1 depends on
    it; R2 ships a structured pane that does.
+6. **The textual form of the echoed `session_id`.** cli-reference says
+   `--session-id` "must be a valid UUID"; no page states whether `system/init`
+   echoes that UUID back in the same case and spelling it was passed in.
+   §6.2's mismatch check is therefore specified as a canonicalized 128-bit
+   comparison rather than a string compare, which makes the gap non-fatal — but
+   the first real session should record the exact form, because a build that
+   answered with something that is not a UUID at all would take the fail-closed
+   branch and deserve to be recognised as a version issue rather than a bug.
