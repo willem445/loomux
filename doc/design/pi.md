@@ -633,3 +633,66 @@ looks like.
    "text or file contents", and loomux always passes a path. Confirm the
    contract is in effect — e.g. the agent can name its own role-instructions
    path — rather than the literal path having been injected as text.
+7. **`pi --list-models` populates the model picker.** Behind the inherit row
+   within the probe timeout, with `provider/model` ids matching what `pi --model`
+   accepts (an OpenRouter row arrives as a two-slash id). If it times out, the
+   picker shows only inherit + custom — expected on a cold catalog.
+
+## The model catalog: `--list-models` is the machine's own answer (#2126 P4)
+
+Everything above configures panes; this section is about the launcher's model
+picker, whose two sources (`doc/design/model-catalog.md`) are a curated
+suggestion and what the CLI on THIS machine reports. For pi only the machine
+can answer: `--list-models [search]` (`SOURCE` `args.ts:196`) prints **only the
+models whose auth is configured** (`DOCS` `models.md`: unauthenticated models
+"stay unavailable in `/model` and `--list-models`") — the "this machine and
+this account" answer no curated list can be.
+
+**The layout, and why pi gets its own parser instead of opencode's.** pi
+prints a two-space-padded column table — header
+`provider  model  context  max-out  thinking  images`, one row per model
+sorted by provider then id, every column `padEnd`'d to its width and joined
+with two spaces (`SOURCE` `src/cli/list-models.ts:83-114`). `provider` and
+`model` are SEPARATE columns, so the id loomux emits is ASSEMBLED:
+`parse_models_from_table` (cliprobe.rs) finds the header by its first two
+whitespace tokens (`provider` `model`), reduces every later line to printable
+text (`plain_line`), splits on runs of two-or-more spaces, and keeps the row
+only if both of its first two columns are id-shaped, as `{provider}/{model}`.
+`parse_models_from_list` cannot serve this: it takes each line's first
+whitespace token, which here is the bare provider half — a token with no `/`,
+rejected by that parser's own id check. Sharing would have meant pi's probe
+always yielded nothing; the per-CLI parser lives in its `ENUMERATORS` row, the
+same DATA-not-a-branch pattern as `CLI_CAPS`.
+
+**A two-slash id is one id.** An OpenRouter row is
+`openrouter  z-ai/glm-5.3-flash  …`, so the assembled id carries a second `/` —
+`openrouter/z-ai/glm-5.3-flash`. The id-shape check accepts `/`-separated
+segments (`is_id_shaped`, shared with the opencode parser), and
+`prettyModelId`'s two-slash guard leaves such an id unlabelled rather than
+half-rewritten; `test/modelcatalog.test.ts` pins both. The header line itself
+never becomes a model: the line that trips the header check is consumed by it,
+not parsed as a row.
+
+**The 8 s probe timeout against pi's 15 s internal budget.** loomux's probe
+kill is `HELP_TIMEOUT`, 8 s; pi runs `--list-models` under its own
+`AbortSignal.timeout(15_000)` (`SOURCE` `main.ts:864`) — pi's budget for a cold
+models.json refresh, not ours. When the refresh loses the race, the probe dies
+mid-list, the parse yields nothing, `probe_with` marks the answer incomplete
+and `probe_cached` declines to cache it — so the picker keeps rendering only
+the curated `[INHERIT_MODEL]` row and the NEXT probe retries, now against a
+catalog pi has finished refreshing. Caching the miss would pin the worst moment
+of the session for the rest of it, the same reason an opencode `models` failure
+is never cached. The cost is bounded: off-thread, once per probe call, and the
+launcher memoizes its own probes.
+
+**No measured time is recorded here, and that is deliberate.** The worst case
+is structural (two 8 s timeouts, off-thread); the typical case is pi answering
+from a warm cache in well under a second, and MEASURING it means running a
+real pi, which constraint 3 forbids an agent. The live check is item 7 of
+"Still for the human (live only)" above.
+
+**The curated row stays `[INHERIT_MODEL]`, probed or not.** pi has no
+vendor-neutral alias (§Knobs), so anything loomux curated would be a stale
+copy of a live answer; the probe's ids merge in behind the inherit row
+(`mergeModelOptions` pins it first — `test/modelcatalog.test.ts`), and a
+timeout degrades to inherit + custom, not to an empty dropdown.

@@ -42,6 +42,7 @@ import {
 import { detailFor, type ModelDetail } from "../src/modelcatalog.ts";
 import { INHERIT_MODEL, ORCH_CLIS } from "../src/orchclis.ts";
 import { ORCH_ROLES } from "../src/roster.ts";
+import { modelLabel } from "../src/modelnames.ts";
 
 const probe = (models: string[]): CliProbe => ({ available: true, models, error: null });
 
@@ -121,6 +122,54 @@ test("ids cross the merge verbatim — the `/` is part of an opencode id (#722)"
   const raw = ["opencode/deepseek-v4-flash-free", "amazon-bedrock/arn:aws:bedrock:us-east-1::foo/bar"];
   const merged = mergeModelOptions([], raw);
   assert.deepEqual(merged, raw);
+});
+
+// ── pi (#2126 P4) ────────────────────────────────────────────────────────────
+//
+// pi's ids reach these two tests from `pi --list-models` (the backend's
+// `parse_models_from_table`, cliprobe.rs), which assembles one `provider/model`
+// id per table row from two SEPARATE columns — so an OpenRouter row arrives as
+// a TWO-slash id, `openrouter/z-ai/glm-5.3-flash`, and every surface below must
+// carry it whole.
+
+test("pi's probed rows merge behind the pinned inherit row (#2126 P4)", () => {
+  const pi = ORCH_CLIS.find((c) => c.id === "pi")!;
+  assert.deepEqual(pi.models, [INHERIT_MODEL], "the curated row is the inherit row alone (P2)");
+  // What `parse_models_from_table` produces from pi's table, in listed order.
+  const reported = [
+    "anthropic/claude-haiku-4-5",
+    "anthropic/claude-sonnet-4-5",
+    "google/gemini-3-pro",
+    "openrouter/z-ai/glm-5.3-flash",
+  ];
+  const merged = mergeModelOptions(pi.models, reported);
+  assert.equal(
+    merged[0],
+    INHERIT_MODEL,
+    "the 'send no --model' row still leads a probed catalog — pi has no vendor-neutral alias, " +
+      "so inherit is the honest default and the row a human is least likely to find buried"
+  );
+  assert.equal(merged.filter((m) => m === INHERIT_MODEL).length, 1);
+  assert.deepEqual(merged.slice(1), reported, "everything else keeps the probe-leads order");
+  // And every role default (inherit, on pi) still SELECTS as itself rather
+  // than falling to the custom branch — the other half of the same failure.
+  for (const { key } of ORCH_ROLES) {
+    assert.equal(pickerSelection(merged, pi.defaults[key]).selected, INHERIT_MODEL);
+  }
+});
+
+test("a two-slash pi id passes the merge and the label verbatim (#2126 P4)", () => {
+  // The exact id the backend emits for an OpenRouter GLM row. Without
+  // `prettyModelId`'s two-slash guard, `modelnames.ts` would split on the FIRST
+  // `/` and hand the model half `z-ai/glm-5.3-flash` back as the name
+  // "Glm 5.3 Flash" — a half-rewritten identifier, the one outcome that
+  // function must never produce.
+  const id = "openrouter/z-ai/glm-5.3-flash";
+  assert.ok(mergeModelOptions(curatedModels("pi"), [id]).includes(id), "the merge never rewrites an id");
+  assert.equal(modelLabel("pi", id), id, "the label carries the id alone — no pretty name for a two-slash id");
+  // A second specimen where the guard is load-bearing a different way: the
+  // nested provider segment must not be silently dropped from the name.
+  assert.equal(modelLabel("pi", "openrouter/anthropic/claude-sonnet-4"), "openrouter/anthropic/claude-sonnet-4");
 });
 
 // ── curated lookup ──────────────────────────────────────────────────────────

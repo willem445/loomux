@@ -116,11 +116,30 @@ struct Enumerator {
 /// flag "[r]efresh[es] the models cache from models.dev" (same page), and a
 /// background probe must not re-pull a remote catalog on the human's behalf —
 /// the cached list is the one their own CLI would use anyway.
-const ENUMERATORS: &[Enumerator] = &[Enumerator {
-    program: "opencode",
-    args: "models",
-    parse: parse_models_from_list,
-}];
+///
+/// `pi --list-models [search]` (`SOURCE` `args.ts:196` at the pin in
+/// `doc/design/pi.md`) is the second row. **HELP_TIMEOUT is 8 s; pi runs this
+/// command under its own `AbortSignal.timeout(15_000)`** (`SOURCE`
+/// `main.ts:864`) — its internal budget for a cold models.json refresh, not
+/// ours. When a cold refresh loses our 8 s race the probe is killed mid-list,
+/// the parse yields nothing, `probe_with` marks the answer incomplete and
+/// `probe_cached` declines to cache it — so the picker keeps rendering only the
+/// curated `[INHERIT_MODEL]` row and the NEXT probe retries, now against a
+/// catalog pi has finished refreshing. Caching the miss would pin the worst
+/// moment of the session for the rest of it, which is the same reason an
+/// opencode `models` failure is never cached.
+const ENUMERATORS: &[Enumerator] = &[
+    Enumerator {
+        program: "opencode",
+        args: "models",
+        parse: parse_models_from_list,
+    },
+    Enumerator {
+        program: "pi",
+        args: "--list-models",
+        parse: parse_models_from_table,
+    },
+];
 
 fn enumerator_for(program: &str) -> Option<&'static Enumerator> {
     ENUMERATORS.iter().find(|e| e.program == program)
@@ -160,6 +179,16 @@ fn plain_line(line: &str) -> String {
     out
 }
 
+/// The id shape every parser in this module emits: every `/`-separated segment
+/// non-empty and made of id characters only. The empty segment is what rejects
+/// a URL's `https://`, and a second `/` is accepted — an OpenRouter-style id
+/// `openrouter/z-ai/glm-5.3-flash` is one id, not a prefix of one.
+fn is_id_shaped(token: &str) -> bool {
+    token.split('/').all(|seg| {
+        !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':'))
+    })
+}
+
 /// Parse a listing command's stdout into model ids: one `provider/model` id
 /// per line, which is the shape opencode documents ("displays all models
 /// available across your configured providers in the form of
@@ -193,13 +222,87 @@ pub fn parse_models_from_list(out: &str) -> Vec<String> {
         if token.len() > 96 || !token.contains('/') {
             continue;
         }
-        // Every segment non-empty (so a URL's `https://` is rejected) and made
-        // of id characters only.
-        let is_id = token
-            .split('/')
-            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':')));
+        let is_id = is_id_shaped(token);
         if is_id && !models.iter().any(|m| m == token) {
             models.push(token.to_string());
+        }
+    }
+    models
+}
+
+/// Split one already-`plain_line`d table row into its columns: a run of two or
+/// more spaces separates columns, and a SINGLE space never does — pi pads every
+/// column to its width with `padEnd` before joining with two spaces
+/// (`SOURCE` `list-models.ts:93-114`), so the run between two columns is two
+/// spaces or more, and any shorter gap is part of a column's own value.
+fn two_space_columns(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut cols: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < line.len() {
+        if bytes[i] == b' ' && i + 1 < line.len() && bytes[i + 1] == b' ' {
+            if i > start {
+                cols.push(&line[start..i]);
+            }
+            while i < line.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < line.len() {
+        cols.push(&line[start..]);
+    }
+    cols
+}
+
+/// Parse `pi --list-models` stdout into model ids (#2126 P4).
+///
+/// pi prints a two-space-padded column table — a header line
+/// `provider  model  context  max-out  thinking  images`, then one row per
+/// model sorted by provider then id, with `provider` and `model` as SEPARATE
+/// columns (`SOURCE` `src/cli/list-models.ts` at the pin in `doc/design/pi.md`).
+/// So the id is ASSEMBLED from the row's first two columns as
+/// `{provider}/{model}` — what pi's own `--model` takes — rather than read out
+/// of one token the way [`parse_models_from_list`] does.
+///
+/// Rule: the header is the first line whose first two whitespace tokens are
+/// `provider` and `model`; every line AFTER it is `plain_line`d, split with
+/// [`two_space_columns`], and kept only if both of its first two columns are
+/// id-shaped ([`is_id_shaped`]). Lines before the header — pi's chalk-coloured
+/// `Warning: errors loading models.json:` line above all — and the
+/// `No models matching "…"` and `No models available. …` messages never reach a
+/// column split at all, so they yield nothing; so does any post-header line
+/// whose first two columns are not both ids.
+///
+/// The degrade direction is the module's own: under-recognise, never
+/// manufacture. An unfamiliar line after the header is dropped, and an
+/// unrecognised layout as a whole yields nothing, which `probe_with` treats as
+/// an incomplete answer and leaves the help-parsed list alone.
+pub fn parse_models_from_table(out: &str) -> Vec<String> {
+    let mut models: Vec<String> = Vec::new();
+    let mut header_seen = false;
+    for raw in out.lines() {
+        let line = plain_line(raw);
+        if !header_seen {
+            let mut tokens = line.split_whitespace();
+            if tokens.next() == Some("provider") && tokens.next() == Some("model") {
+                header_seen = true;
+            }
+            continue;
+        }
+        let cols = two_space_columns(&line);
+        let (Some(provider), Some(model)) = (cols.first().copied(), cols.get(1).copied()) else {
+            continue;
+        };
+        if is_id_shaped(provider) && is_id_shaped(model) {
+            let id = format!("{provider}/{model}");
+            if !models.iter().any(|m| *m == id) {
+                models.push(id);
+            }
         }
     }
     models
@@ -671,5 +774,161 @@ mod tests {
         assert!(probe.models.is_empty());
         assert!(!complete, "and a missing CLI is never cached, so installing it mid-session works");
         assert_eq!(calls.borrow().len(), 1, "nothing to enumerate for a CLI that isn't installed");
+    }
+
+    /// pi's exact `--list-models` table, generated by the vendor's own
+    /// algorithm (`SOURCE` `list-models.ts:83-114` at the pin in
+    /// `doc/design/pi.md`: padEnd every column to its width, join with two
+    /// spaces) over four rows — this is the LAYOUT pi prints, pasted verbatim;
+    /// the row values are representative, since constraint 3 forbids running a
+    /// real pi to collect one. Note the trailing spaces: the last column is
+    /// padEnd'd too, so every row line ends in spaces the header does not have.
+    const PI_MODEL_TABLE: &str = concat!(
+        "provider    model               context  max-out  thinking  images\n",
+        "anthropic   claude-haiku-4-5    200K     64K      yes       no    \n",
+        "anthropic   claude-sonnet-4-5   200K     64K      yes       yes   \n",
+        "google      gemini-3-pro        1M       64K      yes       yes   \n",
+        "openrouter  z-ai/glm-5.3-flash  131K     32K      yes       no    \n",
+    );
+
+    fn pi_ids() -> Vec<String> {
+        [
+            "anthropic/claude-haiku-4-5",
+            "anthropic/claude-sonnet-4-5",
+            "google/gemini-3-pro",
+            "openrouter/z-ai/glm-5.3-flash",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// pi's real `--help` around `--model` (`SOURCE` `args.ts:279-282`). It
+    /// names NO model — so the help parse yields nothing, and the enumerator is
+    /// pi's only source of ids. That is why pi gets an `ENUMERATORS` row at all.
+    const PI_STYLE_HELP: &str = "\
+Options:
+  --provider <name>              Provider name (default: google)
+  --model <pattern>              Model pattern or ID (supports \"provider/id\" and optional \":<thinking>\")
+  --api-key <key>                API key (defaults to env vars)
+";
+
+    /// The load-error warning pi can print BEFORE the table
+    /// (`SOURCE` `list-models.ts:36`: `chalk.yellow(...)` to stderr — here on
+    /// stdout, as it arrives if the streams ever merge). The colour codes wrap
+    /// the whole message, so the reset lands on the SECOND physical line.
+    const PI_LOAD_WARNING: &str = concat!(
+        "\u{1b}[33mWarning: errors loading models.json:\n",
+        "models.json:3:5 unknown provider \"acme\"\u{1b}[39m\n",
+    );
+
+    #[test]
+    fn parses_pi_model_table_into_provider_slash_model_ids() {
+        let models = parse_models_from_table(PI_MODEL_TABLE);
+        assert_eq!(models, pi_ids(), "one id per row, assembled from the two id columns, in listed order");
+        assert!(!models.iter().any(|m| m == "provider/model"), "the header row is not a model: {models:?}");
+        assert!(
+            !models.iter().any(|m| m.ends_with("200K") || m.ends_with("64K") || m.ends_with("yes") || m.ends_with("no")),
+            "no context/max-out/thinking column leaked into an id: {models:?}"
+        );
+    }
+
+    #[test]
+    fn a_warning_line_before_the_pi_header_yields_nothing_extra() {
+        // The warning lines are neither a header nor id-shaped rows, so they
+        // contribute nothing — and the table after them still parses fully.
+        assert!(
+            parse_models_from_table(PI_LOAD_WARNING).is_empty(),
+            "the warning alone yields nothing"
+        );
+        assert_eq!(parse_models_from_table(&format!("{PI_LOAD_WARNING}{PI_MODEL_TABLE}")), pi_ids());
+    }
+
+    #[test]
+    fn a_tab_columned_pi_table_yields_nothing_never_a_splice() {
+        // plain_line turns a tab into ONE space, which is not a two-space run:
+        // a tab-columned table (a layout pi does not print, but a terminal or
+        // a future rewrite could) has its rows collapse into a single column
+        // each, so nothing is kept. What must never happen is the #939 splice —
+        // `anthropic` glued to `claude-haiku-4-5` into one id-shaped token.
+        const TABBED: &str = concat!(
+            "provider\tmodel\tcontext\tmax-out\tthinking\timages\n",
+            "anthropic\tclaude-haiku-4-5\t200K\t64K\tyes\tno\n",
+            "openrouter\tz-ai/glm-5.3-flash\t131K\t32K\tyes\tno\n",
+        );
+        let models = parse_models_from_table(TABBED);
+        assert!(models.is_empty(), "a tab column layout yields nothing: {models:?}");
+        for m in &models {
+            assert!(!m.contains("anthropicclaude") && !m.contains("anthropic claude"), "no splice: {m}");
+        }
+    }
+
+    #[test]
+    fn the_no_match_and_no_models_messages_yield_nothing() {
+        // `SOURCE` list-models.ts:42 (formatNoModelsAvailableMessage — the docs
+        // paths are install-dependent, so the fixture spells them loosely) and
+        // :53. Neither contains the header, so neither reaches a column split.
+        assert!(parse_models_from_table("No models matching \"glm\"\n").is_empty());
+        assert!(parse_models_from_table(
+            "No models available. Use /login to log into a provider via OAuth or API key. See:\n  providers.md\n  models.md\n"
+        )
+        .is_empty());
+        assert!(parse_models_from_table("").is_empty());
+    }
+
+    #[test]
+    fn a_post_header_line_whose_columns_are_not_ids_is_dropped() {
+        // A fixture, not a transcript: pi prints nothing after the table today,
+        // but the parser's contract is under-recognise rather than manufacture,
+        // so a prose line that ever followed the table must not become a model
+        // — `See` is not an id and `https://…` carries an empty `/`-segment.
+        const WITH_FOOTER: &str = concat!(
+            "provider    model               context  max-out  thinking  images\n",
+            "See  https://docs.pi.dev  for the catalog\n",
+            "anthropic   claude-haiku-4-5    200K     64K      yes       no    \n",
+        );
+        assert_eq!(parse_models_from_table(WITH_FOOTER), vec!["anthropic/claude-haiku-4-5".to_string()]);
+    }
+
+    #[test]
+    fn pi_enumerates_through_list_models_and_nothing_else() {
+        let calls = RefCell::new(Vec::new());
+        let _ = probe_with("pi", |program, args| {
+            calls.borrow_mut().push(format!("{program} {args}"));
+            Ok(if args == "--help" { PI_STYLE_HELP.to_string() } else { PI_MODEL_TABLE.to_string() })
+        });
+        assert_eq!(
+            calls.borrow().clone(),
+            vec!["pi --help".to_string(), "pi --list-models".to_string()],
+            "exactly `--list-models`, never with a search pattern"
+        );
+    }
+
+    #[test]
+    fn pi_enumerated_models_replace_the_help_parsed_list() {
+        let (probe, complete) = probe_with("pi", |_program, args| match args {
+            "--help" => Ok(PI_STYLE_HELP.to_string()),
+            "--list-models" => Ok(PI_MODEL_TABLE.to_string()),
+            other => panic!("probed an unexpected command: {other}"),
+        });
+        assert!(probe.available);
+        assert_eq!(probe.models, pi_ids());
+        assert!(complete, "pi's own table is the complete answer");
+    }
+
+    #[test]
+    fn a_timed_out_pi_listing_falls_back_to_help_and_stays_uncached() {
+        // The 8 s vs 15 s budget: pi's cold models.json refresh can lose our
+        // probe's race. The probe must still report pi as installed, and the
+        // incomplete answer must not be cached (the caller-side test for the
+        // same rule is `worthKeeping` in test/modelcatalog.test.ts).
+        let (probe, complete) = probe_with("pi", |_program, args| match args {
+            "--help" => Ok(PI_STYLE_HELP.to_string()),
+            _ => Err("`pi --list-models` timed out".into()),
+        });
+        assert!(probe.available, "an installed CLI whose list command timed out is still installed");
+        assert!(probe.error.is_none(), "no error the launcher would refuse a launch on: {:?}", probe.error);
+        assert!(probe.models.is_empty(), "pi's --help names no model, so there is nothing to fall back to");
+        assert!(!complete, "a timed-out enumeration must not be cached for the rest of the app run");
     }
 }
