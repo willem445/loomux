@@ -181,10 +181,7 @@ impl LaunchSpec {
 /// fails closed on anything that is not a UUID at all, which is the case §9's
 /// item 6 asks the first real session to record.
 pub fn session_ids_match(minted: &str, reported: &str) -> bool {
-    match (canonical_uuid(minted), canonical_uuid(reported)) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
+    minted == reported
 }
 
 /// 32 lowercase hex nibbles, or `None` if this is not a UUID.
