@@ -436,14 +436,28 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
         // declared assembly point for a pi session file, shared by the resume
         // path (`pi_session_cwd_in_dir`) and the usage meter
         // (`usage::pi_session_usage_in`), and it demands the type at its
-        // signature instead of parsing inside one caller. That is a strictly
-        // stronger proof than the row carried before — a `&str` caller cannot
-        // reach the interpolation at all now, rather than being stopped by a
-        // parse a future edit could move.
+        // signature instead of parsing inside one caller.
+        //
+        // **What is stronger is the CODE ARRANGEMENT, not automatically this
+        // row's third field** — and the first draft of this row got that wrong
+        // in a way worth recording, because it is the exact failure this
+        // allowlist's own doc warns about. It named `"pub fn
+        // pi_session_file_in_dir("` as the proof. The signature is wrapped
+        // across four lines, so that header line carries no type: revert
+        // `session: &PathSegment` to `session: &str` and the trigger line and
+        // that proof are both byte-identical, the row still resolves, and the
+        // scan stays green with the property gone — which is precisely the
+        // revert this field exists to notice (rev-final round 2, W2).
+        //
+        // So the proof names the TYPE, as all six sibling rows do. It occurs
+        // exactly once in `mod.rs`, which is what makes it unambiguous under
+        // the file-scoped `contains` check; `claude_transcript_path`'s row can
+        // name its whole single-line signature only because that signature
+        // fits on one line.
         (
             "let suffix = format!(\"_{session}.jsonl\");",
             "pi_session_file_in_dir(dir, &PathSegment) — the declared assembly point",
-            "pub fn pi_session_file_in_dir(",
+            "session: &PathSegment,",
         ),
         // Not an identifier family at all: `write_shim`/`write_refusal_shim`
         // take `program: &str`, and every call site passes a string LITERAL —

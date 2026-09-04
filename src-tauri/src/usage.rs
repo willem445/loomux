@@ -1015,7 +1015,10 @@ enum Advance {
 /// offset there.
 ///
 /// Streaming, per #1218: one reusable line buffer, never the file. Peak live
-/// bytes are the longest single line plus the fold's message-id set.
+/// bytes are the longest single line plus whatever state the folder carries —
+/// [`TranscriptFold`]'s message-id dedupe set on a `Claude` cursor, and four
+/// counters plus one model id on a `Pi` one, which has no such set (see
+/// [`PiFold`]).
 fn fold_appended(cursor: &mut TranscriptCursor, verify_anchor: bool) -> std::io::Result<Advance> {
     let mut file = fs::File::open(&cursor.path)?;
     let mut bytes_read = 0u64;
@@ -1072,9 +1075,13 @@ fn fold_appended(cursor: &mut TranscriptCursor, verify_anchor: bool) -> std::io:
 /// faults on the process, and this loop is that churn.
 ///
 /// **The contract.** A cursor holds the byte offset it has consumed up to, the
-/// fold resumed from there (totals, cost, best model, and the dedupe set —
-/// which is what makes resuming safe against a `--resume` re-emit), and the
-/// stat it last acted on. Per tick:
+/// fold resumed from there — a [`TranscriptFolder`], whose per-CLI arm decides
+/// what that state IS: `Claude` carries totals, cost, best model and the
+/// message-id dedupe set that makes resuming safe against a `--resume`
+/// re-emit; `Pi` carries totals, pi's own summed `cost.total` and the last
+/// assistant turn's model, and needs no dedupe set because pi appends fresh
+/// entry ids rather than re-emitting — and the stat it last acted on. Per
+/// tick:
 ///
 /// - unchanged `len` and `mtime` → the cached totals, with the file not
 ///   opened at all;

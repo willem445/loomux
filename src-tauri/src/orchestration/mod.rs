@@ -12495,9 +12495,20 @@ pub struct UsageSnapshot {
     pub name: String,
     pub role: String,
     /// Where the figures came from: `transcript` (token-derived, exact tokens),
-    /// `session-db` (opencode's own `session` row — exact tokens AND its own
-    /// dollar figure, #722), `statusline` (last-resort parse of the CLI's own
-    /// dollar figure), or `none` (nothing available yet).
+    /// `pi-transcript` (pi's own session file — exact tokens AND the dollar
+    /// figure pi computed itself, #2126), `session-db` (opencode's own
+    /// `session` row — exact tokens AND its own dollar figure, #722),
+    /// `statusline` (last-resort parse of the CLI's own dollar figure), or
+    /// `none` (nothing available yet).
+    ///
+    /// **Five values, on three surfaces that must move together**: this doc,
+    /// `AgentUsage.source`'s union in `src/orchestration.ts`, and the
+    /// enumeration in `doc/design/group-cost-tracking.md`. The frontend's is a
+    /// declared TYPE for a value that crosses the IPC seam untyped, so `tsc`
+    /// cannot catch a value outside it and a narrowing written against a stale
+    /// union is silently wrong. Adding a sixth means one entity grep
+    /// (`grep -rn session-db --include=*.ts --include=*.rs --include=*.md`),
+    /// not three guesses.
     pub source: String,
     pub input_tokens: u64,
     pub output_tokens: u64,

@@ -376,11 +376,32 @@ to re-derive.
 **No message-id dedupe**, unlike claude's fold. claude's exists because
 `--resume` re-emits assistant messages that are already on disk; pi opens the
 same file by id and appends, and re-folding the same bytes is prevented by the
-cursor's guards rather than by a set in the fold. `_rewriteFile` — what a
-`/tree` navigation or a label edit runs — opens the file with mode `"w"`, so a
-rewrite that drops entries shortens it and the cursor's `len < self.len` arm
-throws itself away and re-folds from zero
-(`a_rewritten_pi_file_refolds_from_scratch`).
+cursor's guards rather than by a set in the fold.
+
+**pi ships a whole-file rewriter and claude does not, so name BOTH halves of
+what catches it.** `_rewriteFile` — what a `/tree` navigation or a label edit
+runs — opens the session file with mode `"w"`, a truncate, and writes every
+entry back. Two shapes come out of that, and only one is caught by the arm it
+is tempting to name alone:
+
+- **A rewrite that DROPS entries shortens the file**, so `stat_verdict`'s
+  `len < self.len` arm resets the cursor before any byte is read
+  (`a_rewritten_pi_file_refolds_from_scratch_rather_than_folding_onto_a_stale_position`).
+- **A rewrite that keeps the length or GROWS reaches `Extend` instead**, and
+  what catches it is the 64-byte anchor: the consumed region's tail is re-read
+  through the same handle before anything is folded onto it, and a mismatch
+  discards the cursor
+  (`a_non_shrinking_pi_rewrite_is_caught_by_the_anchor_not_by_the_length_arm`).
+
+That second half matters more here than it does for claude, and the reason is
+the residual on `ANCHOR_BYTES` (#1361 B1): an in-place edit to a consumed byte
+EARLIER than `offset - ANCHOR_BYTES`, on a file that goes on being appended to,
+is seen by no stat arm and no anchor, and is bounded only by
+`CURSOR_REVALIDATE_AFTER` throwing the cursor away on a timer. For claude that
+residual is close to theoretical — nothing rewrites a claude transcript. For pi
+it is reachable by an ordinary `/tree` navigation on a long session, so the
+honest statement is "wrong for at most one revalidation interval", not "cannot
+happen".
 
 **`source: "pi-transcript"`, `estimated: false`.** The snapshot arm keys on
 `pi_sessions_dir(group)` plus the pane's session id, which pi premints

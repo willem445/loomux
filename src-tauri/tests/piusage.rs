@@ -564,6 +564,73 @@ fn a_rewritten_pi_file_refolds_from_scratch_rather_than_folding_onto_a_stale_pos
 }
 
 #[test]
+fn a_non_shrinking_pi_rewrite_is_caught_by_the_anchor_not_by_the_length_arm() {
+    // The OTHER half of `_rewriteFile`, and the half a shrink-only framing
+    // misses (rev-final round 2, W4). pi is the only harness here that rewrites
+    // its whole session file, so unlike claude this cursor meets rewrites that
+    // do NOT shorten the file — those sail past `stat_verdict`'s
+    // `len < self.len` arm and reach `Extend`, where the only thing standing
+    // between them and a fold onto a stale offset is the 64-byte anchor
+    // re-read.
+    //
+    // The fixture GROWS rather than staying the same length, deliberately: a
+    // same-length rewrite has to move the mtime to reach `Extend` at all, and
+    // on a coarse filesystem clock that is a race. Growth reaches `Extend`
+    // whatever the clock says, and it is the same discrimination — `len` is
+    // strictly greater, so the length arm cannot be what fires.
+    let dir = tempfile::tempdir().unwrap();
+    let before = file(&[
+        header(SES, "C:/tmp/repo"),
+        assistant("e1", "anthropic", "claude-opus-4-8", Turn { input: 100, cost: Some(0.1), ..Turn::default() }),
+        assistant("e2", "anthropic", "claude-opus-4-8", Turn { input: 200, cost: Some(0.2), ..Turn::default() }),
+        assistant("e3", "anthropic", "claude-opus-4-8", Turn { input: 300, cost: Some(0.3), ..Turn::default() }),
+    ]);
+    let path = write_session(dir.path(), SES, &before);
+
+    let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
+    let (first, _) = cursors
+        .session_usage_measured(TranscriptKind::Pi, dir.path(), SES)
+        .expect("first read");
+    assert_eq!(first.tokens.input_tokens, 600, "control: the whole file was folded");
+
+    // A `/tree` navigation that lands on a different branch: every entry is
+    // rewritten, the amounts differ, and the file ends up LONGER.
+    let after = file(&[
+        header(SES, "C:/tmp/repo"),
+        assistant("f1", "openrouter", "moonshotai/kimi-k2.6", Turn { input: 11, cost: Some(0.01), ..Turn::default() }),
+        assistant("f2", "openrouter", "moonshotai/kimi-k2.6", Turn { input: 22, cost: Some(0.02), ..Turn::default() }),
+        assistant("f3", "openrouter", "moonshotai/kimi-k2.6", Turn { input: 33, cost: Some(0.03), ..Turn::default() }),
+        assistant("f4", "openrouter", "moonshotai/kimi-k2.6", Turn { input: 44, cost: Some(0.04), ..Turn::default() }),
+    ]);
+    assert!(
+        after.len() > before.len(),
+        "fixture: this test is about the NON-shrinking rewrite — if it ever shrinks, the \
+         length arm fires and the anchor is no longer what is being pinned ({} vs {})",
+        after.len(),
+        before.len()
+    );
+    fs::write(&path, &after).unwrap();
+
+    let (now, w) = cursors
+        .session_usage_measured(TranscriptKind::Pi, dir.path(), SES)
+        .expect("second read");
+    assert!(
+        w.reset,
+        "a grown-but-rewritten file must throw the cursor away; folding its tail onto the \
+         old offset would add the new entries to totals that still hold the old ones"
+    );
+    assert_eq!(
+        now.tokens.input_tokens, 110,
+        "the totals describe the file as it now is, not the old fold plus the new tail"
+    );
+    assert_ne!(
+        now.tokens.input_tokens, 710,
+        "710 is what an append-onto-a-stale-offset would report (600 + the new tail)"
+    );
+    assert_eq!(now.model.as_deref(), Some("openrouter/moonshotai/kimi-k2.6"));
+}
+
+#[test]
 fn a_pi_cursor_and_a_claude_cursor_never_serve_each_others_totals() {
     // The cache key carries the harness. Two stores that happened to share a
     // root would otherwise answer out of one cursor, which is the one way this
@@ -876,6 +943,49 @@ fn a_pi_pane_in_a_second_block_of_its_class_is_read_as_pi_not_as_the_class_defau
     assert_eq!(row["source"], "pi-transcript", "mark_dead must read it too");
     assert_eq!(row["tokens"]["total"].as_u64(), Some(1_500));
     assert_eq!(usage["lifetime_tokens"].as_u64(), Some(1_500));
+}
+
+#[test]
+fn a_pi_turn_with_tokens_but_no_dollars_still_wins_the_arm_and_leaves_the_cost_unknown() {
+    // rev-final round 2, premortem 1: the fold-level distinction between
+    // `Some(0.0)` and `None` is pinned above, but its SNAPSHOT-level
+    // consequence was not — and that consequence is a decision, not an
+    // accident, so it is pinned here rather than left to be rediscovered.
+    //
+    // A pi pane on a local/self-hosted or unpriced provider writes `usage` with
+    // no `cost` object. Tokens are then real and dollars are unknown, and the
+    // arm returns on `u.tokens.total() > 0` — so the statusline fallback is NOT
+    // consulted and the row shows tokens against a blank cost, labelled
+    // reported.
+    //
+    // That is deliberate and it is the same rule the claude arm already
+    // follows: a claude transcript whose model is absent from `price_for`
+    // returns `cost_usd: None` from its own arm too, because exact tokens beat
+    // a scraped dollar figure that is empty on a subscription account anyway.
+    // Tokens are the honest metric; a missing dollar figure is reported as
+    // missing rather than backfilled from a less reliable source.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/pi-repo", rails("pi")).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+    let sid = w.session_id.clone().unwrap();
+    write_session(&reg.pi_sessions_dir(&g.id), &sid, &file(&[
+        header(&sid, "C:/tmp/pi-repo"),
+        assistant("e1", "ollama", "qwen3-coder", Turn {
+            input: 4_000, output: 250, cost: None, ..Turn::default()
+        }),
+    ]));
+
+    let snap = reg.compute_usage_snapshot(&w, "pi");
+    assert_eq!(snap.source, "pi-transcript", "exact tokens still win the arm");
+    assert_eq!(snap.input_tokens, 4_000);
+    assert_eq!(snap.output_tokens, 250);
+    assert_eq!(snap.cost_usd, None, "unpriced is reported as unknown, never as $0");
+    assert!(!snap.estimated, "and it is still not a price-table guess");
+    assert_ne!(
+        snap.source, "statusline",
+        "the fallback must not be reached: it would attach a scraped dollar figure to \
+         tokens this arm already read exactly"
+    );
 }
 
 #[test]

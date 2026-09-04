@@ -106,8 +106,14 @@ is genuinely disjoint.
 navigated away from still counts (the tokens were bought). There is no
 message-id dedupe — pi's entries each get a fresh id, and the cursor's guards
 are what stop the same bytes being folded twice; pi's `_rewriteFile` truncates
-and rewrites, so a rewrite that drops entries shortens the file and the cursor
-resets. The id is preminted, so unlike OpenCode this source is live from spawn.
+and rewrites, so a rewrite that DROPS entries shortens the file and the
+`len < self.len` arm resets the cursor, while a same-length or growing one
+reaches `Extend` and is caught by the 64-byte anchor instead. Naming only the
+length arm would describe the narrower half: pi is the only harness here that
+ships a whole-file rewriter, which is also what makes `ANCHOR_BYTES`' documented
+residual (an edit below the anchor window on a still-appending file, bounded by
+`CURSOR_REVALIDATE_AFTER`) reachable for pi where it is close to theoretical for
+claude. The id is preminted, so unlike OpenCode this source is live from spawn.
 
 ### Copilot CLI — no readable token record today (fallback only)
 
