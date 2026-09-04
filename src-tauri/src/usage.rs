@@ -1182,7 +1182,11 @@ impl TranscriptCursors {
             let mut map = self.cursors.lock_safe();
             map.retain(|_, e| e.used.elapsed() < CURSOR_TTL);
             let entry = map
-                .entry((kind, root.to_path_buf(), session_id.to_string()))
+                // SCRATCH MUTATION M4 (#2126 P3 red-before-green): the harness
+                // is dropped out of the cache key by pinning it to one value,
+                // so a pi read and a claude read over one root share a cursor.
+                // Never merged.
+                .entry((TranscriptKind::Claude, root.to_path_buf(), session_id.to_string()))
                 .or_insert_with(|| CursorEntry {
                     used: Instant::now(),
                     cursor: Arc::new(TrackedMutex::new("usage_cursor_cell", None)),

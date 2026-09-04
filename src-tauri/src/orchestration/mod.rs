@@ -41232,7 +41232,10 @@ impl OrchRegistry {
         // `estimated: false` — the same reported-not-estimated posture as
         // opencode, for the same reason: blending a vendor-priced figure into a
         // total the UI labels a price-table guess would misdescribe both.
-        if cli == "pi" {
+        // SCRATCH MUTATION M2 (#2126 P3 red-before-green): the arm's CLI test is
+        // changed to a value no caller passes, so the pi arm never runs. Never
+        // merged.
+        if cli == "pi-arm-disabled-for-the-counterfactual" {
             if let Some(sid) = entry.session_id.as_deref() {
                 let dir = self.pi_sessions_dir(&entry.group);
                 if let Some(u) = self.usage_cursors.session_usage(
