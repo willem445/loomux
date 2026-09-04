@@ -163,6 +163,27 @@ test('every worker persona keeps the receipt-check step, not just its name', () 
   }
 });
 
+// The tie logic, extracted so its TEETH have a permanent positive control:
+// the roster-tie test below asserts the real roster is clean, and the test
+// after it mutates the roster and asserts the same logic FLAGS the mutation —
+// without that second assertion the first is vacuous (it passed 11/11 with
+// `worker-adv` pointed at a persona file that does not exist: the profile is
+// a REPO PATH, the population is basenames, and the old code tested the
+// `^worker-` pattern against the full path, skipping every block).
+function uncoveredWorkerBlocks(
+  workflow: { blocks: Array<{ id: string; kind: string; profile?: string }> },
+  covered: string[],
+): string[] {
+  const uncovered: string[] = [];
+  for (const b of workflow.blocks) {
+    if (b.kind !== 'worker' || !b.profile) continue;
+    const base = b.profile.split('/').pop() ?? b.profile;
+    if (!/^worker-.+\.md$/.test(base)) continue; // e.g. process.md — S4's, stated residual above
+    if (!covered.includes(base)) uncovered.push(`${b.id} -> ${b.profile}`);
+  }
+  return uncovered;
+}
+
 test("the live roster's worker blocks point at personas the scan covered", () => {
   const workflowText = fs.readFileSync(path.join(root, '.orrerix', 'workflow.yml'), 'utf8');
   const { workflow, findings: syntax } = parseWorkflow(workflowText);
@@ -174,17 +195,35 @@ test("the live roster's worker blocks point at personas the scan covered", () =>
   assert.ok(workerPersonaFiles.length > 0, 'no worker persona files found; the scan below would be vacuous');
   // The roster decides what is live, the file scan decides what is checked,
   // and the two must not disagree for the worker-* namespace.
-  const uncovered: string[] = [];
-  for (const b of workflow.blocks) {
-    if (b.kind !== 'worker' || !b.profile) continue;
-    const rel = b.profile.replace(/^\.\//, '');
-    if (!/^worker-.+\.md$/.test(rel)) continue; // e.g. process.md — S4's, stated residual above
-    if (!workerPersonaFiles.includes(rel)) uncovered.push(`${b.id} -> ${rel}`);
-  }
+  const uncovered = uncoveredWorkerBlocks(workflow, workerPersonaFiles);
   assert.deepEqual(
     uncovered,
     [],
     'worker-kind roster block(s) point at worker personas the receipt-check scan did not cover: ' +
       uncovered.join(', '),
   );
+});
+
+// Positive control for the tie above, permanent in CI: the SAME logic run
+// against a MUTATED roster must flag the mutation, or the tie test proves
+// nothing. Built from the real workflow text so the mutation collides with a
+// live subject (worker-adv really does read worker-deep.md), and the anchor
+// is asserted to have landed — a missed replace would leave the fixture
+// identical to the real roster and the flagging assertion vacuous in its
+// turn.
+test('the roster tie has teeth: a mutated profile is flagged, not skipped', () => {
+  const workflowText = fs.readFileSync(path.join(root, '.orrerix', 'workflow.yml'), 'utf8');
+  const anchor = 'profile: .github/agents/worker-deep.md';
+  assert.ok(workflowText.includes(anchor), 'fixture premise: worker-adv reads worker-deep.md in the real roster');
+  const mutatedText = workflowText.replace(anchor, 'profile: .github/agents/worker-gone.md');
+  assert.notEqual(mutatedText, workflowText, 'the mutation must land, or the control below tests nothing');
+  const { workflow, findings: syntax } = parseWorkflow(mutatedText);
+  assert.deepEqual(
+    syntax.map((f) => `${f.severity} ${f.code}: ${f.message}`),
+    [],
+    'the mutated roster must still parse — the tie logic is under test, not the parser',
+  );
+  assert.deepEqual(uncoveredWorkerBlocks(workflow, workerPersonaFiles), [
+    'worker-adv -> .github/agents/worker-gone.md',
+  ]);
 });
