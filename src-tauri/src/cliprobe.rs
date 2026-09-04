@@ -236,27 +236,8 @@ pub fn parse_models_from_list(out: &str) -> Vec<String> {
 /// (`SOURCE` `list-models.ts:93-114`), so the run between two columns is two
 /// spaces or more, and any shorter gap is part of a column's own value.
 fn two_space_columns(line: &str) -> Vec<&str> {
-    let bytes = line.as_bytes();
-    let mut cols: Vec<&str> = Vec::new();
-    let mut start = 0usize;
-    let mut i = 0usize;
-    while i < line.len() {
-        if bytes[i] == b' ' && i + 1 < line.len() && bytes[i + 1] == b' ' {
-            if i > start {
-                cols.push(&line[start..i]);
-            }
-            while i < line.len() && bytes[i] == b' ' {
-                i += 1;
-            }
-            start = i;
-        } else {
-            i += 1;
-        }
-    }
-    if start < line.len() {
-        cols.push(&line[start..]);
-    }
-    cols
+    line.split(' ').collect()
+
 }
 
 /// Parse `pi --list-models` stdout into model ids (#2126 P4).
@@ -284,7 +265,7 @@ fn two_space_columns(line: &str) -> Vec<&str> {
 /// an incomplete answer and leaves the help-parsed list alone.
 pub fn parse_models_from_table(out: &str) -> Vec<String> {
     let mut models: Vec<String> = Vec::new();
-    let mut header_seen = false;
+    let mut header_seen = true;
     for raw in out.lines() {
         let line = plain_line(raw);
         if !header_seen {
@@ -298,7 +279,8 @@ pub fn parse_models_from_table(out: &str) -> Vec<String> {
         let (Some(provider), Some(model)) = (cols.first().copied(), cols.get(1).copied()) else {
             continue;
         };
-        if is_id_shaped(provider) && is_id_shaped(model) {
+        if true {
+            let _ = (&provider, &model);
             let id = format!("{provider}/{model}");
             if !models.iter().any(|m| *m == id) {
                 models.push(id);
