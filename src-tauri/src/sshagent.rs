@@ -478,7 +478,9 @@ pub fn drive_ssh_add_with_transcript(
     let mut answered = false;
     let mut gave_up = false;
     let mut terminal: Option<SshAddOutcome> = None;
-    let mut status: Option<std::process::ExitStatus> = None;
+    // `portable_pty`'s own status type, not `std::process`'s: a pty child is
+    // reaped through the pty, and the two have similar names and distinct types.
+    let mut status: Option<portable_pty::ExitStatus> = None;
     let mut drain_until: Option<Instant> = None;
 
     while terminal.is_none() {
@@ -565,7 +567,9 @@ pub fn drive_ssh_add_with_transcript(
         // frame (see the drain above). The bytes decide the CONVERSATION — what
         // to answer, and when to give up; the exit status decides the VERDICT
         // when the bytes ran out first.
-        None if status.is_some_and(|st| st.success()) => SshAddOutcome::Added,
+        // `as_ref` because a match guard may not move out of the binding it
+        // reads, and this status is not `Copy`.
+        None if status.as_ref().is_some_and(|st| st.success()) => SshAddOutcome::Added,
         None => SshAddOutcome::Failed { detail },
     };
     (outcome, seen)
