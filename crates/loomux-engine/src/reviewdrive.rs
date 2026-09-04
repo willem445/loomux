@@ -1394,7 +1394,7 @@ pub fn state_bound_ms(
     let lane = minutes_ms(limits.lane_timeout_minutes);
     match state {
         DriveState::CiWait => {
-            Some(CI_WAIT_BOUND_MS.saturating_add(minutes_ms(limits.fix_timeout_minutes)))
+            Some(CI_WAIT_BOUND_MS.max(minutes_ms(limits.fix_timeout_minutes)))
         }
         DriveState::ReviewWait => Some(
             REVIEW_WAIT_BOUND_MS
