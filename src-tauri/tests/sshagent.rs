@@ -120,6 +120,62 @@ fn a_wrong_passphrase_gives_up_the_way_ssh_add_documents() {
     );
 }
 
+/// A fake that asks, reads, and exits with `%1` **without printing a verdict**.
+///
+/// The transcript cannot decide these runs, which is the point: it is exactly
+/// the shape ConPTY produces for real when it drops the last frame before a fast
+/// exit, and the two tests below are the pair that shows the fallback reads
+/// `ssh-add`'s exit CODE rather than assuming success.
+fn silent_verdict(code: &str) -> String {
+    format!(
+        concat!(
+            "@echo off\n",
+            "echo fake-ssh-add-running\n",
+            "set /p p=Enter passphrase for C:\\keys\\id_ed25519: \n",
+            "exit /b {}\n",
+        ),
+        code
+    )
+}
+
+#[test]
+fn a_child_that_exits_zero_is_added_even_when_no_verdict_line_arrives() {
+    // `ssh-add` documents exit 0 as "the identity was added". ConPTY renders a
+    // screen rather than a stream, so the `Identity added` line of a process
+    // that prints it and exits immediately can be dropped — this is not a
+    // hypothetical, it is what CI showed for the success fixture. Reporting
+    // `Timeout` there would refuse a launch whose key really did go in.
+    let dir = tempfile::tempdir().unwrap();
+    let argv = fake_ssh_add(dir.path(), "silent-ok.bat", &silent_verdict("0"));
+
+    let (outcome, seen) = drive_ssh_add_with_transcript(&argv, b"hunter2", Duration::from_secs(20));
+
+    assert_eq!(outcome, SshAddOutcome::Added, "transcript: {}", show(&seen));
+    // The fallback must be what decided it: if the fixture had printed a verdict
+    // line this would be evidence about the transcript instead.
+    assert!(
+        !seen.contains("Identity added"),
+        "this fixture must print no verdict line, or it evidences the wrong path: {}",
+        show(&seen)
+    );
+}
+
+#[test]
+fn a_child_that_exits_nonzero_is_not_added() {
+    // The discriminator for the test above. Without this, an implementation that
+    // simply returned `Added` whenever the child exited would pass it — which is
+    // the failure mode a fallback on an exit code invites.
+    let dir = tempfile::tempdir().unwrap();
+    let argv = fake_ssh_add(dir.path(), "silent-fail.bat", &silent_verdict("7"));
+
+    let (outcome, seen) = drive_ssh_add_with_transcript(&argv, b"hunter2", Duration::from_secs(20));
+
+    match &outcome {
+        SshAddOutcome::Failed { .. } => {}
+        other => panic!("a non-zero exit must not be Added, got {other:?}\ntranscript: {}", show(&seen)),
+    }
+}
+
 #[test]
 fn a_program_that_never_prompts_is_bounded_rather_than_waited_on() {
     // `set /p` with no prompt text blocks on a console read forever. Nothing the

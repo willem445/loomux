@@ -230,6 +230,28 @@ the same wrong value is a spin that ends at the deadline. Both asks carry **no
 trailing newline** — they are asks, not lines — which is why the driver
 classifies the whole transcript rather than complete lines.
 
+#### The bytes decide the conversation; the exit status decides the verdict
+
+Two ConPTY properties make the transcript an unreliable *verdict*, and both were
+measured rather than anticipated — on CI, where all three prompting fixtures
+answered correctly, exited, and were still reported `Timeout`:
+
+- **A ConPTY master read never returns EOF when the child dies**, because the
+  read side stays open as long as the caller holds the master. So a driver that
+  waits for the stream to end waits until its deadline, every time.
+  `spawn_pty_blocking` never hit this because a pane's death is reported by its
+  own `child.wait()` waiter thread — a mechanism this one-shot call does not
+  have and therefore has to supply.
+- **ConPTY renders a screen, not a stream.** A process that prints one line and
+  exits immediately can have that frame dropped: the success fixture's
+  `Identity added` line never arrived at all.
+
+The driver therefore polls `try_wait` between reads, drains for a moment after
+the exit, and — when no line decided the outcome — falls back to `ssh-add`'s own
+exit code, where **0 means the identity was added**. The transcript remains the
+only thing that can decide *what to answer and when to give up*; it is simply not
+the last word on whether the key went in.
+
 ### Persistence honesty
 
 On Windows the agent keeps the key **until it is forgotten** (`ssh-add -D`, or

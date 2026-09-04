@@ -61,6 +61,18 @@ use std::time::{Duration, Instant};
 /// human who mistyped gets an answer rather than a spinner.
 pub const SSH_ADD_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How often the driver checks whether the child has exited, between reads.
+///
+/// Small enough that a finished `ssh-add` is noticed promptly and large enough
+/// that the loop is not a spin: this thread is a blocking-pool slot either way,
+/// and the only cost of a step is one `try_wait`.
+const POLL_STEP: Duration = Duration::from_millis(50);
+
+/// How long the pty pump gets to deliver whatever it still holds after the
+/// child has exited. ConPTY renders a screen rather than a stream, so a process
+/// that prints one line and exits immediately can have that line dropped.
+const POST_EXIT_DRAIN: Duration = Duration::from_millis(300);
+
 /// How long `ssh-add -l` may take to answer "is there an agent".
 const AGENT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -355,6 +367,16 @@ fn zero_secret(buf: &mut [u8]) {
 /// a spin. Everything is inside `timeout`; on expiry the child is killed and the
 /// outcome is [`SshAddOutcome::Timeout`] rather than a wait.
 ///
+/// **The bytes decide the conversation; the exit status decides the verdict.**
+/// The transcript is what tells the driver *what to answer and when to give up*,
+/// and it is the only thing that can. It is not a reliable verdict, for two
+/// reasons that only show up on a real ConPTY: the master never reports EOF when
+/// the child dies (the read side stays open while this function holds the
+/// master), and ConPTY renders a screen rather than a stream, so a process that
+/// prints one line and exits immediately can have that line dropped. So the loop
+/// polls `try_wait`, drains briefly after the exit, and falls back to
+/// `ssh-add`'s own documented exit code when no line decided it.
+///
 /// The pty is local to this call: opened here, never registered with
 /// `PtyManager`, never streamed anywhere, and dropped on return. Nothing about
 /// this conversation is visible in a pane.
@@ -456,6 +478,8 @@ pub fn drive_ssh_add_with_transcript(
     let mut answered = false;
     let mut gave_up = false;
     let mut terminal: Option<SshAddOutcome> = None;
+    let mut status: Option<std::process::ExitStatus> = None;
+    let mut drain_until: Option<Instant> = None;
 
     while terminal.is_none() {
         let now = Instant::now();
@@ -464,16 +488,37 @@ pub fn drive_ssh_add_with_transcript(
             let _ = child.wait();
             return (SshAddOutcome::Timeout, seen);
         }
-        let chunk = match rx.recv_timeout(deadline - now) {
-            Ok(c) => c,
-            // The child closed the pty: it is done talking. Whatever it said is
-            // all there is, and the post-loop classification below reads it.
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let _ = killer.kill();
-                let _ = child.wait();
-                return (SshAddOutcome::Timeout, seen);
+        // The child's EXIT is the other way this conversation ends, and it has
+        // to be polled for: a ConPTY master read does not return EOF when the
+        // child dies, because the read side stays open as long as WE hold the
+        // master. Without this the loop has no way to learn the child is gone
+        // and every run walks to the deadline — measured on CI, where all three
+        // prompting fixtures answered correctly, exited, and were still reported
+        // `Timeout` (#2368). `spawn_pty_blocking` does not need it because a
+        // pane's death is reported by its own `child.wait()` waiter thread.
+        if status.is_none() {
+            if let Ok(Some(st)) = child.try_wait() {
+                status = Some(st);
+                // ConPTY renders a SCREEN, so the last frame before a fast exit
+                // can be dropped: the success fixture's `Identity added` line
+                // never arrived at all. Give the pump a moment to deliver
+                // whatever it still has before deciding.
+                drain_until = Some(now + POST_EXIT_DRAIN);
             }
+        }
+        if drain_until.is_some_and(|until| now >= until) {
+            break;
+        }
+        // Step rather than wait-to-deadline: the exit poll above only runs
+        // between receives, so a long block here would defeat it.
+        let step = POLL_STEP.min(deadline.saturating_duration_since(now));
+        let chunk = match rx.recv_timeout(step) {
+            Ok(c) => c,
+            // Reachable only once the master is dropped, which is after this
+            // function returns — kept as the correctness arm rather than as the
+            // mechanism, which is the exit poll above.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
         };
         seen.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -505,12 +550,22 @@ pub fn drive_ssh_add_with_transcript(
     }
 
     let _ = killer.kill();
-    let _ = child.wait();
+    let status = match status {
+        Some(st) => Some(st),
+        None => child.wait().ok(),
+    };
     let secret = String::from_utf8_lossy(passphrase).into_owned();
     let detail = scrub_secret(last_meaningful_line(&seen), &secret);
     let outcome = match terminal {
         Some(other) => other,
         None if gave_up => SshAddOutcome::BadPassphrase { detail },
+        // No terminal line, but the child exited **0**. `ssh-add` documents
+        // that as "the identity was added", and it is a stronger signal than
+        // the transcript precisely because the transcript can lose the last
+        // frame (see the drain above). The bytes decide the CONVERSATION — what
+        // to answer, and when to give up; the exit status decides the VERDICT
+        // when the bytes ran out first.
+        None if status.is_some_and(|st| st.success()) => SshAddOutcome::Added,
         None => SshAddOutcome::Failed { detail },
     };
     (outcome, seen)
