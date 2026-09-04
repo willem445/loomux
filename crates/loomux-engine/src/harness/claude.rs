@@ -464,7 +464,6 @@ impl Decoder {
         let t = TurnId(self.next_turn);
         self.next_turn += 1;
         self.open_turn = Some(t);
-        out.push(Decoded::Event(HarnessEvent::TurnStarted { turn: t }));
         t
     }
 }
