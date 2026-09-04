@@ -282,30 +282,9 @@ fn two_space_columns(line: &str) -> Vec<&str> {
 /// manufacture. An unfamiliar line after the header is dropped, and an
 /// unrecognised layout as a whole yields nothing, which `probe_with` treats as
 /// an incomplete answer and leaves the help-parsed list alone.
-pub fn parse_models_from_table(out: &str) -> Vec<String> {
-    let mut models: Vec<String> = Vec::new();
-    let mut header_seen = false;
-    for raw in out.lines() {
-        let line = plain_line(raw);
-        if !header_seen {
-            let mut tokens = line.split_whitespace();
-            if tokens.next() == Some("provider") && tokens.next() == Some("model") {
-                header_seen = true;
-            }
-            continue;
-        }
-        let cols = two_space_columns(&line);
-        let (Some(provider), Some(model)) = (cols.first().copied(), cols.get(1).copied()) else {
-            continue;
-        };
-        if is_id_shaped(provider) && is_id_shaped(model) {
-            let id = format!("{provider}/{model}");
-            if !models.iter().any(|m| *m == id) {
-                models.push(id);
-            }
-        }
-    }
-    models
+pub fn parse_models_from_table(_out: &str) -> Vec<String> {
+    Vec::new()
+
 }
 
 /// Run `<program> <args>` without a console window, bounded by a timeout.
