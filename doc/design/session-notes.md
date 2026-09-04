@@ -351,6 +351,99 @@ Comparison is on the trimmed strings and **case-sensitive**: a human who
 renames `worker` to `Worker` has renamed it, and this is a report of what they
 wrote rather than a guess at what they meant.
 
+## The notes chip, and what a row is shaped like
+
+The second half of the acceptance criterion is "a way to open that session's
+notes", live session or dead. That is a chip on the row, opening the same
+overlay the pane header opens — one dialog, two entry points, and `openNotes`
+was written to take whichever target it is given.
+
+**The chip is on every row**, including a session with no notes. A chip that
+appeared only once notes existed would be a way to *read* them and no way to
+write the first one, and the sessions tab is where a human reviews a session
+they are not sitting in.
+
+**What it says is `notesChipLabel`, and the middle state is why it is a
+function.** `SessionLogStore.notesCount` answers `0` for a session with no notes
+**and** for a file nobody has read yet — its own doc says so and forbids the
+collapse. So:
+
+| State | Number | Tooltip |
+| --- | --- | --- |
+| `loaded` false — not read, or the read rejected | none | says the file has not been read |
+| read, no notes | none | says there are none, and names the gesture |
+| read, `n > 0` | `n` | agrees with the number, singular at 1 |
+
+A `0` in the first row would be the chip asserting that a session with notes on
+disk has none — the same silent-loss shape the overlay's own "could not read the
+notes file" line exists to avoid, one surface over. `SessionBrowser.refresh`
+therefore also awaits `ensureLoaded`, so the first render already knows: without
+it the store is read lazily by whatever opens the overlay first, and every chip
+would sit in the unread state until then.
+
+**A row is a wrapper, not a button.** Restore and notes are two independent
+actions, so `.session-row` is a plain `div` holding two sibling `<button>`s. A
+button nested in a button is invalid HTML and leaves a keyboard user with a
+control they cannot reach separately. The hover/press feedback moved from
+`.session-item` onto the wrapper in the same change: on the item alone the chip
+would slide out from under the row it belongs to, and on both it would double.
+
+**What the browser is given is a read port, not the store.** `SessionNotesHost`
+is four reads, a subscription and `openNotes`. `SessionLogStore` is the window's
+single handle on a multi-tenant file whose whole safety rule is that a write is
+published only from a handle that has read it, so a second thing able to publish
+it is exactly the shape that rule exists to prevent. `main.ts` keeps the writer
+and supplies the overlay; `SessionLogStore` satisfies the read half
+structurally, so the adapter carries no state of its own.
+
+Two of those reads are **scalars** — `notesCount` and `paneName` — and not
+`get(id)?.…`. `get` returns `cloneRecord`, a fresh object per note on the
+record; a row reads one number and one immutable string, on every render, and
+notes per record are uncapped. Reading through `get` would make that
+O(total notes across shown rows) short-lived objects per gesture. `paneName` is
+`notesCount`'s sibling in every respect, including answering `undefined` for an
+unknown session and for an unread store alike.
+
+**The list re-renders off `store.onChange`**, skipped while the Sessions tab is
+not the visible one — `leftpanel.ts`'s `onShow` calls `refresh()`, which renders,
+so a change that lands behind the Agents tab is picked up on return and a pane
+rename does not rebuild a list nobody is reading. Either way it replaces the
+children of a list inside the fixed-width `.sessions-inner` column: no layout
+column moves, so no path here reaches a PTY resize (hard constraint 1).
+
+### Focus across a rebuild
+
+That second trigger is one a human can reach *while reading the list*: a note
+written from a pane header rebuilds every row under them. A keyboard user
+standing on one then loses the element they were on and focus drops to `<body>`,
+so the next Tab restarts traversal from the top of the document — the defect
+#2259 fixed on the Agents chip strip, in the shape this list has. That strip
+keys and reuses its elements and hands focus on before removing one; this list
+replaces all of them, so the handoff is *decided* before the rebuild and
+*applied* after it.
+
+`refocusAfterRender(held, shownSessionIds)` is that decision, pure and tested.
+Three outcomes, and the first is the one that must not be got wrong:
+
+| held focus | outcome | why |
+| --- | --- | --- |
+| not in the list | `none` | A render fires on a pane rename and on any grid gesture, so the human is usually typing in a terminal. Nothing is stolen, ever — including when the list is empty, where the temptation to "just focus the search box" is strongest. |
+| on a row still shown | `row`, same control | The chip and the restore button are different controls on one row; landing on the wrong one is landing in the wrong place. |
+| on a row now gone | `search` | A note write can drop a row out of the current search and a mode switch drops many. The search box is where a keyboard traversal of this panel starts, so it is somewhere to carry on from rather than somewhere focus fell to. |
+
+Keyed by **session id**, off `data-session-id` on the wrapper, never by
+position: the list is re-sorted on every refresh, so an index would land the
+human on whichever row moved into their slot. The caller resolves the decision
+to an element, because a control it names can be absent — a row has no chip when
+the browser was built without a notes host — and falls back to that row's
+restore button and then to the search box, so every branch lands somewhere real.
+
+**The overlay's target is a constant getter here, unlike the pane header's.**
+A pane's target is live because a not-yet-identified pane can learn its session
+id under an open overlay and `rekey` empties the pending list. A row named a
+session **id**; that id is what the notes belong to for as long as the dialog is
+open, and nothing can move it.
+
 ## Public-contract changes
 
 | # | Contract | Status |
@@ -361,6 +454,11 @@ wrote rather than a guess at what they meant.
 | 4 | `partitionSessions(sessions, roleOf, mode, showDelegates)` — internal; tests | Landed (slice E1) |
 | 5 | `localStorage` key `loomux.sessions.mode`, decoded totally, default `mine` | Landed (slice E1) |
 | 6 | `paneNameLine(paneName, title, source)` — internal; tests | Landed (slice E2's pure half) |
+| 7 | `notesChipLabel(count, loaded)` — internal; tests | Landed (slice E2) |
+| 8 | `SessionNotesHost` — the read port `SessionBrowser` takes; internal | Landed (slice E2) |
+| 9 | `.session-row` wraps `.session-item` on every session row, carrying `data-session-id` — internal DOM/CSS shape | Landed (slice E2) |
+| 10 | `SessionLogStore.paneName(sessionId)` — a scalar read beside `notesCount` | Landed (slice E2) |
+| 11 | `refocusAfterRender(held, shownSessionIds)` — internal; tests | Landed (slice E2) |
 
 ## Where the pieces live
 
@@ -376,4 +474,6 @@ wrote rather than a guess at what they meant.
 | The unsubmitted draft | `NoteDrafts` in `src/notesmodel.ts` | DOM-free. The editor is a VIEW of the book, seeded on open and written on every `input`, so a re-render cannot eat what the human was typing. |
 | The pane-name line | `paneNameLine` in `src/sessionmeta.ts` | Pure. `test/sessionmeta.test.ts`. |
 | The Notes button, and the re-key wiring | `src/pane.ts`, `src/main.ts` | DOM wiring, hand-validated. Reads `Pane.facts()` / `Pane.key` from #2122 slice A. |
-| Pane name and notes chip ON a session row | `src/sessions.ts` | Slice E2's rendering — *will* land after #2122 slice B (#2122's Agents tab), which restructures this file. `paneNameLine` above is already in and unit-tested; only the rendering waits. |
+| What the notes chip says | `notesChipLabel` in `src/sessionmeta.ts` | Pure. `test/sessionmeta.test.ts`. |
+| Where focus goes after the list is rebuilt | `refocusAfterRender` in `src/sessionmeta.ts` | Pure. `test/sessionmeta.test.ts`. The DOM read (`document.activeElement`) and the element resolution stay in `sessions.ts`. |
+| Pane name and notes chip ON a session row | `src/sessions.ts`, `src/main.ts` | DOM wiring, hand-validated. The read port is `SessionNotesHost`; `main.ts` keeps the store and supplies the overlay. |

@@ -563,6 +563,44 @@ test("loaded tells a caller apart from a store with genuinely nothing in it", as
   const store = new SessionLogStore(io);
   assert.equal(store.loaded, false);
   assert.equal(store.notesCount("s"), 0, "an unread store reports no notes…");
+  assert.equal(store.paneName("s"), undefined, "…and no recorded name either");
   await store.ensureLoaded();
   assert.equal(store.loaded, true, "…and `loaded` is what separates that from an empty file");
+});
+
+test("paneName reads the recorded name without cloning the record", async () => {
+  // #2319 review round 1: the sessions list read `get(id)?.pane_name`, and
+  // `get` clones the whole record — a fresh object per NOTE — to reach one
+  // immutable string, once per row on every render.
+  const io = new FakeIo();
+  const store = new SessionLogStore(io);
+  await store.ensureLoaded();
+  await store.record("s", { cli: "claude", pane_name: "w: #2116 notes", cwd: "C:/x" }, 1);
+  await store.addNote({ sessionId: "s" }, "one", 2);
+  await store.addNote({ sessionId: "s" }, "two", 3);
+  assert.equal(store.paneName("s"), "w: #2116 notes");
+
+  // The property the finding is about, pinned rather than described: this read
+  // hands back no object a caller could hold. A record with two notes is the
+  // fixture precisely so a clone would have something to allocate — a
+  // note-less record cannot distinguish the two implementations.
+  assert.equal(typeof store.paneName("s"), "string");
+  assert.equal(store.get("s")?.notes.length, 2, "the fixture really does carry notes");
+
+  // Unknown session: `undefined`, so `paneNameLine` renders no line — never an
+  // empty string, which would be a recorded-but-blank name.
+  assert.equal(store.paneName("nope"), undefined);
+});
+
+test("paneName follows a rename, and survives a note being added", async () => {
+  const io = new FakeIo();
+  const store = new SessionLogStore(io);
+  await store.ensureLoaded();
+  await store.record("s", { cli: "claude", pane_name: "first", cwd: "C:/x" }, 1);
+  await store.record("s", { cli: "claude", pane_name: "second", cwd: "C:/x" }, 2);
+  assert.equal(store.paneName("s"), "second", "a rename is what the row must show");
+  // `addNote` rebuilds the record from `rec?.pane_name ?? ""`, so a name lost
+  // there would silently blank the row's second line on the next note.
+  await store.addNote({ sessionId: "s" }, "a note", 3);
+  assert.equal(store.paneName("s"), "second");
 });

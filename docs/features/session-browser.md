@@ -99,6 +99,26 @@ MCP tools and no task board.
 Clicking a session opens a new pane in the session's original working directory
 and resumes it there. The pane is auto-named from the session.
 
+#### The name you gave the pane, and your notes
+
+If you renamed the pane you ran a session in, that name is shown on the row
+under the session's own title. It appears only when it adds something: a
+session you never renamed, or one whose pane still carries the name orrerix
+minted for it, shows just its title — the title *is* the fallback, never a
+placeholder.
+
+Every row also carries a small **notes** button on the right, with a count when
+that session has notes. Click it for the same overlay the pane's own
+[Notes button](../core-concepts.html#notes-on-an-agent-pane) opens, where you
+can read, add and delete notes about that session. It works on a **dead**
+session too: a note is your record *about* a session, and whether the session
+can still be resumed is the CLI's business, not the note's.
+
+The count is the number of notes orrerix has read for that session. If it
+cannot read its notes file the button shows no number rather than a zero, and
+says so when you hover it — a zero there would claim a session has no notes
+when orrerix simply does not know.
+
 **Orchestration sessions** in this list are marked with `ORCH` / `W` / `REV`
 chips. Clicking a dead group's orchestrator session restores the *whole*
 orchestration, exactly as the **Orchestrations** list does; worker/reviewer
