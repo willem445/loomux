@@ -124,8 +124,7 @@ impl Renderer {
                 // Not dim: this is the one line that is waiting for a human, and
                 // dimming it would put the thing the pane is blocked on in the
                 // least visible style on the screen.
-                self.newline(&mut out);
-                self.line(&mut out, &format!("[permission] {tool}({preview})"));
+                self.meta(&mut out, &format!("[permission] {tool}({preview})"));
             }
             HarnessEvent::PermissionSettled { decision, by, .. } => {
                 let d = match decision {
