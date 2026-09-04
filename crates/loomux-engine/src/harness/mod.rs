@@ -723,6 +723,12 @@ mod tests {
 
     #[test]
     fn an_unknown_fact_is_none_and_never_a_sentinel_string() {
+        // A CONTRACT GUARD on the enum's wire shape, labelled as one because the
+        // red-before-green wave for this slice reddened it in no round: it pins a
+        // property of the TYPE, so no production path can falsify it without a
+        // type change, and no mutation of the decoder, the log or the renderer
+        // reaches it. That is what it is for, not a gap in the wave.
+        //
         // Rule 1 of the module header, pinned where a future edit would break
         // it: the absence of a session id must not be spellable as a value.
         let ev = HarnessEvent::Booted {
@@ -743,6 +749,10 @@ mod tests {
 
     #[test]
     fn observed_evidence_and_a_reported_fact_have_different_constructors() {
+        // A CONTRACT GUARD on the wire shape, same class and same reason as the
+        // one above: no round of this slice's red-before-green wave reddens it,
+        // because nothing but a type change can make two variants share a tag.
+        //
         // Rule 2. The assertion is on the WIRE tag rather than on the Rust
         // variant, because that is the form a consumer in another process (a
         // remote client, a replay reader) actually branches on.
@@ -911,6 +921,10 @@ mod tests {
 
     #[test]
     fn tokens_never_add_thinking_twice() {
+        // A CONTRACT GUARD on the bucket set — the third of this module's three,
+        // and reddened by no round of the wave for the same structural reason:
+        // it asserts the ABSENCE of a field, which only a type change can add.
+        //
         // The trap named on `Tokens`: `output` already contains thinking, so a
         // total that added a thinking field would double count. There is no
         // thinking field, and this pins that there is not one to add.
