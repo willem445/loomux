@@ -1474,6 +1474,35 @@ fn a_verification_brief_announces_itself_on_every_path_that_grants_it() {
                 (group, Some(lane))
             } else {
                 record_pass(&group, &lane);
+                // **And the lane REPORTS, which is what ends its turn.**
+                // Recording a verdict does not: `idle_since_ms` is stamped by
+                // the REPORT, and until it is, #2109's duplicate-lane refusal
+                // reads that pane as still working and refuses every re-brief —
+                // so the round under test never happens. That is how an earlier
+                // cut failed (CI at `957acaf8`: case C, no lane briefed inside
+                // the tick budget), and it is the product behaving exactly as
+                // `a_body_only_fix_round_re_opens_the_lane_whose_pane_went_idle`
+                // describes, on a fixture that had skipped the half that makes a
+                // reviewer's turn end.
+                let reviewer = Caller {
+                    agent_id: lane.clone(),
+                    group: group.clone(),
+                    role: Role::Reviewer,
+                    role_hint: None,
+                };
+                dispatch(
+                    &reg,
+                    &reviewer,
+                    "tools/call",
+                    &json!({ "name": "report", "arguments": {
+                        "outcome": "approved", "note": "nothing blocking", "ref": "#1758" } }),
+                )
+                .expect("the lane reports, which ends its turn");
+                assert!(
+                    reg.agent(&lane).expect("the lane is on the roster").idle_since_ms.is_some(),
+                    "{label}: the fixture's premise — that pane has finished its turn, so a \
+                     re-brief is not refused as a duplicate"
+                );
                 // **The move goes in BEFORE the tick that observes the verdict**,
                 // and that ordering is the whole of what makes C reach the delta
                 // arm: one tick then fills `at_head` from the verdict file and
