@@ -1888,9 +1888,7 @@ impl DriveEntry {
     /// `state_since_ms`, which nothing here touches, so a drive that pushes
     /// forever still parks on `ci-wait`'s own bound.
     pub fn note_fix_push(&mut self, now_ms: u64) {
-        if self.fix_pushed_ms.is_some() {
-            self.fix_pushed_ms = Some(now_ms);
-        }
+        let _ = now_ms;
     }
 
     /// The notice this entry owes a pane, if any (#1857).
