@@ -5,9 +5,10 @@
 // WHAT IT PINS. `scripts/pr-body-check.cjs` (#2168 S1) re-derives every receipt a
 // posted PR body states, so the lanes that used to spend their rounds on body figures
 // spend them on reasoning instead. That only works if the personas actually name the
-// script and the duplicate-post rule, and prose is editable — a rename or a rewrite
-// silently deletes the witness. This scan reads the live persona files and fails when
-// either reviewer persona stops naming:
+// script and (for the reviewers) the duplicate-post rule, and prose is editable — a
+// rename or a rewrite silently deletes the witness. This scan reads the live persona
+// files and fails when any persona stops naming its rule: the reviewer personas below,
+// and (S2 extension) every worker persona against the one pre-report step.
 //
 //   `pr-body-check`      — the script, run FIRST, its output reported as claims 1–n
 //                          (rev-std) / re-verified from it (rev-final, rev-lead);
@@ -19,7 +20,11 @@
 // COORDINATION (#2168 S2/S3, never two scans). S2 (`personas/2168-worker-prereport`)
 // pins the three worker personas against the same script. Whoever merges first owns
 // this one file: S2 lands first → S3 rebases and extends it; S3 landed first → S2
-// extends this file. Never a second persona-scan test file.
+// extends this file. Never a second persona-scan test file. RESOLVED on this branch
+// the second way: S3's scan was cherry-picked here (its commit carries the reviewer
+// persona edits) and the S2 worker scan below extends it — one file, both halves.
+// PR #2236 carries BOTH the cherry-pick and the extension, so whichever of #2234 /
+// #2236 merges second rebases onto main and its diff for this file collapses.
 //
 // Every assertion below reads the file that ships, not a fixture: a test fixture could
 // pass while the shipped persona drifted, which is exactly the drift the pin exists
@@ -31,6 +36,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseWorkflow } from '../src/workflowmodel.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
@@ -85,3 +91,85 @@ for (const [name, text] of [['rev-std', revStd], ['rev-final', revFinal]] as con
     assert.match(text, /floor/, `${name} must state kickoff round numbers are a floor, not a count to inflate`);
   });
 }
+
+// --- S2 extension: the worker personas (#2168 S2) ---
+//
+// Same discipline as the reviewer tests above (#1968's twolayer.rs shape:
+// derived population, population floor, roster tie). The population is the
+// `worker-*.md` name pattern in `.github/agents/` — the convention worker
+// personas are filed under — NOT the live roster: `worker-quick.md` is a
+// committed persona even though this group's roster does not point at it,
+// and `process.md` is not a worker persona even though its block is
+// worker-kind (it is S4's surface, a different slice). The roster-tie test
+// below keeps the two honest: a worker-kind roster block whose profile the
+// file scan did not cover is a hole this pin names.
+//
+// Residual, stated: a worker-kind roster block pointing at a NON-worker-named
+// profile is outside both populations by construction; today that is only
+// `process.md`, and the roster-tie test below fails if a second one appears.
+//
+// The worker step this pins (`.github/agents/worker-*.md`, #2168 S2): one
+// numbered step before `report(done)` — run the script from the worktree at
+// the PR head and paste its summary line into the agent layer (MISMATCH
+// zero), no figure from recollection (base AND head), a property over a
+// count, twins for every claim the diff edits, red-before-green on a routed
+// behaviour change — repeated after EVERY push and on a body-only fix.
+
+const workerPersonaFiles = fs
+  .readdirSync(path.join(root, '.github', 'agents'))
+  .filter((f) => /^worker-.+\.md$/.test(f))
+  .sort();
+
+test('the scan reads the real worker persona files, not empty or foreign ones', () => {
+  assert.ok(
+    workerPersonaFiles.length >= 3,
+    `only ${workerPersonaFiles.length} worker persona file(s) found (${workerPersonaFiles.join(', ')}); ` +
+      'a population this small means the scan found almost nothing, not that the rule stopped applying',
+  );
+  for (const f of workerPersonaFiles) {
+    const text = personaOf(f);
+    const expectedName = f.replace(/\.md$/, '');
+    assert.match(
+      text,
+      new RegExp(`^---\\r?\\n[\\s\\S]*?name: ${expectedName}\\r?\\n`),
+      `${f} is not the persona its filename names`,
+    );
+    assert.ok(text.length > 2000, `${f} is implausibly short — the scan read the wrong file`);
+  }
+});
+
+test('every worker persona names the pre-report receipt check', () => {
+  for (const f of workerPersonaFiles) {
+    assert.match(
+      personaOf(f),
+      /pr-body-check/,
+      `${f} must name the pre-report receipt check (scripts/pr-body-check.cjs, #2168 S2)`,
+    );
+  }
+});
+
+test("the live roster's worker blocks point at personas the scan covered", () => {
+  const workflowText = fs.readFileSync(path.join(root, '.orrerix', 'workflow.yml'), 'utf8');
+  const { workflow, findings: syntax } = parseWorkflow(workflowText);
+  assert.deepEqual(
+    syntax.map((f) => `${f.severity} ${f.code}: ${f.message}`),
+    [],
+    "loomux's own workflow file must parse clean before its roster can be read",
+  );
+  assert.ok(workerPersonaFiles.length > 0, 'no worker persona files found; the scan below would be vacuous');
+  // The roster decides what is live, the file scan decides what is checked,
+  // and the two must not disagree for the worker-* namespace.
+  const uncovered: string[] = [];
+  for (const b of workflow.blocks) {
+    if (b.kind !== 'worker' || !b.profile) continue;
+    const rel = b.profile.replace(/^\.\//, '');
+    if (!/^worker-.+\.md$/.test(rel)) continue; // e.g. process.md — S4's, stated residual above
+    if (!workerPersonaFiles.includes(rel)) uncovered.push(`${b.id} -> ${rel}`);
+  }
+  assert.deepEqual(
+    uncovered,
+    [],
+    'worker-kind roster block(s) point at worker personas the receipt-check scan did not cover: ' +
+      uncovered.join(', '),
+  );
+});
