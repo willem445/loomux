@@ -125,7 +125,7 @@ pub const DISMISS_REASON_MAX: usize = super::humanq::DISMISS_REASON_MAX;
 /// limiter: the reason is already bounded by [`DISMISS_REASON_MAX`] where it is
 /// sanitized, so the longest line [`dismiss_notice`] can compose is under this
 /// and the `take` cuts nothing today.
-pub const DISMISS_NOTICE_CAP: usize = 900;
+pub const DISMISS_NOTICE_CAP: usize = 700;
 
 /// A board task's title is not written for this file, so it is cut to something
 /// a panel row can hold before it becomes an auto-raised item's text. Cutting
