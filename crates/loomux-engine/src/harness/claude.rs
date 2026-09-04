@@ -737,12 +737,7 @@ impl ClaudePane {
     /// pane the marker is a **display** convention and nothing scrapes for it —
     /// the PTY path's maskability contract has no counterpart here.
     pub fn wire_line(turn: &Turn) -> String {
-        let payload = serde_json::json!({
-            "type": "user",
-            "message": { "role": "user", "content": turn.text() },
-            "parent_tool_use_id": Value::Null,
-        });
-        format!("{payload}\n")
+        format!("{}\n", turn.text())
     }
 
     /// Close the child's stdin.
