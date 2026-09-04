@@ -407,9 +407,7 @@ impl Decoder {
             .get("event")
             .and_then(|e| e.get("delta"))
             .and_then(|d| {
-                (d.get("type").and_then(Value::as_str) == Some("text_delta"))
-                    .then(|| d.get("text").and_then(Value::as_str))
-                    .flatten()
+                d.get("text").or_else(|| d.get("thinking")).and_then(Value::as_str)
             })
             .unwrap_or_default();
         if text.is_empty() {
