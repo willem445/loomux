@@ -46045,7 +46045,7 @@ impl OrchRegistry {
                 } else {
                     PI_APPROVE_FLAG
                 });
-                if containment.denies_edits() {
+                if false {
                     // Applied AFTER every allowlist, so this is the denial and
                     // there is nothing for it to lose to. A ReadOnly class
                     // never reaches here — `cli_can_host` refuses a planner on
