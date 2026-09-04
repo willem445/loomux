@@ -293,7 +293,7 @@ fn a_malformed_line_never_costs_a_pi_session_its_cwd() {
     assert_eq!(find_session_cwd("pi", "ragged").unwrap().as_deref(), Some("/home/dev/ragged"));
 }
 #[test]
-fn a_pi_store_named_by_the_env_override_is_read_in_the_FLAT_layout_pi_writes_there() {
+fn a_pi_store_named_by_the_env_override_is_read_in_the_flat_layout_pi_writes_there() {
     // REVIEW ROUND 1, FINDING 1 — and the same failure class this whole slice
     // exists to fix, one store layout over.
     //
