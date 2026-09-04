@@ -148,6 +148,22 @@ test('every worker persona names the pre-report receipt check', () => {
   }
 });
 
+// The name alone is not the pin: a persona rewrite that keeps the string
+// `pr-body-check` but collapses the (a)-(e) step passes the test above while
+// deleting the substance. These assert the parts of the step a reviewer can
+// re-derive mechanically — the invocation form, the MISMATCH-zero contract,
+// and the after-every-push trigger — the same contract pins the reviewer half
+// makes (FIRST / MISMATCH).
+test('every worker persona keeps the receipt-check step, not just its name', () => {
+  for (const f of workerPersonaFiles) {
+    const text = personaOf(f);
+    assert.match(text, /--pr/, `${f} must state the script's --pr invocation form`);
+    assert.match(text, /MISMATCH/, `${f} must state the MISMATCH-zero contract`);
+    assert.match(text, /EVERY push/, `${f} must carry the after-EVERY-push trigger`);
+    assert.match(text, /--list-claims/, `${f} must name the --list-claims twin sweep`);
+  }
+});
+
 test("the live roster's worker blocks point at personas the scan covered", () => {
   const workflowText = fs.readFileSync(path.join(root, '.orrerix', 'workflow.yml'), 'utf8');
   const { workflow, findings: syntax } = parseWorkflow(workflowText);
