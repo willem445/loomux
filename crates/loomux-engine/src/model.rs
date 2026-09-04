@@ -822,7 +822,7 @@ pub const CLI_CAPS: &[CliCaps] = &[
         // prompts whatsoever, so there is no seam for `ReadOnly`'s denial of
         // the commit/push git subcommands to land on. A planner block is
         // refused on pi by `cli_can_host` for exactly that reason.
-        max_containment: Containment::NoEdits,
+        max_containment: Containment::None,
         containment_note: "--exclude-tools denies built-in tools by name and is applied after every allowlist, which reaches NoEdits — but pi has no bash-command deny and no permission prompts at all, so a ReadOnly class's git-mutation denial has nowhere to be expressed",
         effort_levels: EFFORT_LEVELS,
         effort_note: "--thinking <level> is a session-scoped flag over off|minimal|low|medium|high|xhigh|max, a superset of loomux's five; a model that does not support a level has it clamped or hidden per that model's own thinking-level map",
