@@ -61,7 +61,7 @@ A row without a **Resume** button says why it has none:
 | What the row says | What happened | What to do |
 | --- | --- | --- |
 | *Running now* | The group has live agents in this window | Focus its orchestrator pane |
-| *Session not yet identified* | Copilot and OpenCode mint their session ids after boot, and orrerix has not learned this one yet (or its watcher timed out) | Wait for it. If the watcher timed out there is nothing to resume by hand — start a fresh orchestrator, which reattaches to this group's existing board and roster |
+| *Session not yet identified* | Copilot and OpenCode mint their session ids after boot, and orrerix has not learned this one yet (or its watcher timed out). Claude Code and pi never show this row — orrerix assigns their ids before the pane starts | Wait for it. If the watcher timed out there is nothing to resume by hand — start a fresh orchestrator, which reattaches to this group's existing board and roster |
 | *Recorded session is no longer in the … store* | The CLI's own history no longer holds that conversation | Start a fresh orchestrator — it reattaches to this group's existing board and roster |
 | *This group's record could not be read* | The group's `group.json` is missing or damaged | Repair or remove that file; until then orrerix cannot tell which CLI ran the group |
 
@@ -76,13 +76,22 @@ Below that, the individual agent sessions orrerix found on this machine:
 - **OpenCode** — its own SQLite store, `~/.local/share/opencode/opencode.db`
   (`$XDG_DATA_HOME` and `$OPENCODE_DB` are honoured, exactly as opencode itself
   resolves them), resumed with `opencode --session <id>`.
+- **pi** — `~/.pi/agent/sessions/--<your-folder>--/<timestamp>_<id>.jsonl`
+  (`$PI_CODING_AGENT_SESSION_DIR` and `$PI_CODING_AGENT_DIR` are honoured, in
+  that order, exactly as pi itself resolves them), titled by the first real
+  prompt and resumed with `pi --session <id>`.
 
-Only *your own* opencode sessions are listed — the ones a solo pane or your own
-terminal created. Sessions belonging to an orchestration group live in that
-group's own store and are reopened by restoring the group from the
+If you have moved your pi store using the `sessionDir` key in
+`~/.pi/agent/settings.json` rather than either environment variable, orrerix
+does not read that file and will list no pi sessions. It will not list *wrong*
+ones.
+
+Only *your own* opencode and pi sessions are listed — the ones a solo pane or
+your own terminal created. Sessions belonging to an orchestration group live in
+that group's own store and are reopened by restoring the group from the
 **Orchestrations** list above, not as standalone panes: a bare
-`opencode --session <id>` pane would come back with no MCP tools and no task
-board.
+`opencode --session <id>` or `pi --session <id>` pane would come back with no
+MCP tools and no task board.
 
 Clicking a session opens a new pane in the session's original working directory
 and resumes it there. The pane is auto-named from the session.

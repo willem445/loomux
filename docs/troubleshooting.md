@@ -77,11 +77,12 @@ looks like an orrerix bug.
 
 ## An agent CLI isn't found
 
-Orchestration and agent panes drive the `claude`, `copilot`, and `opencode`
-CLIs — orrerix doesn't bundle them. The launcher warns inline when a selected
-role's CLI isn't installed. Make sure the CLI is on your `PATH` (open a fresh
-terminal and run `claude --version` / `copilot --version` / `opencode
---version`).
+Agent panes drive the `claude`, `copilot`, `opencode` and `pi` CLIs, and an
+orchestration group drives whichever of them its roles name — orrerix doesn't
+bundle any of them. The launcher warns inline when a selected role's CLI isn't
+installed. Make sure the CLI is on your `PATH` (open a fresh terminal and run
+`claude --version` / `copilot --version` / `opencode --version` /
+`pi --version`).
 
 An agent pane that dies with an error **stays open** so you can read what
 happened — it isn't closed out from under you.
