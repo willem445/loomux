@@ -297,7 +297,7 @@ fn turn_summary(usage: Option<&Usage>, cost: Option<&Cost>, stop: &StopReason) -
         StopReason::Aborted => "stopped: aborted".to_string(),
         StopReason::Error => "stopped: error".to_string(),
         StopReason::Other(s) if s.is_empty() => "stopped".to_string(),
-        StopReason::Other(s) => format!("stopped: {s}"),
+        StopReason::Other(_s) => "stopped".to_string(),
     };
     let mut parts = vec![format!("-- {stop}")];
     if let Some(u) = usage {
