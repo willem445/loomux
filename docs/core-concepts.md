@@ -23,6 +23,22 @@ running a shell, an agent CLI, or anything else you'd run in a terminal, with
 full color, escape-sequence, and wide-character fidelity. Panes can be **named**
 (`F2`, or double-click the title) so a wall of agents stays legible.
 
+### The header on a narrow pane
+
+Split the grid far enough and a pane's header runs out of room for its icons. It
+doesn't crowd them: below a threshold it keeps **minimize**, **maximize** and the
+**pane name** in the row and folds everything else — the splits, the overlay
+toggles, open-in-editor, the orchestration buttons, and the ✕ — behind a single
+**`⋯`** button. Hover it (or tab to it) and a small strip drops down carrying all
+of them, each with the tooltip and the action it had in the header.
+
+This is automatic and there is no setting: widen the pane, or close a side panel,
+and the icons come back to the row. The threshold has some slack in it on
+purpose, so dragging a divider slowly across it settles rather than flickering.
+The pane name is only ever shortened with an ellipsis — hover it for the full
+one. The strip floats *over* the terminal, so nothing about folding resizes or
+repaints what your shell is showing.
+
 ### Pane kinds
 
 Every pane starts on the **welcome screen**, where you pick what it becomes.

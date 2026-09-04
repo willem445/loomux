@@ -105,3 +105,22 @@ export async function createWorkflowPane(
 export function paneByName(page: Page, name: string) {
   return page.locator(".pane", { has: page.locator(".pane-title", { hasText: name }) });
 }
+
+/** Click a pane-header control by its own selector, whether the header is
+ *  showing it inline or has folded it into the `⋯` overflow menu (#2191).
+ *
+ *  A narrow pane keeps only minimize, maximize and the name in the row; every
+ *  other control moves into a menu that is `visibility: hidden` until opened, so
+ *  a bare `.click()` on one of them fails an actionability check the moment a
+ *  spec's grid gets tight enough to fold. The element is the SAME one either way
+ *  — the header's own button, moved, not a copy — so this only has to make it
+ *  visible first.
+ *
+ *  Clicking `⋯` (rather than hovering it) is deliberate: a click PINS the menu
+ *  open, so the strip cannot dismiss itself between this call and Playwright's
+ *  actionability wait on the target. */
+export async function clickHeaderControl(pane: Locator, selector: string): Promise<void> {
+  const overflow = pane.locator(".pane-btn.pane-overflow");
+  if (await overflow.isVisible()) await overflow.click();
+  await pane.locator(selector).click();
+}

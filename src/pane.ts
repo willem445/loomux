@@ -902,6 +902,12 @@ export class Pane implements VoiceTargetPane {
   private headerFolded = false;
   private headerSyncTimer: number | undefined;
   private overflowOpen = false;
+  /** Opened by a CLICK rather than by hover, so the pointer leaving does not
+   *  dismiss it. Cleared by every close. */
+  private overflowPinned = false;
+  /** True for exactly the duration of the `focus()` call Escape makes to hand
+   *  focus back to ⋯ — without it, that focus re-opens the menu Escape closed. */
+  private overflowRefocusing = false;
   private overflowCloseTimer: number | undefined;
   /** Registered only while the menu is open — a click-away listener per pane,
    *  live for every pane at once, would be a document listener per terminal. */
@@ -1512,6 +1518,10 @@ export class Pane implements VoiceTargetPane {
       overflowWidth: naturalWidth(this.overflowBtn) || OVERFLOW_BTN_W,
       folded: this.headerFolded,
     });
+    // The strip is placed from the ⋯ button's rect, so a pane that resized under
+    // an OPEN menu has a stale `left` even when the fold decision has not moved.
+    // Before the early return, not after it.
+    if (this.overflowOpen) this.positionOverflowMenu();
     if (plan.folded === this.headerFolded) return; // nothing to move
     this.applyHeaderFold(plan.folded, new Set(plan.overflow));
   }
@@ -1564,13 +1574,28 @@ export class Pane implements VoiceTargetPane {
     const menu = this.overflowMenu;
 
     btn.addEventListener("pointerenter", () => this.openOverflowMenu());
-    btn.addEventListener("focus", () => this.openOverflowMenu());
+    // Focus opens it — that is the keyboard route in. Suppressed for the ONE
+    // focus this class produces itself: Escape closes the menu and hands focus
+    // back to ⋯, and without the guard that hand-back re-opens what Escape just
+    // closed. `focus()` dispatches synchronously, so the flag is scoped to
+    // exactly that call.
+    btn.addEventListener("focus", () => {
+      if (this.overflowRefocusing) return;
+      this.openOverflowMenu();
+    });
     btn.addEventListener("click", (e) => {
-      // A click TOGGLES, for a pointer that never hovers (touch, and a click
-      // straight onto the button after a keyboard Escape closed it).
+      // A click PINS the menu open, and a second one closes it. Hover alone is
+      // not enough for every way this gets used: a touch pointer never hovers,
+      // and a hover-opened menu that dismisses itself while the pointer crosses
+      // the gap makes the icons feel like they are running away. Pinned, the
+      // menu stays until Escape, a click away, or a click back on ⋯.
       e.stopPropagation();
-      if (this.overflowOpen) this.closeOverflowMenu();
-      else this.openOverflowMenu();
+      if (this.overflowPinned) {
+        this.closeOverflowMenu();
+      } else {
+        this.openOverflowMenu();
+        this.overflowPinned = true;
+      }
     });
     menu.addEventListener("pointerenter", () => {
       clearTimeout(this.overflowCloseTimer);
@@ -1595,6 +1620,19 @@ export class Pane implements VoiceTargetPane {
     // it under the grid's pane-reorder pointerdown. Its buttons are already
     // exempt there; this covers the strip's own padding, which is not a button.
     menu.addEventListener("pointerdown", (e) => e.stopPropagation());
+    // Picking a control dismisses the strip, as any menu does. CAPTURE phase,
+    // because every folded button calls `stopPropagation` in its own handler —
+    // these are the header's buttons, unchanged, and that call is what stops a
+    // header click from also focusing the pane. The close is deferred to a
+    // microtask so it lands AFTER the action's own listener has run.
+    menu.addEventListener(
+      "click",
+      (e) => {
+        if (e.target === menu) return; // the strip's own padding
+        queueMicrotask(() => this.closeOverflowMenu());
+      },
+      true
+    );
   }
 
   private openOverflowMenu(): void {
@@ -1620,14 +1658,20 @@ export class Pane implements VoiceTargetPane {
       document.removeEventListener("pointerdown", this.overflowAwayListener, true);
       this.overflowAwayListener = null;
     }
+    this.overflowPinned = false;
     if (!this.overflowOpen) return;
     this.overflowOpen = false;
     this.overflowMenu.classList.remove("open");
     this.overflowBtn.setAttribute("aria-expanded", "false");
-    if (returnFocus && !this.overflowBtn.hidden) this.overflowBtn.focus();
+    if (returnFocus && !this.overflowBtn.hidden) {
+      this.overflowRefocusing = true;
+      this.overflowBtn.focus();
+      this.overflowRefocusing = false;
+    }
   }
 
   private scheduleOverflowClose(): void {
+    if (this.overflowPinned) return; // a clicked-open menu waits to be dismissed
     clearTimeout(this.overflowCloseTimer);
     this.overflowCloseTimer = window.setTimeout(
       () => this.closeOverflowMenu(),
