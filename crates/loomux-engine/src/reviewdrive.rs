@@ -2952,10 +2952,8 @@ fn lane_pass_settles(
     body_digest: Option<&str>,
     verified: bool,
 ) -> bool {
-    if lane_pass_is_current(verdict, head, body_digest) {
-        return true;
-    }
-    verdict.is_some_and(|v| v.pass_covers_body(head, body_digest, verified))
+    let _ = verified;
+    lane_pass_is_current(verdict, head, body_digest)
 }
 
 /// Whether this lane is open for exactly the revision now on the PR: it was
