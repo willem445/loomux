@@ -93,6 +93,18 @@ export function timeAgo(ms: number): string {
 const shortPath = (p: string): string => p.replace(/^.*[\\/](?=[^\\/]+[\\/][^\\/]+$)/, "…\\");
 
 export class SessionBrowser {
+  /** THE PANEL BODY'S ONE SCROLL BOX (#2334). Every list this view renders is
+   *  a child of this element, never of `this.el` directly: `this.el` is the
+   *  tab body `leftpanel.ts` owns, a fixed-height flex column, and anything
+   *  mounted straight into it grows with its content and is then simply clipped
+   *  — which is what happened to the Orchestrations group from #1563 until
+   *  #2334. The chrome above it (heading, filter box, mode tabs) is fixed-height
+   *  and belongs there; a LIST never does. `test/sessionsscroll.test.ts`
+   *  default-denies anything else being appended to the body.
+   *
+   *  It has no width of its own and no transition, so it reaches no PTY resize
+   *  (CLAUDE.md constraint 1). */
+  private scrollEl: HTMLElement;
   private listEl: HTMLElement;
   private searchEl: HTMLInputElement;
   /** The app's single session list (#493) — not a private copy. Every other
@@ -209,7 +221,18 @@ export class SessionBrowser {
     // `modeEl` keeps #2116's position in this list (right after the search
     // box): that slice augmented the append this slice replaced, and the mode
     // control has to stay mounted wherever the column is built.
-    this.el.append(head, this.searchEl, this.modeEl, this.orchEl, this.listEl, this.toggleEl);
+
+    // ONE SCROLL BOX FOR THE WHOLE LIST (#2334). The orchestrations group, the
+    // session rows and the hidden-sessions footnote scroll together; only the
+    // heading, the filter box and the mode tabs stay put. Before this they were
+    // all direct children of the body, so `.sessions-list` scrolled alone and
+    // the `flex: none` orchestrations group above it could not be reached at all
+    // once it outgrew the panel.
+    this.scrollEl = document.createElement("div");
+    this.scrollEl.className = "sessions-scroll";
+    this.scrollEl.append(this.orchEl, this.listEl, this.toggleEl);
+
+    this.el.append(head, this.searchEl, this.modeEl, this.scrollEl);
 
     // A note added or deleted anywhere — this list, a pane's own header — moves
     // the chip on every row that shows that session, and a rename moves the

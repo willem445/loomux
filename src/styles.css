@@ -1451,12 +1451,39 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
-.sessions-list { flex: 1; overflow-y: auto; padding: 0 8px 12px; }
-.sessions-list::-webkit-scrollbar { width: 9px; }
-.sessions-list::-webkit-scrollbar-thumb {
+/* #2334: THE ONE SCROLL BOX. Everything this browser LISTS lives in here — the
+   Orchestrations group, the session rows, and the hidden-sessions footnote — so
+   the panel scrolls as one list in both modes. `overflow-y` used to sit on
+   `.sessions-list`, with `.orch-list` a `flex: none` SIBLING of it in the same
+   fixed-height column (#1563 slice B). A `flex: none` item does not shrink, so
+   the orchestrations group took its full content height out of the column, the
+   rows above the fold had nowhere to scroll to, and the only thing that moved
+   was the session list squeezed in below it. Mine was never affected: it
+   renders no orchestration rows, so that sibling was empty there.
+
+   A flex COLUMN, so every child keeps the cross-axis stretch it had as a direct
+   child of `.leftpanel-body`: the delegate toggle is a <button>, and in a plain
+   block it would shrink to its own text. `min-height: 0` is belt-and-braces — a
+   non-`visible` overflow already resolves this item's automatic minimum size to
+   0, which is what lets it shrink below its content and scroll — but the
+   declaration is what a reader checks, not the cascade rule behind it.
+
+   NO PTY RESIZE (CLAUDE.md constraint 1): this is one more element inside the
+   fixed-width `.sessions-inner` column, and nothing here has a width.
+   `test/sessionsscroll.test.ts` default-denies a second scroll box in this
+   panel, and any content mounted outside this one. */
+.sessions-scroll {
+  flex: 1; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column;
+}
+.sessions-scroll::-webkit-scrollbar { width: 9px; }
+.sessions-scroll::-webkit-scrollbar-thumb {
   background: var(--line); border-radius: 5px;
   border: 2px solid var(--surface-1); background-clip: padding-box;
 }
+/* Inside the scroller now, so it is content-height and carries no overflow of
+   its own: the scrollbar belongs to the box holding the whole list. */
+.sessions-list { flex: none; padding: 0 8px 12px; }
 
 /* #2116 slice E2: a row is a WRAPPER holding two sibling buttons — the restore
    action and the notes chip. The hover/press feedback lives here rather than on
