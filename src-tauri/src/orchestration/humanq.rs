@@ -726,10 +726,10 @@ pub fn dismiss_notice(id: &str, source_tag: &str, reason: Option<&str>) -> Strin
         None => String::new(),
     };
     let text = format!(
-        "[orrerix] question {id} dismissed by the human (via {source_tag}) — NOT AN ANSWER: \
-         nothing was decided, and the hold this question was placing on the work is released. \
-         Un-block the task it cited and carry on; re-ask only if you still need the \
-         decision.{tail}"
+        "[orrerix] question {id} dismissed by the human (via {source_tag}){tail} — NOT AN \
+         ANSWER: nothing was decided, and the hold this question was placing on the work is \
+         released. Un-block the task it cited and carry on; re-ask only if you still need the \
+         decision."
     );
     text.chars().filter(|c| !c.is_control()).take(DISMISS_NOTICE_CAP).collect()
 }
