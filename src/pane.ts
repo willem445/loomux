@@ -1621,6 +1621,12 @@ export class Pane implements VoiceTargetPane {
       // policy's "folding buys nothing" guard refuse to fold a header down to a
       // single control — a welcome pane, whose only control is its ✕.
       overflowWidth: naturalWidth(this.overflowBtn) || OVERFLOW_BTN_W,
+      // No `chromeFloorWidth`: the default of 0 is what `styles.css` makes true,
+      // since every header child that is not a control is `flex-shrink: 1;
+      // min-width: 0` and can be squeezed to nothing before a control loses a
+      // pixel. Pass a real floor here if that rule is ever narrowed — reading
+      // `fixedWidth` on the two rungs below the fold is what collapsed a roomy
+      // header to `minimal` because a queue label WANTED 180px (#2335).
       stage: this.headerStage,
     });
     // The strip is placed from the ⋯ button's rect, so a pane that resized under

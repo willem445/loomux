@@ -52,8 +52,11 @@ const UNFOLD_AT = FULL_W + HYSTERESIS_W; // 383
 // The three rungs below it (#2335), each derived the same way and re-checked by
 // `the ladder's four rungs` below.
 const FOLDED_W = 243; // 100 fixed + 56 title floor + 2 priority * 29 + (23 + 6) for ⋯
-const SQUEEZED_W = 187; // the same row with the title floor released
-const MINIMAL_W = 129; // 100 fixed + (23 + 6) for ⋯, alone
+// The two rungs below the fold price the chrome at its FLOOR, which BASE leaves
+// at its default of 0 — so `fixedWidth` drops out of both. See
+// `chromeFloorWidth` in the module, and the test that varies it.
+const SQUEEZED_W = 87; // 2 priority * 29 + (23 + 6) for ⋯, with the title floor released
+const MINIMAL_W = 29; // (23 + 6) for ⋯, alone
 
 const fit = (over: Partial<HeaderFitInput> = {}) => planHeaderFit({ ...BASE, ...over });
 
@@ -295,8 +298,8 @@ test("the ladder's four rungs are the thresholds the fixture's arithmetic predic
   // Same role as `the arithmetic behind the fixture` above, for the two new
   // rungs: every literal in this section is derived here once.
   assert.equal(FOLDED_W, BASE.fixedWidth + TITLE_MIN_W + 2 * (23 + HEADER_GAP_W) + (23 + HEADER_GAP_W));
-  assert.equal(SQUEEZED_W, FOLDED_W - TITLE_MIN_W);
-  assert.equal(MINIMAL_W, BASE.fixedWidth + (23 + HEADER_GAP_W));
+  assert.equal(SQUEEZED_W, FOLDED_W - TITLE_MIN_W - BASE.fixedWidth);
+  assert.equal(MINIMAL_W, 23 + HEADER_GAP_W);
   // Strictly decreasing — a rung that is not narrower than the one above is not
   // on the ladder at all, which is the guard the welcome-pane test pins.
   assert.ok(FULL_W > FOLDED_W && FOLDED_W > SQUEEZED_W && SQUEEZED_W > MINIMAL_W);
@@ -478,6 +481,30 @@ test("an all-priority header still collapses at the narrowest rung", () => {
   assert.equal(narrow.folded, true);
   assert.deepEqual(narrow.inline, []);
   assert.deepEqual(narrow.overflow, CONTROLS.map((c) => c.id));
+});
+
+test("the lower rungs price the chrome at its FLOOR, not at what it wants", () => {
+  // The defect this axis exists for, caught by `queue-badge.spec.ts` rather than
+  // by anything here: `fixedWidth` counts the queue chip and the folder path at
+  // their natural width, so a chip that WANTED ~180px dragged the ladder all the
+  // way to `minimal` on a header with room to spare — and the pane name vanished
+  // because a label was long. Below the fold the chrome has already given way, so
+  // those rungs read what it cannot give up instead.
+  const fat = { fixedWidth: 500 };
+  // At 300px neither of the top two rungs fits (759 and 643), and the ladder
+  // stops at `squeezed` — whose demand is 87px, because the chrome's floor is 0.
+  const plan = fit({ ...fat, headerWidth: 300 });
+  assert.equal(plan.stage, "squeezed");
+  assert.deepEqual(plan.inline, ["min", "max"]);
+  // Discriminating half: hand the same call a chrome floor it cannot shrink
+  // below and the ladder DOES descend, so the axis is read rather than ignored.
+  assert.equal(fit({ ...fat, headerWidth: 300, chromeFloorWidth: 260 }).stage, "minimal");
+  // The floor is clamped to `fixedWidth` — chrome cannot be said to need more
+  // than it wants. Unclamped, 5000 would put every rung out of reach at 600px
+  // and drop to `minimal`; clamped to 500 it is `squeezed`.
+  assert.equal(fit({ ...fat, headerWidth: 600, chromeFloorWidth: 5000 }).stage, "squeezed");
+  assert.equal(fit({ ...fat, headerWidth: 600, chromeFloorWidth: 500 }).stage, "squeezed");
+  assert.equal(fit({ ...fat, headerWidth: 600, chromeFloorWidth: 520 }).stage, "squeezed");
 });
 
 // -------------------------------------------------- hysteresis across the rungs

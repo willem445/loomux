@@ -65,6 +65,26 @@ use, moving a control between the two sets is one `priority` flag in
 `Pane`'s `headerControls` registry and nothing else: the policy takes the set as
 data, and the menu, the measurement and the tests all follow it.
 
+## The chrome is priced twice, and that is deliberate
+
+`fixedWidth` — the CLI mark, the role badge, the chips and the folder/branch
+items, each at its natural, unshrunk width — is what the chrome **wants**. That
+is the right number for deciding when to FOLD, because folding is how the row
+buys the chrome the width it wants. It is the wrong number for the two rungs
+below the fold, which are what happens *after* the chrome has already given way.
+
+The first cut priced all four rungs off `fixedWidth`, and `queue-badge.spec.ts`
+found it on CI: with a stalled queue badge lit, the chip WANTED ~180px, the
+folder path wanted more, and the ladder descended to `minimal` on a header with
+hundreds of pixels to spare — the pane name disappearing because a label was
+long. The spec's drag-handle floor read `0px` against `55.4px` without the badge.
+
+So `squeezed` and `minimal` read `chromeFloorWidth` instead: the width the
+chrome **cannot** give up. It defaults to 0, and `pane.ts` passes nothing,
+because the stylesheet rule in the next section makes that true. The default and
+that rule are one decision; if the rule is ever narrowed, this is where a real
+floor goes.
+
 ## The narrowest rung, and the promise only flexbox can make (#2335)
 
 At `minimal` the pane name leaves the row outright rather than being clipped

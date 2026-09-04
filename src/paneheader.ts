@@ -105,6 +105,24 @@ export interface HeaderFitInput {
   controls: HeaderControl[];
   /** Width of the single overflow button that replaces the folded set. */
   overflowWidth: number;
+  /** How much of `fixedWidth` the chrome CANNOT give up, px.
+   *
+   *  `fixedWidth` is what the chrome WANTS — every item at its natural, unshrunk
+   *  width — and that is the right number for deciding when to FOLD, because
+   *  folding is how the row buys the chrome its room. It is the wrong number for
+   *  the two rungs below the fold: those are emergency rungs, and by the time
+   *  they are in play the chrome has already given way. Pricing them off
+   *  `fixedWidth` makes a header with a long queue label or a deep folder path
+   *  collapse to `minimal` at a width where the row has room to spare — the pane
+   *  name vanishing at 620px because a chip WANTED 180 (#2335, caught by
+   *  `queue-badge.spec.ts`'s drag-handle floor going to 0).
+   *
+   *  Defaults to 0, which is what `styles.css` makes true: every header child
+   *  that is not a control is `flex-shrink: 1; min-width: 0`, so the chrome can
+   *  be squeezed to nothing before a control loses a pixel. That coupling is the
+   *  reason this default is safe, and it is the thing to revisit — by passing a
+   *  real floor here — if that rule is ever narrowed. */
+  chromeFloorWidth?: number;
   /** Current stage — the only input that makes this decision hysteretic. */
   stage: HeaderFitStage;
   titleMinWidth?: number;
@@ -165,6 +183,12 @@ function ids(cs: HeaderControl[]): string[] {
  *  every narrow width, instead of it drifting in and out of the row 20px at a
  *  time.
  *
+ *  THE TOP TWO RUNGS AND THE BOTTOM TWO PRICE THE CHROME DIFFERENTLY, and that
+ *  asymmetry is the whole of `chromeFloorWidth` (see its doc). Folding is how
+ *  the row buys the chrome the width it WANTS, so `full` and `folded` read
+ *  `fixedWidth`. `squeezed` and `minimal` are what happens after the chrome has
+ *  already given way, so they read the width it cannot give up.
+ *
  *  A RUNG THAT BUYS NOTHING IS NOT ON THE LADDER. Each candidate is kept only if
  *  it is strictly narrower than the last rung kept above it, so:
  *   - a welcome pane, whose only control is its `✕`, never folds — the `⋯` costs
@@ -192,6 +216,7 @@ export function planHeaderFit(input: HeaderFitInput): HeaderFitPlan {
 
   const sum = (cs: HeaderControl[]) => cs.reduce((t, c) => t + controlW(c) + gap, 0);
   const fixed = px(input.fixedWidth);
+  const floor = Math.min(px(input.chromeFloorWidth ?? 0), fixed);
   const overflowCost = px(input.overflowWidth) + gap;
 
   const priority = controls.filter((c) => c.priority);
@@ -205,9 +230,10 @@ export function planHeaderFit(input: HeaderFitInput): HeaderFitPlan {
     overflow: HeaderControl[],
     titleFloor: number,
     title: TitleFit,
-    folded: boolean
+    folded: boolean,
+    chrome: number
   ): boolean => {
-    const need = fixed + titleFloor + sum(inline) + (folded ? overflowCost : 0);
+    const need = chrome + titleFloor + sum(inline) + (folded ? overflowCost : 0);
     const above = ladder[ladder.length - 1];
     if (above && need >= above.need) return false;
     ladder.push({
@@ -217,14 +243,17 @@ export function planHeaderFit(input: HeaderFitInput): HeaderFitPlan {
     return true;
   };
 
-  rung("full", controls, [], titleMin, "floor", false);
-  const folds = rung("folded", priority, foldable, titleMin, "floor", true);
+  rung("full", controls, [], titleMin, "floor", false, fixed);
+  const folds = rung("folded", priority, foldable, titleMin, "floor", true, fixed);
   // `squeezed` keeps whatever row survived above it and only releases the name's
   // floor — so on a pane where folding buys nothing it is the FULL row with a
   // shrinking name, not a folded one. Reading the fold decision off `folds`
   // rather than re-deriving it is what keeps those two answers one answer.
-  rung("squeezed", folds ? priority : controls, folds ? foldable : [], 0, "shrink", folds);
-  rung("minimal", [], controls, 0, "hidden", true);
+  // Both of these price the chrome at its FLOOR, not at what it wants — see
+  // `chromeFloorWidth`. Descending is then driven by the controls that cannot
+  // shrink, which is the only thing that can actually clip.
+  rung("squeezed", folds ? priority : controls, folds ? foldable : [], 0, "shrink", folds, floor);
+  rung("minimal", [], controls, 0, "hidden", true, floor);
 
   const headerWidth = px(input.headerWidth, -1);
   const current = ladder.findIndex((r) => r.plan.stage === input.stage);
