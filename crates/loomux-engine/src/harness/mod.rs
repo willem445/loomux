@@ -457,7 +457,12 @@ pub const UNKNOWN_LINE_MAX_BYTES: usize = 4096;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogRecord {
     pub seq: u64,
-    pub ts: u128,
+    /// Millis since the epoch, as **`u64`** rather than the `u128`
+    /// `Duration::as_millis` hands back. `#[serde(flatten)]` below routes the
+    /// whole struct through serde's `Content` buffer, which has no 128-bit
+    /// variant — a `u128` here fails at *runtime*, on the one path a type check
+    /// cannot see. `obs::now_ms` already narrows the same way.
+    pub ts: u64,
     #[serde(flatten)]
     pub body: LogBody,
 }
@@ -680,10 +685,10 @@ pub(crate) fn truncate_on_char_boundary(s: &str, max: usize) -> (&str, bool) {
     (&s[..end], true)
 }
 
-fn now_millis() -> u128 {
+fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 

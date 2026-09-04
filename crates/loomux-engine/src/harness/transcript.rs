@@ -75,13 +75,17 @@ pub struct Renderer {
 impl Renderer {
     /// `cols` is the pane's width at the time the pane was created. It is not
     /// updated on resize, and that is the rule above rather than an oversight.
+    ///
+    /// A `0` — which a UI really does report mid-layout — is treated as **1**,
+    /// the narrowest real terminal, not as a guessed comfortable width. The
+    /// floor exists only so the wrapper cannot be asked to fit a character into
+    /// no columns; anything above it is the caller's number and is honoured.
+    /// An earlier draft clamped to 20 and CI caught it immediately: that floor
+    /// silently overrode every genuinely narrow pane, which is a made-up width
+    /// rendered as though it were the pane's own.
     pub fn new(cols: u16) -> Self {
         Renderer {
-            // A zero-width pane would make the wrapper emit a newline per
-            // character and never terminate usefully; clamp rather than panic,
-            // because the width arrives from a UI and a renderer is not the
-            // place to discover a bad one.
-            cols: (cols as usize).max(20),
+            cols: (cols as usize).max(1),
             col: 0,
         }
     }
@@ -541,14 +545,28 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_width_pane_does_not_make_the_wrapper_spin() {
-        // The width arrives from a UI. A zero would otherwise emit a newline per
-        // character; the clamp is what stops a bad value becoming a rendering
-        // pathology, and this is the test that would hang without it.
-        let out = render_all(0, &[HarnessEvent::Text {
-            turn: TurnId(0),
-            delta: "abc".into(),
-        }]);
-        assert_eq!(out, "abc");
+    fn a_zero_width_pane_terminates_and_is_not_widened_to_a_guess() {
+        // Two properties, and the second is the one an earlier draft got wrong.
+        // A zero must not make the wrapper unable to place a character — and it
+        // must not be silently replaced by a comfortable width either, because
+        // that renders a number the pane never reported.
+        let out = render_all(
+            0,
+            &[HarnessEvent::Text {
+                turn: TurnId(0),
+                delta: "abc".into(),
+            }],
+        );
+        assert_eq!(out, "a\nb\nc", "zero is treated as one column, not as twenty");
+        // The control: a real narrow width is honoured exactly, so the floor
+        // above cannot be creeping upward unnoticed.
+        let out = render_all(
+            3,
+            &[HarnessEvent::Text {
+                turn: TurnId(0),
+                delta: "abcdef".into(),
+            }],
+        );
+        assert_eq!(out, "abc\ndef");
     }
 }
