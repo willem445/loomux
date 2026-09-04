@@ -106,6 +106,8 @@ import { adoptableSessionId, hasForkSession, sessionCliFromCommand } from "./pan
 // below exists to be matched against `listSessions()` rows, so the two must
 // name the same CLIs by construction (#722).
 import type { Cli } from "./sessionreconcile";
+import { PaneActivity } from "./paneactivity.ts";
+import type { PaneFacts } from "./agentrows.ts";
 
 // The header's icons, from the registry (#879 slice K). They were hand-drawn
 // inline here — inline so the toolbar renders identically regardless of
@@ -547,9 +549,20 @@ interface EmbedSlotState {
   dividerEl: HTMLElement;
 }
 
+/** Source of `Pane.key` (#2122 slice A): a per-WINDOW counter, so two panes
+ *  alive at once never share a key and a key is never reused. Deliberately not
+ *  persisted and deliberately not derived from anything the human or the
+ *  backend controls — its only job is to let a view diff its rows across a
+ *  re-render. `ptyId` cannot do that (it changes on every respawn) and the
+ *  pane name cannot either (the human renames panes). */
+let paneKeySeq = 0;
+
 export class Pane implements VoiceTargetPane {
   readonly el: HTMLElement;
   readonly term: Terminal;
+  /** This pane's identity for the lifetime of this window — see `paneKeySeq`.
+   *  Read through `facts()`; nothing else should key on it. */
+  readonly key = `pane-${++paneKeySeq}`;
   ptyId: number | null = null;
   name = "shell";
 
@@ -886,6 +899,12 @@ export class Pane implements VoiceTargetPane {
   /** Whether this pane is its grid's active pane (`setActive`). The one input
    *  that decides whether output keeps its per-frame cadence. */
   private isActivePane = false;
+  /** This pane's activity reducer (#2122 slice A2, `paneactivity.ts`): what it
+   *  has been outputting, when the human last typed into it, and whether it is
+   *  believed parked at a prompt. Fed from `acceptOutput`, `markFirstInput` /
+   *  `markHumanInput`, `setAttention` and `noteRosterIdle`; read back through
+   *  `facts()`. Pure state — no timer, no IPC, no DOM. */
+  private activity = new PaneActivity();
 
   constructor(private events: PaneEvents) {
     this.el = document.createElement("div");
@@ -1333,6 +1352,14 @@ export class Pane implements VoiceTargetPane {
    *  vector can only be added in one place. */
   private markFirstInput(): void {
     this.firstInputMs ??= Date.now();
+    // #2122 slice A2: a THIRD consumer of this one answer, with a third
+    // lifetime — `lastHumanInputMs` is marked on every call like `humanOrigin`,
+    // but it is a pane-level fact that also clears the at-prompt latch. It
+    // hangs here, and on `markHumanInput` below, for exactly the reason the two
+    // above do: "what counts as human input" has one answer, and the answer
+    // structurally excludes `term.onData` (#440 B2-R), which is what keeps a
+    // copilot boot-time OSC reply from reading as a keystroke.
+    this.activity.noteHumanInput(Date.now());
     // #720: the same single answer to "what counts as human input" also decides
     // when this pane's output is an interactive latency again, so the wake hangs
     // here rather than on `onData` (which also fires for xterm's own query
@@ -1363,6 +1390,13 @@ export class Pane implements VoiceTargetPane {
    *  note. */
   private markHumanInput(): void {
     this.firstInputMs ??= Date.now();
+    // #2122 slice A2, and the SAME call as in `markFirstInput` deliberately: an
+    // IME commit is the human typing. Reading the latch's human-input clear off
+    // one of these two siblings and not the other would be a bypass exactly the
+    // width of the composition path (CLAUDE.md: a guard reads every one of its
+    // inputs by one rule) — an IME user's keystroke would leave their pane
+    // reading `turn-done` after they had already answered it.
+    this.activity.noteHumanInput(Date.now());
     this.wakeOutput(); // #720 — before the mark, same load-bearing order as markFirstInput
     this.humanOrigin.markDeferred();
   }
@@ -1685,6 +1719,13 @@ export class Pane implements VoiceTargetPane {
    *  passes without touching a byte of the stream. */
   private acceptOutput(bytes: Uint8Array): void {
     if (this.disposed) return;
+    // #2122 slice A2: count the chunk as it ARRIVES, not as it is flushed —
+    // the throttle below decides when xterm sees these bytes, and "is this
+    // pane producing output" must not move with a rendering decision. One
+    // counter add; `Date.now()` (not `performance.now()`, which this method
+    // uses for the throttle) because the snapshot compares this against
+    // `firstInputMs`'s clock.
+    this.activity.noteOutput(bytes.length, Date.now());
     this.pendingOut.push(bytes);
     this.pendingOutBytes += bytes.length;
     const decision = decideFlush({
@@ -2660,6 +2701,12 @@ export class Pane implements VoiceTargetPane {
    *  arrives. */
   setAttention(reason: string | null, detail?: string): void {
     const normalizedDetail = reason ? detail ?? null : null;
+    // #2122 slice A2 — ABOVE the change gate, deliberately. That gate exists to
+    // stop the 3-second re-emits from thrashing the DOM; it is a rendering
+    // optimization, and the at-prompt latch must not inherit its filtering. A
+    // reducer fed only the readings that happened to differ from the last one
+    // would be reading a different input from the one this method is told.
+    this.activity.noteAttention(reason);
     if (!attentionChanged(this.attentionReason, this.attentionDetail, reason, normalizedDetail)) return;
     this.attentionReason = reason;
     this.attentionDetail = normalizedDetail;
@@ -4457,6 +4504,50 @@ export class Pane implements VoiceTargetPane {
     if (this.contentKind !== null) return this.contentKind;
     if (this.isSshPane) return "ssh";
     return this.orchGroup ? "orch" : this.launchedCommand ? "agent" : "terminal";
+  }
+
+  /** Hand this pane the roster's own idleness reading for its agent (#2122
+   *  slice A2) — "the reaper would call this idle / it holds no assignment",
+   *  from `idle_since_ms` on the tab-strip poll's summary. `null` for a pane
+   *  the roster does not cover, and for an orchestration pane before the first
+   *  poll lands. Explicitly NOT "parked at a prompt" (#2089): it feeds the
+   *  `idle` rung of `deriveAgentState` and nothing else. */
+  noteRosterIdle(idle: boolean | null): void {
+    this.activity.noteRosterIdle(idle);
+  }
+
+  /** This pane's whole state as plain data (#2122 slice A1) — the one thing the
+   *  Agents tab (#2122) and the pane Notes rows (#2116) read, so neither view
+   *  couples to `Pane`'s shape and both can be tested against literals
+   *  (`agentrows.ts` owns the type and what the reading MEANS).
+   *
+   *  Same contract as `tabPaneInfo()` below and for the same reason: it reads
+   *  no geometry, starts no IPC and touches no timer, so it is safe to call on
+   *  a hidden tab, on every row of a list, once a second. */
+  facts(): PaneFacts {
+    return {
+      key: this.key,
+      name: this.name,
+      kind: this.tabPaneInfo().kind,
+      // Read off the launch line, never branched on a CLI name to produce a
+      // name (#722/#841): `agentCli` is the shared first-token parse, and the
+      // SSH profile's declared far-end CLI is the only answer available for a
+      // pane whose local argv is an ssh client. A CLI neither knows shows up
+      // as null rather than inheriting some other CLI's identity.
+      harness: this.agentCli ?? this.sshDefaultCli ?? null,
+      orch: this.orchGroup
+        ? { group: this.orchGroup, agentId: this.orchAgent, role: this.orchRoleName }
+        : null,
+      sessionId: this.agentSessionId,
+      alive: this.ptyId !== null && !this.exited,
+      dormant: this.isDormant,
+      welcome: this.isWelcome,
+      attention: this.attentionReason
+        ? { reason: this.attentionReason, detail: this.attentionDetail }
+        : null,
+      held: this.heldReason,
+      activity: this.activity.snapshot(Date.now()),
+    };
   }
 
   /** Classify this pane for the per-tab agent counter / orch markers (#194 P4,
