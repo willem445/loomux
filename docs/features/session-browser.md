@@ -21,6 +21,13 @@ nav_order: 5
 
 Press **`Ctrl+Shift+P`** (or the *sessions* button) to open the session browser.
 
+The panel it opens in has **two tabs**. Sessions is this page; the second is the
+[Agents tab](agents-tab.html), which lists the panes already open in this window
+and what each one is doing. `Ctrl+Shift+P` and the *sessions* button always open
+the Sessions tab; the *agents* button opens the other one. Switching between them
+does not resize your panes — only opening and closing the panel does, exactly as
+it always has.
+
 A **Mine ⇄ Orchestration** control at the top picks which world you are looking
 at, and orrerix remembers your choice:
 

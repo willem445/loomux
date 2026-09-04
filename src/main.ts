@@ -8,6 +8,9 @@ import { TabManager } from "./tabs";
 import { TabBar } from "./tabbar";
 import type { Pane, PaneEvents, PaneOptions } from "./pane";
 import { SessionBrowser, timeAgo } from "./sessions";
+import { LeftPanel } from "./leftpanel";
+import { AgentsView } from "./agentsview";
+import { rosterIdleFor } from "./rosteridle";
 import {
   ensureOutputRouter,
   onPtyExit,
@@ -213,6 +216,23 @@ window.addEventListener("unhandledrejection", (e) => {
 });
 
 const sessionsEl = document.getElementById("sessions")!;
+/** The left panel (#2122 slice B): the same one in-flow panel `#sessions` has
+ *  always been, now hosting two TABS — the session browser and the Agents
+ *  overview. Constructed before either view because it owns the body element
+ *  each of them mounts into. Its open/close is still the single discrete human
+ *  click CLAUDE.md constraint 1 sanctions; a tab switch inside it moves no
+ *  column and so costs no PTY resize. */
+const leftPanel = new LeftPanel(sessionsEl);
+/** Built once the tab set and the pane lookup exist. Held as a nullable so the
+ *  refresh triggers below can be wired at the sites they belong to rather than
+ *  after it. */
+let agentsView: AgentsView | null = null;
+/** Re-derive the Agents rows and the needs-you badge. Total and cheap: before
+ *  the view exists it does nothing, and while its tab is closed it updates the
+ *  badge and returns without rendering a row. */
+function refreshAgents(): void {
+  agentsView?.refresh();
+}
 const workspaceEl = document.getElementById("workspace")!;
 const stackEl = document.getElementById("workspace-stack")!;
 const tabBarEl = document.getElementById("tab-bar")!;
@@ -343,6 +363,14 @@ tabs.onChange(() => {
   sideDock?.followActivePane();
 });
 
+// The Agents tab, in contrast, wants the WHOLE tab-set stream unfiltered
+// (#2122): it lists every pane of every tab, so a pane opening or closing
+// anywhere, a rename, or an attention flip in a background tab all change what
+// it should be showing. Nothing here re-reads a pane's live cwd, so the
+// over-firing that made the dock's own subscription a defect costs this one a
+// walk over open panes and a diff.
+tabs.onChange(() => refreshAgents());
+
 // Voice push-to-talk (#58, Alt+S): the global capture controller finds its
 // insertion target via the active pane (of the active tab).
 voiceController.init(() => activeGrid().activePane);
@@ -396,6 +424,11 @@ function eventsFor(ws: Workspace): PaneEvents {
       // through this event — the log records what the human called the pane,
       // not a lifecycle suffix.
       recordPaneSession(pane);
+      // And a rename does NOT reach `tabs.onChange` (#214's whole reason for
+      // this callback), while the Agents rows are keyed by pane but LABELLED
+      // by name (#2122). Both slices want this one event, for different
+      // reasons; neither subsumes the other.
+      refreshAgents();
     },
     // The connect gesture (#271): the pane can't build its own menu (needs the
     // cross-tab armed-connect state + backend wrappers), so it asks its host.
@@ -517,6 +550,12 @@ function applyAttention(items: AttentionItem[]): void {
   // tab bar when nothing changed.
   const next = tabAttention(items, ptyToWs);
   if (!sameAttention(tabs.tabAttention, next)) tabs.setTabAttention(next);
+  // Inside the gate on purpose (#2122): the 3 s scan re-emits an unchanged set,
+  // and a pass that applied nothing has moved no rung of the ladder. Four of the
+  // eight states are decided by the reason this loop just wrote, and `waiting`
+  // is also what arms the at-prompt latch — so this is the event that makes the
+  // needs-you badge move while the panel is closed and its ticker is off.
+  refreshAgents();
 }
 
 /** The tab layer as the orchestration event router sees it (OrchWiring). */
@@ -1598,7 +1637,7 @@ async function resumeDormantGroup(
   // where no placeholder recorded a group at all.
   const groupId = clicked.groupId ?? tabs.groupForWorkspace(ws.id);
   if (!groupId) {
-    sessions.toggle(); // no binding to resume from — let the human pick a session
+    leftPanel.toggle("sessions"); // no binding to resume from — let the human pick a session
     return { ok: true };
   }
   // Another card of this same group is already resuming — the whole group comes
@@ -1671,7 +1710,7 @@ async function resumeDormantGroup(
         "This restored group has no captured agent sessions — resume it from the session browser.",
         "info"
       );
-      sessions.toggle();
+      leftPanel.toggle("sessions");
       return { ok: true };
     }
 
@@ -1708,7 +1747,7 @@ async function resumeDormantGroup(
       const message =
         "This tab's saved layout holds more than one orchestrator and doesn't record which group each belongs to (saved by an older build) — resume each group from the session browser.";
       showToast(message, "error");
-      sessions.toggle();
+      leftPanel.toggle("sessions");
       return { ok: false, message };
     }
     if (!plan.orchestrator) {
@@ -1720,7 +1759,7 @@ async function resumeDormantGroup(
         ? "This group's orchestrator session has no saved conversation to resume — open the session browser."
         : "No captured orchestrator session for this group — open the session browser.";
       showToast(message, "info");
-      sessions.toggle();
+      leftPanel.toggle("sessions");
       return { ok: false, message };
     }
 
@@ -2363,7 +2402,7 @@ function reapIfExited(ws: Workspace, pane: Pane): void {
 }
 
 const sessions = new SessionBrowser(
-  sessionsEl,
+  leftPanel.sessionsBody,
   (s: SessionInfo) => {
     void restoreSession(s);
   },
@@ -2394,6 +2433,53 @@ const sessions = new SessionBrowser(
     });
   }
 );
+
+// #2122 slice B: the Agents view, and what each tab does when it becomes the
+// visible one. `onShow`/`onHide` fire exactly on the (panel open AND this tab
+// selected) transition, which is what the view's poll gate needs — component
+// scope and window visibility are different questions and it answers both.
+agentsView = new AgentsView(leftPanel.agentsBody, {
+  facts: () => tabs.tabs.flatMap((ws) => ws.grid.allPanes().map((pane) => pane.facts())),
+  focus: (key) => {
+    // Through `facts()`, not through `Pane.key` directly: slice A's contract is
+    // that the key is READ THROUGH THE PROJECTION, so the view and the lookup
+    // cannot come to disagree about what identifies a pane. One click, one walk.
+    for (const ws of tabs.tabs) {
+      for (const pane of ws.grid.allPanes()) {
+        if (pane.facts().key !== key) continue;
+        // The same three steps `orch-focus` takes, in the same order: the pane's
+        // TAB first, then the pane inside it, then the terminal.
+        tabs.switchTo(ws.id);
+        ws.grid.setActive(pane);
+        pane.focus();
+        return;
+      }
+    }
+  },
+  onCountChanged: (count) => {
+    leftPanel.setBadge("agents", count);
+    // The top-bar button carries it too, so the count is readable with the panel
+    // closed — which is the whole point of counting it.
+    const badge = document.getElementById("btn-agents-badge");
+    if (badge) {
+      if (count > 0) badge.textContent = String(count);
+      badge.hidden = count === 0;
+    }
+  },
+});
+leftPanel.attach("sessions", {
+  onShow: () => {
+    void sessions.refresh();
+    sessions.focusSearch();
+  },
+  onHide: () => {
+    /* the session list holds no timer and costs nothing while hidden */
+  },
+});
+leftPanel.attach("agents", {
+  onShow: () => agentsView?.show(),
+  onHide: () => agentsView?.hide(),
+});
 
 // Prefetch the session list in the background at boot (live-test feedback:
 // the first click into the sidebar felt slow because nothing had been
@@ -2842,7 +2928,7 @@ document.addEventListener(
         tabs.moveActiveTab(-1);
         break;
       case "toggle-sessions":
-        sessions.toggle();
+        leftPanel.toggle("sessions");
         break;
       case "toggle-git":
         activeGrid().activePane?.toggleGitView();
@@ -2908,7 +2994,8 @@ document.addEventListener(
 );
 
 // Top bar buttons.
-document.getElementById("btn-sessions")!.addEventListener("click", () => sessions.toggle());
+document.getElementById("btn-sessions")!.addEventListener("click", () => leftPanel.toggle("sessions"));
+document.getElementById("btn-agents")!.addEventListener("click", () => leftPanel.toggle("agents"));
 document.getElementById("btn-split-right")!.addEventListener("click", () => openPane("row"));
 document.getElementById("btn-split-down")!.addEventListener("click", () => openPane("column"));
 // Autosize (#936): even out every pane in the active tab. Same one-line call as
@@ -3108,6 +3195,24 @@ void (async () => {
   tabs.onChange(persistTabs);
   // The "+" button opens a real starting surface, same as the shortcut.
   tabBar = new TabBar(tabBarEl, tabs, () => void openUserTab());
+  // The Agents tab's `idle` rung reads the ROSTER (#2122): `idle_since_ms` off
+  // the strip poll's own summary. Subscribing to the read the strip already
+  // makes rather than adding a second one is doc/design/polled-views.md's rule
+  // (one read per strip) — the number is on the wire either way.
+  //
+  // Every pane is told, including the ones with no orchestration identity:
+  // `rosterIdleFor` answers null for those, which is "the roster does not cover
+  // this pane" and is what `deriveAgentState` reads as no evidence. Telling only
+  // SOME panes would leave a pane that lost its group binding wearing its last
+  // reading forever.
+  tabBar.onStrip((strip) => {
+    for (const ws of tabs.tabs) {
+      for (const pane of ws.grid.allPanes()) {
+        pane.noteRosterIdle(rosterIdleFor(strip, pane.orchGroupId, pane.orchAgentId));
+      }
+    }
+    refreshAgents();
+  });
 
   // Persist the freshly rebuilt session once (records the layout + the remembered
   // restore preference); the onChange subscription covers every change after. A

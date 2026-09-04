@@ -559,6 +559,26 @@ const TIMERS: TimerRow[] = [
     overlapGate: null,
   },
   {
+    key: "src/agentsview.ts@AGENTS_TICK_MS",
+    cadenceMs: 1000,
+    policy: "gated",
+    reason:
+      "The Agents tab's re-derive (#2122). Component-scoped to a tab INSIDE a panel — armed by " +
+      "LeftPanel's onShow for the agents tab and cleared by its onHide, so it is off whenever the " +
+      "panel is closed OR the Sessions tab is the one selected — and gated on window visibility " +
+      "within that, which is the second question component scope does not answer. It carries NO " +
+      "IPC: a tick is one Pane.facts() per open pane (a projection of state the pane already " +
+      "holds, no geometry, no invoke) plus a keyed diff that touches only the rows that changed. " +
+      "The cadence exists because two inputs move with no event behind them — the output burst " +
+      "PaneActivity accumulates, and the roster's idle reading, which lands on tabbar's own 4 s " +
+      "strip poll — so a pane that stops painting has to be NOTICED to stop reading as working.",
+    debt: null,
+    // No IPC per tick, so there is no in-flight read for a second tick to
+    // overlap; the body is synchronous and idempotent. Same shape, and the
+    // same null, as tabbar's hover-preview repaint.
+    overlapGate: null,
+  },
+  {
     key: "src/main.ts@20_000",
     cadenceMs: 20000,
     policy: "argued",

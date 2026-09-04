@@ -29,6 +29,10 @@
         </div>
         <div id="actions">
           <button id="btn-sessions" class="bar-btn" title="Session browser (Ctrl+Shift+P)">⟲ sessions</button>
+          <!-- #2122: the Agents tab of the same left panel. Its own button rather than
+               only a tab inside the panel, so the needs-you count is visible with the
+               panel closed and one click opens straight onto it. -->
+          <button id="btn-agents" class="bar-btn" title="Agents — every pane in this window and what it is doing">◍ agents<span id="btn-agents-badge" class="bar-btn-badge" hidden></span></button>
           <button id="btn-split-right" class="bar-btn" title="New pane right (Ctrl+Shift+E)">◫</button>
           <button id="btn-split-down" class="bar-btn" title="New pane below (Ctrl+Shift+O)">⬓</button>
           <button id="btn-autosize" class="bar-btn" title="Autosize — even out every pane in this tab (Ctrl+Shift+A)">▦</button>

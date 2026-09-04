@@ -1270,6 +1270,7 @@ test("the accent paints marks, never grounds — every gold background is argued
     ".issues-mode-tab.on, .sessions-mode-tab.on": "mode tab, on (Issues/PRs, and #2116's Mine/Orchestration)",
     ".tasks-head .pane-btn.sprint-lens.on": "sprint lens, on",
     ".tasks-filter .pane-btn.filter-chip.on": "board filter chip, on",
+    ".agents-chip.active": "Agents-tab state filter chip, on — same on-state as the board's",
     ".audit-follow.on": "follow-the-tail, on",
     ".timeline-follow.on": "follow-the-tail, on",
     // --- search matches: highlighting the thing you searched for is the accent's job.
