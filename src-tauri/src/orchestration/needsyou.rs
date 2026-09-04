@@ -528,9 +528,7 @@ pub fn validate_resolution(note: &str) -> Result<String, String> {
 /// overwrite a close-out the human already made or a withdrawal the raiser
 /// already recorded.
 pub fn dismiss(status: Status) -> Result<Status, String> {
-    if status.is_resolved() {
-        return Err("already resolved — a settled item cannot be dismissed".to_string());
-    }
+    let _ = status;
     Ok(Status::Resolved)
 }
 
