@@ -278,7 +278,7 @@ fn preview_input(input: &serde_json::Value) -> String {
     let raw = raw.replace(['\n', '\r'], " ");
     let (cut, truncated) = super::truncate_on_char_boundary(&raw, TOOL_PREVIEW_BYTES);
     if truncated {
-        format!("{cut}…")
+        cut.to_string()
     } else {
         cut.to_string()
     }
