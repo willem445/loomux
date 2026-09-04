@@ -273,19 +273,27 @@ the TUI. `-t` is already forced for a remote TUI, so a pty was always expected,
 and the alternative — a CLI that cannot be found at all — is strictly worse.
 Documented for users in `docs/features/ssh-panes.md`.
 
-**Known limit, stated rather than guessed around.** `csh`/`tcsh` reject `-l`
-combined with other options, so an account whose shell is one of those cannot run
-the wrapped form. No mitigation is attempted: guessing per-shell flag grammar
-from here is the same class of guess as guessing the shell, and such a host is
-still reachable as a plain login shell (**Remote CLI = None**). If that turns out
-to matter, the honest fix is a declared field, the way `remoteShell` already is.
+**Known limit, stated rather than guessed around.** csh(1) documents `-l` as
+"the shell is a login shell (only applicable if `-l` is the only flag
+specified)", so an account whose shell is `csh`/`tcsh` cannot run the wrapped
+form. No mitigation is attempted: guessing per-shell flag grammar from here is
+the same class of guess as guessing the shell, and such a host is still
+reachable as a plain login shell (**Remote CLI = None**). If it turns out to
+matter, the honest fix is a declared field, the way `remoteShell` already is.
+
+**What has actually been exercised.** `test/sshcommand.test.ts` runs the built
+string through a real local shell on every CI platform, so the wrapped form is
+known to parse and to source an interactive-only rc file under **dash**
+(ubuntu-22.04's `/bin/sh`), **bash in sh-mode** (macos-latest) and **bash**
+(windows-latest, via Git Bash). zsh and fish are covered by the declaration
+model, not by a run.
 
 **`buildCmdRemoteCommand` is deliberately untouched.** cmd.exe has no
 login/non-login distinction and no per-user rc file that sshd's `-c` invocation
 skips, so there is no lost `PATH` for a wrap to recover — and `"$SHELL"` would
-reach cmd.exe as four literal characters rather than an expansion. A test pins
-that path byte-for-byte against its pre-#2395 shape, so "unchanged" is checked
-rather than asserted.
+reach cmd.exe as that literal text rather than an expansion (cmd.exe's own
+variable syntax is `%VAR%`). A test pins that path byte-for-byte against its
+pre-#2395 shape, so "unchanged" is checked rather than asserted.
 
 ## The launch seam, and the two rules it taught
 

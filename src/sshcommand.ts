@@ -171,9 +171,9 @@ function buildPosixRemoteCommand(remoteCwd: string | undefined, remoteCommand: s
  *  Deliberately UNCHANGED by #2395's login-shell wrap, and not by oversight:
  *  cmd.exe has no login/non-login distinction and no per-user rc file that
  *  sshd's `-c` invocation skips, so there is no lost `PATH` for a wrap to
- *  recover — and `"$SHELL"` would reach cmd.exe as four literal characters,
- *  not an expansion. A test pins this path byte-for-byte against its
- *  pre-#2395 shape.
+ *  recover — and `"$SHELL"` would reach cmd.exe as that literal text, not an
+ *  expansion (cmd.exe's own variable syntax is `%VAR%`). A test pins this path
+ *  byte-for-byte against its pre-#2395 shape.
  *
  *  ALWAYS prefixes with `cd /d <quoted-cwd-or-".">` — even when the caller
  *  passed no `remoteCwd` — so the emitted string can never begin with a `"`
