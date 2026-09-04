@@ -601,9 +601,9 @@ pub fn dismiss_notice(id: &str, task: Option<&str>, reason: Option<&str>) -> Str
         None => String::new(),
     };
     let text = format!(
-        "[orrerix] needs-you item {id}{about} dismissed by the human — NOT A LOOK: they did not \
-         open it, nothing was judged, and the task is exactly where it was. Do not raise this \
-         ask again unless something changed.{tail}"
+        "[orrerix] needs-you item {id}{about} dismissed by the human{tail} — NOT A LOOK: they \
+         did not open it, nothing was judged, and the task is exactly where it was. Do not \
+         raise this ask again unless something changed."
     );
     text.chars().filter(|c| !c.is_control()).take(DISMISS_NOTICE_CAP).collect()
 }
