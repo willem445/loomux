@@ -28464,7 +28464,7 @@ impl OrchRegistry {
                 }
             };
             questions[idx].status = next;
-            questions[idx].reason = reason.clone();
+            questions[idx].answer = reason.clone();
             questions[idx].settled_by = Some(tag.clone());
             questions[idx].settled_ms = Some(now_ms());
             let out = questions[idx].clone();
