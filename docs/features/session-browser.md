@@ -20,12 +20,25 @@ nav_order: 5
 ## Session browser
 
 Press **`Ctrl+Shift+P`** (or the *sessions* button) to open the session browser.
-It has two parts: an **Orchestrations** list at the top, and a list of individual
-agent sessions below it.
+
+A **Mine ⇄ Orchestration** control at the top picks which world you are looking
+at, and orrerix remembers your choice:
+
+- **Mine** — the sessions you started yourself: every pane you launched by hand,
+  and nothing an orchestration minted.
+- **Orchestration** — everything an orchestration group minted, with the
+  **Orchestrations** list above it (the primary route back into a recorded
+  group, described below).
+
+The split is on whether orrerix recorded an orchestration identity for the
+session, not on a list of role names — so a workflow that invents a new role
+puts its sessions in **Orchestration**, where they belong, rather than quietly
+mixing them in with your own.
 
 ### Orchestrations
 
-Every orchestration group orrerix has a record of, on every agent CLI, newest
+Shown in **Orchestration** mode, above the session list. Every orchestration
+group orrerix has a record of, on every agent CLI, newest
 activity first with running groups at the top. **Resume** brings the whole group
 back — same group id, state, task board and audit history, with fresh MCP
 identity wired into the resumed orchestrator conversation.
@@ -75,14 +88,19 @@ decided by the recorded membership the chip reflects, never by which CLI wrote
 the session. See
 [Restart after orrerix closes](../orchestration.html#persistence--restart).
 
-#### Agent sessions are hidden by default
+#### Delegate sessions are hidden by default
 
 A group mints a session per delegate and a fresh one on every rejoin, so a
 machine that has run a few fleets accumulates hundreds of worker and reviewer
-rows against the handful you would ever click. By default the list shows only
-**your own sessions and orchestrator sessions**; everything else sits behind a
-**Show N hidden agent sessions** button under the list, which toggles them all
-back on.
+rows against the handful you would ever click. In **Orchestration** mode the
+list therefore shows only **orchestrator** sessions by default; everything else
+sits behind a **Show N hidden agent sessions** button under the list, which
+toggles them all back on.
+
+The two controls answer different questions and compose rather than replace each
+other: the mode picks *whose* sessions, and this button then decides *how much*
+of an orchestration you see. In **Mine** there are no delegates to hide, so the
+button is not shown at all.
 
 Nothing is filtered out of the *scan* — every session is still found, still
 badged, and one click away. Restoring a group still brings its workers and
