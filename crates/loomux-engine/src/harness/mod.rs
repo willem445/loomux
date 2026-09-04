@@ -303,11 +303,16 @@ pub enum CompactTrigger {
 /// header, rule 2). A structured pane never emits one of these; R1 defines the
 /// vocabulary and the PTY adapter (#888 A4-18′) fills it in.
 ///
-/// **The `tag` is load-bearing, not style.** [`HarnessEvent`] is internally
-/// tagged, and an internally-tagged newtype variant can only hold something that
-/// serializes as a map — a unit variant like `ReadyMarker` would otherwise
-/// serialize as the bare string `"ready_marker"` and the whole event would fail
-/// to serialize at runtime, on the one variant no decoder test produces.
+/// **The `tag` is a shape choice, and an earlier comment here claimed it was
+/// load-bearing — a red-before-green round disproved that.** The worry was that
+/// [`HarnessEvent`] is internally tagged, so its newtype variant could only hold
+/// something serializing as a map, and a unit variant like `ReadyMarker` would
+/// serialize as the bare string `"ready_marker"` and blow up at runtime. Removing
+/// this tag on a scratch branch reddened **nothing** (#84 R1 red round 7): serde's
+/// tagged serializer handles a unit variant itself. What the tag actually buys is
+/// a self-describing wire shape — `{"kind":"observed","observed":"ready_marker"}`
+/// rather than a bare variant name — which a remote client branches on more
+/// safely. Keep it for that reason; do not keep it for the one it did not have.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "observed", rename_all = "snake_case")]
 pub enum ObservedEvent {
@@ -831,11 +836,19 @@ mod tests {
 
     #[test]
     fn every_event_variant_survives_a_json_round_trip() {
-        // Not a formality. `HarnessEvent` is internally tagged, which can only
-        // carry a payload that serializes as a MAP — so `Observed(ReadyMarker)`,
-        // a unit variant, is the one shape that would fail at runtime while
-        // every decoder test stayed green, because the decoder never produces
-        // an `Observed` at all. The round trip is what catches it.
+        // A CONTRACT GUARD on the enum's wire shape, and it is labelled that
+        // rather than sold as behaviour coverage. Every variant here must
+        // round-trip because the per-pane event log and the remote protocol both
+        // carry these across a process boundary — and four of them
+        // (`PermissionRequest`, `PermissionSettled`, `Observed`, `Exited`) are
+        // produced by no decoder path in R1, so no decoder test would ever
+        // serialize them.
+        //
+        // What it does NOT guard, stated because an earlier comment here claimed
+        // it did: removing `ObservedEvent`'s `#[serde(tag)]` reddens nothing
+        // (#84 R1 red round 7 came back green). Serde's tagged serializer handles
+        // a unit variant, so this test discriminates a variant that cannot round
+        // trip at all — not the tagging choice above it.
         let all = [
             HarnessEvent::Booted {
                 session: None,
