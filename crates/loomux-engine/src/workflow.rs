@@ -3525,7 +3525,13 @@ impl ReviewVerdict {
 /// reproduces it in POSIX shell, and
 /// `the_shim_and_the_gate_agree_about_which_passes_a_verification_covers`
 /// (`src-tauri/tests/orchestration.rs`) is what keeps the two honest: it walks
-/// one set of verdict files past both halves and asserts they answer alike.
+/// one set of verdict files past both halves and asserts they answer alike —
+/// including the shapes two successive approximations of [`sanitize_digest`]
+/// got wrong in OPPOSITE directions: prose that begins with a 64-hex word (the
+/// shim accepted, Rust refuses) and an uppercase digest (the shim refused, Rust
+/// accepts and lowercases). The shim now derives line 5 through one helper that
+/// reproduces this function and [`parse_verdict_file`]'s split, rather than
+/// testing the first whitespace field.
 /// A glob was cited here before that test existed (#2308 review 4, R1), and a
 /// citation to a name nothing answers to is worse than none — it reads as
 /// coverage.

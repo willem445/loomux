@@ -1390,6 +1390,52 @@ loomux_sha256() { # stdin → 64 hex chars, or empty
   case "$_h" in *[!0-9a-f]*) _h='' ;; esac
   printf '%s' "$_h"
 }
+# Read a verdict file's LINE 5 the way `workflow::parse_verdict_file` does, and
+# apply `workflow::sanitize_digest` to what that yields. Sets `v_digest` (the
+# lowercased 64-hex digest, or empty when the line does not carry one) and
+# `v_mark` (1 when the #2168 E2 `verified-body` mark is present).
+#
+# **One helper because the alternative is three approximations** (#2308 review 5).
+# Every earlier cut tested `${line%% *}` — the first whitespace FIELD — while
+# Rust runs `sanitize_digest` over the WHOLE line minus a trailing mark. The two
+# disagree on both sides at once, and each direction was reached by a real
+# fixture: line 5 reading `<64-hex> is the body digest this pass read` is a
+# first field of 64 hex, so the shim ACCEPTED a pass the Rust half refuses (loose,
+# on the half that refuses merges); and an UPPERCASE 64-hex digest is refused by a
+# `[!0-9a-f]` class while `sanitize_digest` accepts any case and lowercases
+# (strict, so a drive cycles to `drive-stalled` instead of merging). Neither is
+# reproduction. `the_shim_and_the_gate_agree_about_which_passes_a_verification_covers`
+# runs both halves over the same files, including those two.
+loomux_verdict_line5() { # $1=verdict file → sets v_digest, v_mark
+  v_l=$(head -n5 "$1" 2>/dev/null | tail -n1)
+  v_l=$(printf '%s' "$v_l" | tr -d '\r')
+  v_mark=0
+  v_sp=' '
+  v_tb=$(printf '\t')
+  # `trim_end` before the mark split, exactly as `parse_verdict_file` orders it.
+  while :; do
+    case "$v_l" in *"$v_sp"|*"$v_tb") v_l=${v_l%?} ;; *) break ;; esac
+  done
+  case "$v_l" in
+    *" verified-body") v_l=${v_l% verified-body}; v_mark=1 ;;
+  esac
+  # …then `sanitize_digest`, which trims BOTH ends and demands exactly 64 hex.
+  # Interior whitespace is deliberately NOT stripped: removing it could turn a
+  # 65-character line into 64 hex and accept what Rust refuses, which is the very
+  # direction this helper exists to close.
+  while :; do
+    case "$v_l" in
+      "$v_sp"*|"$v_tb"*) v_l=${v_l#?} ;;
+      *"$v_sp"|*"$v_tb") v_l=${v_l%?} ;;
+      *) break ;;
+    esac
+  done
+  v_digest=''
+  case "$v_l" in
+    *[!0-9a-fA-F]*) : ;;
+    *) [ ${#v_l} -eq 64 ] && v_digest=$(printf '%s' "$v_l" | tr 'A-F' 'a-f') ;;
+  esac
+}
 # #256: CLAIM a one-time grant without spending it yet — the MERGE gate's grant
 # (`merge_grants/pr-<N>`) is the only one-time grant left, and it must be
 # consumed only when the real `gh` call it authorizes actually SUCCEEDS (live
@@ -2239,7 +2285,8 @@ if [ -f "$ORX_GD/merge_gate" ]; then
           [ -f "$b_vf" ] || continue
           [ "$(head -n1 "$b_vf" 2>/dev/null)" = "pass" ] || continue
           [ "$(head -n2 "$b_vf" 2>/dev/null | tail -n1)" = "$cur_head" ] || continue
-          if [ "$(head -n5 "$b_vf" 2>/dev/null | tail -n1)" = "$b_now verified-body" ]; then
+          loomux_verdict_line5 "$b_vf"
+          if [ "$v_mark" = "1" ] && [ -n "$v_digest" ] && [ "$v_digest" = "$b_now" ]; then
             b_verified=1
           fi
         done
@@ -2253,15 +2300,14 @@ if [ -f "$ORX_GD/merge_gate" ]; then
           # and re-recording is the same action whether or not it was load-bearing.)
           [ "$(head -n1 "$b_vf" 2>/dev/null)" = "pass" ] || continue
           [ "$(head -n2 "$b_vf" 2>/dev/null | tail -n1)" = "$cur_head" ] || continue
-          # Line 5 is the body digest it reviewed, as its FIRST field — the rest
-          # of the line is the #2168 E2 marker when there is one. Absent (a
+          # Line 5 is the body digest it reviewed, read through the one helper
+          # that reproduces `parse_verdict_file` + `sanitize_digest`. Absent (a
           # verdict recorded before #565, or one whose body gh could not read)
           # reads as EMPTY, which equals no digest and so refuses — unknown is
-          # never "unbound, therefore fine", and `${b_l5%% *}` leaves a
-          # single-field line exactly as it found it.
-          b_l5=$(head -n5 "$b_vf" 2>/dev/null | tail -n1)
-          b_vd=${b_l5%% *}
-          if [ "$b_vd" = "$b_now" ]; then
+          # never "unbound, therefore fine".
+          loomux_verdict_line5 "$b_vf"
+          b_vd=$v_digest
+          if [ -n "$b_vd" ] && [ "$b_vd" = "$b_now" ]; then
             continue
           fi
           # The delegation. This pass is at an EARLIER body, and it is accepted
@@ -2269,25 +2315,15 @@ if [ -f "$ORX_GD/merge_gate" ]; then
           # this pass stayed bound to the head that would merge — so the code it
           # approved has not moved.
           #
-          # **A pass with no READABLE digest is refused, and "non-empty" was not
-          # that test** (#2308 review 4, W1). A verdict file written before #565
-          # has SUMMARY PROSE on line 5, so `${b_l5%% *}` is a word — non-empty,
-          # and the old guard let it through, while `mergeq::body_unchanged`
-          # refused the same file because `sanitize_digest` returns empty for
-          # anything that is not 64 hex characters. The two halves of one gate
-          # disagreed, and in the LOOSE direction on the half that actually
-          # refuses the merge: a pre-#565 pass rode in on somebody else's
-          # verification. So the shim reproduces `sanitize_digest`'s test rather
-          # than approximating it — 64 characters, all lowercase hex, which is
-          # what the tool writes and what `b_now` is compared against two lines
-          # up. Agreement is executed, not asserted:
+          # **A pass with no READABLE digest is refused** (#2308 reviews 4 and 5).
+          # A verdict file written before #565 has SUMMARY PROSE on line 5, and
+          # two successive approximations of `sanitize_digest` let one through:
+          # first "non-empty", then "the first field is 64 lowercase hex" — which
+          # a prose line beginning with a digest satisfies. `v_digest` is the
+          # helper's answer over the whole field, so the two halves now decide
+          # this from one rule. Agreement is executed, not asserted:
           # `the_shim_and_the_gate_agree_about_which_passes_a_verification_covers`.
-          b_ok=0
-          case "$b_vd" in
-            *[!0-9a-f]*) : ;;
-            *) [ ${#b_vd} -eq 64 ] && b_ok=1 ;;
-          esac
-          if [ "$b_verified" = "1" ] && [ "$b_ok" = "1" ]; then
+          if [ "$b_verified" = "1" ] && [ -n "$b_vd" ]; then
             continue
           fi
           b_bad="$b_bad $b_r"

@@ -42640,6 +42640,28 @@ fn the_shim_and_the_gate_agree_about_which_passes_a_verification_covers() {
             false,
         ),
         (
+            // Review 5, finding 1. The shim used to test line 5's FIRST
+            // WHITESPACE FIELD, so prose that happens to BEGIN with a digest
+            // read as readable and the delegation accepted a pass the Rust half
+            // refuses — `sanitize_digest` runs over the whole field, and a line
+            // with spaces in it is not 64 hex. Loose, on the half that refuses
+            // merges: the same direction and the same population as review 4's
+            // W1, one shape further in.
+            "PRE-#565 whose prose BEGINS with a 64-hex word — still no digest",
+            format!("pass\n{HEAD}\n1\nrev-9\n{then} is the body digest this pass read\nfine\n"),
+            false,
+        ),
+        (
+            // Review 5, finding 2, the other direction. `sanitize_digest`
+            // accepts any case and lowercases; a `[!0-9a-f]` class in the shim
+            // refused uppercase outright. Fail-closed, so it cost a cycling
+            // drive rather than a bad merge — but a divergence either way, and
+            // "reproduces exactly" has to mean both directions.
+            "an UPPERCASE 64-hex digest — accepted by both, lowercased",
+            format!("pass\n{HEAD}\n1\nrev-9\n{}\nfine\n", then.to_ascii_uppercase()),
+            true,
+        ),
+        (
             "the current body itself — covered without any delegation",
             format!("pass\n{HEAD}\n1\nrev-9\n{now}\nfine\n"),
             true,
