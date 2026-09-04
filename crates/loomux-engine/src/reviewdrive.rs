@@ -6107,6 +6107,7 @@ mod tests {
     fn a_state_clock_never_outruns_the_drives_own_age() {
         // The pre-#2110 entry, reconstructed the way serde would: a real
         // `started_ms`, and a `state_since_ms` the older build never wrote.
+        let limits = DriveLimits::default();
         let mut old = entry_at(DriveState::CiWait);
         old.started_ms = 1_000;
         old.state_since_ms = 0;
@@ -6117,8 +6118,11 @@ mod tests {
             minutes_ms(200),
             "a drive that has existed for 200 minutes cannot have been in one state longer"
         );
+        // Asked of `state_bound_ms` rather than of the constant: since #2168 E1
+        // `CI_WAIT_BOUND_MS` is the slack over `fix_timeout_minutes`, so a
+        // comparison against it would understate the bound this half is about.
         assert!(
-            old.state_elapsed_ms(now) >= CI_WAIT_BOUND_MS,
+            old.state_elapsed_ms(now) >= state_bound_ms(DriveState::CiWait, &limits, 0).unwrap(),
             "…and it still reaches the bound, so the argued hold-then-resume is unchanged"
         );
 
@@ -6189,10 +6193,16 @@ mod tests {
     /// so the disclosure cannot go false with nothing red to say so.
     ///
     /// The clocks are absolute stamps rather than tick counts, so a group paused
-    /// or an app closed across a two-hour gap is indistinguishable from a drive
-    /// that sat in `ci-wait` for two hours. The age bound had this property
-    /// before #2110 and nobody reached it at four hours; at ninety minutes it is
-    /// an ordinary lunch break.
+    /// or an app closed across a gap is indistinguishable from a drive that sat
+    /// in `ci-wait` for that long. The age bound had this property before #2110
+    /// and nobody reached it at four hours; at the per-state bounds it is an
+    /// unattended afternoon, and on the three arms shorter than `ci-wait`'s it
+    /// is less than that.
+    ///
+    /// **The gap this test uses is derived from the bound rather than written**,
+    /// because the figure moved once already: it was a literal two hours against
+    /// a bare ninety-minute `ci-wait` bound, and #2168 E1 made that arm the
+    /// constant plus `fix_timeout_minutes`.
     ///
     /// **This pins the residual itself, not a fix**, and the second half is what
     /// makes that honest: the drive is recoverable by the remedy its own notice
@@ -6203,10 +6213,19 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::CiWait);
         e.head = "head-a".into();
-        // One tick at 1_000, then nothing for two hours — orrerix was not
-        // running. No starvation was recorded, because no tick was there to
-        // record one.
-        let after_gap = 1_000 + minutes_ms(120);
+        // One tick at 1_000, then nothing at all — orrerix was not running. No
+        // starvation was recorded, because no tick was there to record one.
+        //
+        // **The gap is derived from the bound and not written as a number.** It
+        // was a literal 120 minutes, chosen when `ci-wait`'s bound was the bare
+        // `CI_WAIT_BOUND_MS`; #2168 E1 made that arm the constant PLUS
+        // `fix_timeout_minutes`, and a literal that no longer crosses the bound
+        // stops witnessing the residual while still reading like a lunch break.
+        // Asked of `state_bound_ms` instead, so the next change to that arm
+        // moves the specimen with it (CLAUDE.md: a test's specimen must stay a
+        // member of the class it witnesses).
+        let bound = state_bound_ms(DriveState::CiWait, &limits, 0).unwrap();
+        let after_gap = 1_000 + bound;
         assert_eq!(
             decide(&e, &DriveFacts { now_ms: after_gap, ..facts_at("head-a") }, &limits),
             DriveStep::held(HeldReason::StateStalled),
@@ -6262,8 +6281,11 @@ mod tests {
 
         // The control: the same entry at a forward clock past the bound holds,
         // so the assertion above is about the step and not about a drive that
-        // could never hold at all.
-        let ahead = minutes_ms(500) + CI_WAIT_BOUND_MS;
+        // could never hold at all. **The bound is asked of `state_bound_ms`**,
+        // not restated as `CI_WAIT_BOUND_MS` — since #2168 E1 that constant is
+        // the SLACK over `fix_timeout_minutes` rather than the whole bound, and
+        // a control that stops crossing it is a control that stops controlling.
+        let ahead = minutes_ms(500) + state_bound_ms(DriveState::CiWait, &limits, 0).unwrap();
         assert_eq!(
             decide(&e, &DriveFacts { now_ms: ahead, ..facts_at("head-a") }, &limits),
             DriveStep::held(HeldReason::StateStalled),

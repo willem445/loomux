@@ -6724,7 +6724,14 @@ fn a_drive_stuck_in_one_state_parks_on_that_states_bound_and_the_notice_says_so(
     reg.set_pr_head_override(Some(HEAD_A.to_string()));
     let (group, _session) = driven(&reg, &repo, &gh);
 
-    let short = reg.rd_drive_group_with(&group, &gh, reviewdrive::CI_WAIT_BOUND_MS - 1);
+    // **The bound is derived, not restated.** `CI_WAIT_BOUND_MS` was the whole
+    // of `ci-wait`'s bound when this was written; since #2168 E1 it is the SLACK
+    // over `fix_timeout_minutes`, which the fixture leaves at its 60-minute
+    // default. Written as the constant, the "one tick short" half would tick at
+    // 89m59s against a 150-minute bound and stop discriminating anything.
+    let bound = reviewdrive::state_bound_ms(reviewdrive::DriveState::CiWait, &DriveLimits::default(), 0)
+        .expect("a working state has a bound");
+    let short = reg.rd_drive_group_with(&group, &gh, bound - 1);
     assert_eq!(
         status_state(&reg, &group),
         "ci-wait",
@@ -6736,7 +6743,7 @@ fn a_drive_stuck_in_one_state_parks_on_that_states_bound_and_the_notice_says_so(
         short.notices
     );
 
-    let held = reg.rd_drive_group_with(&group, &gh, reviewdrive::CI_WAIT_BOUND_MS);
+    let held = reg.rd_drive_group_with(&group, &gh, bound);
     assert_eq!(status_state(&reg, &group), "held");
     let status = reg.review_drive_status(&group);
     let drive = &status["drives"][0];
@@ -6752,7 +6759,7 @@ fn a_drive_stuck_in_one_state_parks_on_that_states_bound_and_the_notice_says_so(
     );
     assert_eq!(
         drive["held_state_ms"],
-        json!(reviewdrive::CI_WAIT_BOUND_MS),
+        json!(bound),
         "…and for how long, measured on the clock that fired: {status}"
     );
 
@@ -6762,11 +6769,11 @@ fn a_drive_stuck_in_one_state_parks_on_that_states_bound_and_the_notice_says_so(
         .find(|n| n.contains("HELD"))
         .expect("a hold delivers exactly one notice");
     assert!(
-        notice.contains("in ci-wait for 1h 30m"),
+        notice.contains("in ci-wait for 2h 30m"),
         "the notice must name the state and the time in it: {notice}"
     );
     assert!(
-        notice.contains("bound for that state is 1h 30m"),
+        notice.contains("bound for that state is 2h 30m"),
         "…and the bound that decided, so a near miss reads differently from a long \
          stall: {notice}"
     );

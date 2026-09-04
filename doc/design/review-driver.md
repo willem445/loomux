@@ -1836,8 +1836,8 @@ interpolates single-line facts and has no line breaks to keep.
   did not.
 
 [orrerix] review drive PR #2104: HELD — the drive stopped moving at
-  df6a73d0. It was in ci-wait for 1h 31m. The bound for that state is
-  1h 30m, and time the live-delegate cap refused it a lane is not counted
+  df6a73d0. It was in ci-wait for 2h 31m. The bound for that state is
+  2h 30m, and time the live-delegate cap refused it a lane is not counted
   against it. Nothing about the PR is asserted by this: read the state
   named above, then drive_review resumes it or cancel_review_drive stops
   it. Panes this drive still owns, all still running: w-1715 (worker).
