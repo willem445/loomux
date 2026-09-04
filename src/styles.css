@@ -1756,12 +1756,45 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   color: var(--ink); border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
+/* #2371: the group order control. A segmented pair in the panel head, right of
+   the title (`.sessions-head h2` takes the flex, so this needs no margin). The
+   selected one is marked by an accent RING and a neutral fill, never an accent
+   ground — `test/theme.test.ts`'s default-deny guard is what that rule is, and a
+   ring is the accent's own position (#1340). */
+.agents-order { flex: none; display: flex; gap: 0; }
+.agents-order-btn {
+  padding: 2px 7px; border: 1px solid var(--line); border-right-width: 0;
+  background: none; color: var(--ink-dim); font: inherit; font-size: 10px;
+  letter-spacing: 0.2px; cursor: pointer; white-space: nowrap;
+}
+.agents-order-btn:first-child { border-radius: 6px 0 0 6px; }
+.agents-order-btn:last-child { border-right-width: 1px; border-radius: 0 6px 6px 0; }
+.agents-order-btn:hover { color: var(--ink); }
+.agents-order-btn.active {
+  color: var(--ink); background: var(--surface-2); border-color: var(--accent);
+}
+/* The right neighbour of the selected button has no left border of its own
+   (they collapse), so lift its left edge to the accent too or the ring reads as
+   three-sided. */
+.agents-order-btn.active + .agents-order-btn { border-left-color: var(--accent); }
+
 .agents-list { flex: 1; overflow-y: auto; padding: 0 8px 12px; }
 .agents-list::-webkit-scrollbar { width: 9px; }
 .agents-list::-webkit-scrollbar-thumb {
   background: var(--line); border-radius: 5px;
   border: 2px solid var(--surface-1); background-clip: padding-box;
 }
+/* #2371: a tab's group header. Quiet chrome — the rows are the content and the
+   header only says where they live, so it is the same uppercase micro-label the
+   panel head uses rather than a second heading weight. `:first-child` drops the
+   leading gap so the first group does not float. */
+.agents-group {
+  padding: 10px 10px 4px; font-size: 10px; font-weight: 600;
+  letter-spacing: 1.2px; text-transform: uppercase; color: var(--ink-faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.agents-group:first-child { padding-top: 2px; }
+
 .agents-item {
   display: block; width: 100%; text-align: left;
   background: none; border: 1px solid transparent; border-radius: 9px;
@@ -1772,6 +1805,13 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .agents-item:hover { background: var(--surface-2); border-color: var(--line); }
 .agents-top { display: flex; align-items: center; gap: 8px; }
+/* #2371: the agent-type mark. `flex: none` and a fixed line box so a row with a
+   mark and one without agree on where the name starts; `agentsview.ts` HIDES it
+   (not empties it) when there is no CLI to name, so the flex gap goes with it. */
+.agents-mark {
+  flex: none; display: inline-flex; align-items: center;
+  width: 13px; height: 13px; color: var(--ink-dim);
+}
 .agents-name {
   flex: 1; min-width: 0; font-size: 12.5px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;

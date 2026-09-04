@@ -15,6 +15,36 @@
 import { attentionPresentation, DECISION_REASONS, REPORT_REASONS } from "./attention.ts";
 import { ACTIVITY_FLOOR_BYTES, type ActivitySnapshot } from "./paneactivity.ts";
 
+/** Which tab (workspace) a pane lives in, as the Agents tab groups by (#2371).
+ *
+ *  SUPPLIED BY THE CALLER, not derived by the pane, and that is a fact about
+ *  the object graph rather than a shortcut: `Workspace` owns a `Grid` and a
+ *  `Grid` owns its panes, with no back-reference in the other direction, so a
+ *  `Pane` genuinely does not know which tab it is in. The one caller that needs
+ *  the answer — the Agents view's `facts()` dep — reaches every pane BY walking
+ *  `tabs.tabs`, so it is holding the tab at the moment it asks. Passing it in
+ *  keeps `facts()`'s contract intact (no geometry, no IPC, no timer); a lookup
+ *  would have to walk the whole tab set once per pane to recover something the
+ *  caller already had. */
+export interface TabRef {
+  /** The workspace id. Stable for the tab's life and the key a group is
+   *  identified by — never a path (it reaches no `.join`; hard constraint 6 is
+   *  about group ids and is untouched by this type). */
+  readonly id: string;
+  /** The tab's human-facing name, renames included — what a group header
+   *  reads. Not the group key: the human may name two tabs the same thing, and
+   *  a rename must re-label a group rather than split or merge it. */
+  readonly title: string;
+  /** This tab's 0-based position in the tab strip when the reading was taken.
+   *
+   *  THE ORDER `groupRows` SORTS GROUPS BY under `"tab"`, and it is the strip's
+   *  own order rather than the title's on purpose: the human arranges the strip
+   *  by dragging (`dropTargetIndex`, #379), so that arrangement is a decision
+   *  they made, while alphabetical order would silently reshuffle the whole
+   *  list on a rename. */
+  readonly index: number;
+}
+
 /** One pane's whole reading, as plain data. Produced by `Pane.facts()`.
  *
  *  Every field is a projection of something the pane already knows — nothing
@@ -32,6 +62,11 @@ export interface PaneFacts {
   readonly name: string;
   /** The pane's classification, straight off `tabPaneInfo().kind`. */
   readonly kind: string;
+  /** The tab this reading was taken from, or `null` when the caller named
+   *  none — see `TabRef`. `null` is a complete answer for every caller but the
+   *  Agents view: the pane Notes rows (#2116) and `main.ts`'s focus walk group
+   *  nothing, so neither has anything to name. */
+  readonly tab: TabRef | null;
   /** Which agent CLI is running, READ OFF THE LAUNCH LINE — `agentCli` (i.e.
    *  `sessionCliFromCommand`) for a local pane, the SSH profile's declared
    *  far-end CLI for a remote one, null for a plain shell or an unrecognised
@@ -171,6 +206,9 @@ export interface AgentRow {
   readonly role: string | null;
   readonly state: AgentState;
   readonly notes: number | null;
+  /** The tab this row's pane lives in (#2371), or null when the reading named
+   *  no tab. Carried through unchanged from `PaneFacts.tab`. */
+  readonly tab: TabRef | null;
 }
 
 /** Project one pane's facts into a row. `notes` is supplied by the caller
@@ -185,6 +223,7 @@ export function toAgentRow(facts: PaneFacts, notes: number | null = null): Agent
     role: facts.orch?.role ?? null,
     state: deriveAgentState(facts),
     notes,
+    tab: facts.tab,
   };
 }
 
@@ -204,6 +243,93 @@ export function sortRows(rows: readonly AgentRow[]): AgentRow[] {
   return [...rows].sort(
     (a, b) => STATE_ORDER[a.state] - STATE_ORDER[b.state] || a.name.localeCompare(b.name),
   );
+}
+
+/** Which order the human has chosen for the GROUPS (#2371).
+ *
+ *  Not for the rows: `sortRows` orders those inside every group either way, so
+ *  this never changes what "most wants you" means within one tab. The choice is
+ *  only ever about which tab's block you read first. */
+export type AgentOrder = "state" | "tab";
+
+/** The default when nothing is stored, and the pre-#2371 reading: most-wants-you
+ *  first. A viewer who has never touched the control gets the order the tab
+ *  already had. */
+export const DEFAULT_AGENT_ORDER: AgentOrder = "state";
+
+/** One tab's block of rows. `tab` is `null` only for rows whose reading named
+ *  no tab, which the view renders with no header — there is nothing to call it. */
+export interface AgentGroup {
+  readonly tab: TabRef | null;
+  readonly rows: readonly AgentRow[];
+}
+
+/** The strip position an unattributed group stands in for: past every real tab.
+ *
+ *  It decides the `"tab"` order outright — a group with no tab has no position
+ *  in the strip, so it goes last — and under `"state"` it is only the TIE-BREAK.
+ *  That asymmetry is deliberate: `"state"` exists to put the rows that most want
+ *  you at the top, and a headerless group holding a wedged pane is still a
+ *  wedged pane. Sorting it below a tab whose worst row is `idle` would hide
+ *  urgency for the sake of tidiness, which is the opposite of what the order is
+ *  for. */
+const NO_TAB_INDEX = Number.MAX_SAFE_INTEGER;
+
+/** Project rows into per-tab groups, ordered by the human's choice.
+ *
+ *  GROUPING IS UNCONDITIONAL and `order` decides only which group comes first.
+ *  That is the shape the issue asks for: the headers are what make the fleet
+ *  read by where it lives, so they are not something you have to switch an
+ *  order to see, and it gives `"state"` a defined group order instead of an
+ *  accidental one.
+ *
+ *   - `"state"` — the group holding the most urgent row first. Rows are already
+ *     `sortRows`-ordered inside each group, so `rows[0]` IS that row and the
+ *     comparison is one lookup rather than a second scan. Ties fall to strip
+ *     order, so two tabs whose worst row is the same state stay in the human's
+ *     own arrangement rather than in `Map` insertion order.
+ *   - `"tab"` — strip order outright, `TabRef.index`. Deliberately NOT the
+ *     title: see `TabRef.index`.
+ *
+ *  A TAB WITH NO ROWS PRODUCES NO GROUP, by construction rather than by a
+ *  filter — the buckets are built from the rows, so a tab this call never saw
+ *  cannot appear. That also means a filtered list (`matchesFilter` upstream)
+ *  drops the header of a tab whose rows all filtered out, which is the same
+ *  rule read from the other end.
+ *
+ *  Returns new arrays throughout; the caller's input is not mutated. */
+export function groupRows(rows: readonly AgentRow[], order: AgentOrder): AgentGroup[] {
+  // Keyed by tab id, NOT by title: two tabs may legally share a name, and a
+  // rename must re-label one group rather than split or merge two. `Map` so a
+  // tab id can never collide with `Object.prototype` and so iteration is
+  // insertion order — which is the tie-break's starting point before it is
+  // re-sorted below.
+  const buckets = new Map<string, { tab: TabRef | null; rows: AgentRow[] }>();
+  for (const row of rows) {
+    const key = row.tab?.id ?? "";
+    const found = buckets.get(key);
+    if (found) {
+      found.rows.push(row);
+      // The LAST reading of a tab wins its label. Every row of one tab carries
+      // the same `TabRef` in practice (one walk, one title read), and taking a
+      // side rather than leaving it implicit is what stops a rename mid-walk
+      // from being decided by bucket-insertion luck.
+      if (row.tab !== null) found.tab = row.tab;
+    } else {
+      buckets.set(key, { tab: row.tab, rows: [row] });
+    }
+  }
+  const groups = [...buckets.values()].map((b) => ({ tab: b.tab, rows: sortRows(b.rows) }));
+  const strip = (g: AgentGroup): number => g.tab?.index ?? NO_TAB_INDEX;
+  // `rows` is never empty — a bucket exists only because a row created it — so
+  // `rows[0]` is a real row and the `state` arm needs no absent-group case.
+  const worst = (g: AgentGroup): number => STATE_ORDER[g.rows[0].state];
+  groups.sort(
+    order === "tab"
+      ? (a, b) => strip(a) - strip(b)
+      : (a, b) => worst(a) - worst(b) || strip(a) - strip(b),
+  );
+  return groups;
 }
 
 /** How many rows are actually waiting on the human — the badge number. The two

@@ -117,7 +117,7 @@ import { adoptableSessionId, hasForkSession, sessionCliFromCommand } from "./pan
 // name the same CLIs by construction (#722).
 import type { Cli } from "./sessionreconcile";
 import { PaneActivity } from "./paneactivity.ts";
-import type { PaneFacts } from "./agentrows.ts";
+import type { PaneFacts, TabRef } from "./agentrows.ts";
 import { notesApplyToPane } from "./notesmodel.ts";
 
 // The header's icons, from the registry (#879 slice K). They were hand-drawn
@@ -5196,7 +5196,11 @@ export class Pane implements VoiceTargetPane {
    *  Same contract as `tabPaneInfo()` below and for the same reason: it reads
    *  no geometry, starts no IPC and touches no timer, so it is safe to call on
    *  a hidden tab, on every row of a list, once a second. */
-  facts(): PaneFacts {
+  /** @param tab which tab this reading is being taken from (#2371), or `null`
+   *  when the caller is not grouping and has nothing to name. Supplied rather
+   *  than derived because a `Pane` holds no back-reference to its `Workspace`
+   *  — see `TabRef` in `agentrows.ts`. */
+  facts(tab: TabRef | null = null): PaneFacts {
     // ONE reading of `tabPaneInfo()`, for `kind` and for `alive` both. `alive`
     // is deliberately NOT `ptyId !== null && !exited`: a CONTENT pane (files,
     // editor, git, workflow) has no PTY by design and is fully functional the
@@ -5208,6 +5212,7 @@ export class Pane implements VoiceTargetPane {
       key: this.key,
       name: this.name,
       kind: info.kind,
+      tab,
       // Read off the launch line, never branched on a CLI name to produce a
       // name (#722/#841): `agentCli` is the shared first-token parse, and the
       // SSH profile's declared far-end CLI is the only answer available for a
