@@ -600,6 +600,7 @@ impl EventLog {
         if rotated {
             self.segment += 1;
             self.written = 0;
+            self.retain()?;
         }
 
         let path = self.segment_path(self.segment);
