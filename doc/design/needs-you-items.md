@@ -404,6 +404,20 @@ differs in the tag it writes, the audit action it records, and whether it
 delivers at all. A boolean threaded through one method would have made all
 three of those conditionals inside a function whose callers could not see them.
 
+**The split needs a guard, and review round 2 found it missing.** Both settle
+methods take a `ResolveSource` by value while each hard-codes its own tag,
+audit action and delivery rule — so the mismatched pairing
+(`resolve_needs_you(…, WebviewDismiss)`) wrote `resolved_by:
+"dismissed:webview"`, which every reader downstream treats as *the human did
+not look*, while auditing `needs-you-resolve` and, with no note, delivering
+nothing at all. Each method now refuses the other's source via
+`ResolveSource::is_dismissal`, and
+`a_resolve_and_a_dismissal_each_refuse_the_other_s_source` performs both
+forbidden pairings rather than asserting the guard exists. Neither is reachable
+from the two Tauri commands, each of which hard-codes one variant; the guard is
+for the second dismissing surface, which is where an unguarded parameter gets
+passed the wrong way.
+
 ## The board lifecycle mapping
 
 **One hook, in `OrchRegistry::upsert_task`.** Every status transition already

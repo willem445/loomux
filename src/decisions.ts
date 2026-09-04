@@ -189,7 +189,18 @@ export function canDismissItem(i: NeedsYouItem): boolean {
 }
 
 /** The `resolved_by` tag a dismissed ITEM carries — `ResolveSource::WebviewDismiss`'s
- *  `tag()`, mirrored once so the string is not spelled at each reader. */
+ *  `tag()`, mirrored once so the string is not spelled at each reader.
+ *
+ *  **Matched WHOLE, not by prefix, and that is a live trade-off.** Today the
+ *  backend can only write this one dismissal tag, so an exact match is the
+ *  precise reading and `the item tag this panel reads is the one the backend
+ *  writes` pins that a near-miss (`"dismissed"`) is not a dismissal. The day a
+ *  second dismissing surface exists — `dismissed:console`, say — this stops
+ *  matching it and that row renders in the settled tail with an answer's
+ *  weight instead of a `Dismissed:` prefix. The fix then is to match the
+ *  `dismissed:` PREFIX here and widen that test; doing it now would be a guard
+ *  for a tag no backend can emit, whose test could only assert against a
+ *  fabricated row. */
 export const DISMISSED_ITEM_TAG = "dismissed:webview";
 
 // A question-only `projectQuestions` used to live here, splitting the file into

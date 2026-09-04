@@ -401,9 +401,28 @@ impl ResolveSource {
     /// Whether this settle is the human saying the ask no longer matters,
     /// rather than saying they have looked at it.
     ///
-    /// Read by the registry to pick the audit action and the notice, so the
-    /// two cannot disagree about which gesture happened — one predicate, not a
-    /// `matches!` at each site.
+    /// **The GUARD each settle method uses to refuse the other's source**, and
+    /// the only thing that makes "a resolve and a dismissal cannot disagree
+    /// about which gesture happened" true rather than merely intended.
+    ///
+    /// The two gestures are two methods
+    /// ([`resolve_needs_you`](super::OrchRegistry::resolve_needs_you) and
+    /// [`dismiss_needs_you`](super::OrchRegistry::dismiss_needs_you)), each
+    /// hard-coding its own tag, audit action and delivery rule — which is the
+    /// split `dismiss_needs_you`'s doc argues for, and is why neither *picks*
+    /// between them at runtime. But both take a `ResolveSource` by value, so
+    /// without a guard `resolve_needs_you(…, WebviewDismiss)` would write
+    /// `resolved_by: "dismissed:webview"` — which every reader downstream
+    /// treats as *the human did not look* — while auditing `needs-you-resolve`
+    /// and delivering `resolve_notice`, or with `note: None` delivering
+    /// **nothing at all**. A dismissal that delivers nothing is precisely the
+    /// outcome `dismiss_needs_you` exists to prevent.
+    ///
+    /// So each method asks this and refuses the mismatch. Not reachable from
+    /// either of today's callers — each Tauri command hard-codes one variant —
+    /// which is exactly why it is worth closing now: the second dismissing
+    /// surface is where an unguarded parameter gets passed the wrong way, and
+    /// nothing would have been red.
     pub fn is_dismissal(&self) -> bool {
         matches!(self, ResolveSource::WebviewDismiss)
     }

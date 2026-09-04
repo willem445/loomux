@@ -349,6 +349,33 @@ un-block the task; it does not do it. Which row moves, and whether the
 question is worth re-asking, stay the orchestrator's calls, exactly as they
 are for an answer.
 
+### Who can read the reason — and why that differs from an item's
+
+`reason` travels on the `list_questions` wire, which is a **shared read every
+delegate may call**. The needs-you registry does the opposite with the
+equivalent field: `needsyou::project_list` withholds `resolution` and exposes
+only `had_resolution: bool`, arguing that "a note the human typed to their
+orchestrator is not thereby addressed to every worker in the fleet". Since
+#2137 gives both registries a human-authored close-out, the two now handle the
+same kind of text oppositely, and that is worth stating rather than leaving for
+a reader to notice.
+
+**It follows from the projections, not from a judgement about dismissal
+reasons.** The item registry has a *projection type* — `AgentItem` — built for
+exactly this withholding, so a field must be opted IN to reach an agent. The
+question registry has none: `question_list` returns stored `Question` rows
+whole, so `text`, `options` and `answer` are already fleet-visible and `reason`
+is visible for the same reason they are. That asymmetry predates this change
+(Q1 vs #1151) and #2137 inherits it.
+
+**Which leaves a genuine question this note does not close**: a dismissal
+reason is precisely the thing argued above to be *not a decision*, which is the
+property the item side's withholding rests on. So the inherited answer is
+defensible but not obviously right, and it is recorded here as inherited rather
+than dressed up as chosen. Narrowing it later means giving this registry an
+`AgentQuestion` projection — a change to a public wire contract, and the reason
+it was not done inside a slice about a Dismiss button.
+
 ### The answer notice
 
 `[orrerix] answer to q-N (via <source>): <answer>`, delivered through the ordinary

@@ -208,8 +208,8 @@ fn app_commands_len_is_161() {
          +1 for liveness_stamp — the webview's half of the liveness heartbeat, added in \
          #1601 Phase 0.4, +2 for orch_group_view/orch_strip_view — the published-snapshot \
          reads that replaced the group view's ten-invoke poll batch and the tab strip's \
-         per-group-bound-tab sweep, added in #1608, \r
-         +2 for orch_question_dismiss/orch_needs_you_dismiss — the human's \r
+         per-group-bound-tab sweep, added in #1608, \
+         +2 for orch_question_dismiss/orch_needs_you_dismiss — the human's \
          no-longer-relevant close-out on each registry, added in #2137) — \
          if this is an intentional addition/removal, update this tripwire's count too"
     );

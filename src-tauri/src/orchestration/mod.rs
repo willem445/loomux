@@ -28752,6 +28752,25 @@ impl OrchRegistry {
         source: needsyou::ResolveSource,
     ) -> Result<needsyou::Item, String> {
         let tag = source.tag();
+        // **This method settles a LOOK, so it refuses a dismissal's source**
+        // (#2137, review round 2 B1). Both gestures take a `ResolveSource` by
+        // value and each hard-codes its own tag, audit action and delivery
+        // rule; without this, `resolve_needs_you(…, WebviewDismiss)` would
+        // write `resolved_by: "dismissed:webview"` — read downstream as *the
+        // human did not look* — while auditing `needs-you-resolve` and, with
+        // no note, delivering nothing at all. Unreachable from today's one
+        // caller, which hard-codes `Webview`; the guard is what keeps
+        // `is_dismissal`'s "the two cannot disagree" a fact rather than an
+        // intention.
+        if source.is_dismissal() {
+            self.audit(group, "human", "needs-you-reject", json!({
+                "id": id, "source": tag, "op": "resolve", "reason": "wrong-source",
+            }));
+            return Err(format!(
+                "{tag} is a dismissal source — resolving records that the human LOOKED, so it \
+                 cannot be settled with it; call dismiss_needs_you instead"
+            ));
+        }
         // Validated before the lock, and a bad note settles nothing: the audit
         // records what was turned away rather than half-resolving a row.
         let note = match note.map(str::trim).filter(|n| !n.is_empty()) {
@@ -28855,6 +28874,21 @@ impl OrchRegistry {
         source: needsyou::ResolveSource,
     ) -> Result<needsyou::Item, String> {
         let tag = source.tag();
+        // The mirror of `resolve_needs_you`'s guard, and needed for the same
+        // reason in the other direction: settling a DISMISSAL with a resolve's
+        // source would write `resolved_by: "webview"` — read downstream as *the
+        // human looked* — while auditing `needs-you-dismiss` and delivering the
+        // dismissal notice. Both directions, so the pair cannot disagree
+        // whichever way a future caller gets it wrong.
+        if !source.is_dismissal() {
+            self.audit(group, "human", "needs-you-reject", json!({
+                "id": id, "source": tag, "op": "dismiss", "reason": "wrong-source",
+            }));
+            return Err(format!(
+                "{tag} is not a dismissal source — dismissing records that the ask no longer \
+                 matters, so it cannot be settled with it; call resolve_needs_you instead"
+            ));
+        }
         // Validated before the lock, and a bad reason settles nothing — the
         // audit records what was turned away rather than half-dismissing a row.
         let reason = match needsyou::validate_dismiss_reason(reason) {
