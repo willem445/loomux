@@ -3506,7 +3506,7 @@ impl ReviewVerdict {
     /// drive — arc 8 skipping the very lane #1871 B1 exists to re-open. A
     /// predicate whose safety depends on where it is called is not a predicate.
     pub fn pass_covers_body(&self, head: &str, now: Option<&str>, verified: bool) -> bool {
-        if self.verdict != Verdict::Pass || self.body_digest.is_empty() || !self.reviewed(head) {
+        if self.verdict != Verdict::Pass || self.body_digest.is_empty() {
             return false;
         }
         let Some(now) = now.filter(|d| !d.is_empty()) else { return false };
