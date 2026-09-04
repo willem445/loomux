@@ -1490,7 +1490,10 @@ fn a_verification_brief_announces_itself_on_every_path_that_grants_it() {
                     gh.set_facts("OPEN", HEAD_B);
                     reg.set_pr_head_override(Some(HEAD_B.to_string()));
                 }
-                (group, tick_until_lane(&reg, &gh, &group, 30_000))
+                // Bound the borrow before the move: a tuple evaluates its first
+                // element first, so `(group, f(&group))` moves and then borrows.
+                let opened = tick_until_lane(&reg, &gh, &group, 30_000);
+                (group, opened)
             }
         };
 
