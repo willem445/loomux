@@ -3072,6 +3072,9 @@ pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> D
 }
 
 fn decide_ci_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> DriveStep {
+    if entry.fix_pushed {
+        return decide_fix_receipts(entry, facts, limits);
+    }
     match facts.ci {
         // **Arc 2, and since #2168 E1 green is not on its own enough when the
         // head arrived by arc 7.** See [`decide_fix_receipts`] for the whole
