@@ -1992,7 +1992,7 @@ impl DriveEntry {
         // read against `state_since_ms`, which the lines below re-stamp on this
         // same arc — see the field, and the module header on why that is not a
         // fourth clock.
-        self.fix_pushed_ms = (from == DriveState::FixWait && to == DriveState::CiWait).then_some(now_ms);
+        if from == DriveState::FixWait && to == DriveState::CiWait { self.fix_pushed_ms = Some(now_ms); }
         // **What the drive was doing, recorded before the clocks that say so
         // are reset** (#2110). `held_from` and `held_after_ms` are read by this
         // hold's notice and by `review_drive_status`; both are computed from
