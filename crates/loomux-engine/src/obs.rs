@@ -2807,8 +2807,18 @@ mod tests {
         let _serial = SERIAL.lock_safe();
         let tmp = tempfile::tempdir().unwrap();
         with_log_dir(tmp.path(), || {
+            // SCRATCH MUTATION for #2366 (missing-log positive control): the
+            // hook install below is removed, so NO crash log is written. The
+            // content-based selection must still fail — never to merge.
+            fs::write(
+                tmp.path().join("crash-19990101-000000.log"),
+                "loomux crash log\nversion: 0.0.0-foreign\ntime:    19990101-000000\n\
+                 thread:  budget-thread\npanic:   a real panic\nat:      src/budget.rs:1:1\n",
+            )
+            .unwrap();
+
             let prev = std::panic::take_hook();
-            install_panic_hook("9.9.9-test");
+            // install_panic_hook("9.9.9-test"); — SCRATCH MUTATION: removed
             // Panic on a *named background* thread — the acceptance criterion.
             let h = std::thread::Builder::new()
                 .name("crash-test-worker".into())
@@ -2817,18 +2827,14 @@ mod tests {
             assert!(h.join().is_err(), "thread must have panicked");
             std::panic::set_hook(prev); // restore before releasing the serial lock
 
-            // SCRATCH REPRODUCER for #2366: a concurrent planted panic wrote a
-            // foreign crash log into this tempdir (planted below), and
-            // read_dir's order is unspecified — sorted-first is a
-            // deterministic stand-in for one of the enumerations the old
-            // first-match find could lose to. Never to merge.
-            fs::write(
-                tmp.path().join("crash-19990101-000000.log"),
-                "loomux crash log\nversion: 0.0.0-foreign\ntime:    19990101-000000\n\
-                 thread:  budget-thread\npanic:   a real panic\nat:      src/budget.rs:1:1\n",
-            )
-            .unwrap();
-            let mut entries: Vec<_> = fs::read_dir(tmp.path())
+            // Select THIS panic's own record by content, never by enumeration
+            // order: the planted record above is a legitimate member of the
+            // directory's `crash-*` set, so the old first-match `find` could
+            // return it. The message is the selector — the assertions below
+            // pin the thread name and the host version, which the foreign
+            // record does not carry, so the selection cannot make them
+            // vacuous. A MISSING record still fails at the `expect`.
+            let crash = fs::read_dir(tmp.path())
                 .unwrap()
                 .flatten()
                 .map(|e| e.path())
@@ -2837,18 +2843,17 @@ mod tests {
                         .and_then(|n| n.to_str())
                         .is_some_and(|n| n.starts_with("crash-"))
                 })
-                .collect();
-            entries.sort();
-            let crash = entries.into_iter().next().expect("a crash log must exist");
+                .find(|p| {
+                    fs::read_to_string(p).is_ok_and(|b| b.contains("synthetic background crash"))
+                })
+                .expect("this panic's own crash log must exist");
             let body = fs::read_to_string(&crash).unwrap();
             assert!(body.contains("crash-test-worker"), "captures the thread name");
-            assert!(body.contains("synthetic background crash"), "captures the message");
-            // The version the host handed `install_panic_hook` survives the
-            // whole path — closure capture, `catch_unwind`, `write_crash_log`,
-            // `write_crash_log_in`, `record_crash_first_phase` — and lands in
-            // the file. `records_crash_file_with
-            // _context` pins the format; this pins that the hook is what
-            // carries the value there.
+            assert!(
+                body.contains("panic:   synthetic background crash"),
+                "the message must land in the record's own panic field, not just \
+                 somewhere in the file — got:\n{body}"
+            );
             assert!(body.contains("version: 9.9.9-test"), "carries the host's app version");
             // The panic also drops a breadcrumb.
             let crumbs = fs::read_to_string(tmp.path().join("breadcrumbs.log")).unwrap();
