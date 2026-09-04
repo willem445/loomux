@@ -159,6 +159,20 @@ accepted — a `declined-unread` leaves the notes where a later attempt can stil
 find them. A second `rekey` for the same pane is then a no-op, which is what
 makes the call safe from a site that may fire more than once.
 
+**The dialog's target is a getter, not a value** (#2116 review B1). The one
+thing that moves a target moves it while the overlay is open: the pane learns
+its id, `rekey` moves the pending notes onto the session record and empties the
+pending list. A target captured at open would then point at an emptied pane key
+— the overlay showing its "notes here are ephemeral" empty state at the exact
+moment they became durable, and every note added afterwards filed as pending
+against a pane `adoptSessionId` will never re-key again. `NoteDrafts.migrate`
+carries the half-typed note across with it, because the draft book is keyed on
+the target too.
+
+That is also what keeps the residual below as narrow as it claims to be: with a
+live target, a note written *after* the id is learned reaches the session
+record. Only notes written strictly *before* it are exposed.
+
 **The residual, stated rather than hidden: a pending note does not survive an
 app restart.** It is in memory only, because there is nothing durable to key it
 to — `PersistedPane` has no stable per-pane key. This is reachable only for a
@@ -205,6 +219,29 @@ conflates two questions, and the human asked for an explicit control.
 that surface in a view the human asked to be "my own sessions". The user docs
 say where it went.
 
+## What is bounded, and what is not
+
+The cap bounds the number of RECORDS. Two things it does not bound are stated
+here rather than left to be discovered, since neither is visible from the
+two-tier argument above.
+
+**A noted record CAN be evicted — past 500 of them.** The two tiers guarantee
+that names are shed before notes, not that notes are never shed: the 501st
+most-recently-updated *noted* record is dropped at the next encode, silently.
+At 500 noted sessions on one machine that is far past any working set this was
+designed for, and the alternative — an unbounded file — is worse. It is a real
+loss of something the human wrote, so it is written down.
+
+**Notes per record are not capped at all**, and the whole blob is re-serialised
+and fsynced on every note add, every delete and every identity change. One
+long-lived session accumulating notes is therefore the resource question the
+record cap does not answer: at ~1,000 notes near the 2,000-character cap the
+blob is a couple of megabytes, sorted and written on the webview's own turn.
+Not a problem at plausible sizes, and deliberately not fixed with a second cap
+here — a cap that silently drops the human's oldest notes is a worse failure
+than a slow save, and the honest fix if this ever bites is incremental
+persistence, not eviction.
+
 ## What the dialog does when a write does not land
 
 The store's outcome is READ, not discarded, and the two failure shapes are told
@@ -218,6 +255,18 @@ wording and the give-it-back decision are testable without a DOM.
 | `unchanged` | a no-op (unreachable from a non-pristine draft) | nothing |
 | `failed` | the note IS in memory and on screen; the save missed | says the note is not saved yet, and does NOT hand the text back — that would leave a note beside a copy of its own text, and re-submitting would duplicate it |
 | `declined-unread` | **nothing was recorded anywhere** — the store returned before mutating, because it has never read the file | hands the text back into the box and says so |
+| `threw` | the promise REJECTED, so nothing is known | hands the text back and says to check the list first — at worst the human sees a note *and* its text, which is visible and one Escape from fixed, where not handing it back can lose the note outright |
+
+A subscriber that throws cannot reach any of this: `emit()` runs inside
+`publish()`, before the save, so an exception escaping it would reject the whole
+write on a path the caller's `.then` cannot see — the note in memory, nothing on
+disk, no message. Listeners are isolated and reported individually
+(#2116 review premortem 1).
+
+The list itself distinguishes "no notes" from "I could not look", which is the
+same rule one level up: while `store.loaded` is false the overlay says the list
+may be incomplete rather than asserting the session has no notes
+(#2116 review N1).
 
 The last row is the one this section exists for. The obvious wiring — clear the
 box, fire the write, ignore the result — loses that note outright: it reaches

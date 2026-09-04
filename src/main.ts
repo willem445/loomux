@@ -407,10 +407,16 @@ function eventsFor(ws: Workspace): PaneEvents {
     // on the per-window pane key when there is not — the store holds those in
     // memory until `onSessionIdentified` re-keys them.
     onOpenNotes: (pane) => {
-      const facts = pane.facts();
       void openNotes({
-        target: noteTargetFor(facts.sessionId, pane.key),
-        title: facts.name,
+        // A GETTER, re-read by the dialog on every render and every write
+        // (#2116 review B1). A copilot/opencode pane can learn its session id
+        // while the overlay is open; `pane.facts()` reports the new one the
+        // moment `adoptSessionId` records it, so the overlay follows the notes
+        // onto the session record instead of staring at an emptied pending
+        // list and filing everything after it against an id that will never be
+        // re-keyed again.
+        target: () => noteTargetFor(pane.facts().sessionId, pane.key),
+        title: pane.facts().name,
         store: sessionLog,
       }).then(() => pane.focus());
     },

@@ -194,6 +194,40 @@ test("the target a pane key produces is the one rekey later moves", () => {
   assert.notEqual(targetKey(pending), targetKey(noteTargetFor("pane-7", "pane-7")));
 });
 
+test("a draft follows its target when a session id is learned mid-edit", () => {
+  // #2116 review B1's other half. The book is keyed on the target, so a re-key
+  // the book did not hear about would blank a half-typed note — the very loss
+  // NoteDrafts exists to prevent, arrived at from the other direction.
+  const drafts = new NoteDrafts();
+  const pending = noteTargetFor(null, "pane-3");
+  const learned = noteTargetFor("sess-9", "pane-3");
+  drafts.set(pending, "half a thought");
+  drafts.migrate(pending, learned);
+  assert.equal(drafts.get(learned), "half a thought");
+  assert.equal(drafts.get(pending), "");
+  assert.equal(drafts.size, 1, "moved, not copied");
+});
+
+test("migrating never overwrites what the human has since typed", () => {
+  // The destination's text can only have been typed AFTER the target moved, so
+  // it is the newer of the two and wins.
+  const drafts = new NoteDrafts();
+  drafts.set({ paneKey: "pane-3" }, "older");
+  drafts.set({ sessionId: "sess-9" }, "newer");
+  drafts.migrate({ paneKey: "pane-3" }, { sessionId: "sess-9" });
+  assert.equal(drafts.get({ sessionId: "sess-9" }), "newer");
+  assert.equal(drafts.get({ paneKey: "pane-3" }), "", "the source is still cleared");
+});
+
+test("migrating is a no-op with nothing held, and onto itself", () => {
+  const drafts = new NoteDrafts();
+  drafts.migrate({ paneKey: "pane-3" }, { sessionId: "sess-9" });
+  assert.equal(drafts.size, 0);
+  drafts.set({ sessionId: "sess-9" }, "kept");
+  drafts.migrate({ sessionId: "sess-9" }, { sessionId: "sess-9" });
+  assert.equal(drafts.get({ sessionId: "sess-9" }), "kept", "self-migration must not delete it");
+});
+
 // ---- what a write outcome owes the human ----
 
 test("a declined write hands the text back — nothing was recorded anywhere", () => {
@@ -221,11 +255,29 @@ test("the two failure messages are different — they ask for different things",
   assert.notEqual(noteWriteFeedback("declined-unread").message, noteWriteFeedback("failed").message);
 });
 
+test("a rejected write says so and hands the text back — nothing is known", () => {
+  // #2116 review premortem 1: `store.addNote` can REJECT rather than resolve
+  // with an outcome. Erring toward handing the text back is deliberate: at
+  // worst the human sees a note and its text, which is visible and one Escape
+  // from fixed; not handing it back can lose the note outright, silently.
+  const { message, restoreDraft } = noteWriteFeedback("threw");
+  assert.equal(restoreDraft, true);
+  assert.notEqual(message, null);
+  assert.match(message!, /check the list above/i);
+});
+
 test("success is silent, and no outcome is left to a default", () => {
   // Exhaustive over the union rather than over the two happy values: a new
   // outcome added to `NoteWriteOutcome` must be given a branch, and this list
   // is what makes forgetting one visible.
-  const all: NoteWriteOutcome[] = ["saved", "unchanged", "pending", "declined-unread", "failed"];
+  const all: NoteWriteOutcome[] = [
+    "saved",
+    "unchanged",
+    "pending",
+    "declined-unread",
+    "failed",
+    "threw",
+  ];
   const silent = all.filter((o) => noteWriteFeedback(o).message === null);
   assert.deepEqual(silent, ["saved", "unchanged", "pending"]);
   for (const o of all) {
@@ -236,11 +288,18 @@ test("success is silent, and no outcome is left to a default", () => {
   }
 });
 
-test("only the declined outcome asks for the text back", () => {
-  const all: NoteWriteOutcome[] = ["saved", "unchanged", "pending", "declined-unread", "failed"];
+test("exactly the two outcomes that may have recorded NOTHING ask for the text back", () => {
+  const all: NoteWriteOutcome[] = [
+    "saved",
+    "unchanged",
+    "pending",
+    "declined-unread",
+    "failed",
+    "threw",
+  ];
   assert.deepEqual(
     all.filter((o) => noteWriteFeedback(o).restoreDraft),
-    ["declined-unread"]
+    ["declined-unread", "threw"]
   );
 });
 

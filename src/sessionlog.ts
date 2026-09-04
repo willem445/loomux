@@ -381,8 +381,20 @@ export class SessionLogStore {
     };
   }
 
+  /** Notify subscribers. **A throwing listener must not cost the human a
+   *  note** (#2116 review premortem 1): `emit` runs inside `publish`, before
+   *  the save, so an exception escaping here would reject the whole write on a
+   *  path the caller's `.then` cannot see — the note in memory, nothing on
+   *  disk, and no message. A subscriber that throws has a bug of its own; it is
+   *  isolated and reported, and every other subscriber still runs. */
   private emit(): void {
-    for (const cb of [...this.listeners]) cb();
+    for (const cb of [...this.listeners]) {
+      try {
+        cb();
+      } catch (e) {
+        console.error("sessionlog: an onChange listener threw", e);
+      }
+    }
   }
 
   /** Upsert this session's identity.

@@ -486,6 +486,59 @@ test("two panes' pending notes do not mix", async () => {
   assert.equal(store.pendingFor("pane-2").length, 1);
 });
 
+test("a note added AFTER a rekey lands on the session, not back in pending", async () => {
+  // #2116 review B1, at the store level: this is what the dialog's live target
+  // must produce. The sequence is a copilot pane — note written while the id is
+  // unknown, id learned, then a SECOND note. Before the fix the dialog kept
+  // aiming at the pane key, so this second note was filed pending against a
+  // pane `rekey` will never fire for again (`adoptSessionId` refuses a second
+  // adoption): on no disk, in no record, gone on restart, silently.
+  const io = new FakeIo();
+  const store = new SessionLogStore(io);
+  await store.addNote({ paneKey: "pane-3" }, "note A", 1);
+  assert.equal(await store.rekey("pane-3", "sess-9", 2), "saved");
+  assert.equal(store.pendingFor("pane-3").length, 0, "rekey empties the pending list");
+
+  // What a LIVE target does: re-read, see the id, write to the session.
+  assert.equal(await store.addNote({ sessionId: "sess-9" }, "note B", 3), "saved");
+  assert.deepEqual(
+    io.last().sessions.get("sess-9")?.notes.map((n) => n.text),
+    ["note A", "note B"],
+    "both notes are on disk, in order"
+  );
+
+  // And the negative control — what a FROZEN target did — so this test cannot
+  // pass by the store having changed shape. The note goes nowhere durable.
+  const saves = io.saved.length;
+  assert.equal(await store.addNote({ paneKey: "pane-3" }, "note C", 4), "pending");
+  assert.equal(io.saved.length, saves, "a stale pane-keyed write publishes nothing");
+  assert.equal(
+    io.last().sessions.get("sess-9")?.notes.length,
+    2,
+    "and never reaches the session record"
+  );
+});
+
+test("an onChange listener that throws cannot cost the human the note", async () => {
+  // #2116 review premortem 1. `emit()` runs inside `publish()`, BEFORE the
+  // save, so an exception escaping it would reject the whole write on a path
+  // the caller's `.then` cannot see: note in memory, nothing on disk, no
+  // message. A subscriber with a bug is isolated; every other subscriber and
+  // the save itself still run.
+  const io = new FakeIo();
+  const store = new SessionLogStore(io);
+  let secondRan = 0;
+  store.onChange(() => {
+    throw new Error("a buggy subscriber");
+  });
+  store.onChange(() => {
+    secondRan += 1;
+  });
+  assert.equal(await store.addNote({ sessionId: "s" }, "survives", 1), "saved");
+  assert.equal(io.last().sessions.get("s")?.notes.length, 1, "the note reached disk");
+  assert.ok(secondRan > 0, "the listener after the throwing one still ran");
+});
+
 // ---------------------------------------------------------------------------
 // onChange
 // ---------------------------------------------------------------------------

@@ -13,11 +13,26 @@
 // KIT rather than the function, which is the same call `promptModal` in that
 // file already made.
 //
-// ONE DIALOG, TWO ENTRY POINTS. The pane header opens it against the pane, and
-// the sessions list opens it against a recorded session — live or dead. A note
-// is the human's record ABOUT a session; whether the session can still be
-// resumed is the harness's concern, not the note's, so a dead session's notes
-// are read/write like any other.
+// ONE DIALOG, AND AT THIS HEAD ONE ENTRY POINT. The pane header opens it
+// against the pane (`main.ts`'s `onOpenNotes`). The sessions list *will* open
+// it against a recorded session — live or dead — in #2116 slice E2, after
+// #2122 slice B restructures `sessions.ts`; the signature already takes
+// whichever target it is given, so that slice adds a call site and nothing
+// else. When it lands, a dead session's notes are read/write like any other: a
+// note is the human's record ABOUT a session, and whether the session can still
+// be resumed is the harness's concern, not the note's.
+//
+// THE TARGET IS LIVE, NOT FROZEN AT OPEN (#2116 review B1). It is a GETTER the
+// dialog re-reads on every render and every write, because the one thing that
+// moves it moves it while the overlay is open: a pane learns its session id,
+// `rekey` moves the pending notes onto the session record and clears the
+// pending list. A target captured once would then point at a pane key whose
+// notes have just been emptied — the overlay would show its "notes here are
+// ephemeral" empty state at the exact moment they became durable, and every
+// note added afterwards would be filed as pending against an id that will never
+// be re-keyed again (`adoptSessionId` refuses a second adoption). Every step
+// succeeds and nothing says a word — the same silent-loss shape this module's
+// write-outcome handling was written to close, on a path it could not see.
 //
 // THE UNSUBMITTED DRAFT LIVES IN THIS VIEW, NEVER IN ITS DOM. The list
 // re-renders on every `store.onChange` — a note added on another surface, a
@@ -35,6 +50,7 @@ import {
   noteWriteFeedback,
   notesEmptyState,
   orderedNotes,
+  targetKey,
   type NoteTarget,
   type NoteWriteOutcome,
   type SessionNote,
@@ -55,8 +71,11 @@ function sessionIdOf(target: NoteTarget): string | null {
 const drafts = new NoteDrafts();
 
 export interface NotesDialogSpec {
-  /** Which session (or not-yet-identified pane) these notes belong to. */
-  target: NoteTarget;
+  /** Which session (or not-yet-identified pane) these notes belong to, as a
+   *  GETTER rather than a value — see "THE TARGET IS LIVE" above. The caller
+   *  reads its own live state each time (`main.ts` re-reads `pane.facts()`), so
+   *  a session id learned under an open overlay re-points it. */
+  target: () => NoteTarget;
   /** What the header calls it — the pane name, or the session's row title. */
   title: string;
   store: SessionLogStore;
@@ -68,7 +87,10 @@ export interface NotesDialogSpec {
  *  focus back to the pane (`pane.focus()`, as `openInEditor` does). */
 export function openNotes(spec: NotesDialogSpec): Promise<void> {
   const now = spec.now ?? (() => Date.now());
-  const sessionId = sessionIdOf(spec.target);
+  /** The target as of the last render. Kept only so a CHANGE can be detected —
+   *  the draft book is keyed on the target, so a re-key that was not mirrored
+   *  there would blank a half-typed note. */
+  let target = spec.target();
 
   return new Promise<void>((resolve) => {
     let settled = false;
@@ -105,7 +127,7 @@ export function openNotes(spec: NotesDialogSpec): Promise<void> {
     input.placeholder = "Add a note about this session…";
     // Seeded from the VIEW's draft, never from a literal: the human may have
     // been typing when they last closed this.
-    input.value = drafts.get(spec.target);
+    input.value = drafts.get(target);
 
     // `.dlg-error` is shown by the `visible` CLASS, not by the `hidden`
     // attribute — the rule is `display: none` until then, so an attribute
@@ -124,7 +146,7 @@ export function openNotes(spec: NotesDialogSpec): Promise<void> {
      *  is disabled rather than one that refuses after the click. */
     const reflectDraft = (): void => {
       const text = input.value;
-      drafts.set(spec.target, text);
+      drafts.set(target, text);
       addBtn.disabled = noteDraftIsPristine(text);
       // Only ever shown near the cap — a character counter on an empty box is
       // noise, and this is a note, not a form field with a quota.
@@ -154,12 +176,42 @@ export function openNotes(spec: NotesDialogSpec): Promise<void> {
       error.classList.toggle("visible", message !== null);
     };
 
+    /** Re-read the target, and carry the draft across if it moved. Returns the
+     *  current one, so every caller below is reading the same value it acted
+     *  on rather than calling the getter again. */
+    const currentTarget = (): NoteTarget => {
+      const next = spec.target();
+      if (targetKey(next) !== targetKey(target)) {
+        drafts.migrate(target, next);
+        target = next;
+      }
+      return target;
+    };
+
     const renderList = (): void => {
+      const here = currentTarget();
+      const sessionId = sessionIdOf(here);
+      list.replaceChildren();
+      // "I could not read the file" is not "there are no notes", and the record
+      // type's own doc forbids the collapse (#2116 review N1). An unread store
+      // is transient on the happy path — the `ensureLoaded` below re-renders —
+      // but a load that REJECTED would otherwise leave this stating, for as
+      // long as the overlay is open, that a session with notes on disk has
+      // none.
+      if (!spec.store.loaded && sessionId !== null) {
+        list.appendChild(
+          el(
+            "div",
+            "notes-empty",
+            "Could not read the notes file, so this list may be incomplete. Anything you add is kept in this window and retried on the next note."
+          )
+        );
+        return;
+      }
       const notes: SessionNote[] =
         sessionId === null
-          ? spec.store.pendingFor(paneKeyOf(spec.target))
+          ? spec.store.pendingFor(paneKeyOf(here))
           : (spec.store.get(sessionId)?.notes ?? []);
-      list.replaceChildren();
       if (notes.length === 0) {
         // An explicit sentence, never a blank box: the empty state is where
         // the pending residual is disclosed (`notesmodel.ts`).
@@ -181,11 +233,18 @@ export function openNotes(spec: NotesDialogSpec): Promise<void> {
               true
             );
             if (!ok) return;
-            if (sessionId === null) spec.store.deletePendingNote(paneKeyOf(spec.target), note.id);
+            // Re-read: the target can have moved since this row was rendered.
+            const at = currentTarget();
+            const sid = sessionIdOf(at);
+            if (sid === null) spec.store.deletePendingNote(paneKeyOf(at), note.id);
             // A delete has no text to hand back, so `attempted` is empty — the
             // point here is the MESSAGE: a `failed` delete leaves the note on
             // disk, and a `declined-unread` one never happened at all.
-            else reportWrite(await spec.store.deleteNote(sessionId, note.id, now()), "");
+            else
+              reportWrite(
+                await spec.store.deleteNote(sid, note.id, now()).catch(() => "threw" as const),
+                ""
+              );
           })();
         });
         row.append(text, when, del);
@@ -200,13 +259,23 @@ export function openNotes(spec: NotesDialogSpec): Promise<void> {
       // through, so the two routes cannot disagree about whether the box was
       // emptied (CLAUDE.md's in-list-editor rule: clearing on one route only is
       // the classic miss).
+      // Re-read the target at the moment of the write, not at the moment the
+      // overlay opened (#2116 review B1).
+      const at = currentTarget();
       input.value = "";
-      drafts.clear(spec.target);
+      drafts.clear(at);
       reflectDraft();
       error.classList.remove("visible");
+      // `.catch` and not a bare `.then`: a rejection here would otherwise be an
+      // unhandled promise with an already-emptied box and no message — the same
+      // silent loss the outcome handling exists to close, one layer out
+      // (#2116 review premortem 1).
       void spec.store
-        .addNote(spec.target, text, now())
-        .then((outcome) => reportWrite(outcome, text));
+        .addNote(at, text, now())
+        .then(
+          (outcome) => reportWrite(outcome, text),
+          () => reportWrite("threw", text)
+        );
     };
 
     input.addEventListener("input", reflectDraft);

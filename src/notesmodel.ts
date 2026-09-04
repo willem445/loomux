@@ -96,7 +96,12 @@ export type NoteWriteOutcome =
   | "unchanged"
   | "pending"
   | "declined-unread"
-  | "failed";
+  | "failed"
+  /** The store's promise REJECTED rather than resolving with an outcome —
+   *  something threw on a path that has no other answer. Distinct from `failed`
+   *  because `failed` knows the note is in memory and on screen, and this does
+   *  not know anything (#2116 review premortem 1). */
+  | "threw";
 
 /** What the dialog must tell the human, and whether it owes them their text
  *  back.
@@ -133,6 +138,17 @@ export function noteWriteFeedback(outcome: NoteWriteOutcome): {
       return {
         message: "Could not write the notes file. This note is here for now, but is not saved yet.",
         restoreDraft: false,
+      };
+    case "threw":
+      // Nothing is known about what landed, so this errs toward the recoverable
+      // side. Handing the text back can at worst leave the human looking at a
+      // note AND its text — visible, and one Escape from fixed. NOT handing it
+      // back can lose the note outright, which is silent. The list beside the
+      // box is what tells them which happened.
+      return {
+        message:
+          "Something went wrong saving that note. Your text is back in the box — check the list above before adding it again.",
+        restoreDraft: true,
       };
     case "saved":
     case "pending":
@@ -213,6 +229,26 @@ export class NoteDrafts {
   /** Forget a target's draft outright — what a successful submit does. */
   clear(target: NoteTarget): void {
     this.drafts.delete(targetKey(target));
+  }
+
+  /** Move a draft from one target to another, for the one thing that changes a
+   *  target under a live editor: a pane's session id being learned while the
+   *  overlay is open (#2116 review B1).
+   *
+   *  The book is keyed on the target, so a re-key that was not mirrored here
+   *  would silently blank a half-typed note — the very loss `NoteDrafts` exists
+   *  to prevent, arrived at from the other direction. A no-op when there is
+   *  nothing held, and it never overwrites a draft the destination already has:
+   *  the destination's own text is the newer of the two, since the human can
+   *  only have typed it after the target moved. */
+  migrate(from: NoteTarget, to: NoteTarget): void {
+    const fromKey = targetKey(from);
+    const toKey = targetKey(to);
+    if (fromKey === toKey) return;
+    const held = this.drafts.get(fromKey);
+    if (held === undefined) return;
+    this.drafts.delete(fromKey);
+    if (!this.drafts.has(toKey)) this.drafts.set(toKey, held);
   }
 
   /** How many targets have something unsubmitted. */
