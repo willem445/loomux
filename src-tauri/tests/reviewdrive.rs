@@ -1433,6 +1433,35 @@ fn a_verification_brief_announces_itself_on_every_path_that_grants_it() {
             let (_pr, _block, lane) = report.lanes_opened.first().cloned().expect("lane 0 opens");
             let brief = lane_brief(&reg, &lane);
             record_pass(&reg, &group, &lane);
+            // **And the lane REPORTS, which is what ends its turn.** Recording
+            // a verdict does not: `idle_since_ms` is stamped by the report, and
+            // until it is, #2109's duplicate-lane refusal reads that pane as
+            // still working and refuses every re-brief — so the round under
+            // test never happens. That is how the previous cut failed (CI at
+            // `53dd287c`: `answered=true body_moved=true`, no lane opened
+            // inside the tick budget), and it is the product behaving exactly
+            // as `a_body_only_fix_round_re_opens_the_lane_whose_pane_went_idle`
+            // describes, on a fixture that had skipped the half that makes a
+            // reviewer's turn end.
+            let reviewer = Caller {
+                agent_id: lane.clone(),
+                group: group.clone(),
+                role: Role::Reviewer,
+                role_hint: None,
+            };
+            dispatch(
+                &reg,
+                &reviewer,
+                "tools/call",
+                &json!({ "name": "report", "arguments": {
+                    "outcome": "approved", "note": "nothing blocking", "ref": "#1758" } }),
+            )
+            .expect("the lane reports, which ends its turn");
+            assert!(
+                reg.agent(&lane).expect("the lane is on the roster").idle_since_ms.is_some(),
+                "{label}: the fixture's premise — that pane has finished its turn, so a \
+                 re-brief is not refused as a duplicate"
+            );
             // **And the lane has to END ITS TURN**, or no later tick can
             // re-brief it at all: #2109/#2162 refuse a second lane for a block
             // whose pane is live and still working, so the re-brief this row is
