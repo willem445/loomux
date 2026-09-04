@@ -7,10 +7,10 @@ projects (`Pane.facts()`), how that projection becomes a state
 derivation — how far each harness can be trusted when the answer is
 `turn-done`.
 
-Slice A ships the foundation only: `src/paneactivity.ts`, `src/agentrows.ts`,
-`Pane.key` / `Pane.facts()` / `Pane.noteRosterIdle()`, and the tests. There is
-no UI in it. The view that renders these rows, the tab host, the spinner and the
-badge are slice B and extend this note.
+Slice A shipped the foundation: `src/paneactivity.ts`, `src/agentrows.ts`,
+`Pane.key` / `Pane.facts()` / `Pane.noteRosterIdle()`, and the tests. There was
+no UI in it. Slice B — the tab host, the view that renders these rows, the
+spinner and the badge — is the last section of this note.
 
 ## The projection: `Pane.facts()`
 
@@ -228,3 +228,170 @@ the order inside one state is stable as states change around it;
 person must act on (`attention`, `question`) and is the badge number — `held` is
 loomux's own doing and clears itself, and a finished turn is not something
 anyone is blocked on.
+
+## Slice B: the tab, the view, and the two things it is wired to
+
+Slice B ships the UI: `src/leftpanel.ts` + `src/leftpanelmodel.ts` (the tab
+host), `src/agentsview.ts` + `src/agentsviewmodel.ts` (the rows),
+`src/spinner.ts` (the working glyph), `src/rosteridle.ts` (the strip reading),
+and a `TabBar.onStrip` hook. Nothing in the state model above changed; this is
+what reads it.
+
+### A tab, and why that is the whole argument
+
+CLAUDE.md constraint 1 permits exactly two in-flow panels, `#sessions` and
+`.sidedock`, and a third would need the argument `doc/design/side-dock.md` and
+`doc/design/xterm-resize-reflow.md` describe before it may exist. Two tabs
+inside one panel need none, and the reason is mechanical rather than
+rhetorical: the panel's width is bound to one boolean — is it open — and a tab
+switch does not touch that boolean. So a switch moves no column, autosizes
+nothing, and reaches no `fit()`.
+
+That is stated as a transition function rather than as a comment.
+`toggleTarget(state, requested)` in `leftpanelmodel.ts` is the only thing that
+decides where a toggle lands, `LeftPanel.sync()` is the only thing that touches
+`#sessions`'s `hidden` class, and `test/leftpanelmodel.test.ts` enumerates every
+crossing of {open, closed} × {same tab, other tab} — including the one that
+matters, *switching tabs on an open panel never changes visibility*.
+
+**The `#sessions` CSS rules are untouched**, and that is load-bearing rather
+than tidy: `test/resizeburst.test.ts` reads the panel's 240 ms width transition
+off the stylesheet to derive the app's frame budget, so a change to the width or
+the transition changes a number that test asserts against `FIT_MAX_WAIT_MS`.
+Everything slice B adds sits *inside* `.sessions-inner`, which was already a
+fixed-width flex column. The one structural move is that `.sessions-inner` now
+belongs to `LeftPanel` rather than to `SessionBrowser`: the browser is handed a
+body inside it, and `visible` / `toggle` / `hide` move to the panel, because
+they were always answers about the panel and there are now two views that would
+each have needed a copy.
+
+### Two refresh triggers, one ticker, and what each is for
+
+| trigger | why it exists |
+| --- | --- |
+| `tabs.onChange` | a pane opened, closed, moved or was renamed anywhere in the window |
+| `PaneEvents.onRecordChanged` | a rename, which does **not** reach `tabs.onChange` (#214) |
+| `applyAttention` (inside its gate) | four of the eight rungs are decided by the reason that pass just wrote |
+| `TabBar.onStrip` | the roster reading landed |
+| the 1 s ticker | the two inputs that move with no event behind them |
+
+The dock's own `tabs.onChange` subscription is deliberately *filtered* to real
+active-tab changes, because following it unfiltered was a defect (#1097
+rev-767 B1) — it re-reads the active pane's live cwd. This one is deliberately
+**unfiltered**, and the two are not in tension: a rename, a background tab's
+pane closing and an attention flip are all things this view should redraw for,
+and a redraw here is a walk over open panes and a keyed diff, with no live read
+of anything.
+
+The ticker exists because two inputs change with no event: the output burst
+`PaneActivity` accumulates (a pane that *stops* painting has to be noticed to
+stop reading as `working`), and the roster's reading, which lands on the strip
+poll's 4 s cadence. It is armed by `LeftPanel`'s `onShow` for this tab and
+cleared by its `onHide` — so it is off whenever the panel is closed *or* the
+Sessions tab is the selected one — and it is gated on window visibility within
+that scope through `pollgate.ts`, because component scope and visibility are
+different questions (performance.md §3 INV-4). It is declared in
+`test/perfpolicy.test.ts`'s TIMERS manifest, which refuses an undeclared
+`setInterval` outright. A tick carries no IPC at all.
+
+**The badge does not depend on the ticker.** `AgentsView.refresh()` derives the
+count and returns before rendering when the tab is closed, so an attention flip
+moves the number on a closed panel without paying for a render — which is what
+makes the count useful unopened.
+
+### The roster reading rides the strip poll that already exists
+
+The `idle` rung needs `idle_since_ms`, which arrives on
+`StripViewPayload.groups[g].summary.agents[]` — the payload of the tab strip's
+own 4 s poll, and the app's single `orch_strip_view` read
+(`doc/design/polled-views.md`: one read per strip). So `TabBar` gained an
+`onStrip(cb)` subscription rather than this feature gaining a poll: the number
+is on the wire either way, and a second poll would double the app's standing IPC
+for it.
+
+Two details of that hook are decisions, not incidentals.
+
+- **It fires only on a read that RESOLVED.** The strip's failure path returns
+  early, so a tick the backend refused leaves every pane's previous reading in
+  place — the same stale-but-true rule the badges themselves follow, rather than
+  handing out a fabricated empty roster.
+- **It fires LAST**, after `recordSweepSuccess` and the render, so a subscriber
+  that throws cannot cost the sweep its witness or leave the badges unpainted.
+
+`rosterIdleFor` (`src/rosteridle.ts`) is the lookup, and it is a module rather
+than four inline branches because three separate absences all have to answer
+`null` rather than `false`: the group may not be in the payload, its summary may
+be a refusal, and the agent may not be in the roster. `null` means *the roster
+does not cover this pane*, which the ladder reads as no evidence; `false` would
+be a positive claim that the agent holds work, derived from a lookup that found
+nothing. Both land on `working` today, so honouring the distinction costs
+nothing and is the difference between an honest reading and a lucky one. The
+reading is also `idle_since_ms !== null`, never a truthiness test: it is a
+unix-ms timestamp and `0` is a legal one.
+
+Every pane is told, including panes with no orchestration identity —
+`rosterIdleFor` answers `null` for those. Telling only *some* panes would leave
+one that lost its group binding wearing its last reading forever.
+
+### The spinner is a sprite
+
+`src/spinner.ts` emits one inline `<svg>` whose inner `<g>` is
+`SPINNER_FRAMES × SPINNER_CELL` units wide; the viewBox is one cell, and
+`styles.css` walks the strip with a `steps(8, jump-end)` translate of exactly one
+cell per step. So there is no per-frame DOM work at all — the issue rules that
+out in as many words — and the animation is a compositor transform.
+
+Three shapes were considered.
+
+| candidate | verdict |
+| --- | --- |
+| a braille-glyph `content:` keyframe animation | rejected: on Windows braille falls back to Segoe UI Symbol, whose baseline and advance drift against the UI stack, and a `content:` glyph cannot be dyed per state |
+| a per-frame DOM swap | rejected: per-frame churn on a list that can hold every pane in the window |
+| one SVG sprite stepped by CSS | shipped: deterministic geometry, one element, `currentColor` |
+
+It is **not** in `src/icons.ts`. That registry is vendored Lucide pinned
+verbatim by `test/icons.test.ts`, which would refuse a hand-drawn entry —
+correctly.
+
+The geometry is pinned from both sides: `test/spinner.test.ts` asserts eight
+distinct frames, a solid head with a strictly fading tail, a head that walks one
+ring position per frame and returns to its start after a full turn, and that
+every dot sits at a whole-pixel position inside its own cell. The stylesheet's
+`-40px` and `steps(8)` are the same arithmetic written once more, and the
+comment above them says so.
+
+`prefers-reduced-motion: reduce` stops the animation on frame 0. The row's state
+**word** is what carries the meaning either way, which is why the word sits
+beside the glyph rather than being replaced by it.
+
+### Colour: which channel each mark is on
+
+A row's left edge and its state cell are **state** positions, so they take
+`--state-*` tokens — that is what channel 1 is for (`styles.css`'s own note).
+`held` and `idle` are achromatic there by design: a stopped agent carries no
+dye, and is separated by its word and its edge rather than by a hue. The
+selected filter chip and the selected tab are **interaction** positions, so they
+take `--accent`: "the one you picked" is not an agent state. The needs-you badge
+is a state position again — it counts exactly the two rungs a person must act
+on — so it is attention-dyed.
+
+`.agents-chip.active` is an accent *background*, which
+`test/theme.test.ts`'s default-deny guard refuses unless argued; it is listed
+there as an on-state, the same class as the task board's own filter chip.
+
+### Residuals, stated
+
+- **A hold masks a needs-you count until the next attention change.** `held`
+  outranks `attention` and `question` on the ladder, so a pane that is both held
+  and blocked reads `held` and is not counted. When the hold clears, the count
+  should rise — and the delivery-held events do not drive a refresh, so with the
+  panel closed the badge can lag until the next attention *change* (the 3 s scan
+  re-emits an unchanged set, which `AttentionGate` correctly drops). Opening the
+  panel repaints immediately, and the ticker covers it while open. Not wired,
+  because widening `OrchWiring` for a badge that is already correct within one
+  attention change is a wire change for a lag nobody has measured.
+- **The list is this window's open panes.** An agent with no pane open, or a
+  pane in another orrerix window, is not here; the session browser is.
+- **No keyboard chord.** Out of scope for this slice — a new chord needs the
+  `agent-cli-reference` sweep `doc/design/side-dock.md` describes, and the two
+  buttons plus the tablist cover the gesture.

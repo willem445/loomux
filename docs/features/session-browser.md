@@ -35,6 +35,13 @@ session, not on a list of role names — so a workflow that invents a new role
 puts its sessions in **Orchestration**, where they belong, rather than quietly
 mixing them in with your own.
 
+The panel it opens in has **two tabs**. Sessions is this page; the second is the
+[Agents tab](agents-tab.html), which lists the panes already open in this window
+and what each one is doing. `Ctrl+Shift+P` and the *sessions* button always open
+the Sessions tab; the *agents* button opens the other one. Switching between them
+does not resize your panes — only opening and closing the panel does, exactly as
+it always has.
+
 ### Orchestrations
 
 Shown in **Orchestration** mode, above the session list. Every orchestration
