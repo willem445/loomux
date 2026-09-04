@@ -1062,9 +1062,17 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
  * policy's input independent of its own output (see src/paneheader.ts's header).
  * `visibility: hidden` also takes the strip out of the tab order and the
  * accessibility tree, exactly as `display: none` would. */
+/* PLACED BY `transform`, NOT BY `left`, and that is a layout fact rather than an
+ * animation preference. An absolutely-positioned box with `width: auto` is
+ * shrink-to-fit against the space between its `left` and the containing block's
+ * right edge — so writing a computed `left` back onto the element CHANGES the
+ * width the computation was based on, and a strip placed near the right edge
+ * would wrap into rows it did not need. `left: 0` here fixes the width at
+ * "as much of the pane as the strip wants", measured once; pane.ts then slides
+ * it with `translateX`, which moves nothing in layout. */
 .pane-overflow-menu {
   position: absolute; /* containing block: `.pane` (position: relative) */
-  top: var(--pane-header-h); z-index: 30;
+  top: var(--pane-header-h); left: 0; z-index: 30;
   display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
   max-width: calc(100% - 8px);
   max-height: calc(100% - var(--pane-header-h) - 8px); overflow-y: auto;

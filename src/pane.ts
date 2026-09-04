@@ -1710,7 +1710,15 @@ export class Pane implements VoiceTargetPane {
 
   /** Place the strip under the ⋯ button, inside the pane. The menu is laid out
    *  even while closed (`visibility: hidden`, not `display: none`), so its width
-   *  is readable here without a flash. */
+   *  is readable here without a flash.
+   *
+   *  Written as a `transform`, never as `left` — see the rule in styles.css. The
+   *  strip is `position: absolute` with `width: auto`, so its width is
+   *  shrink-to-fit against the space between its `left` and the pane's right
+   *  edge; writing the computed offset back as `left` would change the very
+   *  width it was computed from, and a strip near the right edge would wrap into
+   *  rows it has room not to need. `left: 0` is fixed in the stylesheet and this
+   *  slides the laid-out box, which costs layout nothing. */
   private positionOverflowMenu(): void {
     const pane = this.el.getBoundingClientRect();
     const anchor = this.overflowBtn.getBoundingClientRect();
@@ -1720,7 +1728,7 @@ export class Pane implements VoiceTargetPane {
       this.overflowMenu.offsetWidth,
       pane.width
     );
-    this.overflowMenu.style.left = `${Math.round(left)}px`;
+    this.overflowMenu.style.transform = `translateX(${Math.round(left)}px)`;
   }
 
   /** Mark genuine human input into this pane (#440 B2, review round 3 B2-R;

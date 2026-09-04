@@ -64,6 +64,16 @@ than, what `menuLeftFor` enforces. The strip wraps (`flex-wrap`) and caps its ow
 `max-width`/`max-height` against the pane, so a very narrow pane gets a
 multi-row strip rather than a clipped one.
 
+`menuLeftFor`'s answer is written to the element as a **`transform`**, never as
+`left`, and that is a layout fact rather than a taste. An absolutely-positioned
+box with `width: auto` is shrink-to-fit against the space between its `left` and
+its containing block's right edge, so writing the computed offset back as `left`
+would change the very width the computation read — a strip anchored near the
+right edge would measure narrow, wrap into rows it had room not to need, and
+then be placed from a width that no longer applied. `left: 0` is fixed in the
+stylesheet, which fixes the width at "as much of the pane as the strip wants";
+the transform then slides the laid-out box and costs layout nothing.
+
 ## Why closed is `visibility: hidden`, never `display: none`
 
 This is the part that looks like a transition convenience and is not.
