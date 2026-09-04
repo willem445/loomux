@@ -932,6 +932,24 @@ runs no driver. This one is carried by a field only `review_verdict` writes, and
 only from the drive's own lane record for the exact revision it briefed: a
 reviewer cannot set it, and an undriven repo never sees it.
 
+**What that agreement covers, and one place the two sides still differ.** The
+shared rule is the VERIFICATION question — "has a required reviewer verified the
+body as it stands" — and
+`the_driver_and_the_gate_answer_the_verification_question_identically` runs both
+readers over every crossing of it. It is **not** a claim that the driver and the
+gate agree about every pass in every state, and they do not: `lane_pass_is_current`
+reads an *unknown* digest as not-drift (#791's asymmetry — one transient `gh`
+failure to read a PR body must not re-brief every open lane in the group), while
+the gate refuses an empty digest outright (#565's — unknown may never discharge a
+merge condition). Both are right about their own question, so on a gate declaring
+`body-unchanged` a pass recorded during a body-read outage settles in
+`review-wait` and is refused at `gate-check`, and the drive cycles
+`gate-check -> ci-wait -> review-wait` on unchanged facts until
+`held(drive-stalled)` — the same exit §8's `also: [base-green]` row parks on.
+That divergence predates #2168 E2 and is not closed by it: closing it means
+deciding which of the two asymmetries yields, which is a change to the gate's
+contract rather than to the driver, and it wants its own slice.
+
 The distinction is not cosmetic. An `edges:` graph would be the runtime deciding
 *which agent runs next in a workflow* — the 500-line-YAML sprawl that section
 refuses. The gate is the runtime deciding *what must be true before a merge*,

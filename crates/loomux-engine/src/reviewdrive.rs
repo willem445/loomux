@@ -2946,6 +2946,26 @@ pub fn lane_pass_is_current(
 /// [`ReviewVerdict::pass_covers_body`], not re-implemented, for §4's reason: a
 /// driver that decided "this lane is settled" on a rule the gate does not share
 /// would drive to `gate-check` and be refused there for ever.
+///
+/// **That claim is scoped to the DELEGATION arm, and the scoping is not
+/// pedantry** (#2308 review 1, premortem 2). The first arm is deliberately NOT
+/// the gate's rule: [`lane_pass_is_current`] reads an unknown digest — the
+/// verdict carries none, or the body could not be read now — as *not drift*,
+/// because one transient `gh` failure must not re-brief every open lane in the
+/// group, while the gate refuses an empty digest outright (unknown may never
+/// discharge a merge condition). So on a gate declaring `body-unchanged`, a pass
+/// recorded during a body-read outage settles here and is refused there, and the
+/// drive cycles `gate-check -> ci-wait -> review-wait` on unchanged facts.
+///
+/// **Pre-existing, bounded, and deliberately not closed here.** That divergence
+/// predates #2168 E2 — it is the #565 asymmetry meeting the #791 one, and both
+/// arms are right about their own question — and it is bounded by
+/// `drive_timeout_minutes` into `held(drive-stalled)`, which is the same exit
+/// §8's `also: [base-green]` row parks on. Closing it means deciding which
+/// asymmetry yields, which is a change to the gate's contract rather than to
+/// this function, and it wants its own slice. What this slice DOES pin is that
+/// the two sides agree about the verification question itself, over every
+/// crossing of it: `the_driver_and_the_gate_answer_the_verification_question_identically`.
 fn lane_pass_settles(
     verdict: Option<&ReviewVerdict>,
     head: &str,
