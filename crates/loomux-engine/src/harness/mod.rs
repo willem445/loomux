@@ -619,9 +619,6 @@ impl EventLog {
         // segment too many — an off-by-one that only appears once the log has
         // rotated `SEGMENTS_RETAINED` times, which is late enough that no early
         // test would see it.
-        if rotated {
-            self.retain()?;
-        }
         Ok(seq)
     }
 
