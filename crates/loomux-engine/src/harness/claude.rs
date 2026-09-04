@@ -322,6 +322,9 @@ impl Decoder {
 
     fn assistant(&mut self, v: &Value) -> Vec<Decoded> {
         let mut out = Vec::new();
+        if !v.get("parent_tool_use_id").map_or(true, Value::is_null) {
+            return out;
+        }
         let turn = self.ensure_turn(&mut out);
         let Some(content) = v
             .get("message")
