@@ -16,6 +16,7 @@ import type { ShellKind } from "./panesetup";
 import type { CliKnobs } from "./selectorknobs";
 import type { CliProbe } from "./modelcatalog";
 import type { CliModelReply } from "./modelwire";
+import type { SessionSource } from "./sessionsource.ts";
 import { PtyRouter, type RouteOwner } from "./ptyroute.ts";
 
 export interface SpawnOptions {
@@ -42,12 +43,12 @@ export interface SpawnOptions {
 
 export interface SessionInfo {
   id: string;
-  /** Which CLI's store this row came out of. Mirrors `SessionInfo.source` in
-   *  `src-tauri/src/sessions.rs` — a plain string over IPC, so nothing checks
-   *  the two sets against each other and a scanner added there without a
-   *  widening here is silently mis-handled (#722: an opencode row read as
-   *  copilot's) rather than rejected. */
-  source: "claude" | "copilot" | "opencode";
+  /** Which CLI's store this row came out of — the set lives in
+   *  `sessionsource.ts`, a leaf, because `sessionreconcile.ts` needs the same
+   *  one and importing it from here would add a cycle (#2126 P2). That module's
+   *  doc carries the "nothing checks this against the Rust side" argument
+   *  (#722: an opencode row read as copilot's). */
+  source: SessionSource;
   title: string;
   cwd: string;
   modified_ms: number;

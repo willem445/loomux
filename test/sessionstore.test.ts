@@ -175,3 +175,26 @@ test("refresh() replaces the cached rows, so a stale list can't outlive a rescan
   assert.deepEqual(rows.map((r) => r.id), ["new"]);
   assert.equal(calls, 2, "ensureLoaded added no scan of its own");
 });
+test("every source the backend's scanner can emit is spellable on the wire (#2126)", () => {
+  // `SessionInfo["source"]` in src/pty.ts mirrors `SessionInfo.source` in
+  // src-tauri/src/sessions.rs, and NOTHING checks the two against each other —
+  // the row crosses IPC as a plain string, so a scanner added on the Rust side
+  // without a widening here is silently mis-handled rather than rejected (#722's
+  // opencode row was read as copilot's).
+  //
+  // WHAT ACTUALLY POLICES THAT UNION IS THE COMPILER, AND NOT FROM HERE. The
+  // annotation below cannot fail the build: the root `tsconfig.json` sets
+  // `"include": ["src"]`, so `tsc --noEmit` never reads this file, and
+  // `npm test` is `node --test` over `.ts`, which strips types without checking
+  // them. What does fail is `src/sessionreconcile.ts`'s `Cli`, which is DERIVED
+  // from this union (`export type Cli = SessionInfo["source"]`) and reached by
+  // `main.ts`'s `toRecords` — removing a member there is a real `TS2322` in
+  // `src/`. This test is the runtime companion to that, and the annotation is
+  // documentation of intent rather than an enforced pin; said plainly so a
+  // mutation table's "no test reddened" row is read correctly.
+  const sources: SessionInfo["source"][] = ["claude", "copilot", "opencode", "pi"];
+  assert.equal(sources.length, 4);
+  const pi: SessionInfo = { ...row("pi-1"), source: "pi", resume_command: "pi --session pi-1" };
+  assert.equal(pi.source, "pi");
+  assert.ok(pi.resume_command.startsWith("pi "), pi.resume_command);
+});

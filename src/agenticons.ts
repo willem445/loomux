@@ -146,7 +146,7 @@ export const MARK_SOURCES: Record<string, string> = Object.fromEntries(
  * value lands in a `class` attribute inside an `innerHTML` string — the same untrusted byte
  * the letter badge clamps to one character (§Safety). Interpolating it would put
  * `"><img onerror=…>` straight into the markup. It cannot: only a name that MATCHES one of
- * the literals below is ever interpolated, so what reaches the attribute is one of seven
+ * the literals below is ever interpolated, so what reaches the attribute is one of eight
  * compile-time strings and there is nothing to escape. Same discipline as the clamp — make
  * the hostile value unexpressible rather than escaped.
  */
@@ -158,6 +158,7 @@ export const CLI_DYE_PROGRAMS = [
   "gemini",
   "hermes",
   "ante",
+  "pi",
 ] as const;
 
 /** Membership test for the roster above. A `Set`, so a program named after a prototype

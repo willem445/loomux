@@ -118,6 +118,7 @@
   --cli-gemini: #9677c5;
   --cli-hermes: #b67c94;
   --cli-ante: #c3c455;
+  --cli-pi: #00d2f0;
 
   /* --- type roles. Sans carries labels and titles; mono is reserved for MACHINE
          IDENTIFIERS — paths, branches, ids, counts, timings — so the mono face always
@@ -228,6 +229,7 @@
 .cli-gemini   { color: var(--cli-gemini); }
 .cli-hermes   { color: var(--cli-hermes); }
 .cli-ante     { color: var(--cli-ante); }
+.cli-pi       { color: var(--cli-pi); }
 
 * { box-sizing: border-box; }
 
@@ -1486,6 +1488,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .session-badge.claude { background: color-mix(in srgb, var(--cli-claude) 16%, transparent); color: var(--cli-claude); }
 .session-badge.copilot { background: color-mix(in srgb, var(--cli-copilot) 16%, transparent); color: var(--cli-copilot); }
 .session-badge.opencode { background: color-mix(in srgb, var(--cli-opencode) 16%, transparent); color: var(--cli-opencode); }
+.session-badge.pi { background: color-mix(in srgb, var(--cli-pi) 16%, transparent); color: var(--cli-pi); }
 /* The agent roles, in the one role table this app has: orchestrator azure, worker
    jade, reviewer violet, planner amber, manager orchid. Every surface that names a role uses it — this
    list, .group-role.role-* and the workflow pane's .wf-node-* / .wf-chip-* — and

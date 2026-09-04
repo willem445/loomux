@@ -27,7 +27,7 @@ use loomux_lib::sessions::{
     list_sessions_for_test, opencode_store_from, set_claude_projects_root_for_test,
     set_copilot_session_state_root_for_test, set_launch_intent_path_for_test,
     set_legacy_copilot_posture_path_for_test, set_opencode_store_for_test,
-    set_session_index_path_for_test, SessionInfo, LIST_LIMIT,
+    set_pi_sessions_root_for_test, set_session_index_path_for_test, SessionInfo, LIST_LIMIT,
 };
 use rusqlite::Connection;
 use std::fs;
@@ -135,10 +135,17 @@ impl Seam {
         fs::create_dir_all(&dir).unwrap();
         let claude = dir.join("claude-projects");
         let copilot = dir.join("copilot-session-state");
+        let pi = dir.join("pi-sessions");
         fs::create_dir_all(&claude).unwrap();
         fs::create_dir_all(&copilot).unwrap();
+        fs::create_dir_all(&pi).unwrap();
         set_claude_projects_root_for_test(Some(claude));
         set_copilot_session_state_root_for_test(Some(copilot));
+        // #2126 P2: bound for the same reason every other root here is — the
+        // scan is one pass over all of them, so an unbound pi root would walk
+        // the developer's own ~/.pi and make every row count on this file a
+        // fact about their machine.
+        set_pi_sessions_root_for_test(Some(pi));
         set_session_index_path_for_test(Some(dir.join("session-index.json")));
         set_launch_intent_path_for_test(Some(dir.join("launch-intent.json")));
         set_legacy_copilot_posture_path_for_test(Some(dir.join("copilot-posture.json")));
@@ -159,6 +166,7 @@ impl Drop for Seam {
     fn drop(&mut self) {
         set_claude_projects_root_for_test(None);
         set_copilot_session_state_root_for_test(None);
+        set_pi_sessions_root_for_test(None);
         set_session_index_path_for_test(None);
         set_launch_intent_path_for_test(None);
         set_legacy_copilot_posture_path_for_test(None);

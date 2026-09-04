@@ -27,13 +27,31 @@
 // candidate — for any pane it touches — is refused outright rather than
 // guessed. Worst case after a refusal is exactly today's status quo.
 
-/** The CLIs a `listSessions()` row can name (`SessionInfo["source"]`) — the
- *  set this module matches panes against. `opencode` joined it with #722's
- *  scanner: its rows arrive with a cwd and a session id like any other, so the
- *  matching and refusal logic below applies unchanged, and leaving it out
- *  would silently make every opencode pane unadoptable while the sidebar
- *  listed the very session it should have adopted. */
-export type Cli = "claude" | "copilot" | "opencode";
+import type { SessionSource } from "./sessionsource.ts";
+
+/** The CLIs a `listSessions()` row can name — the set this module matches panes
+ *  against, and **an alias of the one definition rather than a second spelling**
+ *  (#2126 P2).
+ *
+ *  It used to be a hand-written union whose own doc said it was
+ *  `SessionInfo["source"]`, which is a claim a reader has to check. Two copies of
+ *  one set is one copy too many in the direction that fails silently: a scanner
+ *  added on the Rust side widens the wire row's `source`, and a `Cli` that did
+ *  not follow left every pane of the new CLI unadoptable while the sidebar
+ *  listed the very session it should have adopted. That is exactly what #722
+ *  fixed by hand for opencode. There is now nothing to disagree: this and
+ *  `SessionInfo["source"]` are the SAME type, so widening the wire row widens
+ *  this by construction. What would catch a future re-spelling — someone typing
+ *  a union out here again — is `main.ts`'s `toRecords`, which maps
+ *  `SessionInfo[]` into `SessionRecord[]` and fails to compile if the two drift
+ *  (`TS2322`, measured in the mutation table on the PR).
+ *
+ *  Taken from the LEAF (`sessionsource.ts`) rather than from `pty.ts`, which
+ *  would be a new import cycle — review round 1 finding 2; that module's doc has
+ *  the argument. `import type` either way, so nothing at runtime is pulled in:
+ *  `pty.ts` reaches `transport.ts` (the one module that may import
+ *  `@tauri-apps/*`) and this module is DOM-free and I/O-free by design. */
+export type Cli = SessionSource;
 
 /** Just enough of a `listSessions()` row to match against, for both functions
  *  below. main.ts maps the backend's `SessionInfo[]` (source→cli, modified_ms

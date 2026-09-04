@@ -207,19 +207,20 @@ From here you can:
   falls back to PowerShell rather than failing to start.
 - **Name** a pane with `F2` so you can tell your agents apart.
 - **Restore a past agent session** with the session browser (`Ctrl+Shift+P`) —
-  it scans your machine for resumable Claude Code, Copilot CLI, and OpenCode
+  it scans your machine for resumable Claude Code, Copilot CLI, OpenCode and pi
   sessions and drops the one you pick back into a pane, in its original folder.
   See the [session browser](features/session-browser.html).
 
 ## Your first agent pane
 
 Orrerix is built to run AI coding agents, but it doesn't bundle them — it drives
-the CLIs you already have installed. The three first-class ones are:
+the CLIs you already have installed. The four first-class ones are:
 
 - **[Claude Code](https://claude.com/claude-code)** — the `claude` CLI.
 - **[GitHub Copilot CLI](https://github.com/github/copilot-cli)** — the
   `copilot` CLI.
 - **[OpenCode](https://opencode.ai/)** — the `opencode` CLI.
+- **[pi](https://pi.dev/)** — the `pi` CLI.
 
 Make sure at least one is installed and on your `PATH`. Then, to open an agent
 in a pane:
@@ -267,7 +268,7 @@ work to a fleet that manages itself, that's the
 
 | For | Requirement |
 | --- | --- |
-| Running an agent pane | `claude`, `copilot`, and/or `opencode` on your `PATH` |
+| Running an agent pane | `claude`, `copilot`, `opencode` and/or `pi` on your `PATH` |
 | The issues/PR view and the orchestration PR workflow | `gh` CLI, authenticated (`gh auth login`) |
 | Voice prompts (Windows, opt-in) | a whisper.cpp runtime + a model — see [Voice prompts](features/voice-prompts.html) |
 

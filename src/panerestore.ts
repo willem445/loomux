@@ -337,6 +337,24 @@ const SESSION_FLAG_NAMES = ["--session-id", "--resume"];
  *  `--session=` / `--session-id=`, which cannot alias either. */
 const OPENCODE_SESSION_FLAG_NAMES = [...SESSION_FLAG_NAMES, "--session"];
 
+/** The same set plus pi's own `--session` (#2126 P2), for a line this module
+ *  has ALREADY identified as pi's.
+ *
+ *  pi has BOTH spellings and they are not synonyms: `--session-id <id>` opens
+ *  the named session or CREATES it, `--session <path|id>` continues an existing
+ *  one, and pi itself refuses them together (`validateSessionIdFlags`). loomux
+ *  only ever emits the first — see `agentResumeCommand` — but the Sessions tab's
+ *  own `resume_command` is `pi --session <id>`, so a pane opened from that tab
+ *  is RECORDED with the second. Excising only `--session-id` would leave it in
+ *  place, and the very next restore would build
+ *  `pi --session A --session-id A` — a line pi rejects outright.
+ *
+ *  Identical membership to `OPENCODE_SESSION_FLAG_NAMES` today, and deliberately
+ *  not aliased to it: the two are equal by coincidence of vendor vocabulary, not
+ *  by a shared rule, and one CLI's flag set moving must not silently move the
+ *  other's. The doc above each says which vendor's facts it rests on. */
+const PI_SESSION_FLAG_NAMES = [...SESSION_FLAG_NAMES, "--session"];
+
 /** True when `raw` — the RAW slice of ONE token, quotes included if it was a
  *  quoted token — is a session flag written bare (no value attached: not
  *  even a trailing `=`). A quoted token's raw slice always starts with `"`,
@@ -506,6 +524,20 @@ function stripSessionFlagsFromArgv(
  *      of the backend's own `build_agent_command`; its excision uses
  *      `OPENCODE_SESSION_FLAG_NAMES` so the recorded `--session` is dropped
  *      rather than doubled.
+ *   6. **pi resumes with `--session-id <id>` — the SAME flag a fresh pi launch
+ *      uses** (#2126 P2), which is the one place this module deliberately emits
+ *      no difference between the two paths. pi's `--session-id` opens the named
+ *      session if it exists and creates it with that id if it does not
+ *      (`SOURCE` `main.ts`'s `createSessionManager`:
+ *      `findLocalSessionByExactId` … else `SessionManager.create(…, { id })`),
+ *      so one flag answers both cases and the pane keeps its identity either
+ *      way. That matters because a pi session file does not exist until the
+ *      first assistant response: a pane killed before it was ever prompted has
+ *      a real, pre-minted id and NO file, and `--session` — which requires an
+ *      existing one — would fail on exactly the pane a restore is most likely
+ *      to hit. Excision uses `PI_SESSION_FLAG_NAMES` so a `--session` recorded
+ *      by the Sessions tab is dropped rather than combined with it, which pi
+ *      refuses.
  *
  *  Prefers the string `command`; falls back to structured `argv`, then to a
  *  bare `claude --resume` (the historical default — a bare fallback with no
@@ -522,18 +554,26 @@ export function agentResumeCommand(
   const program = programFromRestore(command, argv);
   const isCopilot = program === "copilot";
   const isOpencode = program === "opencode";
-  const names = isOpencode ? OPENCODE_SESSION_FLAG_NAMES : SESSION_FLAG_NAMES;
+  const isPi = program === "pi";
+  const names = isOpencode
+    ? OPENCODE_SESSION_FLAG_NAMES
+    : isPi
+      ? PI_SESSION_FLAG_NAMES
+      : SESSION_FLAG_NAMES;
   if (command && command.trim()) {
     const resumeFlag = isCopilot
       ? `--resume=${sessionId}`
       : isOpencode
         ? `--session ${sessionId}`
-        : `--resume ${sessionId}`;
+        : isPi
+          ? `--session-id ${sessionId}`
+          : `--resume ${sessionId}`;
     return { command: `${stripSessionFlagsFromCommand(command, names)} ${resumeFlag}` };
   }
   if (argv && argv.length) {
     const stripped = stripSessionFlagsFromArgv(argv, names);
     if (isCopilot) return { argv: [...stripped, `--resume=${sessionId}`] };
+    if (isPi) return { argv: [...stripped, "--session-id", sessionId] };
     return { argv: [...stripped, isOpencode ? "--session" : "--resume", sessionId] };
   }
   return { command: `claude --resume ${sessionId}` };
@@ -565,14 +605,29 @@ export function agentResumeCommand(
  *  unknown flag; appending `--session <id>` would be worse than that — it is
  *  precisely the doomed resume this function exists to avoid, since this arm
  *  is only reached when the caller has established that the session is not
- *  resumable. */
+ *  resumable.
+ *
+ *  **pi DOES keep its identity here** (#2126 P2), and that is not an
+ *  inconsistency with the paragraph above — it is the same rule reaching the
+ *  opposite answer on a different vendor fact. opencode loses its id because no
+ *  opencode flag can pre-assign one; pi's `--session-id` is exactly such a flag,
+ *  so the shared arm below is right for it and no pi branch is needed. The
+ *  result is that this function and `agentResumeCommand` emit the IDENTICAL line
+ *  for pi, which is the honest consequence of one flag meaning
+ *  open-or-create — pinned in `test/panerestore.test.ts` so a later reader finds
+ *  the reason rather than an apparent duplication. */
 export function agentFreshCommand(
   command: string | null,
   argv: string[] | null,
   sessionId: string
 ): { command?: string; argv?: string[] } {
-  const isOpencode = programFromRestore(command, argv) === "opencode";
-  const names = isOpencode ? OPENCODE_SESSION_FLAG_NAMES : SESSION_FLAG_NAMES;
+  const program = programFromRestore(command, argv);
+  const isOpencode = program === "opencode";
+  const names = isOpencode
+    ? OPENCODE_SESSION_FLAG_NAMES
+    : program === "pi"
+      ? PI_SESSION_FLAG_NAMES
+      : SESSION_FLAG_NAMES;
   if (command && command.trim()) {
     const stripped = stripSessionFlagsFromCommand(command, names);
     return { command: isOpencode ? stripped : `${stripped} --session-id ${sessionId}` };
@@ -584,9 +639,11 @@ export function agentFreshCommand(
   return { command: `claude --session-id ${sessionId}` };
 }
 
-/** The two CLIs `solo_prepare` (mod.rs:10441) mints a channel identity for —
- *  the only ones whose recorded command can carry the flags `stripSoloMcpFlags`
- *  below recognizes.
+/** The CLIs `solo_prepare` (mod.rs:10441) mints a channel identity for — the
+ *  only ones whose recorded command can carry the flags `stripSoloMcpFlags`
+ *  below recognizes. Three of them since #2126 added pi; the count is
+ *  deliberately not spelled out again below, where `SOLO_MCP_CLI_SET` is the
+ *  one place it can be read off.
  *
  *  Bound to `CliCaps::mcp_argv_seam`, NOT to the set of CLIs whose sessions
  *  loomux can list: opencode joined `SessionInfo["source"]` in #722 and stays
@@ -597,8 +654,57 @@ export function agentFreshCommand(
  *  at all, so there is nothing for this type to name and nothing for
  *  `stripSoloMcpFlags` to excise — it comes back from that function untouched,
  *  as `cli: null`, which is correct. This widens when opencode gets an argv
- *  seam, not when the Sessions tab learns to list it. */
-export type SoloCli = "claude" | "copilot";
+ *  seam, not when the Sessions tab learns to list it.
+ *
+ *  **pi joined with #2126 P2, and it is the seam rule doing the work, not the
+ *  listing one.** pi's MCP config is named by a real CLI flag —
+ *  `--mcp-config <path>`, registered by the `pi-mcp-adapter` package
+ *  (`pi.registerFlag("mcp-config", …)`) and read straight off `process.argv` —
+ *  so `CliCaps::mcp_argv_seam` is true for it and `solo_prepare` mints a solo pi
+ *  pane a real channel identity. That identity's config file is deleted at agent
+ *  exit exactly like claude's, so it has to be excised here for the same reason;
+ *  see `PI_SOLO_MCP_RE`. */
+export type SoloCli = "claude" | "copilot" | "pi";
+
+/** Every `SoloCli`, as a **total** record — the shape that makes widening the
+ *  union without widening the list a compile error (#2126 P2, review round 2).
+ *
+ *  `readonly SoloCli[]` was the first attempt and it does not hold: an array
+ *  typed by a union accepts any SUBSET of it, so adding a fourth member to
+ *  `SoloCli` and forgetting this line compiled cleanly — the very drift the list
+ *  exists to prevent, with a doc comment claiming otherwise. A
+ *  `Record<SoloCli, true>` is checked in both directions at once: a missing key
+ *  is `TS2741`, and a key that is not a `SoloCli` is an excess-property error.
+ *
+ *  The value is `true` rather than anything meaningful because the KEYS are the
+ *  data; nothing reads the value. */
+const SOLO_MCP_CLI_SET: Record<SoloCli, true> = { claude: true, copilot: true, pi: true };
+
+/** The CLIs a solo launch may mint a channel identity for — `SoloCli` as a
+ *  runtime value, so the launcher's toggle gate, its mint gate and this module's
+ *  excision cannot disagree about the set (#2126 P2).
+ *
+ *  Before this there were two hand-typed copies of the pair in `launcher.ts`
+ *  (`applyChannelTools` and the mint loop) and a third answer implicit in
+ *  `stripSoloMcpFlags` — three places to widen, one rule, and the failure mode
+ *  of missing one is silent: a CLI offered the toggle but never minted for, or
+ *  minted for but with the toggle hidden.
+ *
+ *  Derived from `SOLO_MCP_CLI_SET` above rather than written out again, so the
+ *  totality that record enforces is the totality this list has.
+ *
+ *  Its authority is still the backend's `CliCaps::mcp_argv_seam`, which this
+ *  mirrors; `solo_prepare` reads the real table and answers delivery-only for a
+ *  CLI whose row says otherwise, so a disagreement costs a pane its eager
+ *  identity, never a wrong grant. */
+export const SOLO_MCP_CLIS: readonly SoloCli[] = Object.keys(SOLO_MCP_CLI_SET) as SoloCli[];
+
+/** Whether a solo launch of `program` can be handed a channel identity on its
+ *  command line. Pure, so `test/panerestore.test.ts` can pin the set against
+ *  `SoloCli` directly rather than through a DOM. */
+export function isSoloMcpCli(program: string | null | undefined): program is SoloCli {
+  return (SOLO_MCP_CLIS as readonly string[]).includes(program ?? "");
+}
 
 // The minted config path is always a real Windows profile path
 // (`C:\Users\<username>\AppData\Roaming\loomux\orchestration\__solo__\configs\
@@ -633,6 +739,37 @@ const CLAUDE_SOLO_MCP_RE = new RegExp(
 const COPILOT_SOLO_MCP_RE = new RegExp(
   `(^|\\s)--additional-mcp-config\\s+(${QUOTED_OR_BARE_VALUE})\\s+--allow-tool\\s+(?:${MCP_SERVERS.join("|")})(?=\\s|$)`
 );
+/** pi's solo identity is ONE flag and its value — `--mcp-config <path>` — with
+ *  no allow-list token after it, because pi has no permission surface to name
+ *  one to: it "intentionally does not include … permission popups" (`DOCS`
+ *  `usage.md` §Design Principles), and exclusivity is delivered by
+ *  `PI_MCP_CONFIG_MODE=exclusive` in the pane ENVIRONMENT rather than by a
+ *  second flag. So there is no trailing token to anchor on, and this pattern is
+ *  correspondingly weaker than its two neighbours.
+ *
+ *  **That weakness is why the pi branch is gated on the PROGRAM and the other
+ *  two are not.** `--mcp-config <path>` is also the leading half of claude's
+ *  group and a flag a human may reasonably have typed themselves; an ungated
+ *  match would classify a hand-written `claude --mcp-config ./my.json` as pi's
+ *  and silently delete the human's own flag on every restore. Matching only on
+ *  a line this module has already identified as pi's costs nothing and closes
+ *  that. (A pi line the human typed with their OWN `--mcp-config` is the
+ *  residual: it is stripped and re-minted rather than preserved. Stated in
+ *  `doc/design/pi.md`; the same trade claude's group has always made, one flag
+ *  narrower.)
+ *
+ *  **`--mcp-config` is not pi's own flag, and that matters to whoever sets
+ *  `CliCaps::mcp_argv_seam`** (review round 1, finding 3). pi core at
+ *  `b79e4cc8` does not know it and rejects unregistered flags outright
+ *  (`SOURCE` `main.ts`: "Unknown option --<x>"); it is registered by the
+ *  third-party `pi-mcp-adapter` package (`ADAPTER` `index.ts`:
+ *  `pi.registerFlag("mcp-config", …)`). So on a machine without that extension
+ *  installed, a solo pi launch that has been minted a channel identity boots
+ *  into an unknown-flag error rather than a pane. Nothing in THIS module can
+ *  prevent that — this side only ever removes the flag — so it is named here
+ *  and owned by the slice that decides to emit it: the seam row and the
+ *  adapter-presence question belong to #2126 P1. */
+const PI_SOLO_MCP_RE = new RegExp(`(^|\\s)--mcp-config\\s+(${QUOTED_OR_BARE_VALUE})(?=\\s|$)`);
 
 /** Remove a recorded agent command's solo channel-identity MCP flags (#439):
  *  `--mcp-config <path> --strict-mcp-config --allowedTools mcp__<server>`
@@ -677,6 +814,17 @@ export function stripSoloMcpFlags(
         command: command.slice(0, copilot.index) + command.slice(copilot.index + copilot[0].length),
       };
     }
+    // Program-gated, and ordered LAST so the two anchored patterns above always
+    // get first refusal — see `PI_SOLO_MCP_RE`.
+    if (programFromRestore(command, null) === "pi") {
+      const pi = PI_SOLO_MCP_RE.exec(command);
+      if (pi) {
+        return {
+          cli: "pi",
+          command: command.slice(0, pi.index) + command.slice(pi.index + pi[0].length),
+        };
+      }
+    }
     return { cli: null, command }; // untouched — see doc comment above
   }
   if (argv && argv.length) {
@@ -695,6 +843,13 @@ export function stripSoloMcpFlags(
       }
       if (argv[i] === "--additional-mcp-config" && argv[i + 2] === "--allow-tool" && (MCP_SERVERS as readonly string[]).includes(argv[i + 3])) {
         return { cli: "copilot", argv: [...argv.slice(0, i), ...argv.slice(i + 4)] };
+      }
+      if (
+        argv[i] === "--mcp-config" &&
+        argv[i + 1] !== undefined &&
+        programFromRestore(null, argv) === "pi"
+      ) {
+        return { cli: "pi", argv: [...argv.slice(0, i), ...argv.slice(i + 2)] };
       }
     }
     return { cli: null, argv }; // untouched, same guarantee as the command branch
@@ -757,8 +912,13 @@ export function sessionIdFromCommand(command: string | null, argv: string[] | nu
   // already falls back to argv when there is no string command, which is the
   // same ground the scan below falls through to — the asymmetry `hasForkSession`
   // was fixed for (review NB1), avoided here by never deriving it twice.
+  const program = programFromRestore(command, argv);
   const names =
-    programFromRestore(command, argv) === "opencode" ? OPENCODE_SESSION_FLAG_NAMES : SESSION_FLAG_NAMES;
+    program === "opencode"
+      ? OPENCODE_SESSION_FLAG_NAMES
+      : program === "pi"
+        ? PI_SESSION_FLAG_NAMES
+        : SESSION_FLAG_NAMES;
   const scan = (tokens: string[]): string | null => {
     for (let i = 0; i < tokens.length; i++) {
       const t = tokens[i];
@@ -872,7 +1032,9 @@ export function sessionCliFromCommand(command: string | null | undefined): Cli |
   const first = command?.trim().split(/\s+/)[0];
   if (!first) return null;
   const program = normalizeAgentProgram(first);
-  return program === "claude" || program === "copilot" || program === "opencode" ? program : null;
+  return program === "claude" || program === "copilot" || program === "opencode" || program === "pi"
+    ? program
+    : null;
 }
 
 /** Whether a restored copilot pane's command/argv actually carries

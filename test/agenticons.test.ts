@@ -571,3 +571,21 @@ test("the pane feeds its SSH state to the resolver, not just its launch line", (
       'and caption the pane "Agent CLI: ssh" again (#992 review B1)'
   );
 });
+test("pi draws a P in its own dye, and the roster's letters stay distinguishable (#2126)", () => {
+  const view = agentMark({ command: "pi --session-id abc" });
+  assert.ok(view);
+  assert.equal(view.program, "pi");
+  // The letter tier, not a vendored mark: pi's vendor publishes no glyph loomux
+  // holds a licence over, so the badge is the generated fallback (§Licensing).
+  assert.equal(view.kind, "letter");
+  assert.ok(view.svg.includes("cli-pi"), `pi's mark must wear its own dye class: ${view.svg}`);
+
+  // No other first-class CLI badges a `P`, which is what lets colour be the
+  // second channel rather than the only one — the obligation
+  // test/theme.test.ts enforces for a SAME-glyph pair, checked here from the
+  // shape side. Derived from the roster, not listed, so a future `pnpm-agent`
+  // trips it on the day it is added.
+  const glyph = (p: string) => agentMark({ command: p })!.svg.replace(/class="[^"]*"/, "");
+  const sameShape = CLI_DYE_PROGRAMS.filter((p) => p !== "pi" && glyph(p) === glyph("pi"));
+  assert.deepEqual(sameShape, [], `these CLIs draw pi's badge: ${sameShape.join(", ")}`);
+});

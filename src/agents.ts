@@ -18,6 +18,7 @@ export const AGENTS: AgentDef[] = [
   { id: "copilot", label: "Copilot CLI", command: "copilot" },
   { id: "codex", label: "Codex", command: "codex" },
   { id: "opencode", label: "OpenCode", command: "opencode" },
+  { id: "pi", label: "pi", command: "pi" },
   { id: "gemini", label: "Gemini CLI", command: "gemini" },
   { id: "hermes", label: "Hermes", command: "hermes" },
   { id: "ante", label: "Ante", command: "ante" },
