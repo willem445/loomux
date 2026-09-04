@@ -93,7 +93,7 @@ const AGENT_START_TIMEOUT: Duration = Duration::from_secs(10);
 /// it is the default state of a machine that has never used ssh-agent.
 pub const WINDOWS_AGENT_HINT: &str =
     "Windows ships the OpenSSH Authentication Agent disabled. In an Administrator PowerShell: \
-     Set-Service ssh-agent -StartupType Automatic; Start-Service ssh-agent";
+     Set-Service ssh-agent -StartupType Automatic";
 
 /// The same refusal off Windows, where there is no service to enable and the
 /// agent is whatever the user's session started.
