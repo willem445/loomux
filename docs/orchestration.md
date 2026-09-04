@@ -35,9 +35,11 @@ in an audit log.
    you can mix agent types in one group (e.g. a Claude orchestrator driving
    Copilot workers). The top *Agent* select is the group default that seeds every
    role; override any role you like. Model dropdowns are populated by asking the
-   selected CLI what it offers — `opencode models`, which lists the models *your*
-   configured providers actually expose, for OpenCode; the CLI's own help for the
-   others — so new models appear automatically, with a custom-entry escape hatch.
+   selected CLI what it offers — `opencode models`, which lists the models
+   *your* configured providers actually expose, for OpenCode; `pi --list-models`,
+   which lists the models your authed providers offer, for pi; the CLI's own
+   help for the others — so new models appear automatically, with a
+   custom-entry escape hatch.
 
    Orrerix also asks each CLI directly which models *this machine and this
    account* can actually run, and what each one supports — the same list your
