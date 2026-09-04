@@ -639,9 +639,11 @@ export function agentFreshCommand(
   return { command: `claude --session-id ${sessionId}` };
 }
 
-/** The two CLIs `solo_prepare` (mod.rs:10441) mints a channel identity for —
- *  the only ones whose recorded command can carry the flags `stripSoloMcpFlags`
- *  below recognizes.
+/** The CLIs `solo_prepare` (mod.rs:10441) mints a channel identity for — the
+ *  only ones whose recorded command can carry the flags `stripSoloMcpFlags`
+ *  below recognizes. Three of them since #2126 added pi; the count is
+ *  deliberately not spelled out again below, where `SOLO_MCP_CLI_SET` is the
+ *  one place it can be read off.
  *
  *  Bound to `CliCaps::mcp_argv_seam`, NOT to the set of CLIs whose sessions
  *  loomux can list: opencode joined `SessionInfo["source"]` in #722 and stays
@@ -664,6 +666,20 @@ export function agentFreshCommand(
  *  see `PI_SOLO_MCP_RE`. */
 export type SoloCli = "claude" | "copilot" | "pi";
 
+/** Every `SoloCli`, as a **total** record — the shape that makes widening the
+ *  union without widening the list a compile error (#2126 P2, review round 2).
+ *
+ *  `readonly SoloCli[]` was the first attempt and it does not hold: an array
+ *  typed by a union accepts any SUBSET of it, so adding a fourth member to
+ *  `SoloCli` and forgetting this line compiled cleanly — the very drift the list
+ *  exists to prevent, with a doc comment claiming otherwise. A
+ *  `Record<SoloCli, true>` is checked in both directions at once: a missing key
+ *  is `TS2741`, and a key that is not a `SoloCli` is an excess-property error.
+ *
+ *  The value is `true` rather than anything meaningful because the KEYS are the
+ *  data; nothing reads the value. */
+const SOLO_MCP_CLI_SET: Record<SoloCli, true> = { claude: true, copilot: true, pi: true };
+
 /** The CLIs a solo launch may mint a channel identity for — `SoloCli` as a
  *  runtime value, so the launcher's toggle gate, its mint gate and this module's
  *  excision cannot disagree about the set (#2126 P2).
@@ -672,15 +688,16 @@ export type SoloCli = "claude" | "copilot" | "pi";
  *  (`applyChannelTools` and the mint loop) and a third answer implicit in
  *  `stripSoloMcpFlags` — three places to widen, one rule, and the failure mode
  *  of missing one is silent: a CLI offered the toggle but never minted for, or
- *  minted for but with the toggle hidden. It is a `readonly` tuple typed BY
- *  `SoloCli`, so adding a member to that union without adding it here is a
- *  compile error rather than a drift.
+ *  minted for but with the toggle hidden.
+ *
+ *  Derived from `SOLO_MCP_CLI_SET` above rather than written out again, so the
+ *  totality that record enforces is the totality this list has.
  *
  *  Its authority is still the backend's `CliCaps::mcp_argv_seam`, which this
  *  mirrors; `solo_prepare` reads the real table and answers delivery-only for a
  *  CLI whose row says otherwise, so a disagreement costs a pane its eager
  *  identity, never a wrong grant. */
-export const SOLO_MCP_CLIS: readonly SoloCli[] = ["claude", "copilot", "pi"];
+export const SOLO_MCP_CLIS: readonly SoloCli[] = Object.keys(SOLO_MCP_CLI_SET) as SoloCli[];
 
 /** Whether a solo launch of `program` can be handed a channel identity on its
  *  command line. Pure, so `test/panerestore.test.ts` can pin the set against

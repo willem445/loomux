@@ -173,8 +173,24 @@ test("a fourth source names itself, on the badge and on the restored pane (#2126
   assert.equal(restoredPaneName("pi", "fix the login bug"), "pi · fix the login bug");
 
   // The property, not the row: every source the wire can carry labels itself,
-  // and no two collapse onto one label. Written as a loop over the union's own
-  // members so a fifth source has to be added HERE, not discovered in the UI.
+  // and no two collapse onto one label.
+  //
+  // THIS LIST IS HAND-MAINTAINED, and saying otherwise would be the claim this
+  // very test exists to police. An earlier version of this comment said it was
+  // "a loop over the union's own members, so a fifth source has to be added
+  // HERE" — it is not: `sources` is a plain string array, and nothing makes a
+  // new `SessionSource` appear in it. Typing it `SessionSource[]` would not fix
+  // that either, in two ways at once: a union-typed array accepts any SUBSET
+  // (the same hole `SOLO_MCP_CLIS` had before it became a `Record`), and the
+  // root `tsconfig.json` is `"include": ["src"]`, so `tsc --noEmit` never reads
+  // this file at all.
+  //
+  // What actually keeps the set honest lives in `src/`: `sessionsource.ts` is
+  // the single definition, and `main.ts`'s `toRecords` makes `pty.ts` and
+  // `sessionreconcile.ts` disagreeing a compile error. A fifth source that
+  // reaches the UI without reaching this array costs this test its coverage of
+  // that source — it does not fail. Stated so a reader knows which half is
+  // enforced.
   const sources = ["claude", "copilot", "opencode", "pi"];
   const labels = sources.map(sessionBadgeLabel);
   assert.deepEqual(labels, ["CLAUDE", "COPILOT", "OPENCODE", "PI"]);
