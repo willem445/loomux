@@ -1433,6 +1433,33 @@ fn a_verification_brief_announces_itself_on_every_path_that_grants_it() {
             let (_pr, _block, lane) = report.lanes_opened.first().cloned().expect("lane 0 opens");
             let brief = lane_brief(&reg, &lane);
             record_pass(&reg, &group, &lane);
+            // **And the lane has to END ITS TURN**, or no later tick can
+            // re-brief it at all: #2109/#2162 refuse a second lane for a block
+            // whose pane is live and still working, so the re-brief this row is
+            // about never happens and there is no brief to assert on (CI at
+            // `53dd287c`). A `report` is what stamps `idle_since_ms`, and the
+            // reuse arm needs the pane's own pty and a delivery on record —
+            // the same fixture `a_body_only_fix_round_re_opens_the_lane_whose_
+            // pane_went_idle` builds, for the same reason.
+            dispatch(
+                &reg,
+                &Caller {
+                    agent_id: lane.clone(),
+                    group: group.clone(),
+                    role: Role::Reviewer,
+                    role_hint: None,
+                },
+                "tools/call",
+                &json!({ "name": "report", "arguments": {
+                    "outcome": "approved", "note": "nothing blocking", "ref": "#1758" } }),
+            )
+            .expect("the lane reports, which ends its turn");
+            assert!(
+                reg.agent(&lane).expect("the lane is on the roster").idle_since_ms.is_some(),
+                "the fixture's premise: that pane has finished its turn"
+            );
+            with_pane(&reg, &lane, 7002);
+            make_pane_ready(&reg, 7002, false);
             // **One tick before the shape can be claimed.** `review_verdict`
             // writes the verdict FILE; the lane RECORD's `at_head` is filled by
             // `record_verdict_seen` inside a tick. Asserting the answered shape
