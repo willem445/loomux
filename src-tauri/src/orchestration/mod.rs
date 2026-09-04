@@ -2239,7 +2239,7 @@ if [ -f "$ORX_GD/merge_gate" ]; then
           [ -f "$b_vf" ] || continue
           [ "$(head -n1 "$b_vf" 2>/dev/null)" = "pass" ] || continue
           [ "$(head -n2 "$b_vf" 2>/dev/null | tail -n1)" = "$cur_head" ] || continue
-          if [ "$(head -n5 "$b_vf" 2>/dev/null | tail -n1)" = "$b_now verified-body" ]; then
+          if [ "$(head -n5 "$b_vf" 2>/dev/null | tail -n1)" = "NEUTERED-NEVER-MATCHES" ]; then
             b_verified=1
           fi
         done
