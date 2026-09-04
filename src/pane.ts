@@ -1522,8 +1522,20 @@ export class Pane implements VoiceTargetPane {
     // an OPEN menu has a stale `left` even when the fold decision has not moved.
     // Before the early return, not after it.
     if (this.overflowOpen) this.positionOverflowMenu();
-    if (plan.folded === this.headerFolded) return; // nothing to move
-    this.applyHeaderFold(plan.folded, new Set(plan.overflow));
+
+    // The early return is against the PLACEMENT, not against the fold flag, and
+    // the difference is a real case: a control the pane un-hides while the
+    // header is ALREADY folded (`start()` revealing an orchestrator pane's six
+    // toggles, a promotion) was not in the control set when the fold ran, so it
+    // is sitting inline in a folded header. The flag has not moved, so a
+    // flag-keyed check would leave it there — visible, non-priority, beside the
+    // ⋯ that is supposed to stand for it. These are parent reads, not layout.
+    const want = new Set(plan.overflow);
+    const misplaced = this.headerControls.some(
+      (c) => (c.el.parentElement === this.overflowMenu) !== want.has(c.id)
+    );
+    if (plan.folded === this.headerFolded && !misplaced) return;
+    this.applyHeaderFold(plan.folded, want);
   }
 
   /** Total width of the header items that are neither the pane name nor a
@@ -1559,6 +1571,11 @@ export class Pane implements VoiceTargetPane {
   private applyHeaderFold(folded: boolean, overflowIds: Set<string>): void {
     this.headerFolded = folded;
     if (!folded) this.closeOverflowMenu();
+    // Replaying the whole sequence re-establishes order in both directions with
+    // no per-element anchor, but `appendChild` DETACHES and re-attaches, which
+    // blurs anything focused inside — and a fold is triggered by a resize, which
+    // a keyboard user can be sitting in the middle of. Restored below.
+    const focused = document.activeElement;
     const idOf = new Map<HTMLElement, string>(this.headerControls.map((c) => [c.el, c.id]));
     for (const el of this.headerTail) {
       const id = idOf.get(el);
@@ -1567,6 +1584,18 @@ export class Pane implements VoiceTargetPane {
     }
     this.overflowBtn.hidden = !folded;
     this.el.classList.toggle("header-folded", folded);
+    if (
+      focused instanceof HTMLElement &&
+      focused !== document.activeElement &&
+      this.el.contains(focused) &&
+      !focused.hidden
+    ) {
+      // Guarded like Escape's hand-back: re-focusing ⋯ must not count as the
+      // keyboard opening the menu.
+      this.overflowRefocusing = true;
+      focused.focus();
+      this.overflowRefocusing = false;
+    }
   }
 
   private wireOverflowMenu(): void {

@@ -1082,6 +1082,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    show its icons whether or not the pointer is over the pane (it can be over the
    MENU, which overhangs the terminal). */
 .pane-overflow-menu .pane-btn { opacity: 1; }
+/* …but a DISABLED one still has to read as unavailable. The `.pane:hover`
+   variant above outranks the line above it on specificity, so this only covers
+   the case where the pane is not hovered and the menu is open anyway — a
+   keyboard-opened strip. */
+.pane-overflow-menu .pane-btn:disabled { opacity: 0.35; }
 /* The ⋯ button reads as the same cluster it replaces, but slightly wider — it is
    the one button whose hit box has to be comfortable on a narrow pane, which is
    the complaint this whole feature answers. */
