@@ -45,10 +45,22 @@ being asked:
   re-review; only `mergeStateStatus: CONFLICTING` is work, and it is the owning
   worker's. Print `gh pr view <n> --json mergeStateStatus --jq .mergeStateStatus` and
   move on.
-- **Body:** read the whole PR body. Make a numbered list of every claim it makes
-  (every "fixes", "tests pass", "measured", every number, every run id). For each:
-  verified (how) / not verified (why). A claim you could not verify is reported as
-  such, not skipped.
+- **Body:** run `node scripts/pr-body-check.cjs <pr>` FIRST and paste its report as
+  the numbered claim list - it re-derives every receipt the POSTED body states (the
+  diffstat, per-file figures, SHA roles, run ids, backticked identifiers, a quantity
+  stated twice, HTML placeholders), so your judgment goes to the class a script
+  cannot check. It exits 0 always: every MISMATCH is a finding; a CHECK row is a
+  sentence to re-read, not a defect. Its on-disk byte instrument is valid only from
+  a worktree whose HEAD is the PR head - a reviewer gets there with
+  `gh pr checkout <n> --detach` in its own scratch worktree, never a bare checkout;
+  off head, a correct on-disk byte figure reports MISMATCH (#2214). THEN read the
+  whole PR body and make the prose-vs-prose pass: for every claim the diff EDITS -
+  not only what the body asserts - find its twins across every root (a corrected
+  claim lives on several surfaces at once; a corrected line has a paraphrase
+  elsewhere), and measure the subject the body NAMES, never a neighbouring one
+  (#1764 F3 was a false finding on the wrong subject). For each claim: verified
+  (how) / not verified (why). A claim you could not verify is reported as such,
+  not skipped.
 - **Completeness:** read the issue's acceptance criteria and, for a rule or doc
   change, every case the text itself names. For EACH case write one line: covered
   at file:line / not covered. A rule that names two situations and gives a remedy
@@ -188,3 +200,12 @@ No local `cargo`; read CI. `npm test`, `node -e`, `wc`, `grep` and
   class does not appear once. Signature: a symbol sweep reported N/N present
   while a later lane found the same false-behaviour defect in four more places,
   one of them producing a wrong state transition (#1782 rev-final vs rev-std).
+
+- **Before posting, read `gh pr view <n> --json reviews` and refuse to post a
+  byte-identical review body.** The same review posted twice is a dup-post: it
+  costs no round directly, but every lane's round discipline is counted off the
+  review history, so a duplicate pulls the next lane's round count forward by one
+  (3 of the 4 beta5/6 final rev-final passes dup-posted; #2140's final pass then
+  called itself "round 6" on a 5-review PR). A round is a distinct
+  (lane, head, digest), not a post count - and a round number the kickoff
+  states is a floor, never a count to inflate.

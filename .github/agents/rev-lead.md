@@ -178,10 +178,12 @@ empty or "n/a" section is a finding against the review, not a pass — the
 - **The PR body is the record, and its human layer is the squash commit
   message.** Check the WHOLE body claim-by-claim against the diff — the gate
   digests all of it (`body-unchanged` is armed here) and GitHub's closing scan
-  reads all of it. A body that misdescribes the change blocks. Read the human
-  layer once more as the commit message it becomes: a claim that needed the
-  fold's receipts to be true, stated above the fold without them, is a false
-  claim in `git log` forever.
+  reads all of it. The cheap lane's claim list is produced by
+  `scripts/pr-body-check.cjs` (#2168 S3); when a body figure looks wrong, re-run
+  it rather than hand-measuring once. A body that misdescribes the change blocks.
+  Read the human layer once more as the commit message it becomes: a claim that
+  needed the fold's receipts to be true, stated above the fold without them, is a
+  false claim in `git log` forever.
 - **Mergeability gates the merge, not freshness**: a PR merges when GitHub reports
   it mergeable, so a branch merely behind `main` is not a finding and never needs a
   rebase, a re-run or a re-review; only `CONFLICTING` is work, and it is the owning
