@@ -1668,12 +1668,16 @@ test("a loomux-owned block may not run remotely (#1457)", () => {
 });
 
 test("a remote block must SPELL OUT cli: claude (#1457)", () => {
-  // Only Claude's session identity survives the trip: orrerix pre-mints the id
-  // and the CLI accepts it, while the others recognize a session by scanning a
-  // LOCAL store. An OMITTED cli: inherits the group default — picked at launch,
-  // unknowable to a parser — so it is refused rather than parsed into a promise
-  // the spawn would have to break.
-  for (const cli of ["copilot", "gemini", "opencode"]) {
+  // Claude is the only CLI orrerix drives remotely. Session identity is what
+  // made that true originally — orrerix pre-mints the id and claude accepts it,
+  // while copilot/gemini/opencode recognize a session by scanning a LOCAL store
+  // — but pi accepts a pre-minted id too (#2126), so the refusal is worded from
+  // what orrerix drives rather than from what a CLI can accept. pi is in the
+  // loop below as a REFUSED cli for exactly that reason. An OMITTED cli:
+  // inherits the group default — picked at launch, unknowable to a parser — so
+  // it is refused rather than parsed into a promise the spawn would have to
+  // break.
+  for (const cli of ["copilot", "gemini", "opencode", "pi"]) {
     const f = analyzeWorkflow(remoteDoc({ kind: "worker", cli, remote: "buildbox" })).findings;
     assert.ok(has(f, "remote-requires-claude"), `${cli}: ${codes(f)}`);
   }

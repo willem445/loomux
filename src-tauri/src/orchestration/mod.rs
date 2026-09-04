@@ -93,8 +93,8 @@ pub(crate) use loomux_engine::text::tail_snippet;
 // flat form — a method's visibility is the defining crate's to set, and no
 // re-export narrows it.
 pub use loomux_engine::model::{
-    self, cli_can_host, cli_caps, CliCaps, Containment, ReadyMarker, Role, CLI_CAPS,
-    CONTEXT_VARIANTS, EFFORT_LEVELS, SUPPORTED_CLIS,
+    self, cli_can_host, cli_caps, premints_session_id, CliCaps, Containment, ReadyMarker, Role,
+    CLI_CAPS, CONTEXT_VARIANTS, EFFORT_LEVELS, SUPPORTED_CLIS,
 };
 pub(crate) use loomux_engine::model::{default_model, sanitize_model_opt};
 
@@ -3923,9 +3923,10 @@ const OPENCODE_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 /// Where to look for the session a just-spawned pane is about to mint, plus
 /// the snapshot of what was already there (#722).
 ///
-/// Only the CLIs that mint their own id after boot have one. Claude is handed
-/// its id up front (`--session-id`), so there is nothing to learn; gemini has
-/// no session store loomux reads.
+/// Only the CLIs that mint their own id after boot have one. Claude and pi are
+/// handed their id up front ([`CliCaps::premints_session_id`], both spelled
+/// `--session-id`), so there is nothing to learn; gemini has no session store
+/// loomux reads.
 #[derive(Clone, Debug)]
 #[doc(hidden)] // pub for integration tests
 pub enum SessionBaseline {
@@ -5846,6 +5847,21 @@ pub const GEMINI_SETTINGS_ENV: &str = "GEMINI_CLI_SYSTEM_SETTINGS_PATH";
 pub fn cli_extra_env(cli: &str, cfg: &Path) -> Vec<(String, String)> {
     match cli {
         "gemini" => vec![(GEMINI_SETTINGS_ENV.to_string(), cfg.display().to_string())],
+        // pi (#2126): `cfg` is named on ARGV (`--mcp-config`), so none of this
+        // pane's MCP identity rides the environment — the one variable here is
+        // the boot-time version check, and it is unrelated to `cfg`.
+        //
+        // **`PI_MCP_CONFIG_MODE=exclusive` is deliberately NOT set, and the
+        // reason is a fact about the adapter rather than a preference.** In
+        // exclusive mode the adapter discards the `--mcp-config` override —
+        // `getEffectivePiGlobalConfigPath` passes `undefined` for it — and
+        // reads one fixed per-user file instead. So exclusivity and a
+        // per-agent config are mutually exclusive at the pin, loomux takes the
+        // per-agent config, and the merge that leaves is measured by
+        // `pi_repo_mcp_exposure` and documented as an open residual in
+        // `doc/design/pi.md`. Setting the variable here would not harden this
+        // pane; it would point it at somebody else's file.
+        "pi" => vec![(PI_SKIP_VERSION_CHECK_ENV.to_string(), "1".to_string())],
         _ => Vec::new(),
     }
 }
@@ -6297,6 +6313,404 @@ pub fn opencode_pane_env(
     env
 }
 
+// ── pi (#2126) ─────────────────────────────────────────────────────────────
+//
+// Every claim below is verified against the vendors' own source and docs at
+// the version pins recorded in `doc/design/pi.md` — pi itself, and separately
+// the community `pi-mcp-adapter` extension that gives pi MCP at all. That
+// document carries the citations, the containment argument and the residuals.
+// Same shape as the gemini and opencode blocks above: literals in constants,
+// generated documents in pure functions, so what a pane is actually handed can
+// be asserted without a spawn.
+
+/// The two built-in tools a [`Containment::denies_edits`] pi pane is denied,
+/// as one `--exclude-tools` value.
+///
+/// pi's built-ins are `read, bash, powershell (Windows), edit, write, grep,
+/// find, ls`, and `--exclude-tools` "Disable specific built-in, extension, and
+/// custom tools" is applied AFTER every allowlist — so this is the same
+/// deny-beats-allow property claude's `--disallowedTools` and opencode's
+/// `edit: deny` have, reached a third way.
+///
+/// A NAME list rather than a permission key, which is why the #448 hazard the
+/// `*_EDIT_DENY_TOOLS` constants warn about applies here in full: a
+/// file-modifying tool pi ships tomorrow under a third name is NOT denied by
+/// this, and nothing goes red to say so. That is a stated property of pi's
+/// containment ceiling, not an oversight — see `CLI_CAPS`' pi row.
+pub const PI_EDIT_DENY_TOOLS: &str = "edit,write";
+
+/// Trust the project folder for this run. Every group spawn carries this or
+/// [`PI_NO_APPROVE_FLAG`], so pi's one boot dialog can never appear on a pane
+/// loomux is about to type a kickoff into.
+///
+/// The dialog it forecloses ("Trust project folder?") is raised when the cwd
+/// carries any of `.pi/{settings.json,extensions,skills,prompts,themes,
+/// SYSTEM.md,APPEND_SYSTEM.md}`, or a `.agents/skills` directory in the cwd or
+/// any parent — and only when no decision is already saved in
+/// `~/.pi/agent/trust.json`. A repo with none of those raises no dialog at
+/// all, which is why this flag's effect is invisible on most repos and
+/// load-bearing on the one that has them.
+///
+/// The UNCONTAINED classes take this one: a repo's own extensions, skills and
+/// prompts are legitimate worker material, exactly as opencode's project
+/// config is left loaded for a worker.
+pub const PI_APPROVE_FLAG: &str = "--approve";
+
+/// Ignore project-local pi resources for this run — the CONTAINED classes'
+/// half of the pair above.
+///
+/// The calculus flips for a reviewer for the reason
+/// [`OPENCODE_DISABLE_PROJECT_CONFIG_ENV`] gives: a repo's `.pi/extensions`
+/// could register a file-writing tool under a name `--exclude-tools edit,write`
+/// does not mention, and "the repo's resources never load" is a much simpler
+/// claim than "loomux's denials outrank them". A contained pane is the one
+/// place worth paying a repo's custom skills for the simpler story.
+///
+/// User- and global-level extensions — the MCP adapter included — load either
+/// way; this is a PROJECT-local switch only.
+pub const PI_NO_APPROVE_FLAG: &str = "--no-approve";
+
+/// pi's unattended posture: **nothing**, and that is a measured claim rather
+/// than an unfilled blank.
+///
+/// pi has no permission prompts to bypass. Its own design principles say so
+/// outright — "It intentionally does not include built-in MCP, sub-agents,
+/// permission popups, plan mode…" — so there is no `--auto`, no `--yolo`, no
+/// `--approval-mode` and nothing for an autopilot toggle to turn on. An
+/// ATTENDED pi pane already runs every tool without asking, which makes the
+/// attended and unattended launch lines byte-identical (pinned by
+/// `pi_launch_flags_per_posture`) and makes the group's `auto_ops` toggle a
+/// genuine no-op on this CLI.
+///
+/// Kept as a named atom anyway, for the #101 invariant the other three CLIs
+/// rest on: the launcher toggle and the group spawn must mean the same thing
+/// on every CLI loomux can spawn, and the only way to say "they agree on
+/// nothing" without two independent empty strings is one shared empty one.
+///
+/// NOT to be confused with [`PI_APPROVE_FLAG`], which is about the folder-trust
+/// dialog and rides EVERY group line regardless of posture.
+pub const PI_UNATTENDED_FLAGS: &str = "";
+
+/// Suppress pi's boot-time latest-version request to `pi.dev`.
+///
+/// The narrow variable, not `PI_OFFLINE`: the broad one would also cut off
+/// whatever else pi reaches the network for, and the only thing loomux wants
+/// gone is a startup request whose failure or slowness sits between the pane
+/// appearing and the kickoff landing.
+pub const PI_SKIP_VERSION_CHECK_ENV: &str = "PI_SKIP_VERSION_CHECK";
+
+/// Where a group's pi sessions live, relative to the group's state dir — a
+/// sibling of opencode's `opencode/`.
+///
+/// Per-GROUP rather than per-agent, and that is enough precisely because ids
+/// are pre-minted: a session is located by an exact `_<id>.jsonl` filename
+/// suffix in one directory, so a second agent's file in the same directory is
+/// not an ambiguity. Per-agent would buy nothing and cost a directory per
+/// pane.
+///
+/// The point of moving it off the human's own store at all is the same one
+/// [`OPENCODE_DB_ENV`] makes: a group's sessions stay out of the human's
+/// `pi --resume` list, and their sessions stay out of the group's.
+const PI_SESSIONS_SUBDIR: &str = "pi";
+const PI_SESSIONS_LEAF: &str = "sessions";
+
+/// [`OrchRegistry::pi_sessions_dir`] against an already-resolved group state
+/// directory — the one derivation of this path in the codebase.
+///
+/// Free rather than a method because the launch-line builders receive a
+/// `group_dir: &Path` and have no [`GroupId`] in scope, and two independent
+/// spellings of the directory a pane WRITES its session to and the directory
+/// a resume LOOKS in is the disagreement that would present as "this pane
+/// cannot be resumed" with nothing red to say why.
+pub fn pi_sessions_in(group_dir: &Path) -> PathBuf {
+    group_dir.join(PI_SESSIONS_SUBDIR).join(PI_SESSIONS_LEAF)
+}
+
+/// Whether a CLI's session store, as loomux configures it, lives under the
+/// GROUP's own state dir rather than in a per-user location shared by every
+/// group on the machine.
+///
+/// Two consumers, and they are the reason this is a function rather than a
+/// condition written twice: [`session_cwd_in_store`] needs the group's store
+/// path handed to it for these CLIs and would otherwise silently search a
+/// per-user root, and `orch_list_recorded` must keep them OFF [`StoreIndex`],
+/// whose whole premise (#1592) is amortising ONE enumeration of a big shared
+/// store across many groups. A group-local store is already O(1) per group and
+/// has nothing to share, so indexing it would be strictly more work and would
+/// answer for the wrong group besides.
+///
+/// A by-name match, deliberately, and it is not the "re-derived at a call
+/// site" shape `CliCaps` warns about: it is derived ONCE, here, and asked by
+/// everything that cares. It is not a `CliCaps` field because it is a fact
+/// about how LOOMUX points the CLI (`OPENCODE_DB`, `--session-dir`), not a
+/// capability of the vendor's.
+pub fn group_local_session_store(cli: &str) -> bool {
+    matches!(cli, "opencode" | "pi")
+}
+
+/// Where a pi session recorded that it ran, read from a group's own pi store
+/// (#2126) — the pi half of [`session_cwd_in_store`].
+///
+/// `dir` is [`OrchRegistry::pi_sessions_dir`]: one flat directory holding
+/// `<timestamp>_<uuid>.jsonl` for every pane in the group, because pi writes
+/// directly under a `--session-dir` with no per-cwd subdirectory of its own.
+///
+/// **Matched on an exact `_<id>.jsonl` filename SUFFIX, never a prefix or a
+/// `contains`.** pi's ids are loomux-minted UUIDs, so a prefix match would be
+/// harmless today and wrong the first time an id is a prefix of another — and
+/// the leading `_` is what makes the suffix unambiguous against a timestamp
+/// that happens to end in the same digits.
+///
+/// **`Ok(None)` for an absent directory**, matching opencode's `Absent` rule:
+/// a group whose panes have not written a session yet has no such session,
+/// which is "not found in the history" rather than a store failure worth
+/// telling the caller to investigate. That case is ordinary rather than
+/// exotic — pi defers creating the file to the first assistant response, so a
+/// pane that was spawned and never prompted has no file at all.
+///
+/// A matched file with no readable header is `Ok(Some(""))`, the same
+/// "recorded, but recorded no working directory" answer `resolve_resume_cwd`
+/// already distinguishes from "not found".
+#[doc(hidden)] // pub for integration tests
+pub fn pi_session_cwd_in_dir(dir: &Path, session_id: &str) -> Result<Option<String>, String> {
+    // The same admission `find_session_cwd` applies before it will touch a
+    // store at all (#925): an id that is not a single path component cannot
+    // name a file here, so it is "not found" rather than a lookup.
+    let Ok(seg) = PathSegment::parse(session_id) else { return Ok(None) };
+    let suffix = format!("_{seg}.jsonl");
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(&suffix) {
+            continue;
+        }
+        // The header is pi's FIRST line — `{"type":"session","version":3,
+        // "id":…,"cwd":…}` — so only that line is read, however long the
+        // transcript grew. A file that exists but is empty (created and not
+        // yet written through) reads as "no recorded cwd", not as absent: the
+        // session id is real, its workspace is merely unknown.
+        let cwd = fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|body| body.lines().next().map(str::to_string))
+            .and_then(|line| serde_json::from_str::<Value>(&line).ok())
+            .filter(|v| v.get("type").and_then(Value::as_str) == Some("session"))
+            .and_then(|v| v.get("cwd").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        return Ok(Some(cwd));
+    }
+    Ok(None)
+}
+
+/// The filename extension of the contract file a pi block's
+/// `--append-system-prompt` points at.
+///
+/// `.pi.md` rather than opencode's bare `.md` so the two never collide in the
+/// one `configs/` directory they share: `generated_agent_handle` is
+/// `loomux-<group>-<block>`, which is the SAME handle for a block whose `cli:`
+/// changed between two launches of one group.
+const PI_CONTRACT_FILE_EXT: &str = ".pi.md";
+
+/// Timeout (ms) on the loomux MCP entry in a pi config, raised from the
+/// adapter's own default for the reason [`OPENCODE_MCP_TIMEOUT_MS`] gives:
+/// loomux's tools do real work behind a call, and one timing out reads to an
+/// agent as the tool being broken.
+const PI_MCP_TIMEOUT_MS: u64 = 30_000;
+
+/// The two repo-authored files pi's MCP adapter merges into a pane's tool
+/// surface, relative to the pane's own working directory.
+///
+/// Named as data rather than matched inline because [`pi_repo_mcp_exposure`]
+/// reports them and its fixture pins them; a third one the adapter grows is
+/// then a row here.
+const PI_REPO_MCP_FILES: &[&str] = &[".mcp.json", ".pi/mcp.json"];
+
+/// The MCP server name in ONE pi agent's generated config — `<loomux>-<agent
+/// id>` rather than the bare [`MCP_SERVER`] every other CLI uses.
+///
+/// **Per-agent on purpose, and free only here.** pi's adapter merges its
+/// config sources and resolves a collision by server NAME, later source
+/// winning — and the repo's own `.mcp.json` / `.pi/mcp.json` are LATER than
+/// the file loomux names on `--mcp-config` (`doc/design/pi.md`, "Why the
+/// bridge is not exclusive"). A repo declaring a server called `orrerix`
+/// would therefore REPLACE loomux's entry outright, and the pane would boot
+/// with no orrerix tools, or with something else's. An id a repo cannot guess
+/// removes that route.
+///
+/// It costs nothing on pi and would cost something on every other CLI, which
+/// is why `one_server_map`'s "one name, so the file and the argv cannot drift"
+/// argument is untouched: claude, copilot and gemini all SPELL the server name
+/// on argv (`--allowedTools mcp__<server>`, `--allow-tool <server>`,
+/// `--allowed-mcp-server-names <server>`), and pi spells it nowhere. With
+/// `toolPrefix: "none"` the name does not reach a tool name either, so the
+/// role templates' bare `report(...)` is unaffected.
+///
+/// Side effect worth naming: the adapter's direct-tool metadata cache is keyed
+/// by server name, so a per-agent name also means a pane never inherits the
+/// tool list a DIFFERENT role's pane cached under one shared name.
+///
+/// `agent` is a [`PathSegment`] (#925) — the same proof `write_mcp_config`
+/// already takes before the id becomes a file name — so the result cannot
+/// carry a separator or a character JSON would have to escape.
+#[doc(hidden)] // pub for integration tests
+pub fn pi_server_name(agent: &PathSegment) -> String {
+    format!("{MCP_SERVER}-{agent}")
+}
+
+/// The generated MCP config document for one pi pane — the file named on
+/// `--mcp-config`, read by the `pi-mcp-adapter` extension the human installs.
+///
+/// Pure and `pub` so the whole document is assertable without a spawn: this
+/// file IS a pi agent's orrerix identity, so "does it say what we think it
+/// says" must be answerable directly.
+///
+/// Every key is checked against the adapter's own `readValidatedConfig` /
+/// `validateConfig` at the pin in `doc/design/pi.md`: the document is
+/// `{ mcpServers, imports?, settings? }`, `mcpServers` is a name→entry map and
+/// an entry is accepted as any JSON object, so the per-entry keys below are
+/// read by the runtime rather than the validator.
+///
+/// - `url` + `headers` — StreamableHTTP with an SSE fallback, carrying the
+///   same agent-token header every other CLI's config does. A reconnect
+///   re-`initialize`s with the same token, so it comes back as the same
+///   `Caller` and the same pane identity.
+/// - `lifecycle: "keep-alive"` — connect at startup and stay connected,
+///   instead of the lazy default, so the kickoff's first `report` pays no
+///   connect latency and the direct-tool registry is reconciled from a live
+///   `tools/list` before the first status snapshot.
+/// - `directTools: true` — register every tool of this server individually,
+///   rather than behind the adapter's own proxy tool. loomux's largest role
+///   surface is well under the adapter's 75-tool advisory.
+/// - `toolPrefix: "none"` — bare tool names, which is what the role templates
+///   spell (`report(...)`, never a prefixed form). `brand::MCP_TOOL_PREFIX` is
+///   a claude ALLOWLIST fact, not a template fact.
+/// - `settings.disableProxyTool` / `scriptMode` — drop the adapter's own two
+///   tools once direct tools are up; nothing loomux does asks for them.
+///
+/// No `type` key: that is a claude-shaped field the adapter reads only through
+/// its compatibility importer, and stating it here would be a claim about a
+/// schema this document is not written in. `protocolVersion` is left at the
+/// adapter's default, which is the handshake `mcp.rs` already echoes back.
+#[doc(hidden)] // pub for integration tests
+pub fn pi_mcp_config_json(port: u16, token: &str, server_name: &str) -> String {
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        server_name.to_string(),
+        json!({
+            "url": format!("http://127.0.0.1:{port}/mcp"),
+            "headers": agent_token_headers(token),
+            "lifecycle": "keep-alive",
+            "requestTimeoutMs": PI_MCP_TIMEOUT_MS,
+            "directTools": true,
+            "toolPrefix": "none",
+        }),
+    );
+    let cfg = json!({
+        "mcpServers": Value::Object(servers),
+        "settings": {
+            "disableProxyTool": true,
+            "scriptMode": false,
+            "notifyOnStartupConnect": true,
+            "mcpFooterStatus": "full",
+        },
+    });
+    serde_json::to_string_pretty(&cfg).unwrap()
+}
+
+/// What a pane's own repo declares that pi's MCP adapter will MERGE into that
+/// pane's tool surface — measured, reported once, and never refused.
+///
+/// **Why this exists at all.** pi has no exclusive-config seam loomux can
+/// reach: the adapter's `PI_MCP_CONFIG_MODE=exclusive` DISCARDS the
+/// `--mcp-config` override and reads one fixed per-user file instead, so a
+/// per-agent config and exclusivity are mutually exclusive at the pin (see
+/// `doc/design/pi.md`, which cites the two lines). loomux takes the per-agent
+/// config, which means the repo's own MCP files are merged in — repo-authored
+/// input, in a threat model where the repo is the thing under review.
+///
+/// **Measure and warn, never refuse** (the generic-product rule, constraint
+/// 8): a repo declaring its own MCP servers is a legitimate, common thing, and
+/// loomux is not in a position to adjudicate it. What loomux CAN do is say, in
+/// the audit trail, exactly what it saw — so a human debugging a pane whose
+/// `report` went somewhere strange has the row rather than a mystery.
+///
+/// **What it can and cannot see, stated because the gap matters.** A server
+/// NAME collision is fully detectable and is the sharp case: the later source
+/// wins, so a repo entry named the same as this agent's server REPLACES it. A
+/// TOOL-name collision is only detectable where the repo pins `directTools` to
+/// an explicit list of names; an entry with `directTools: true` advertises its
+/// names only at connect time, and loomux never connects to a repo's server to
+/// find out. So an empty `tools` list here is "nothing statically visible",
+/// never "nothing there" — the same absence-is-not-proof line the residual in
+/// the design note is written on.
+///
+/// `None` when the repo declares nothing — the overwhelmingly common case, and
+/// the one that must cost no audit row at all.
+#[doc(hidden)] // pub for integration tests
+pub fn pi_repo_mcp_exposure(
+    workdir: &Path,
+    server_name: &str,
+    loomux_tools: &std::collections::BTreeSet<String>,
+) -> Option<Value> {
+    let mut files = Vec::new();
+    for rel in PI_REPO_MCP_FILES {
+        let path = workdir.join(rel);
+        let Ok(body) = fs::read_to_string(&path) else { continue };
+        // A file that is present but unparsable is still REPORTED: the adapter
+        // would skip it with a console warning, so "loomux saw a file here and
+        // could not read it" is the honest row — and silently dropping it is
+        // how a real exposure comes to look like an absent one.
+        let parsed: Option<Value> = serde_json::from_str(&body).ok();
+        let servers = parsed
+            .as_ref()
+            .and_then(|v| v.get("mcpServers").or_else(|| v.get("mcp-servers")))
+            .and_then(Value::as_object);
+        let mut names: Vec<String> = Vec::new();
+        let mut tools: Vec<String> = Vec::new();
+        if let Some(map) = servers {
+            for (name, entry) in map {
+                names.push(name.clone());
+                // Only an explicit NAME LIST is readable here — see this
+                // function's doc for why `directTools: true` is not.
+                if let Some(list) = entry.get("directTools").and_then(Value::as_array) {
+                    for t in list.iter().filter_map(Value::as_str) {
+                        if loomux_tools.contains(t) {
+                            tools.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        names.sort();
+        tools.sort();
+        tools.dedup();
+        files.push(json!({
+            "file": rel,
+            "parsed": parsed.is_some(),
+            "servers": names.clone(),
+            // The sharp case: later source wins by NAME, so this entry would
+            // replace loomux's outright.
+            "shadows_this_agents_server": names.iter().any(|n| n == server_name),
+            "shadows_loomux_tool_names": tools,
+        }));
+    }
+    if files.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "files": files,
+        "why": "pi's MCP adapter MERGES its config sources and cannot be made exclusive to \
+                loomux's per-agent file, so these repo-authored declarations are part of this \
+                pane's tool surface. Reported, not refused. A tool-name overlap is visible only \
+                where an entry pins directTools to explicit names — an entry with directTools \
+                true advertises its names at connect time, and loomux never connects to one.",
+    }))
+}
+
 /// The generic Claude PreCompact / SessionStart(compact) hook body (#417),
 /// written once per machine (`OrchRegistry::ensure_compact_hook_script`) and
 /// invoked per agent with `event`, the group's state dir, and the agent's id
@@ -6665,6 +7079,15 @@ pub fn single_pane_autopilot_flags(program: &str) -> String {
         // toggle and the group spawn must mean the same thing on every CLI
         // loomux can spawn, and opencode is now one.
         "opencode" => OPENCODE_UNATTENDED_FLAGS.to_string(),
+        // pi (#2126): the same atom the group path builds, and it is EMPTY —
+        // see `PI_UNATTENDED_FLAGS` for why that is a measured claim about pi
+        // rather than an unfilled arm. Wired explicitly, sharing the atom,
+        // for the #101 invariant: the launcher toggle and the group spawn
+        // must mean the same thing on every CLI loomux can spawn, and "they
+        // agree that there is nothing to turn on" is a claim two independent
+        // `String::new()`s could not make. Falling through to the `_` arm
+        // would produce the same string and evidence nothing.
+        "pi" => PI_UNATTENDED_FLAGS.to_string(),
         _ => String::new(),
     }
 }
@@ -12276,6 +12699,28 @@ pub struct PersonaInject {
     /// per-user CLI directory, which would need an orphan sweep; a group's
     /// files go when the group does.
     pub opencode_prompt_file: Option<PathBuf>,
+    /// pi `--append-system-prompt <path>` (#2126) — the block's full contract,
+    /// by FILE.
+    ///
+    /// The fourth shape, and the only one of the four that is not a *named*
+    /// custom agent: pi has no `--agent` equivalent at all, so there is
+    /// nothing to name and nothing to resolve — the contract is appended to
+    /// pi's own system prompt directly. That makes it the SIMPLEST of the four
+    /// and still `ContractCarrier::SystemLayerFull`: the flag is launch-time
+    /// system-prompt construction, not a conversation-history artifact a
+    /// compaction could touch, exactly like claude's
+    /// [`Self::claude_append_system_prompt_file`].
+    ///
+    /// A file rather than argv text, although pi's flag accepts either: the
+    /// contract is many KB and Windows `CreateProcessW`'s 32,767-character
+    /// command-line limit made that a real, demo-blocking bug once (#417).
+    /// Only the path reaches argv.
+    ///
+    /// `None` when the file could not be written — the group dir is
+    /// unwritable. The pane then launches with no flag (audited
+    /// `pi-contract-file-unwritable`, carrier `KickoffOnly`) rather than with
+    /// a flag pointing at a file that is not there.
+    pub pi_append_system_prompt_file: Option<PathBuf>,
     /// Extra pre-approved tool patterns from the persona's `allow:`. Widens
     /// only *within* the capability class: deny rules beat allow rules on both
     /// CLIs, so this can never re-grant what the block's `kind` denies.
@@ -14701,8 +15146,9 @@ pub(crate) fn resolve_resume_cwd(
     cli: &str,
     session_id: &str,
     opencode_db: Option<&Path>,
+    pi_sessions: Option<&Path>,
 ) -> Result<String, String> {
-    match session_cwd_in_store(cli, session_id, opencode_db) {
+    match session_cwd_in_store(cli, session_id, opencode_db, pi_sessions) {
         Ok(Some(cwd)) if Path::new(&cwd).is_dir() => Ok(cwd),
         // Found the session, but its record carries no cwd at all (a session
         // whose first ≤60 lines never mention one) — distinct from "not
@@ -14736,10 +15182,12 @@ pub(crate) fn resolve_resume_cwd(
 /// hard-fails a resume on that answer, which made an opencode group
 /// unresumable outright.
 ///
-/// opencode's answer comes from **this group's** store rather than a global
-/// one, because that is where a group's panes write: `OPENCODE_DB` points each
-/// of them at `opencode_db_path(group)`. `None` for the db (a caller with no
-/// group in hand) is "not found", never a fall-through to another CLI's store.
+/// opencode's and pi's answers come from **this group's** store rather than a
+/// global one, because that is where a group's panes write: `OPENCODE_DB`
+/// points each opencode pane at `opencode_db_path(group)` and `--session-dir`
+/// points each pi pane at `pi_sessions_dir(group)` (`group_local_session_store`
+/// is the predicate). `None` for either path (a caller with no group in hand)
+/// is "not found", never a fall-through to another CLI's store.
 ///
 /// `Absent` maps to `Ok(None)` deliberately — a group whose store was never
 /// created has no such session, which is exactly "not found in the history",
@@ -14749,7 +15197,18 @@ pub fn session_cwd_in_store(
     cli: &str,
     session_id: &str,
     opencode_db: Option<&Path>,
+    pi_sessions: Option<&Path>,
 ) -> Result<Option<String>, String> {
+    if cli == "pi" {
+        // `None` (a caller with no group in hand) is "not found", never a
+        // fall-through to another CLI's store — the same rule opencode's
+        // branch below states, and the reason both are stated is that the
+        // fall-through is exactly the defect this function was written for.
+        let Some(dir) = pi_sessions else {
+            return Ok(None);
+        };
+        return pi_session_cwd_in_dir(dir, session_id);
+    }
     if cli != "opencode" {
         return crate::sessions::find_session_cwd(cli, session_id);
     }
@@ -14815,10 +15274,22 @@ struct StoreIndex {
 
 impl StoreIndex {
     /// Whether `cli`'s store holds `session_id` — the same answer
-    /// `matches!(session_cwd_in_store(cli, session_id, _), Ok(Some(_)))` gives
-    /// for every non-opencode `cli`, including the default-arm CLIs
-    /// `find_session_cwd` routes to claude.
+    /// `matches!(session_cwd_in_store(cli, session_id, _, _), Ok(Some(_)))`
+    /// gives for every cli whose store is NOT group-local, including the
+    /// default-arm CLIs `find_session_cwd` routes to claude.
+    ///
+    /// A group-local store (`group_local_session_store`: opencode, pi) is
+    /// `false` here rather than searched, and the guard below is what keeps
+    /// that sentence true. Its caller already routes those elsewhere, so this
+    /// is belt-and-braces — kept because the invariant must live at the site
+    /// that depends on it: without it, a future caller reaching here with a
+    /// group-local CLI would silently be answered from CLAUDE's projects
+    /// directory (the `else` branch below), which is precisely the
+    /// wrong-store fall-through `session_cwd_in_store` exists to have ended.
     fn contains(&mut self, cli: &str, session_id: &str) -> bool {
+        if group_local_session_store(cli) {
+            return false;
+        }
         // The same admission `find_session_cwd` applies before it will touch a
         // store at all (#925): an id that is not a single path component is
         // `Ok(None)` there, so it is `false` here. Kept rather than left to the
@@ -14867,11 +15338,12 @@ pub(crate) fn resolve_worker_resume_cwd(
     roster_cwd: Option<&str>,
     group_repo: &str,
     opencode_db: Option<&Path>,
+    pi_sessions: Option<&Path>,
 ) -> Result<String, String> {
     if let Some(c) = roster_cwd.filter(|c| !c.trim().is_empty() && Path::new(c).is_dir()) {
         return Ok(c.to_string());
     }
-    let cwd = resolve_resume_cwd(cli, session_id, opencode_db)?;
+    let cwd = resolve_resume_cwd(cli, session_id, opencode_db, pi_sessions)?;
     if Path::new(&cwd) == Path::new(group_repo) {
         return Err(format!(
             "resume-workspace-missing: session {session_id}'s only recorded workspace is the \
@@ -27927,6 +28399,32 @@ impl OrchRegistry {
         self.group_dir(group).join(OPENCODE_DB_SUBDIR).join(OPENCODE_DB_FILE)
     }
 
+    /// This group's pi session store — the directory `--session-dir` points
+    /// every pi pane in the group at (#2126).
+    ///
+    /// One function rather than a `join` at each call site, for the reason
+    /// [`Self::opencode_db_path`]'s doc gives: the spawn that CREATES this
+    /// path and the reads that CONSUME it disagreeing would not fail loudly —
+    /// the reader would simply find no session and report the pane as
+    /// unresumable.
+    ///
+    /// **A directory, not a file, and its layout is pi's rather than
+    /// loomux's.** With `--session-dir <dir>` pi writes the session file
+    /// DIRECTLY under `<dir>` — `SessionManager.create` uses the given
+    /// directory with no per-cwd subdirectory, unlike the default store, whose
+    /// `--<cwd with every separator and colon replaced by ->--` segment is
+    /// what makes the default layout cwd-keyed. So one flat directory per
+    /// group holds `<timestamp>_<uuid>.jsonl` for every pane in it, and a
+    /// lookup by id is an exact `_<id>.jsonl` filename-suffix match.
+    /// Delegates to [`pi_sessions_in`] rather than joining, because the launch
+    /// line is built from a `group_dir: &Path` that has no [`GroupId`] in
+    /// scope — so the two would otherwise be two independent spellings of one
+    /// directory, which is precisely what this function exists to prevent.
+    #[doc(hidden)] // pub for integration tests
+    pub fn pi_sessions_dir(&self, group: &GroupId) -> PathBuf {
+        pi_sessions_in(&self.group_dir(group))
+    }
+
     /// Scratch dir holding images pasted/attached into the steering strip (#72).
     /// A subdir of the group state dir, so it's naturally per-group and swept
     /// on group end alongside the worktrees.
@@ -30784,9 +31282,10 @@ impl OrchRegistry {
 
     /// Snapshot the sessions a CLI's store already holds, immediately before a
     /// pane is spawned, so the one that pane mints can be told apart later.
-    /// `None` for a CLI with nothing to learn (claude is handed its id;
-    /// gemini has no store loomux reads), and `None` when the snapshot itself
-    /// could not be taken — see below.
+    /// `None` for a CLI with nothing to learn (claude and pi are handed their
+    /// id — [`CliCaps::premints_session_id`]; gemini has no store loomux
+    /// reads), and `None` when the snapshot itself could not be taken — see
+    /// below.
     ///
     /// **A baseline that cannot be read is not an empty baseline.** An empty
     /// one says "the store held nothing", which makes every session in it a
@@ -30803,6 +31302,20 @@ impl OrchRegistry {
         cli: &str,
         group: &GroupId,
     ) -> Option<SessionBaseline> {
+        // #2126: asked as a CAPABILITY, and asked FIRST. "loomux hands this
+        // CLI its id" and "there is nothing for a store watcher to learn" are
+        // one fact, and before this they were two — the mint sites named
+        // claude and this function omitted it, so a CLI that gained a
+        // `--session-id` had to be remembered in two places or it would both
+        // be handed an id AND have a thread watching a store for the id it was
+        // never going to invent. `CLI_CAPS` decides it once for both.
+        //
+        // Ahead of the match rather than folded into it, so a row landing here
+        // with `premints_session_id: true` and a `SessionBaseline` variant of
+        // its own cannot end up with the variant silently winning.
+        if premints_session_id(cli) {
+            return None;
+        }
         match cli {
             "copilot" => crate::sessions::copilot_session_state_root().map(|root| {
                 let ids = crate::sessions::copilot_session_ids(&root);
@@ -31055,9 +31568,10 @@ impl OrchRegistry {
     /// told: `Pane.capture()` wrote `sessionId: null` into `tabs.json` and the
     /// dormant-group card then offered no resume for a session `agents.json`
     /// had recorded all along. The roster knew; the webview had no way to be
-    /// told. claude is unaffected — its id is minted onto the command line at
-    /// spawn, so it never reaches this path at all
-    /// ([`Self::capture_session_baseline`] answers `None` for every other CLI).
+    /// told. A PREMINTING CLI is unaffected — claude and pi both have their id
+    /// minted onto the command line at spawn, so neither ever reaches this path
+    /// at all ([`Self::capture_session_baseline`] answers `None` for them, so no
+    /// watcher is started and nothing is ever learned to emit).
     ///
     /// One event per binding, on the same `AppHandle` seam `orch-focus` and
     /// `orch-spawn-request` use.
@@ -31455,17 +31969,19 @@ impl OrchRegistry {
             // forbids, so the answer is to ask none.
             let resumable = !cli.is_empty()
                 && session_id.as_deref().is_some_and(|sid| {
-                    // opencode's answer is already O(1) — one indexed SELECT
-                    // against THIS GROUP's own db — and there is nothing to
-                    // share across groups, so it keeps asking the resume path's
-                    // own function. The file-backed stores are the shared ones,
-                    // and those go through the index (#1592).
-                    if cli == "opencode" {
+                    // A GROUP-LOCAL store is already cheap — one indexed
+                    // SELECT against this group's own opencode db, or one
+                    // `read_dir` of its own pi directory — and there is nothing
+                    // to share across groups, so those keep asking the resume
+                    // path's own function. The per-user stores are the shared
+                    // ones, and only those go through the index (#1592).
+                    if group_local_session_store(&cli) {
                         matches!(
                             session_cwd_in_store(
                                 &cli,
                                 sid,
-                                Some(&self.opencode_db_path(&group_id))
+                                Some(&self.opencode_db_path(&group_id)),
+                                Some(&self.pi_sessions_dir(&group_id)),
                             ),
                             Ok(Some(_))
                         )
@@ -35153,8 +35669,8 @@ impl OrchRegistry {
     /// a channel-scoped identity for a newly-launching standalone pane
     /// BEFORE it boots, so the MCP flags can be appended to its command line
     /// (you cannot inject an MCP server into an already-running CLI). `cli`
-    /// is the CLI the human picked. For claude/copilot — the only CLIs with
-    /// an MCP-config flag seam today (`SUPPORTED_CLIS`) — this writes the
+    /// is the CLI the human picked. For a CLI whose [`CliCaps::mcp_argv_seam`]
+    /// is true — claude, copilot and pi today — this writes the
     /// same per-agent config `write_mcp_config` gives an orchestration-group
     /// agent and mints a real token: the pane is a FULL member, able to
     /// `channel_send`. For any other CLI (no seam: codex/gemini/opencode/
@@ -35185,15 +35701,19 @@ impl OrchRegistry {
         let (token, mcp_args) = if has_seam {
             let token = new_token();
             // A solo pane is `Role::Solo` — `Containment::None`, nothing to
-            // deny, no block, and therefore no persona to compile. Only the
-            // argv-seam CLIs reach here (`has_seam`), and neither reads either
-            // of the last two arguments.
+            // deny, no block, and therefore no persona to compile. No
+            // argv-seam CLI reads `containment` or `persona`; `workdir` IS
+            // read on pi, which is why the human's own cwd is passed rather
+            // than a placeholder — a solo pi pane is exposed to the repo's own
+            // MCP files exactly as a group pane is, and the audit row saying
+            // so is worth as much here.
             let cfg = self
                 .write_mcp_config(
                     solo_group_id(),
                     &agent_id,
                     &token,
                     cli,
+                    Path::new(cwd),
                     Containment::None,
                     false,
                     &PersonaInject::default(),
@@ -35220,9 +35740,47 @@ impl OrchRegistry {
                     "--additional-mcp-config \"@{}\" --allow-tool {server}",
                     cfg.display(), server = MCP_SERVER
                 ),
-                _ => unreachable!("has_seam is only true for a CliCaps row with mcp_argv_seam"),
+                // pi: the flag alone, and DELIBERATELY without the exclusivity
+                // a group pane gets. `PI_MCP_CONFIG_MODE=exclusive` is pane
+                // ENVIRONMENT (`cli_extra_env`), and a solo launch only ever
+                // appends a flag string to a command line the human owns — it
+                // sets no environment at all. So a solo pi pane's adapter
+                // merges this config with the human's own MCP sources, which
+                // is the right answer for their pane: the loomux server is an
+                // ADDITION to what they already had, not a replacement for it.
+                // A group pane is the opposite case and gets the env.
+                "pi" => format!("--mcp-config \"{}\"", cfg.display()),
+                // Not `unreachable!()` any more (constraint 10). `has_seam`
+                // comes from `CLI_CAPS`, so this arm is reached by DATA — a
+                // row landing with `mcp_argv_seam: true` and no arm here would
+                // have aborted the process, and `solo_prepare` is called
+                // inline on the webview thread from a synchronous
+                // `#[tauri::command]`, where an unwind is an abort rather than
+                // a degrade. A row without an arm is a loomux bug, so it is
+                // reported as one, at the one cost a solo pane can actually
+                // pay: this pane launches delivery-only, exactly as a CLI with
+                // no seam does. `every_argv_seam_cli_has_a_solo_mcp_arm` is
+                // what keeps the pairing from drifting in the first place.
+                other => {
+                    self.audit(solo_group_id(), brand::AUDIT_ACTOR, "error", json!({
+                        "what": "solo MCP flag missing for an argv-seam CLI",
+                        "cli": other,
+                        "detail": "CLI_CAPS says this CLI's MCP config is argv-deliverable, but \
+                                   solo_prepare has no flag string for it — the pane launches \
+                                   delivery-only. This is a loomux bug: add the arm beside the \
+                                   row.",
+                    }));
+                    String::new()
+                }
             };
-            (token, args)
+            // An empty flag string from that arm means the config never
+            // reaches the pane, so the token it was minted with can never be
+            // presented — and `delivery_only` below is computed from the
+            // token. Dropping it here is what keeps the pane's ADVERTISED
+            // status ("full member, may channel_send") from disagreeing with
+            // what it can actually do; the alternative is a pane the UI
+            // offers `channel_send` on that fails at every call.
+            if args.is_empty() { (String::new(), args) } else { (token, args) }
         } else {
             (String::new(), String::new())
         };
@@ -43779,6 +44337,13 @@ impl OrchRegistry {
         agent_id: &str,
         token: &str,
         cli: &str,
+        // The directory this pane will be launched in — read by the pi branch
+        // alone, to MEASURE what the repo declares that pi's MCP adapter will
+        // merge into the pane's tool surface (`pi_repo_mcp_exposure`). Passed
+        // rather than re-derived so the file that is written and the tree that
+        // is scanned are the same spawn's, and so the check cannot drift to a
+        // different directory than the one the pane gets.
+        workdir: &Path,
         containment: Containment,
         unattended: bool,
         persona: &PersonaInject,
@@ -43825,6 +44390,35 @@ impl OrchRegistry {
             let db_dir = db.parent().expect("opencode_db_path always has a parent").to_path_buf();
             fs::create_dir_all(&db_dir).map_err(|e| e.to_string())?;
             let env = opencode_pane_env(&cfg, containment, unattended, &db);
+            return Ok(AgentCliConfig { path, env });
+        }
+        // pi (#2126): the file written here IS the file named on
+        // `--mcp-config` — audit copy and authoritative bytes are one
+        // artifact, as claude's are — and the pane environment carries no part
+        // of this agent's identity (see `cli_extra_env`'s pi arm).
+        if cli == "pi" {
+            let cfg = pi_mcp_config_json(port, token, &pi_server_name(&agent_seg));
+            fs::write(&path, cfg).map_err(|e| e.to_string())?;
+            // pi creates the session FILE lazily (on the first assistant
+            // response) but not the directory `--session-dir` names, and a
+            // pane whose store cannot be opened does not boot — so this is an
+            // error, not a best-effort mkdir, exactly like opencode's db dir
+            // above.
+            fs::create_dir_all(self.pi_sessions_dir(group)).map_err(|e| e.to_string())?;
+            // Measure-and-warn, once per spawn, and NEVER a refusal — see
+            // `pi_repo_mcp_exposure`. Best-effort by construction: it returns
+            // `None` for the repo that declares nothing, which is nearly every
+            // repo, so the ordinary spawn writes no row at all.
+            if let Some(exposure) = pi_repo_mcp_exposure(
+                workdir,
+                &pi_server_name(&agent_seg),
+                &crate::orchestration::mcp::every_tool_name(),
+            ) {
+                let mut row = exposure;
+                row["agent"] = json!(agent_id);
+                self.audit(group, brand::AUDIT_ACTOR, "pi-repo-mcp-merged", row);
+            }
+            let env = cli_extra_env(cli, &path);
             return Ok(AgentCliConfig { path, env });
         }
         let mut server = json!({
@@ -44391,9 +44985,18 @@ impl OrchRegistry {
         Some(handle)
     }
 
-    /// Generate (or refresh) the file an opencode block's generated agent
-    /// entry points its `prompt` at (#722), returning `(handle, path)` or
-    /// `None` if it can't be written.
+    /// Generate (or refresh) the file a block's durable CONTRACT is written
+    /// to under the group's own state dir, returning `(handle, path)` or `None`
+    /// if it can't be written.
+    ///
+    /// **Two CLIs, one file, two ways of naming it** (#722, generalised for
+    /// #2126). opencode's generated agent entry points its `prompt` at this
+    /// file through a `{file:...}` reference in the config document; pi points
+    /// `--append-system-prompt` straight at it on argv. `ext` is the whole
+    /// difference, and it exists so the two never collide in the one
+    /// `configs/` directory they share  `generated_agent_handle` is
+    /// `loomux-<group>-<block>`, which is the SAME handle for a block whose
+    /// `cli:` changed between two launches of one group.
     ///
     /// **Written under the GROUP's own state dir**, unlike its claude and
     /// copilot siblings, and for two reasons rather than one. opencode has no
@@ -44420,11 +45023,12 @@ impl OrchRegistry {
     /// so quotes, newlines and backslashes in a persona cannot break the
     /// document around it, and it `.trim()`s the content, so nothing may
     /// depend on the trailing newline.
-    fn write_opencode_agent_file(
+    fn write_contract_file(
         &self,
         group: &GroupId,
         block: &workflow::Block,
         contract: &str,
+        ext: &str,
     ) -> Option<(String, PathBuf)> {
         if !self.group_state_exists(group) {
             return None;
@@ -44432,7 +45036,7 @@ impl OrchRegistry {
         let dir = self.group_dir(group).join("configs");
         fs::create_dir_all(&dir).ok()?;
         let handle = generated_agent_handle(group, &block.id)?;
-        let path = dir.join(format!("{handle}{OPENCODE_AGENT_FILE_EXT}"));
+        let path = dir.join(format!("{handle}{ext}"));
         let instructions_path = self.group_dir(group).join(block.instructions_file());
         let body =
             format!("{contract}{}\n", compaction_self_check_clause(&instructions_path));
@@ -44862,7 +45466,7 @@ impl OrchRegistry {
         // file nor its frontmatter. Its text is already folded into `contract`
         // by `block_contract_text`, so nothing is lost by ignoring the flag.
         if cli == "opencode" {
-            match self.write_opencode_agent_file(group, block, contract) {
+            match self.write_contract_file(group, block, contract, OPENCODE_AGENT_FILE_EXT) {
                 Some((handle, path)) => {
                     out.opencode_agent = Some(handle);
                     out.opencode_prompt_file = Some(path);
@@ -44886,6 +45490,55 @@ impl OrchRegistry {
                         "reason": "could not write the block's contract file under the group dir; \
                                    the pane launches with no --agent (an unresolvable one would \
                                    silently fall back to the default `build` agent) and the \
+                                   contract reaches it through the kickoff only",
+                    }));
+                }
+            }
+            return out;
+        }
+
+        // pi (#2126): the same "contract in a file under the group dir" shape
+        // as opencode's above, and SIMPLER at the flag end — pi has no
+        // `--agent` equivalent, so there is no handle to emit and nothing that
+        // could resolve to the wrong definition. `--append-system-prompt`
+        // names the file and pi appends it to its own system prompt.
+        //
+        // `contract` is used whole — the full instructions body plus any
+        // persona — matching claude and opencode rather than copilot, whose
+        // slim composition exists solely because GitHub documents a 30,000
+        // character body cap. pi documents no cap on this flag.
+        //
+        // A `copilot_native` persona is as irrelevant here as it is in the
+        // opencode branch: that flag records what COPILOT's `--agent` can
+        // resolve, and pi resolves neither the file nor its frontmatter. The
+        // text is already folded into `contract` by `block_contract_text`.
+        if cli == "pi" {
+            match self.write_contract_file(group, block, contract, PI_CONTRACT_FILE_EXT) {
+                Some((_handle, path)) => {
+                    out.pi_append_system_prompt_file = Some(path);
+                    out.contract_carrier = ContractCarrier::SystemLayerFull;
+                }
+                None => {
+                    // The group dir is unwritable. Emit NO flag: pointing
+                    // `--append-system-prompt` at a file that is not there
+                    // would at best be silently ignored and at worst put the
+                    // literal path into the system prompt as TEXT, since the
+                    // flag documents "text or file contents". Fall back to the
+                    // kickoff-text path exactly as copilot and opencode do,
+                    // and audit it for the reason the claude fallback is
+                    // audited: a dropped persona must be findable in the trail
+                    // rather than inferred from its absence.
+                    //
+                    // Nothing about containment rests on this flag — pi's
+                    // denial rides `--exclude-tools` on the same line — so the
+                    // loss here is the durable contract and nothing else.
+                    if persona.is_some_and(|p| !p.text.trim().is_empty()) {
+                        out.kickoff = persona.map(|p| p.text.clone());
+                    }
+                    self.audit(group, brand::AUDIT_ACTOR, "pi-contract-file-unwritable", json!({
+                        "block": block.id,
+                        "reason": "could not write the block's contract file under the group dir; \
+                                   the pane launches with no --append-system-prompt and the \
                                    contract reaches it through the kickoff only",
                     }));
                 }
@@ -45328,6 +45981,98 @@ impl OrchRegistry {
                 // block widens nothing; it only ever gets its class's baseline.
                 cmd
             }
+            // pi (#2126). Everything loomux configures on pi rides argv — its
+            // MCP config, its session identity, its session store, its
+            // contract and its containment — which is what makes this the
+            // longest of the non-claude arms and what makes its assertions
+            // land here rather than on a generated document.
+            "pi" => {
+                // ONE flag for both directions, and that is the whole reason
+                // pi needs no session watcher, no baseline and no contest
+                // refusal: `--session-id <id>` is documented "use exact
+                // project session ID, creating it if missing", so the same
+                // token opens an existing session and creates a missing one.
+                // A resume of a pane that was never prompted therefore starts
+                // a fresh session under the id it was always going to have,
+                // rather than failing — pi does not create the session FILE
+                // until the first assistant response.
+                //
+                // `resume` is deliberately not read. That is not a dropped
+                // case: it is the fact, and `pi_launch_flags_per_posture`
+                // pins the fresh and resumed lines EQUAL so a later edit
+                // that splits them has to argue for it.
+                let mut cmd = String::from("pi");
+                if let Some(s) = session {
+                    cmd.push_str(&format!(" --session-id {s}"));
+                }
+                // The group's own store, so a group's sessions stay out of the
+                // human's `pi --resume` list and theirs stay out of the
+                // group's — `OPENCODE_DB`'s argument, reached by a flag.
+                cmd.push_str(&format!(
+                    " --session-dir \"{}\"",
+                    pi_sessions_in(group_dir).display()
+                ));
+                // The MCP seam pi has only through the adapter extension the
+                // human installs. pi's own parser files an unknown
+                // `--flag value` into `unknownFlags` rather than erroring, so
+                // this is inert — not fatal — on a machine where the adapter
+                // is missing, and the pane then boots with no orrerix tools.
+                // That failure is invisible to loomux and visible to the human
+                // in `/mcp`; a launcher preflight for it is a follow-up.
+                cmd.push_str(&format!(" --mcp-config \"{}\"", cfg.display()));
+                if let Some(path) = &persona.pi_append_system_prompt_file {
+                    // BY FILE, never as argv text: the flag takes "text or
+                    // file contents", and a role contract is many KB against
+                    // Windows CreateProcessW's 32,767-character command-line
+                    // limit (#417). Only the path ever reaches argv.
+                    cmd.push_str(&format!(" --append-system-prompt \"{}\"", path.display()));
+                }
+                // Exactly one of the pair, on EVERY group line, so pi's one
+                // boot dialog ("Trust project folder?") can never appear on a
+                // pane loomux is about to type a kickoff into. Which one is
+                // the containment question — see the two constants.
+                cmd.push(' ');
+                cmd.push_str(if containment.denies_edits() {
+                    PI_NO_APPROVE_FLAG
+                } else {
+                    PI_APPROVE_FLAG
+                });
+                if containment.denies_edits() {
+                    // Applied AFTER every allowlist, so this is the denial and
+                    // there is nothing for it to lose to. A ReadOnly class
+                    // never reaches here — `cli_can_host` refuses a planner on
+                    // pi outright, because pi has no bash-command deny for
+                    // `Containment::denies_git_mutation` to be expressed as.
+                    cmd.push_str(&format!(" --exclude-tools {PI_EDIT_DENY_TOOLS}"));
+                }
+                // Omitted entirely when empty, for the reason opencode's arm
+                // gives: `default_model("pi", …)` is empty on purpose, and a
+                // blank `--model` would be an argument, not a silence.
+                if !model.is_empty() {
+                    cmd.push_str(&format!(" --model {model}"));
+                }
+                // #687: a member of a closed enum by the time it reaches here
+                // (parser + `clamped_knob`), so it needs no quoting — the same
+                // argument `model` rests on. pi's own level vocabulary is a
+                // superset of loomux's five.
+                if !knobs.effort.is_empty() {
+                    cmd.push_str(&format!(" --thinking {}", knobs.effort));
+                }
+                // `unattended` is READ and deliberately changes nothing — pi
+                // has no permission prompts to bypass, so the attended and
+                // unattended lines are byte-identical. See
+                // `PI_UNATTENDED_FLAGS` for why that is a measured claim, and
+                // `docs/orchestration.md` for what it means for a human
+                // running an attended pi worker.
+                debug_assert!(PI_UNATTENDED_FLAGS.is_empty());
+                let _ = unattended;
+                // `persona.extra_allow` holds claude/copilot tool-pattern
+                // strings; pi has no allow mechanism at all (no permission
+                // engine, no prompts), so there is nothing to translate them
+                // into and a pi block widens nothing — the same decision, for
+                // a stronger reason, as gemini's and opencode's arms.
+                cmd
+            }
             // "claude" and the explicit fallback for anything unrecognized.
             _ => {
                 // Assigning the session id up front is what makes per-task
@@ -45684,6 +46429,49 @@ impl OrchRegistry {
                     }
                 }
             }
+            // pi (#2126) — the same atoms and the same order as the string
+            // form above; see it for why each flag is there. Every path is one
+            // literal argv element (no shell here, so no quotes), and
+            // `build_agent_argv_matches_command_line` tokenizes the string
+            // form and asserts it equals this vector across the matrix.
+            "pi" => {
+                push(&mut a, "pi");
+                // `resume` unread on purpose — `--session-id` opens-or-creates.
+                if let Some(s) = session {
+                    push(&mut a, "--session-id");
+                    push(&mut a, s);
+                }
+                push(&mut a, "--session-dir");
+                a.push(pi_sessions_in(group_dir).display().to_string());
+                push(&mut a, "--mcp-config");
+                a.push(cfg.display().to_string());
+                if let Some(path) = &persona.pi_append_system_prompt_file {
+                    push(&mut a, "--append-system-prompt");
+                    a.push(path.display().to_string());
+                }
+                push(
+                    &mut a,
+                    if containment.denies_edits() { PI_NO_APPROVE_FLAG } else { PI_APPROVE_FLAG },
+                );
+                if containment.denies_edits() {
+                    push(&mut a, "--exclude-tools");
+                    // ONE element: the value is a comma-joined list with no
+                    // spaces, so it is a single token on both forms.
+                    push(&mut a, PI_EDIT_DENY_TOOLS);
+                }
+                if !model.is_empty() {
+                    push(&mut a, "--model");
+                    push(&mut a, model);
+                }
+                if !knobs.effort.is_empty() {
+                    push(&mut a, "--thinking");
+                    push(&mut a, knobs.effort);
+                }
+                // == PI_UNATTENDED_FLAGS (empty), stated so the two forms make
+                // the same claim about the posture rather than one of them
+                // simply omitting it.
+                debug_assert!(PI_UNATTENDED_FLAGS.is_empty());
+            }
             // "claude" and the explicit fallback for anything unrecognized.
             _ => {
                 push(&mut a, "claude");
@@ -46022,11 +46810,16 @@ impl OrchRegistry {
         let resume = resume_session.is_some();
         let session_id = match resume_session {
             Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
-            None => (cli == "claude").then(new_session_uuid),
+            // #2126: the CAPABILITY, not the CLI name. claude and pi are both
+            // handed the id they will run under; every other spawnable CLI
+            // mints its own somewhere inside boot. Asking `CLI_CAPS` here and
+            // in `capture_session_baseline` is what keeps "mint one" and
+            // "watch a store for one" from ever both being true.
+            None => premints_session_id(&cli).then(new_session_uuid),
         };
 
-        // Copilot and opencode mint their own session id after boot (neither
-        // has a `--session-id`), so snapshot the sessions that already exist
+        // A CLI that mints its own session id after boot has one; snapshot the
+        // sessions that already exist
         // now, before this pane's CLI starts — the watcher then identifies the
         // newly appeared one.
         let session_baseline =
@@ -46172,6 +46965,7 @@ impl OrchRegistry {
             &agent_id,
             &token,
             &cli,
+            Path::new(&cwd),
             role.containment(),
             unattended,
             &inject,
@@ -53046,7 +53840,7 @@ pub fn promote_to_orchestrator_sync(
     // session (claude writes no transcript until the first exchange, so
     // "never spoke to it" reads as "not found" here rather than as claude's
     // opaque "No conversation found" a moment later).
-    match session_cwd_in_store(cli, &session_id, None) {
+    match session_cwd_in_store(cli, &session_id, None, None) {
         Ok(Some(_)) => {}
         Ok(None) => {
             return Err(format!(
@@ -54906,9 +55700,11 @@ fn register_orchestrator_pane(
     let resume = origin.resumes_session();
     let session_id = match origin.session_id() {
         Some(s) => Some(sanitize_session(s).ok_or("invalid resume session id")?),
-        None => (cli == "claude").then(new_session_uuid),
+        // #2126: the capability, not the CLI name — see the same line in
+        // `spawn_agent_ex`.
+        None => premints_session_id(&cli).then(new_session_uuid),
     };
-    // Copilot and opencode mint their own id on boot; snapshot existing
+    // A CLI that mints its own id on boot; snapshot existing
     // sessions now so the orchestrator's newly created one can be tracked
     // (this is what gives such an orchestration its ORCH chip and restore).
     let session_baseline =
@@ -54948,6 +55744,7 @@ fn register_orchestrator_pane(
         &agent_id,
         &token,
         &cli,
+        Path::new(&group.repo),
         containment,
         group.guardrails.auto_ops || containment.forces_unattended(),
         &inject,
@@ -55483,7 +56280,8 @@ pub fn resume_recorded_session(
             // after looking somewhere else entirely — and no opencode group
             // could be reopened at all.
             let db = reg.opencode_db_path(&record.group_id);
-            match session_cwd_in_store(&cli, session_id, Some(&db)) {
+            let pi = reg.pi_sessions_dir(&record.group_id);
+            match session_cwd_in_store(&cli, session_id, Some(&db), Some(&pi)) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     return Err(format!(
@@ -55642,6 +56440,7 @@ pub fn resume_recorded_session(
             matched.as_ref().map(|r| r.cwd.as_str()),
             &group.repo,
             Some(&reg.opencode_db_path(&group.id)), // #722: this group's store
+            Some(&reg.pi_sessions_dir(&group.id)), // #2126: and this one
         )?;
         (Some(sid.clone()), Some(cwd), false, String::new())
     };

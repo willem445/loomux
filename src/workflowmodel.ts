@@ -69,7 +69,7 @@ export function isBlockKind(v: string): v is BlockKind {
  *  reach a catalog no other adapter here can. Which CLIs can host which *kinds*
  *  is a separate question the backend owns (`CLI_CAPS` / `cli_can_host`):
  *  membership here is spawnability, not capability. */
-export const WORKFLOW_CLIS = ["claude", "copilot", "gemini", "opencode"] as const;
+export const WORKFLOW_CLIS = ["claude", "copilot", "gemini", "opencode", "pi"] as const;
 export type WorkflowCli = (typeof WORKFLOW_CLIS)[number];
 
 export function isWorkflowCli(v: string): v is WorkflowCli {
@@ -3327,7 +3327,7 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
           severity: "error",
           code: "remote-requires-claude",
           message: b.cli
-            ? `Block "${where}" declares remote: with cli "${b.cli}" — a remote block must run cli: claude, the only CLI that accepts a session id orrerix minted before the spawn.`
+            ? `Block "${where}" declares remote: with cli "${b.cli}" — a remote block must run cli: claude, the only CLI orrerix drives remotely today.`
             : `Block "${where}" declares remote: with no cli — a remote block must spell out cli: claude. An omitted cli inherits the group default, which is picked at launch, so orrerix cannot check it here.`,
           blockId: b.id,
         });

@@ -333,7 +333,7 @@ impl Containment {
 /// `join(", ")` in error messages). The *reasons* a CLI is or isn't in it —
 /// and what it can do once it is — live in [`CLI_CAPS`], pinned against this
 /// list by `supported_clis_match_the_capability_table`.
-pub const SUPPORTED_CLIS: [&str; 4] = ["claude", "copilot", "gemini", "opencode"];
+pub const SUPPORTED_CLIS: [&str; 5] = ["claude", "copilot", "gemini", "opencode", "pi"];
 
 /// A per-CLI **ready marker** (#1591) — a shape the CLI's own output takes
 /// once it is genuinely able to accept typed input, for a CLI whose painted
@@ -539,6 +539,25 @@ pub struct CliCaps {
     /// `solo_prepare` needs, and it is NOT the same question as
     /// [`Self::orchestration`].
     pub mcp_argv_seam: bool,
+    /// loomux hands this CLI the session id it minted, on the launch line,
+    /// **before** the pane boots — rather than discovering afterwards which id
+    /// the CLI chose for itself.
+    ///
+    /// True for claude (`--session-id <uuid>` on a fresh spawn, `--resume
+    /// <id>` on a rejoin) and for pi (`--session-id <id>`, whose documented
+    /// behaviour is "use exact project session ID, creating it if missing" —
+    /// one flag for both directions). False for copilot, gemini and opencode,
+    /// each of which mints its own id somewhere inside boot.
+    ///
+    /// **Why this is a row rather than an `if` at the two mint sites.** The
+    /// premise had been re-derived as `cli == "claude"` at `spawn_agent_ex`
+    /// and at the orchestrator's own spawn, and asked a THIRD time by name
+    /// inside `capture_session_baseline` — which is the "re-derived at a call
+    /// site that then silently disagrees" failure this whole table exists to
+    /// end. The two facts are one fact: a CLI that is handed its id has
+    /// nothing to learn from a store, so a preminting CLI takes no session
+    /// baseline, and both consult this field instead of naming a CLI.
+    pub premints_session_id: bool,
     /// The deepest [`Containment`] tier loomux can actually *enforce* on this
     /// CLI at spawn. A class whose [`Role::containment`] sits above this may
     /// not run on it — see [`cli_can_host`].
@@ -629,6 +648,16 @@ pub const CONTEXT_VARIANTS: &[&str] = &["1m"];
 ///   `deny` decision plus `tools.exclude`, both of which can name
 ///   `write_file`/`replace` while leaving `run_shell_command` — see
 ///   `GEMINI_EDIT_DENY_TOOLS`.
+/// - **pi** — its load-bearing facts are read off the vendor's own source and
+///   docs at the version pin recorded in `doc/design/pi.md` (`pi` 0.84.4, and
+///   the community `pi-mcp-adapter` extension separately pinned there),
+///   because the published docs do not cover all of them: `--session-id` is
+///   in the CLI's argument parser and its help text but not in
+///   `docs/sessions.md`, while `--exclude-tools`, `--thinking` and the
+///   design principle "It intentionally does not include built-in MCP,
+///   sub-agents, permission popups, plan mode…" are documented. The same
+///   labelled-observation rule `doc/design/opencode.md` states applies: a
+///   source-read fact is an observation against a pin, not a contract.
 /// - **codex** — evaluated for #267 stage 2 and **rejected as a reviewer
 ///   host**. Its only containment axis is `sandbox_mode`
 ///   (`read-only | workspace-write | danger-full-access`,
@@ -681,6 +710,7 @@ pub const CLI_CAPS: &[CliCaps] = &[
         cli: "claude",
         orchestration: true,
         mcp_argv_seam: true,
+        premints_session_id: true,
         max_containment: Containment::ReadOnly,
         containment_note: "--disallowedTools denies tools by name and beats both the permission mode and the allow list",
         effort_levels: EFFORT_LEVELS,
@@ -695,6 +725,7 @@ pub const CLI_CAPS: &[CliCaps] = &[
         cli: "copilot",
         orchestration: true,
         mcp_argv_seam: true,
+        premints_session_id: false,
         max_containment: Containment::ReadOnly,
         containment_note: "--deny-tool denies the write category and shell prefixes, and deny beats --allow-all-tools",
         effort_levels: &[],
@@ -710,6 +741,7 @@ pub const CLI_CAPS: &[CliCaps] = &[
         cli: "gemini",
         orchestration: true,
         mcp_argv_seam: false,
+        premints_session_id: false,
         max_containment: Containment::ReadOnly,
         containment_note: "policy-engine deny rules and tools.exclude both name built-in tools (write_file/replace) and shell command prefixes, and both outrank --approval-mode yolo",
         effort_levels: &[],
@@ -730,6 +762,7 @@ pub const CLI_CAPS: &[CliCaps] = &[
         // flag string to a command line the human owns — cannot. Same shape as
         // gemini, so solo opencode panes stay delivery-only (#288).
         mcp_argv_seam: false,
+        premints_session_id: false,
         max_containment: Containment::ReadOnly,
         containment_note: "permission rules deny by key: `edit` is the key every file-modifying tool asks under, `bash` narrows by command pattern, and a deny is refused before any prompt — so deny outranks --auto",
         effort_levels: &[],
@@ -764,9 +797,51 @@ pub const CLI_CAPS: &[CliCaps] = &[
         ready_marker: Some(ReadyMarker::CountThen(" MCP")),
     },
     CliCaps {
+        cli: "pi",
+        orchestration: true,
+        // pi itself ships no MCP at all ("It intentionally does not include
+        // built-in MCP, sub-agents, permission popups, plan mode…"), and the
+        // seam is the community `pi-mcp-adapter` extension the human installs:
+        // it registers a real `--mcp-config <path>` CLI flag, and pi's own
+        // parser files an unknown `--flag value` into `unknownFlags` rather
+        // than erroring, so the flag reaches the adapter intact. Paired with
+        // `PI_MCP_CONFIG_MODE=exclusive` on the pane, the adapter reads that
+        // file and NOTHING else — claude's `--mcp-config … --strict-mcp-config`
+        // pair, reached a different way. So a SOLO pi pane can carry its
+        // channel identity, which is what this field decides.
+        mcp_argv_seam: true,
+        // `--session-id <id>` — "Use exact project session ID, creating it if
+        // missing": ONE flag for a fresh spawn and for a rejoin, because it
+        // opens the session file if it is there and creates it if it is not.
+        // So loomux pre-mints a UUID exactly as it does for claude, and no
+        // store watcher, baseline or contest refusal exists for pi at all.
+        premints_session_id: true,
+        // `--exclude-tools edit,write` denies the two editing built-ins by
+        // name, and it is applied AFTER every allowlist — that is `NoEdits`,
+        // and it is the ceiling: pi has no bash-pattern deny and no permission
+        // prompts whatsoever, so there is no seam for `ReadOnly`'s denial of
+        // the commit/push git subcommands to land on. A planner block is
+        // refused on pi by `cli_can_host` for exactly that reason.
+        max_containment: Containment::NoEdits,
+        containment_note: "--exclude-tools denies built-in tools by name and is applied after every allowlist, which reaches NoEdits — but pi has no bash-command deny and no permission prompts at all, so a ReadOnly class's git-mutation denial has nowhere to be expressed",
+        effort_levels: EFFORT_LEVELS,
+        effort_note: "--thinking <level> is a session-scoped flag over off|minimal|low|medium|high|xhigh|max, a superset of loomux's five; a model that does not support a level has it clamped or hidden per that model's own thinking-level map",
+        context_variants: &[],
+        context_note: "pi's context window is model-determined — its --list-models table REPORTS a context column, and no flag, setting or session control selects a variant",
+        // pi's interactive mode focuses the editor and starts the UI BEFORE it
+        // initialises extensions ("Start the UI before initializing extensions
+        // so session_start handlers can use interactive dialogs"), i.e. the
+        // input box is live before the adapter has connected anything — the
+        // opposite order from opencode's (#1591), and the reason the generic
+        // painted-and-quiet gate is expected to hold. A row gets a marker when
+        // a pane on it is caught painted-but-not-listening, never speculatively.
+        ready_marker: None,
+    },
+    CliCaps {
         cli: "codex",
         orchestration: false,
         mcp_argv_seam: false,
+        premints_session_id: false,
         max_containment: Containment::None,
         containment_note: "codex has no tool-level edit deny (its `tools` config covers only view_image/web_search); its sandbox_mode is all-or-nothing, and its read-only rung also blocks running commands and network access, so a contained agent could neither edit nor run the tests it exists to run",
         effort_levels: &[],
@@ -783,6 +858,22 @@ pub const CLI_CAPS: &[CliCaps] = &[
 /// trimmed and matched exactly everywhere else.
 pub fn cli_caps(cli: &str) -> Option<&'static CliCaps> {
     CLI_CAPS.iter().find(|c| c.cli == cli)
+}
+
+/// Is this CLI handed the session id loomux minted, up front? — the one
+/// question three spawn-path sites used to ask by naming claude (#2126).
+///
+/// Named rather than left as `cli_caps(cli).is_some_and(…)` at each site
+/// because it is asked in two DIRECTIONS: the two mint sites ask "should I
+/// mint one at all", and `capture_session_baseline` asks the negation ("is
+/// there anything to learn from a store"). Those are the same fact, and the
+/// point of the field is that they cannot come apart.
+///
+/// An unknown CLI is `false`, which is the conservative side: it takes the
+/// discover-after-boot path, which degrades to an unidentified pane rather
+/// than to a pane launched with a `--session-id` flag its CLI does not have.
+pub fn premints_session_id(cli: &str) -> bool {
+    cli_caps(cli).is_some_and(|c| c.premints_session_id)
 }
 
 /// **May this CLI host this capability class?** — the containment gate (#267).
@@ -846,6 +937,17 @@ pub fn default_model(cli: &str, role: Role) -> &'static str {
     // human who had already chosen. A block that wants a specific model pins
     // its own `model:`, and the launcher offers a curated list.
     if cli == "opencode" {
+        return "";
+    }
+    // pi: EMPTY, for the same argument as opencode's above and none of its
+    // own. Its `--model <pattern>` takes `provider/id` (optionally with a
+    // `:<thinking>` suffix) against 15+ providers, so it has no
+    // vendor-neutral alias to map a class onto — any default loomux picked
+    // would be the hardcoded model table #329 says ages badly, and would also
+    // silently override a human who had already set `defaultModel` in their
+    // own pi settings. A block that wants a specific model pins its own
+    // `model:`; the launcher offers whatever `pi --list-models` reports.
+    if cli == "pi" {
         return "";
     }
     match role {
