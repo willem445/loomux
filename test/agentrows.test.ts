@@ -146,6 +146,28 @@ const LADDER: { why: string; state: AgentState; facts: PaneFacts }[] = [
     }),
   },
   {
+    // A content pane (files / editor / git / workflow) has no PTY BY DESIGN and
+    // is live the moment it exists — `tabPaneInfo()` says so explicitly.
+    //
+    // Scope, stated because it is narrower than it looks: this pins what the
+    // LADDER does with such a pane. It cannot pin how `Pane.facts()` DERIVES
+    // `alive`, which is DOM code with no test file — the first draft derived it
+    // as `ptyId !== null && !exited` and called every content pane dead, and no
+    // literal-fed test here would have reddened. What keeps that out is
+    // structural rather than a fixture: `facts()` now takes `alive` and `kind`
+    // from ONE `tabPaneInfo()` reading, so there is no second rule to drift.
+    why: "a content pane has no PTY and is not dead",
+    state: "idle",
+    facts: facts({
+      kind: "files",
+      alive: true,
+      orch: null,
+      harness: null,
+      sessionId: null,
+      activity: { lastHumanInputMs: null, rosterIdle: null, lastOutputMs: null, bytesInWindow: 0 },
+    }),
+  },
+  {
     why: "no evidence of a prompt — the honest default",
     state: "working",
     facts: facts(),

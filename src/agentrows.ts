@@ -44,7 +44,12 @@ export interface PaneFacts {
   readonly orch: { readonly group: string; readonly agentId: string | null; readonly role: string | null } | null;
   /** The agent session id this pane has recorded, if any (#440). */
   readonly sessionId: string | null;
-  /** A PTY exists and its process has not exited. */
+  /** This pane is functional — `tabPaneInfo().live`, which is the repo's one
+   *  answer to that question. True for a running PTY, and also for a CONTENT
+   *  pane (files, editor, git, workflow), which has no PTY by design and is
+   *  live the moment it exists. False for a welcome form, a dormant
+   *  placeholder, and a pane whose process has exited — the ladder tells those
+   *  three apart on its own rungs, and only the last is a failure. */
   readonly alive: boolean;
   /** Showing a dormant restore placeholder (no PTY yet). */
   readonly dormant: boolean;

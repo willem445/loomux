@@ -132,8 +132,18 @@ Two rungs need their reasoning stated, because both are places where an
 obvious-looking simplification is wrong.
 
 **`dead` outranks a stale `waiting`.** The scan's last word about a process that
-has since exited is not news. Note that `welcome` and `dormant` are also "no
-PTY" — only one of the three is a failure.
+has since exited is not news.
+
+The trap under that rung is that **"no PTY" is four different things**, and only
+one of them is a failure: a welcome form and a dormant placeholder have not
+started one yet, a **content pane** (files, editor, git, workflow) needs none at
+all and is live the moment it exists, and a dead pane had one and lost it.
+`facts().alive` is therefore `tabPaneInfo().live` — the repo's single existing
+answer to "is this pane live", which already draws that distinction — and not a
+fresh `ptyId !== null && !exited`, which is the same expression for a *terminal*
+pane and calls every content pane dead. `facts()` reads `kind` and `alive` from
+one `tabPaneInfo()` call for that reason: two rules asking one question is how
+the two drift apart.
 
 **`idle` reads different evidence per pane kind, because different evidence
 exists.** An orchestration pane has the roster's `idle_since_ms`, which means

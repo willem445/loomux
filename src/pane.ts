@@ -1343,13 +1343,15 @@ export class Pane implements VoiceTargetPane {
    *  — see that handler's comment for why it can't tell a keystroke from
    *  data xterm generated on its own.
    *
-   *  Two consumers, deliberately with different lifetimes. `firstInputMs` is
+   *  Three consumers, deliberately with different lifetimes. `firstInputMs` is
    *  idempotent — only the first call after a `start`/`respawnFresh` reset
    *  does anything. `humanOrigin` is marked on EVERY call: it is a per-turn
    *  origin flag for the write that is about to follow, not a once-per-process
-   *  fact (#518, see `humanorigin.ts`). Both hang off this one function so
-   *  "what counts as human input" has a single answer and a future input
-   *  vector can only be added in one place. */
+   *  fact (#518, see `humanorigin.ts`). `activity.noteHumanInput` is marked on
+   *  every call too, but is a PANE-level fact that outlives any one process
+   *  (#2122 slice A2). All three hang off this one function so "what counts as
+   *  human input" has a single answer and a future input vector can only be
+   *  added in one place. */
   private markFirstInput(): void {
     this.firstInputMs ??= Date.now();
     // #2122 slice A2: a THIRD consumer of this one answer, with a third
@@ -4525,10 +4527,17 @@ export class Pane implements VoiceTargetPane {
    *  no geometry, starts no IPC and touches no timer, so it is safe to call on
    *  a hidden tab, on every row of a list, once a second. */
   facts(): PaneFacts {
+    // ONE reading of `tabPaneInfo()`, for `kind` and for `alive` both. `alive`
+    // is deliberately NOT `ptyId !== null && !exited`: a CONTENT pane (files,
+    // editor, git, workflow) has no PTY by design and is fully functional the
+    // moment it exists, so that expression calls every one of them dead —
+    // `tabPaneInfo()` already owns the one answer to "is this pane live", and
+    // asking it twice by two rules is how the two drift apart.
+    const info = this.tabPaneInfo();
     return {
       key: this.key,
       name: this.name,
-      kind: this.tabPaneInfo().kind,
+      kind: info.kind,
       // Read off the launch line, never branched on a CLI name to produce a
       // name (#722/#841): `agentCli` is the shared first-token parse, and the
       // SSH profile's declared far-end CLI is the only answer available for a
@@ -4539,7 +4548,7 @@ export class Pane implements VoiceTargetPane {
         ? { group: this.orchGroup, agentId: this.orchAgent, role: this.orchRoleName }
         : null,
       sessionId: this.agentSessionId,
-      alive: this.ptyId !== null && !this.exited,
+      alive: info.live,
       dormant: this.isDormant,
       welcome: this.isWelcome,
       attention: this.attentionReason
