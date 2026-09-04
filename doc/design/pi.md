@@ -327,6 +327,85 @@ for the same cause — not because anything downstream needs it.
 store across many groups, and a group-local store is already O(1) per group
 with nothing to share.
 
+## The human's own store: solo panes and the sessions browser (#2126 P2)
+
+The section above is the GROUP's store. This one is the other half: the store an
+unadorned `pi` writes, which is what the Sessions tab lists and what a solo pane
+resumes from. A group's sessions are deliberately not listed there — they are
+reopened through the group, with its roster, board and MCP identity, never as a
+bare `--session` pane.
+
+**Where it is.** `pi_sessions_root_from(session_dir, agent_dir, home)` ports the
+vendor's own order: `PI_CODING_AGENT_SESSION_DIR` names the sessions directory
+itself and wins; otherwise `<PI_CODING_AGENT_DIR or ~/.pi/agent>/sessions`. A
+blank variable is not a value — the shell exports one routinely, and treating it
+as a path would send every lookup to the app's own working directory.
+
+**The settings-file `sessionDir` key is a disclosed residual.** pi resolves
+`--session-dir` > `PI_CODING_AGENT_SESSION_DIR` > settings `sessionDir`, and
+reading the third would pin loomux to the schema of a second vendor file. A human
+who has moved their store that way sees no pi rows; they never see *wrong* ones,
+which is the failure mode that matters.
+
+**Both layouts are read, and that is not a hedge.** The flat-under-`--session-dir`
+fact the Sessions section above records applies to the environment variable too,
+and the first version of this scanner walked two levels unconditionally — so an
+override store yielded zero rows, and `find_session_cwd("pi", id)` answered
+`Ok(None)`, *"no such session"*, for a session that exists. `walk_pi_session_files`
+now walks both shapes and is shared by the browser's collector **and** the by-id
+lookup, so the two consumers cannot drift apart about where a store keeps its
+files. Accepting both unconditionally rather than selecting on which root won: the
+resolver would have to thread a second value through the test seam; a store used
+both ways still lists everything; and neither arm can find anything where the
+other owns the layout.
+
+**No cwd filtering.** pi's own `list` filters an override store against the header
+`cwd` because it answers "what can I resume from HERE". Both consumers here answer
+something else — the browser lists every session and shows each one's own cwd, the
+lookup is keyed on the id — so a filter would only hide real rows.
+
+**The filename is not the id.** A session is `<timestamp>_<uuid>.jsonl`, matched
+on the exact `_<id>.jsonl` SUFFIX. A prefix or bare `contains` would let one
+session answer for another, and the leading `_` is what stops an id that merely
+ends with another's from matching. The **header's** `id` then beats the one in the
+file name, falling back to it only when the header is truncated — so a renamed or
+hand-copied file still resumes the conversation it actually contains.
+
+**Which resume flag, and why the two paths differ from every other CLI's.** The
+Sessions tab emits `pi --session <id>`: it CONTINUES, and fails honestly on a file
+the human deleted, where `--session-id` would mint an empty pane wearing the right
+id. The pane-restore path emits `--session-id` on BOTH resume and fresh, because
+that flag opens-or-creates and a pi session file does not exist until the first
+assistant response — a pane killed before it was ever prompted has a real
+pre-minted id and no file. `PI_SESSION_FLAG_NAMES` recognises both spellings for
+excision, since pi refuses them together.
+
+**Solo MCP excision, and the one flag that is not pi's.** A solo pi pane's channel
+identity is one flag and its value, `--mcp-config <path>` — no allow-list token,
+because pi has no permission surface and exclusivity rides on
+`PI_MCP_CONFIG_MODE`. That makes the pattern weaker than claude's and copilot's,
+so the pi branch of `stripSoloMcpFlags` is gated on the PROGRAM: ungated, it would
+classify a hand-typed `claude --mcp-config ./my.json` as pi's and delete the
+human's own flag on every restore. Residual: a pi line carrying the human's OWN
+`--mcp-config` is stripped and re-minted rather than preserved.
+
+**That flag comes from the adapter, not from pi.** pi core does not know
+`--mcp-config` and rejects unregistered flags; `pi-mcp-adapter` registers it. So a
+channel-tools solo launch on a machine without the extension boots into an
+unknown-flag error. Nothing on the excision side can prevent that — it only ever
+removes the flag — so it is named here as the requirement it is: an
+adapter-presence preflight is still unbuilt (see §Deliberately not done).
+
+**The argv-seam set is total over its union.** `SOLO_MCP_CLIS` is derived from a
+`Record<SoloCli, true>` rather than written as `readonly SoloCli[]`, because a
+union-typed array accepts any SUBSET — so widening `SoloCli` and forgetting the
+list used to compile cleanly. Both directions are now a compile error. The
+launcher's toggle gate, its mint gate and the excision all read that one list.
+
+**Colour and badge.** `cerulean` `#00d2f0`, badge letter `P`. The measurements,
+and the alternatives rejected against them, are in
+[`ui-redesign.md`](ui-redesign.md) §The per-CLI hues.
+
 ## Usage and cost: a transcript fold with pi's own dollars (#2126 P3)
 
 pi's session file is the usage record, so a pi pane is read the way a claude
