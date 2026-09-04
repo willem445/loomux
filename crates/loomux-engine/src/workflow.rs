@@ -2518,11 +2518,17 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         //    either onto a machine the repo file named is not a feature with a
         //    missing implementation; it is the feature this design refuses.
         //
-        // 3. `cli: claude` MUST BE SPELLED OUT. Only Claude's session identity
-        //    survives the trip: loomux pre-mints the session id and the CLI
-        //    accepts it (`--session-id`/`--resume`), while copilot/opencode/
-        //    gemini identify a session by scanning a LOCAL store, which a
-        //    remote CLI's store is not. An `cli:` omitted inherits the group
+        // 3. `cli: claude` MUST BE SPELLED OUT. claude is the only CLI loomux
+        //    drives remotely, and the gate is that fact rather than a
+        //    capability claim. Session identity is what made it TRUE
+        //    originally: loomux pre-mints the id and claude accepts it
+        //    (`--session-id`/`--resume`), while copilot/opencode/gemini
+        //    identify a session by scanning a LOCAL store, which a remote
+        //    CLI's store is not. pi (#2126) accepts a pre-minted id too, so
+        //    that argument no longer separates claude from every other CLI —
+        //    what still does is that no remote pi block has ever been
+        //    exercised, and a gate is only as good as the reason it states.
+        //    An `cli:` omitted inherits the group
         //    default — picked in the launcher, unknowable here — so a block
         //    that leaves it blank is refused rather than parsed into a promise
         //    the spawn would have to break. The asymmetry decides it: relaxing
@@ -2560,9 +2566,11 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                     errs.push(format!(
                         "blocks[{i}] ({id}): remote: requires cli: claude{spelled} — a remote \
                          agent's session has to be identified by an id loomux minted before the \
-                         spawn, and claude is the only CLI that accepts one (the others \
-                         recognize a session by scanning a local store, which a remote CLI's \
-                         store is not).",
+                         spawn, and claude is the only CLI loomux drives remotely today. pi \
+                         accepts a pre-minted id too (--session-id), but nothing has exercised \
+                         a remote pi block, so the gate stays claude-only rather than widening \
+                         on an unvalidated capability. Every other CLI recognizes a session by \
+                         scanning a local store, which a remote CLI's store is not.",
                         spelled = if cli.is_empty() {
                             ", spelled out on the block — an omitted cli: inherits the group \
                              default, which is picked at launch and cannot be checked here"
@@ -4708,11 +4716,22 @@ mod tests {
 
     #[test]
     fn a_remote_block_must_spell_out_cli_claude() {
-        // Session identity is what decides this (plan #1436 part 5): loomux
-        // pre-mints the session id and claude accepts it (`--session-id` /
-        // `--resume`), while copilot/opencode/gemini recognize a session by
-        // scanning a LOCAL store — which a remote CLI's store is not.
-        for cli in ["copilot", "gemini", "opencode"] {
+        // Session identity is what DECIDED this originally (plan #1436 part
+        // 5): loomux pre-mints the session id and claude accepts it
+        // (`--session-id` / `--resume`), while copilot/opencode/gemini
+        // recognize a session by scanning a LOCAL store — which a remote CLI's
+        // store is not.
+        //
+        // `pi` is in the loop for a DIFFERENT reason, and it is the reason the
+        // refusal's wording had to change (#2126): pi does accept a pre-minted
+        // id, so "claude is the only CLI that accepts one" became false the
+        // day pi landed. The gate is unchanged — a remote pi block has never
+        // been exercised and loomux drives no CLI but claude remotely — but a
+        // refusal is only as good as the reason it gives, and a reason a
+        // reader can falsify in one grep is worse than none. So pi is pinned
+        // here as a REFUSED cli whose refusal must not claim it cannot carry
+        // an id.
+        for cli in ["copilot", "gemini", "opencode", "pi"] {
             let errs = parse_workflow(&remote_doc(&[
                 ("kind", "worker"),
                 ("cli", cli),
@@ -4722,6 +4741,17 @@ mod tests {
             assert!(
                 errs.iter().any(|e| e.contains("remote:") && e.contains("claude")),
                 "a remote block on {cli} must be refused and name claude: {errs:?}"
+            );
+            // The refusal must not claim the refused CLI *cannot* be handed a
+            // pre-minted id — for pi that is false (#2126), and a false reason
+            // sends a reader to fix the wrong thing. Asserted for every CLI in
+            // the loop, not just pi: the claim was wrong as a UNIVERSAL, so
+            // the pin is the universal too.
+            assert!(
+                !errs.iter().any(|e| e.contains("the only CLI that accepts one")),
+                "the refusal must not claim claude is the only CLI that accepts a pre-minted \
+                 session id — pi accepts one; the gate is about what loomux drives remotely: \
+                 {errs:?}"
             );
         }
         // An OMITTED cli: is refused too, and this is the fail-closed half: it

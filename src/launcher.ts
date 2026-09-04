@@ -1021,7 +1021,7 @@ export class WelcomeForm {
   }
 
   /** Show the channel-tools toggle only where it applies — agent kind,
-   *  claude/copilot specifically (the only CLIs whose MCP config can be
+   *  claude/copilot specifically (CLIs whose MCP config can be
    *  delivered as flags appended to the command line this launcher builds;
    *  every other CLI stays lazy regardless of this toggle, so offering it
    *  there would promise a capability loomux can't deliver). Purely
@@ -1031,7 +1031,15 @@ export class WelcomeForm {
    *  is group-spawnable but its MCP server reaches it through a settings file
    *  named by an environment variable, which only a pane loomux spawns itself
    *  can be given. That is the backend's `CliCaps.mcp_argv_seam`, and a solo
-   *  gemini pane is delivery-only for exactly this reason. */
+   *  gemini pane is delivery-only for exactly this reason.
+   *
+   *  Nor is it the whole of `mcp_argv_seam` any more: pi's row is `true` too
+   *  (#2126 P1 — its adapter takes `--mcp-config` on argv, and `solo_prepare`
+   *  has the arm), so this list is currently NARROWER than the backend's
+   *  capability rather than equal to it. Widening it is #2126 P2's, with the
+   *  rest of the launcher's per-CLI identity; until then a solo pi pane is
+   *  delivery-only in the UI, which is a missing offer and never a broken
+   *  one. */
   private applyChannelTools(): void {
     this.channelToolsField.hidden =
       this.kind !== "agent" || (this.agentSel.value !== "claude" && this.agentSel.value !== "copilot");

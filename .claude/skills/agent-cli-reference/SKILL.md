@@ -59,6 +59,39 @@ layout, the exact merge ranks, `--agent` failure behavior, `run` without
 recorded as labeled observations in `doc/design/opencode.md` — not inferred,
 and not presented as contract.
 
+pi (root: https://github.com/earendil-works/pi/tree/main/packages/coding-agent/docs):
+
+- CLI reference, tool options, slash commands, design principles (`--model`,
+  `--thinking`, `--tools`/`--exclude-tools`, `--approve`/`--no-approve`,
+  `--append-system-prompt`): `docs/usage.md`
+- Settings, incl. the Tools section's allowlist-then-filter rule and the
+  Sessions section's `sessionDir`: `docs/settings.md`
+- Sessions and the session TREE (`--session`, `--fork`, `/tree`):
+  `docs/sessions.md`
+- Session file format (the header line, entry types, per-message `usage`):
+  `docs/session-format.md`
+- Environment variables (`PI_CODING_AGENT_SESSION_DIR`,
+  `PI_SKIP_VERSION_CHECK`, `PI_OFFLINE`): `docs/environment-variables.md`
+- Extensions (tools, commands, events, `tool_call` blocking):
+  `docs/extensions.md`
+- Models and the `provider/id` format, thinking-level map: `docs/models.md`
+- RPC mode (JSON-per-line over stdin/stdout): `docs/rpc.md`
+- Windows specifics (the `bash` tool runs Git Bash): `docs/windows.md`
+
+Two things about pi's index in particular. Its docs are **versioned with the
+source**, not published as a site, so read them at a TAG rather than at
+`main` — `doc/design/pi.md` carries the pin orrerix's code was written
+against. And they are silent on several surfaces orrerix depends on, most
+sharply `--session-id`, which is in `src/cli/args.ts` and in `--help` but in
+no `docs/` page at all; those are read from source at that pin and recorded
+as labeled observations in `doc/design/pi.md`.
+
+pi ships **no MCP** by design, so orrerix's tools reach a pi pane through a
+THIRD-PARTY extension: `nicobailon/pi-mcp-adapter`, pinned separately in
+`doc/design/pi.md`. Facts about `--mcp-config`, `PI_MCP_CONFIG_MODE` and the
+config merge order are facts about that adapter and not about pi — cite it
+as its own subject, and never assume a pi doc covers it.
+
 Any other agent CLI: find the vendor's official reference before wiring
 anything, and ADD its root URL to this index in the
 same PR that introduces the dependency. A CLI with no reference docs gets

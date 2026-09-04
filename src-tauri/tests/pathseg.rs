@@ -425,6 +425,19 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
             "claude_transcript_path(root, &PathSegment) — the declared assembly point",
             "fn claude_transcript_path(root: &Path, session: &PathSegment)",
         ),
+        // pi's session lookup (#2126). Not a path JOIN — the interpolation
+        // builds a SUFFIX that filenames read out of `read_dir` are matched
+        // against, so nothing built from `seg` is ever handed to the
+        // filesystem. The proof is nonetheless the same one every row above
+        // rests on, and it is the right one to demand: `seg` is the binding
+        // from `PathSegment::parse(session_id)` a few lines up, so the
+        // interpolation cannot be handed a raw string even by a caller that
+        // passes `../x` (which is `Ok(None)`, not a lookup).
+        (
+            "let suffix = format!(\"_{seg}.jsonl\");",
+            "pi_session_cwd_in_dir(dir, &str) — parsed to a PathSegment at the top of the fn",
+            "let Ok(seg) = PathSegment::parse(session_id) else { return Ok(None) };",
+        ),
         // Not an identifier family at all: `write_shim`/`write_refusal_shim`
         // take `program: &str`, and every call site passes a string LITERAL —
         // the proofs below are those call sites, so a future caller threading a

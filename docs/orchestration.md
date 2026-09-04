@@ -1887,8 +1887,11 @@ Two rules the parser enforces, both of which fail the file rather than warn:
   into. Put `remote:` on the blocks the orchestrator spawns.
 - **`cli: claude`, written on the block.** A remote agent's session has to be
   identified by an id orrerix minted before the spawn, and Claude is the only CLI
-  today that accepts one — the others recognise a session by scanning a store on
-  the local disk, which a remote CLI's disk is not. Leaving `cli:` off is refused
+  orrerix drives remotely today. Most CLIs recognise a session by scanning a store
+  on the local disk, which a remote CLI's disk is not; `pi` does accept a
+  pre-minted id, but nothing has exercised a remote `pi` block, so the rule stays
+  Claude-only rather than widening on an unvalidated path. Leaving `cli:` off is
+  refused
   too: an omitted CLI inherits the group default, which is picked at launch, so
   orrerix cannot tell at load time whether the block would end up on Claude.
 
@@ -2100,7 +2103,7 @@ line, plus number fields bounded to the ranges shown above - #1869.)
 
 ### Setting up a cross-model reviewer
 
-`cli:` accepts `claude`, `copilot`, `gemini`, or `opencode`. So a workflow
+`cli:` accepts `claude`, `copilot`, `gemini`, `opencode`, or `pi`. So a workflow
 whose worker runs on Claude gets a genuinely different model family
 reviewing it by naming one on a reviewer block:
 
@@ -2155,6 +2158,44 @@ point:
   pane up front, so orrerix learns which session is the reviewer's after it
   starts rather than minting one — but once bound, that session resumes and
   its transcript reads back like any claude or copilot one.
+
+`cli: pi` is the fifth choice, and it is the one whose differences are worth
+reading before you point a lane at it — pi is a deliberately minimal harness,
+and two of its omissions change what an orrerix block on it means:
+
+- **pi has no permission prompts at all, so an attended `pi` worker still runs
+  every tool without asking.** This is the one you want to know before your
+  first run. On every other CLI a non-`auto_ops` group means a human is asked
+  before the agent does something; on pi there is nothing to ask with, so
+  attended and unattended `pi` panes get a byte-identical command line and the
+  group's autopilot toggle is a no-op. Point a `pi` block at work you would
+  have let run unattended anyway.
+- **A `planner` block cannot run on pi, and orrerix refuses the file rather
+  than launching one.** A planner is read-only, which means denying the
+  git subcommands that commit and push; pi denies tools by NAME
+  (`--exclude-tools edit,write`) and has no command-pattern deny, so there is
+  nowhere for that denial to live. A `reviewer` is fine — denying `edit` and
+  `write` by name is exactly what a reviewer's containment is.
+- **`allow:` doesn't apply to a `pi` block either**, for a stronger reason
+  than gemini's or opencode's: pi has no permission engine to pre-approve
+  anything in. A `pi` block runs with its class's baseline and can't be
+  widened.
+- **No compact nudge.** pi isn't on the short list of CLIs orrerix pastes
+  `/compact` into, so its context management is left to the CLI, which
+  auto-compacts by default.
+- **Session history works, the claude way.** pi takes `--session-id` and
+  creates the session if it is missing, so orrerix mints the id up front
+  rather than learning it after boot — no watcher, and a resume is the same
+  flag as a fresh start.
+- **Its orrerix tools ride a community extension, and that extension is not
+  optional.** pi ships no MCP support of its own by design. orrerix writes a
+  per-agent MCP config and names it with `--mcp-config`, which the
+  `pi-mcp-adapter` extension reads. If that extension isn't installed, pi
+  files the unknown flag away without complaining and the pane boots with **no
+  orrerix tools at all** — it cannot `report`, and nothing goes red to say so.
+  Check `/mcp` in the pane on your first run. `doc/design/pi.md` carries the
+  setup and the one exposure this bridge has (the extension merges your repo's
+  own `.mcp.json` into the pane's tools).
 
 **Why not codex?** codex can't deny its editing tool by name, and its sandbox
 is all-or-nothing — strict enough to block the tests and `gh` a review needs,
@@ -2823,7 +2864,7 @@ it gates, the per-item approve-with-comment grants, and the gate's audit trail.
 
 ## Requirements
 
-- An agent CLI on `PATH` — `claude`, `copilot`, `gemini`, or `opencode`. Roles
+- An agent CLI on `PATH` — `claude`, `copilot`, `gemini`, `opencode`, or `pi`. Roles
   can run on different ones (see [cross-model reviewers](#setting-up-a-cross-model-reviewer)).
   The launcher warns inline as you pick, and re-checks on submit — if one of
   those CLIs isn't on `PATH` it refuses the whole launch rather than starting

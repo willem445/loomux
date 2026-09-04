@@ -611,11 +611,11 @@ fn an_opencode_resume_reads_its_own_store_and_not_claudes() {
     // session history on this machine". An opencode group could not be
     // reopened at all.
     assert_eq!(
-        orchestration::session_cwd_in_store("opencode", NEW, Some(&s.db())).unwrap().as_deref(),
+        orchestration::session_cwd_in_store("opencode", NEW, Some(&s.db()), None).unwrap().as_deref(),
         Some("C:/Projects/loomux-worktrees/feat/x"),
     );
     assert_eq!(
-        orchestration::session_cwd_in_store("opencode", OTHER, Some(&s.db())).unwrap(),
+        orchestration::session_cwd_in_store("opencode", OTHER, Some(&s.db()), None).unwrap(),
         None,
         "a session this store has never held is not found — not an error to escalate"
     );
@@ -624,7 +624,7 @@ fn an_opencode_resume_reads_its_own_store_and_not_claudes() {
     // the caller should be told to go investigate.
     let empty = Scratch::new("router-absent");
     assert_eq!(
-        orchestration::session_cwd_in_store("opencode", NEW, Some(&empty.db())).unwrap(),
+        orchestration::session_cwd_in_store("opencode", NEW, Some(&empty.db()), None).unwrap(),
         None
     );
 }
@@ -790,7 +790,7 @@ fn a_group_whose_record_is_damaged_still_appears_in_the_orchestrations_list() {
     // asked as claude. Without this, the assertion below passes just as well
     // against a store that holds nothing at all.
     assert_eq!(
-        orchestration::session_cwd_in_store("claude", claude_sid, None).unwrap().as_deref(),
+        orchestration::session_cwd_in_store("claude", claude_sid, None, None).unwrap().as_deref(),
         Some("C:/tmp/opencode-torn"),
         "the claude fixture must be findable, or the short-circuit below is untested"
     );
@@ -885,9 +885,9 @@ fn the_listing_and_the_per_group_store_lookup_agree_about_resumability() {
     // Asserted, not merely read, so a fixture that never became reachable fails
     // here rather than quietly making both sides agree on "no".
     let oracle_yes =
-        orchestration::session_cwd_in_store("claude", &yes_sid, None).unwrap().is_some();
+        orchestration::session_cwd_in_store("claude", &yes_sid, None, None).unwrap().is_some();
     let oracle_no =
-        orchestration::session_cwd_in_store("claude", &no_sid, None).unwrap().is_some();
+        orchestration::session_cwd_in_store("claude", &no_sid, None, None).unwrap().is_some();
     assert!(oracle_yes, "the fixture must be reachable, or this test proves nothing");
     assert!(!oracle_no, "the other id must really be absent, or neither half discriminates");
 

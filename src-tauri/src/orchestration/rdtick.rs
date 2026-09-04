@@ -1771,12 +1771,14 @@ impl OrchRegistry {
             None => g.guardrails.agent_cli.clone(),
         };
         let db = self.opencode_db_path(group);
+        let pi = self.pi_sessions_dir(group);
         resolve_worker_resume_cwd(
             &cli,
             session,
             owner.as_ref().map(|o| o.cwd.as_str()),
             &g.repo,
             Some(&db),
+            Some(&pi),
         )
         .map(Some)
     }
