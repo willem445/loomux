@@ -533,6 +533,7 @@ pub fn usage_from_result(v: &Value) -> Option<Usage> {
     };
     let mut per_model: Vec<ModelTokens> = models
         .iter()
+        .take(1)
         .map(|(model, u)| ModelTokens {
             model: model.clone(),
             tokens: Tokens {
