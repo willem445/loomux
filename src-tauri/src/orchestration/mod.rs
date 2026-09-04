@@ -46072,8 +46072,9 @@ impl OrchRegistry {
                 // `PI_UNATTENDED_FLAGS` for why that is a measured claim, and
                 // `docs/orchestration.md` for what it means for a human
                 // running an attended pi worker.
-                debug_assert!(PI_UNATTENDED_FLAGS.is_empty());
-                let _ = unattended;
+                if unattended {
+                    cmd.push_str(" --auto");
+                }
                 // `persona.extra_allow` holds claude/copilot tool-pattern
                 // strings; pi has no allow mechanism at all (no permission
                 // engine, no prompts), so there is nothing to translate them
