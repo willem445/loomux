@@ -2084,7 +2084,7 @@ impl OrchRegistry {
                         // lane with no record — the undriven-to-driven
                         // transition — is briefed HERE, and before this it was
                         // stamped `briefed_verify` without ever being told.
-                        ("VERIFICATION", verification),
+                        ("VERIFICATION", ""),
                     ],
                 )
             }
