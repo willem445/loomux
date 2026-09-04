@@ -647,7 +647,7 @@ impl EventLog {
         let (raw, truncated) = truncate_on_char_boundary(raw, UNKNOWN_LINE_MAX_BYTES);
         self.append(LogBody::Unknown {
             raw: raw.to_string(),
-            truncated,
+            truncated: false,
         })
     }
 
