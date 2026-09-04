@@ -60283,3 +60283,74 @@ fn a_pi_spawn_reports_what_the_repos_own_mcp_files_merge_in() {
     assert_eq!(dot["parsed"], json!(false), "{row}");
     assert_eq!(dot["servers"], json!([]), "nothing readable, and it says so: {row}");
 }
+
+/// The header read is bounded, and reading it that way still gets the right
+/// answer (#2126, rev-std round 1 finding 2).
+///
+/// **Why the bound matters where this is called.** `orch_list_recorded`'s
+/// `resumable` check asks `pi_session_cwd_in_dir` once per pi group on every
+/// session-browser refresh, and a pi transcript is append-only and unbounded.
+/// The first version read the WHOLE file with `fs::read_to_string` and then
+/// took `.lines().next()` — so a listing's cost scaled with how much work a
+/// group had done, to answer a question the first few hundred bytes answer.
+///
+/// **What this test does NOT pin, stated rather than implied.** The bound is a
+/// RESOURCE property, and every case below returns the same value under the
+/// old unbounded read as under the new one — a truncated non-JSON prefix and a
+/// whole non-JSON file both fail to parse and both yield `Some("")`. So no
+/// assertion here would redden if `take()` were deleted tomorrow. What these
+/// DO pin is that the bounded read is still CORRECT: that narrowing the read
+/// did not change any answer, which is the half a regression would break.
+/// Nothing in this repo can currently pin the read's size; the honest guard is
+/// this note plus the constant's own doc.
+#[test]
+fn a_pi_session_header_is_read_correctly_from_a_bounded_prefix() {
+    let scratch = scratch_dir("pi-header-bound");
+    let dir = scratch.join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A real header followed by a transcript far larger than the read cap.
+    // The cwd must still come back — the tail is not merely ignored, it is
+    // never reached, and either way the answer is the header's.
+    let mut big = String::from(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"big\",\"cwd\":\"C:/big\"}\n",
+    );
+    for i in 0..20_000 {
+        big.push_str(&format!(
+            "{{\"type\":\"message\",\"role\":\"assistant\",\"n\":{i},\"text\":\"{}\"}}\n",
+            "x".repeat(60)
+        ));
+    }
+    assert!(big.len() > 256 * 1024, "the fixture must exceed the read cap: {}", big.len());
+    std::fs::write(dir.join("20260904T130000_big.jsonl"), &big).unwrap();
+    assert_eq!(
+        pi_session_cwd_in_dir(&dir, "big").unwrap().as_deref(),
+        Some("C:/big"),
+        "the header's cwd must survive a transcript much larger than the read cap"
+    );
+
+    // The case the cap exists for: no newline anywhere, so "the first line" and
+    // "the whole file" would be the same thing. It must answer, not hang or
+    // panic — and it must answer "recorded, workspace unknown", which is what a
+    // header it cannot parse means.
+    std::fs::write(dir.join("20260904T130100_nonewline.jsonl"), "x".repeat(512 * 1024))
+        .unwrap();
+    assert_eq!(
+        pi_session_cwd_in_dir(&dir, "nonewline").unwrap().as_deref(),
+        Some(""),
+        "a file with no newline at all is a session whose workspace is unknown, not a hang"
+    );
+
+    // And the control that keeps the two above from passing vacuously: an
+    // ordinary small file still resolves, so `Some("")` is a fact about an
+    // unparseable header rather than about a function that stopped reading.
+    std::fs::write(
+        dir.join("20260904T130200_small.jsonl"),
+        "{\"type\":\"session\",\"version\":3,\"id\":\"small\",\"cwd\":\"C:/small\"}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        pi_session_cwd_in_dir(&dir, "small").unwrap().as_deref(),
+        Some("C:/small")
+    );
+}

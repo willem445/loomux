@@ -446,7 +446,7 @@ use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Weak};
@@ -6490,14 +6490,38 @@ pub fn pi_session_cwd_in_dir(dir: &Path, session_id: &str) -> Result<Option<Stri
             continue;
         }
         // The header is pi's FIRST line — `{"type":"session","version":3,
-        // "id":…,"cwd":…}` — so only that line is read, however long the
-        // transcript grew. A file that exists but is empty (created and not
-        // yet written through) reads as "no recorded cwd", not as absent: the
-        // session id is real, its workspace is merely unknown.
-        let cwd = fs::read_to_string(entry.path())
+        // "id":…,"cwd":…}` — and only a BOUNDED PREFIX of the file is read to
+        // get it, never the whole transcript.
+        //
+        // The bound is load-bearing rather than tidy, because of WHO calls
+        // this. `orch_list_recorded`'s `resumable` check asks it once per pi
+        // group on every session-browser refresh — the boot prefetch, each
+        // sidebar open, each resume settle — and a pi transcript is
+        // append-only and unbounded (one line per turn). Reading the whole
+        // file to answer a question the first line answers made the cost of a
+        // listing scale with how much WORK a group had done, which is the
+        // wrong axis entirely (rev-std round 1, finding 2). The earlier
+        // version's doc comment claimed this bound while `read_to_string`
+        // quietly took the lot.
+        //
+        // `read_line` on a `BufReader` stops at the first `\n`, so the tail is
+        // never touched; the extra cap is for the pathological case where a
+        // corrupt or mid-write file carries no newline at all, which would
+        // otherwise make "the first line" mean "everything".
+        //
+        // A file that exists but is empty (created and not yet written
+        // through) reads as "no recorded cwd", not as absent: the session id
+        // is real, its workspace is merely unknown.
+        let cwd = fs::File::open(entry.path())
             .ok()
-            .and_then(|body| body.lines().next().map(str::to_string))
-            .and_then(|line| serde_json::from_str::<Value>(&line).ok())
+            .and_then(|f| {
+                let mut line = String::new();
+                BufReader::new(f.take(PI_SESSION_HEADER_MAX_BYTES))
+                    .read_line(&mut line)
+                    .ok()
+                    .map(|_| line)
+            })
+            .and_then(|line| serde_json::from_str::<Value>(line.trim_end()).ok())
             .filter(|v| v.get("type").and_then(Value::as_str) == Some("session"))
             .and_then(|v| v.get("cwd").and_then(Value::as_str).map(str::to_string))
             .unwrap_or_default();
@@ -6505,6 +6529,22 @@ pub fn pi_session_cwd_in_dir(dir: &Path, session_id: &str) -> Result<Option<Stri
     }
     Ok(None)
 }
+
+/// How much of a pi session file [`pi_session_cwd_in_dir`] will read looking
+/// for its header line.
+///
+/// The header is the first line and is a few hundred bytes in practice, so
+/// this is not a budget anyone is expected to spend — it is the ceiling for
+/// the one case where `read_line` would otherwise not stop: a corrupt or
+/// mid-write file with no newline in it at all, where "the first line" and
+/// "the whole transcript" are the same thing.
+///
+/// Generous on purpose (constraint 8 — nothing here is tuned to this repo's
+/// own transcripts). It fails toward "no recorded cwd" rather than toward a
+/// wrong one: a truncated read cannot parse as JSON, so the session still
+/// lists and still says its workspace is unknown, which is the answer a
+/// header-less file already gets.
+const PI_SESSION_HEADER_MAX_BYTES: u64 = 64 * 1024;
 
 /// The filename extension of the contract file a pi block's
 /// `--append-system-prompt` points at.

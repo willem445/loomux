@@ -292,6 +292,19 @@ with another, and the leading `_` is what disambiguates a real id from a
 timestamp that happens to end in the same digits. The cwd comes from the first
 line — pi's session header, `{"type":"session","version":3,"id":…,"cwd":…}`.
 
+**That header read is BOUNDED, and the bound is about the caller rather than
+the file.** `orch_list_recorded`'s `resumable` check asks this once per pi
+group on every session-browser refresh — the boot prefetch, each sidebar open,
+each resume settle — while a pi transcript is append-only and grows a line per
+turn. So the read is a `read_line` over a capped `BufReader`
+(`PI_SESSION_HEADER_MAX_BYTES`, 64 KB) rather than a whole-file
+`read_to_string`: a listing's cost must not scale with how much work a group
+has done, to answer a question the first few hundred bytes answer. The cap
+itself only bites on a file with no newline at all — a corrupt or mid-write
+one — where "the first line" would otherwise mean "everything"; a truncated
+read fails to parse and the session lists with an unknown workspace, which is
+what a header-less file already gets.
+
 **A pane that was never prompted has no file at all**, because pi defers
 creating it to the first assistant response (`SOURCE` `session-manager.ts`
 :1480, whose own comment says so). That makes an absent directory "not found"

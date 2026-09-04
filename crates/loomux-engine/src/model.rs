@@ -804,11 +804,23 @@ pub const CLI_CAPS: &[CliCaps] = &[
         // seam is the community `pi-mcp-adapter` extension the human installs:
         // it registers a real `--mcp-config <path>` CLI flag, and pi's own
         // parser files an unknown `--flag value` into `unknownFlags` rather
-        // than erroring, so the flag reaches the adapter intact. Paired with
-        // `PI_MCP_CONFIG_MODE=exclusive` on the pane, the adapter reads that
-        // file and NOTHING else — claude's `--mcp-config … --strict-mcp-config`
-        // pair, reached a different way. So a SOLO pi pane can carry its
-        // channel identity, which is what this field decides.
+        // than erroring, so the flag reaches the adapter intact. That flag is
+        // the whole seam, and a SOLO pi pane can therefore carry its channel
+        // identity, which is what this field decides.
+        //
+        // **It is NOT claude's `--mcp-config … --strict-mcp-config` pair**, and
+        // the difference is a fact about the adapter rather than a gap loomux
+        // left. The adapter's exclusive mode DISCARDS this override — it reads
+        // one fixed per-user file instead — so a per-agent config and
+        // exclusivity cannot be had together, and loomux takes the per-agent
+        // config. The consequence is that a pi pane also merges whatever the
+        // repo's own `.mcp.json`/`.pi/mcp.json` declare; that residual is
+        // measured (`pi_repo_mcp_exposure`) rather than claimed closed, and
+        // `doc/design/pi.md` carries the two adapter lines that decide it.
+        // Anyone tempted to "restore" `PI_MCP_CONFIG_MODE=exclusive` here
+        // would point every pi pane at somebody else's config and silently
+        // take its orrerix tools away — see `cli_extra_env`'s pi arm, which
+        // states this at the site that would have to change.
         mcp_argv_seam: true,
         // `--session-id <id>` — "Use exact project session ID, creating it if
         // missing": ONE flag for a fresh spawn and for a rejoin, because it
