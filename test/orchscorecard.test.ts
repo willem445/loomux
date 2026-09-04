@@ -447,14 +447,271 @@ test('coverage: rows inside a window that no counter consumed are reported by ac
 });
 
 test('coverage: every heuristic is declared with an id, a statement and its structural fix', () => {
-  assert.ok(REPORT.coverage.heuristics.length >= 8);
+  assert.ok(REPORT.coverage.heuristics.length >= 9);
   const ids = REPORT.coverage.heuristics.map((h: any) => h.id);
   assert.deepEqual(ids, [...new Set(ids)], 'heuristic ids must be unique');
+  // …and in ascending order. A new heuristic spliced in above its predecessor
+  // renders as "H7, H9, H8", which is how H9 first landed (rev-std).
+  const nums = ids.map((i: string) => Number(i.slice(1)));
+  assert.deepEqual(nums, [...nums].sort((a: number, b: number) => a - b), 'heuristics must read in id order');
   for (const h of REPORT.coverage.heuristics) {
     assert.match(h.id, /^H\d+$/);
     assert.ok(h.what.length > 20, `heuristic ${h.id} has no statement`);
     assert.ok(h.fix.length > 10, `heuristic ${h.id} names no structural fix`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// #2167 — a zero `usage.json` row backfilled from the transcript on disk.
+//
+// The corpus for this is its own directory (`fixtures/orchscorecard/backfill/`)
+// rather than an extra row in the shared one, because the shared fixture's
+// counters are pinned to the digit and a new session would move several of them
+// for a reason that has nothing to do with what those tests are about.
+//
+// It is the shared corpus with ONE change: `ses-13` — `w-13`, the worker
+// attributed to #900 — has the row the broken collector wrote, four zero
+// counters under `source: "statusline"`, and its transcript sits under a
+// WORKTREE-cwd project folder (`C--Projects-loomux-worktrees-agent-rev-1919`).
+// That folder name is the shape #2167 first suspected of breaking the lookup;
+// it is here as a non-regression witness, since neither the script's scan nor
+// `usage::claude_transcript_path` derives a slug at all.
+//
+// Two controls sit beside it, so "the backfill ran" is fail-able:
+//   ses-14  a NON-zero row whose transcript is also on disk — it must be left
+//           exactly alone, which is what stops the backfill from being a
+//           blanket "recompute every row from disk".
+//   ses-19  a zero row with NO transcript — it must be reported as skipped
+//           rather than silently dropped.
+//   ses-20  a zero row whose transcript EXISTS and folds to nothing (one user
+//           line, no usage). A missing file and an empty one are different
+//           facts — only one of them is recoverable by putting the file back —
+//           so they are reported in different buckets, and this is what stops
+//           the second bucket being a field nothing ever fills.
+//   agent:w-21
+//           a zero row keyed by `agent:<id>` rather than by a CLI session,
+//           which `UsageSnapshot::key` produces for a pane that never got one.
+//           No transcript could ever match it, so filing it as "no transcript"
+//           would report a session LOST that never existed — on the live store
+//           that was 125 of 146 skips. Third bucket, same reason as ses-20's.
+// ---------------------------------------------------------------------------
+
+const BACKFILL = path.join(fixtures, 'backfill');
+const BF_USAGE = path.join(BACKFILL, 'usage.json');
+const BF_AGENTS = path.join(BACKFILL, 'agents.json');
+const BF_PROJECTS = path.join(BACKFILL, 'claude-projects');
+
+function runBackfill(extraArgs: string[] = []): any {
+  const out = execFileSync(process.execPath, [
+    scriptPath,
+    '--audit', AUDIT,
+    '--usage', BF_USAGE,
+    '--agents', BF_AGENTS,
+    '--transcript', TRANSCRIPT,
+    '--pr-meta', PR_META,
+    '--claude-projects', BF_PROJECTS,
+    '--pr', '900', '--pr', '901', '--pr', '902',
+    ...extraArgs,
+  ], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+  return JSON.parse(out);
+}
+
+test('backfill: a zero row whose transcript is on disk is summed from it, and reaches the counters', () => {
+  const withBf = runBackfill();
+  const without = runBackfill(['--no-backfill']);
+
+  // NEGATIVE CONTROL first: with the backfill off, #900's delegate tokens are
+  // short by exactly w-13's row. If this ever equalled the backfilled figure the
+  // test below would be measuring nothing.
+  assert.equal(without.prs.find((c: any) => c.pr === 900).delegates.tokens.total, 2140,
+    '5350 minus the whole 3210 row w-13 lost: the shortfall is exactly that session');
+
+  // And with it on, the card reproduces the number the collector should have
+  // written — asserted against the SHARED corpus's own run, not against a
+  // constant retyped here: the backfill's job is to reconstruct exactly the row
+  // a working collector produces, so the two reports must agree field by field.
+  assert.deepEqual(
+    withBf.prs.find((c: any) => c.pr === 900).delegates.tokens,
+    REPORT.prs.find((c: any) => c.pr === 900).delegates.tokens,
+  );
+  assert.equal(withBf.prs.find((c: any) => c.pr === 900).delegates.tokens.total, 5350);
+  assert.deepEqual(
+    withBf.prs.find((c: any) => c.pr === 900).share,
+    REPORT.prs.find((c: any) => c.pr === 900).share,
+    'the orchestrator share is the figure #2167 says was wrong — it must come back too',
+  );
+});
+
+test('backfill: coverage says how many rows, from where, and what it left alone', () => {
+  const cov = runBackfill().coverage.usage_rows_backfilled_from_transcript;
+  assert.equal(cov.scanned, true);
+  assert.equal(cov.claude_projects_root, BF_PROJECTS);
+  // POPULATION CONTROL: every zero row considered is accounted for by exactly one
+  // outcome. The script itself throws if these do not reconcile; asserting the
+  // parts here is what makes the reconciliation fail-able rather than a tautology
+  // over whatever it happened to count.
+  assert.equal(cov.zero_rows_considered, 4);
+  assert.equal(cov.rows, 1);
+  // The THREE skip outcomes are kept apart, and each says a different thing:
+  // ses-19's file is missing (the store lost it), ses-20's exists and folds to
+  // nothing (nothing was lost), agent:w-21 was never keyed by a session at all
+  // (there was never a file to lose). Collapsing any pair reports a loss that
+  // did not happen.
+  assert.deepEqual(cov.zero_rows_without_a_transcript, ['ses-19']);
+  assert.deepEqual(cov.zero_rows_whose_transcript_summed_to_zero, ['ses-20']);
+  assert.deepEqual(cov.zero_rows_with_no_session_id, ['agent:w-21']);
+  assert.equal(
+    cov.rows + cov.zero_rows_without_a_transcript.length
+      + cov.zero_rows_whose_transcript_summed_to_zero.length
+      + cov.zero_rows_with_no_session_id.length,
+    cov.zero_rows_considered,
+  );
+  // The scan really did walk more than the one folder it needed, so "found it"
+  // is not "there was only one thing there".
+  assert.equal(cov.projects_scanned, 2);
+  assert.equal(cov.transcripts_indexed, 3);
+
+  assert.equal(cov.from.length, 1);
+  const [row] = cov.from;
+  assert.equal(row.session, 'ses-13');
+  assert.equal(row.agent_id, 'w-13');
+  assert.equal(row.was_source, 'statusline', 'the source it replaced is named, not discarded');
+  assert.equal(row.tokens.total, 3210);
+  assert.deepEqual(row.tokens, { input: 300, cache_read: 2700, cache_creation: 150, output: 60, total: 3210 });
+  // Dedup on `message.id` — the same rule the orchestrator transcript goes
+  // through. The fixture writes that message TWICE, mid-stream (output 30) and
+  // final (output 60); summing the lines would read 90 and two turns.
+  assert.equal(row.turns, 1);
+  assert.equal(row.tokens.output, 60);
+  // The worktree-cwd folder, mixed separators and all: the lookup is a scan, so
+  // the folder's NAME never decided anything.
+  assert.match(row.path, /C--Projects-loomux-worktrees-agent-rev-1919/);
+});
+
+test('backfill: a row that already has tokens is never rewritten from disk', () => {
+  const cov = runBackfill().coverage.usage_rows_backfilled_from_transcript;
+  // `ses-14` has a transcript in the fixture tree (11/11/11/11, unlike anything
+  // in its row) AND a non-zero usage row. It is not a candidate at all — it
+  // never appears in `from`, and it never appears in the skipped list either,
+  // because it was never considered.
+  assert.equal(cov.from.some((f: any) => f.session === 'ses-14'), false);
+  assert.equal(cov.zero_rows_without_a_transcript.includes('ses-14'), false);
+  // Its figures are the shared corpus's, untouched.
+  const bf = runBackfill();
+  const w14 = bf.prs.find((c: any) => c.pr === 901).delegates.agents.find((a: any) => a.agent === 'w-14');
+  const ref = REPORT.prs.find((c: any) => c.pr === 901).delegates.agents.find((a: any) => a.agent === 'w-14');
+  assert.deepEqual(w14, ref);
+});
+
+test('backfill: --no-backfill still reports how many zero rows there are', () => {
+  const cov = runBackfill(['--no-backfill']).coverage.usage_rows_backfilled_from_transcript;
+  assert.equal(cov.disabled, true);
+  assert.equal(cov.scanned, false, 'no projects tree is walked when the backfill is off');
+  assert.equal(cov.rows, 0);
+  // The zero rows are still COUNTED, so turning the backfill off cannot hide the
+  // condition it exists for.
+  assert.equal(cov.zero_rows_considered, 4);
+});
+
+test('backfill: an unreadable projects root leaves every zero row named, not silently at zero', () => {
+  const out = runBackfill(['--claude-projects', path.join(BACKFILL, 'no-such-dir')]);
+  const cov = out.coverage.usage_rows_backfilled_from_transcript;
+  assert.equal(cov.scanned, false);
+  assert.equal(cov.rows, 0);
+  // "I could not look" is not "there was nothing there": every zero row is
+  // named, where a readable root names only the one that really had no file.
+  assert.deepEqual(cov.zero_rows_without_a_transcript, ['ses-13', 'ses-19', 'ses-20']);
+  assert.deepEqual(cov.zero_rows_whose_transcript_summed_to_zero, [],
+    'nothing was read, so nothing can be reported as having folded to nothing');
+  // The agent:-keyed row is still classified correctly: that judgement needs no
+  // filesystem read, so an unreadable root does not make it unknowable.
+  assert.deepEqual(cov.zero_rows_with_no_session_id, ['agent:w-21']);
+});
+
+test('backfill: the shared corpus has no zero row, so its run never walks a projects tree', () => {
+  // The DEFAULT root is ~/.claude/projects, and this pins that the default costs
+  // nothing on a store with nothing to backfill — the index is built only when a
+  // candidate exists, so a run over a healthy store never touches the home dir.
+  const cov = REPORT.coverage.usage_rows_backfilled_from_transcript;
+  assert.equal(cov.zero_rows_considered, 0);
+  assert.equal(cov.scanned, false);
+  assert.equal(cov.rows, 0);
+  assert.equal(cov.claude_projects_root, sc.defaultClaudeProjectsRoot());
+});
+
+test('backfill: a row keyed by agent id, not by a session, is its own outcome', async () => {
+  // #2167 review N1. `UsageSnapshot::key` is the CLI session id "or `agent:<id>`
+  // when there is none", and an `agent:`-keyed row can never match a transcript
+  // index. Filing it under "no transcript" says the store lost a session that
+  // never existed — 86% of the live store's skips, all of them phantom losses.
+  const rows = [
+    { key: 'agent:w-99', agent_id: 'w-99', source: 'none', input_tokens: 0, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0 },
+    { key: 'ses-missing', agent_id: 'w-98', source: 'none', input_tokens: 0, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0 },
+  ];
+  const { backfill } = await sc.backfillZeroUsageRows(rows, BF_PROJECTS);
+  assert.deepEqual(backfill.zero_rows_with_no_session_id, ['agent:w-99']);
+  assert.deepEqual(backfill.zero_rows_without_a_transcript, ['ses-missing']);
+  // DISCRIMINATING: the two rows are identical but for the key shape, so this
+  // cannot pass by classifying everything one way.
+  assert.equal(backfill.zero_rows_with_no_session_id.length, 1);
+  assert.equal(backfill.zero_rows_without_a_transcript.length, 1);
+  assert.equal(sc.isAgentKeyedRow(rows[0]), true);
+  assert.equal(sc.isAgentKeyedRow(rows[1]), false);
+});
+
+test('reconcileBackfill: the accounting guard refuses a record that does not add up', () => {
+  // #2167 review N2. The guard is UNFIREABLE through the pipeline — the four
+  // outcomes are exhaustive by construction, and a reviewer's mutation disabling
+  // the throw left the suite green, correctly. So it is pinned DIRECTLY, with a
+  // record no branch in the pipeline can produce, rather than left as a guard
+  // the suite cannot redden. Its job is to trip a FUTURE branch that forgets to
+  // record its skip.
+  const ok = {
+    zero_rows_considered: 3, rows: 1,
+    zero_rows_without_a_transcript: ['a'],
+    zero_rows_whose_transcript_summed_to_zero: ['b'],
+    zero_rows_with_no_session_id: [],
+  };
+  assert.equal(sc.reconcileBackfill(ok), ok, 'a record that adds up is returned unchanged');
+  // One row swallowed by an unrecorded branch — the shape that certifies
+  // coverage never delivered.
+  assert.throws(
+    () => sc.reconcileBackfill({ ...ok, zero_rows_considered: 4 }),
+    /backfill accounting: 1 backfilled \+ 2 skipped != 4/,
+  );
+  // And the other direction: a skip recorded twice.
+  assert.throws(
+    () => sc.reconcileBackfill({ ...ok, zero_rows_with_no_session_id: ['c'] }),
+    /backfill accounting/,
+  );
+  // NEGATIVE CONTROL: each of the three skip buckets really is in the sum, so
+  // "it throws" is not carried by one of them alone.
+  for (const bucket of ['zero_rows_without_a_transcript', 'zero_rows_whose_transcript_summed_to_zero', 'zero_rows_with_no_session_id']) {
+    const one = { zero_rows_considered: 1, rows: 0,
+      zero_rows_without_a_transcript: [], zero_rows_whose_transcript_summed_to_zero: [],
+      zero_rows_with_no_session_id: [], [bucket]: ['x'] };
+    assert.doesNotThrow(() => sc.reconcileBackfill(one), `${bucket} must count toward the sum`);
+  }
+});
+
+test('backfillZeroUsageRows: the four counters decide, never the source label', async () => {
+  // Unit-level, because the CLI corpus can only show ONE spelling of a zero row.
+  // A row can arrive at zero under any source — `none`, `statusline`, even
+  // `transcript` — and it is the FIGURES that make it a candidate.
+  const rows = [
+    { key: 'ses-13', agent_id: 'a', source: 'none', input_tokens: 0, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0 },
+    { key: 'ses-14', agent_id: 'b', source: 'transcript', input_tokens: 0, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0 },
+    { key: 'ses-15', agent_id: 'c', source: 'statusline', input_tokens: 1, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0 },
+  ];
+  const { usage, backfill } = await sc.backfillZeroUsageRows(rows, BF_PROJECTS);
+  assert.equal(backfill.zero_rows_considered, 2, 'both zero rows, whatever they call themselves');
+  assert.deepEqual(backfill.from.map((f: any) => f.session).sort(), ['ses-13', 'ses-14']);
+  // ses-15 has one token and no transcript in the tree; it is not considered.
+  assert.equal(usage[2], rows[2], 'a non-zero row is passed through by identity');
+  // The caller's array is never mutated — the report echoes its inputs.
+  assert.equal(rows[0].input_tokens, 0);
+  assert.equal(usage[0].input_tokens, 300);
+  assert.equal(usage[0].source, 'transcript-backfill');
 });
 
 // ---------------------------------------------------------------------------

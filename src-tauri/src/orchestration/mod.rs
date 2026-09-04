@@ -5155,10 +5155,43 @@ impl Guardrails {
     /// `cli`, else the group default `agent_cli`. May return an unsupported
     /// value (a block CLI is not coerced in `clamped`); the spawn paths validate
     /// it.
+    ///
+    /// **A caller holding an agent wants [`cli_for_block`](Self::cli_for_block),
+    /// not this** (#2167). This answers a question about a CLASS — which is the
+    /// right question for "what would a plain `spawn_agent(kind:)` run" and the
+    /// wrong one for "what is THIS pane running".
     pub fn cli_for(&self, role: Role) -> &str {
         match self.block_for(role) {
             Some(b) => workflow::cli_of(b, &self.agent_cli),
             None => &self.agent_cli,
+        }
+    }
+
+    /// The agent CLI **one agent** runs: the CLI of the block that agent was
+    /// spawned from, else — for a block id this roster no longer declares — the
+    /// class default [`cli_for`](Self::cli_for) resolves.
+    ///
+    /// **This, not `cli_for`, is the question every caller holding an agent is
+    /// really asking (#2167).** A block IS an agent's identity (#222) and
+    /// carries its own `cli`; `cli_for` answers only "what does the FIRST block
+    /// of this kind run". The two agree exactly while every class declares one
+    /// block, which is why the built-in roster never showed the difference — and
+    /// diverge the moment a roster declares two, at which point every agent in
+    /// the second block is described by the first block's CLI. That is how a
+    /// roster ordering `worker-std` (opencode) ahead of `worker-adv` (claude)
+    /// silently stopped every claude delegate's transcript from being read: the
+    /// usage collector asked `cli_for(Role::Worker)`, got `opencode`, and never
+    /// ran its claude arm at all.
+    ///
+    /// The fallback is the class default rather than `agent_cli` on purpose: an
+    /// agent whose block was renamed or dropped out of the workflow file is
+    /// still an agent of its class, and the class default is the best answer
+    /// left. An empty `block` (a record persisted before #222) takes the same
+    /// path.
+    pub fn cli_for_block(&self, block_id: &str, role: Role) -> &str {
+        match self.block(block_id) {
+            Some(b) => workflow::cli_of(b, &self.agent_cli),
+            None => self.cli_for(role),
         }
     }
 
@@ -7235,7 +7268,13 @@ fn canonicalize_compact_nudge_roles(roles: Vec<String>) -> Vec<String> {
 /// function — see `git log` for the prior two-gate shape if a future CLI ever
 /// needs hook-admission without `/compact`-paste (or vice versa), which would
 /// be the reason to split them again. Pure so the gate is testable without a
-/// registry; `cli` comes from `Guardrails::cli_for`.
+/// registry; `cli` comes from `Guardrails::cli_for_block` — the agent's OWN
+/// block, not its class's default block (#2167). Both feeders pass it: the loop
+/// admission gate reads `g.cli_for_block(&a.block, a.role)` directly, and
+/// `request_compact` reaches it through `OrchRegistry::cli_for_agent`. Feeding
+/// this `cli_for(role)` instead is what silently excluded every claude delegate
+/// in a two-block class from compact nudges, since this list does not admit
+/// `opencode`.
 ///
 /// **This is no longer "every supported CLI" (#267).** Gemini is spawnable
 /// since #267 stage 2 and is deliberately NOT in this list: its equivalent
@@ -9795,11 +9834,14 @@ pub struct AgentEntry {
     pub idle_tick_skip_rearm_ms: u64,
     /// The actual agent CLI a **solo** pane (`role == Role::Solo`) is
     /// running, e.g. `"codex"`/`"gemini"` — the group-guardrails CLI
-    /// resolution (`Guardrails::cli_for`) that every orchestration-group
+    /// resolution (`Guardrails::cli_for_block`) that every orchestration-group
     /// agent's delivery/usage code paths use cannot answer this for a solo
     /// pane, since `__solo__` is one shared group across panes running
-    /// arbitrary, possibly-different CLIs. `None` for every non-solo agent
-    /// (its CLI always comes from its block). See
+    /// arbitrary, possibly-different CLIs. `None` for every non-solo agent —
+    /// and that is the same statement as the sentence below, now that the
+    /// resolver named above is the per-BLOCK one: a non-solo agent's CLI always
+    /// comes from its block (#2167 made those two halves agree; this doc used
+    /// to name `cli_for`, the per-CLASS resolver, and contradict itself). See
     /// `OrchRegistry::cli_for_agent`, the single read site.
     pub solo_cli: Option<String>,
     /// Rolling output tail captured at exit (#281), stripped of ANSI. The live
@@ -27946,8 +27988,11 @@ impl OrchRegistry {
         self.group_dir(group).join(format!("ledger-{agent_id}.log"))
     }
 
-    /// The CLI the group's orchestrator runs (`claude`/`copilot`/…), resolving
-    /// per-role overrides through `cli_for`. Used to format image references the
+    /// The CLI the group's orchestrator runs (`claude`/`copilot`/…) — a CLASS
+    /// question with no agent in hand, so `cli_for` is the right resolver here
+    /// and this is the one call site #2167 deliberately left alone. (A group has
+    /// exactly one orchestrator, so its class default cannot diverge from the
+    /// pane the way a two-block worker class can.) Used to format image references the
     /// way that CLI consumes them (#72). Falls back to the default `claude`
     /// wording if the group isn't loaded (a save always follows a live steer, so
     /// this is just a safety net).
@@ -29277,10 +29322,15 @@ impl OrchRegistry {
 
     /// The CLI a roster row's block/role resolves to, dead-agent-safe (unlike
     /// `cli_for_agent`, which needs a live `AgentEntry`). Mirrors its
-    /// fallback: unresolvable role/group both fall back to `"claude"`.
+    /// resolution — the row's OWN block first (#2167) — and its fallback:
+    /// unresolvable role/group both fall back to `"claude"`. A row persisted
+    /// before #222 carries an empty `block`, which `cli_for_block` resolves to
+    /// the class default, exactly as this did for every row before.
     fn cli_for_record(&self, group: &GroupId, rec: &AgentRecord) -> String {
         let role = workflow::kind_from_str(&rec.role).unwrap_or(Role::Worker);
-        self.group(group).map(|g| g.guardrails.cli_for(role).to_string()).unwrap_or_else(|| "claude".to_string())
+        self.group(group)
+            .map(|g| g.guardrails.cli_for_block(&rec.block, role).to_string())
+            .unwrap_or_else(|| "claude".to_string())
     }
 
     /// Read+parse a session's transcript into normalized digest events.
@@ -32513,7 +32563,7 @@ impl OrchRegistry {
             let groups = self.groups.lock_safe();
             groups.get(group).is_some_and(|g| {
                 should_confirm_copilot_autopilot(
-                    g.guardrails.cli_for(a.role),
+                    g.guardrails.cli_for_block(&a.block, a.role),
                     g.guardrails.auto_ops || a.role == Role::Planner,
                     kind.confirms_autopilot_dialog(),
                 )
@@ -36175,8 +36225,10 @@ impl OrchRegistry {
     ) -> Vec<String> {
         let paused = self.paused.lock_safe().clone();
         // Snapshot per-group guardrails (Clone) rather than per-agent CLI
-        // lookups while holding the agents lock — `Guardrails::cli_for` needs
-        // the whole roster, and `cli_for_agent` would re-lock `self.groups`.
+        // lookups while holding the agents lock — `Guardrails::cli_for_block`
+        // needs the whole roster, and `cli_for_agent` would re-lock
+        // `self.groups`. (The resolver was `cli_for` until #2167; the lock
+        // reasoning is unchanged, both read `self.blocks`.)
         let groups: HashMap<GroupId, Guardrails> = self
             .groups
             .lock_safe()
@@ -36250,7 +36302,9 @@ impl OrchRegistry {
                 // supported`'s doc) — the loop admission gate and the
                 // `/compact`-paste gate are the same check now for both
                 // currently-supported CLIs, so there's a single gate here.
-                if a.status != AgentStatus::Running || !compact_nudge_cli_supported(g.cli_for(a.role)) {
+                if a.status != AgentStatus::Running
+                    || !compact_nudge_cli_supported(g.cli_for_block(&a.block, a.role))
+                {
                     continue;
                 }
 
@@ -36536,7 +36590,7 @@ impl OrchRegistry {
                     && now >= a.compact_inference_guard_until_ms
                 {
                     if let Some((tail, _)) = manual_signals.get(&a.id) {
-                        if copilot_compaction_marker_detected(g.cli_for(a.role), tail) {
+                        if copilot_compaction_marker_detected(g.cli_for_block(&a.block, a.role), tail) {
                             // rev-21 review: match the SIBLING busy-then-
                             // quiet "confirmed" branch's exact field-reset
                             // inventory below — that branch does NOT clear
@@ -37080,7 +37134,7 @@ impl OrchRegistry {
                 // discussion of the test that just ran.
                 if !a.compact_pending && !currently_quiet && now >= a.compact_inference_guard_until_ms {
                     if let Some((tail, _)) = manual_signals.get(&a.id) {
-                        if auto_compact_banner_detected(g.cli_for(a.role), tail) {
+                        if auto_compact_banner_detected(g.cli_for_block(&a.block, a.role), tail) {
                             // Inference arm (loomux only believes the CLI's
                             // own auto-compact banner appeared) — untrusted,
                             // keeps the hard `inferred_compaction_confirmed`
@@ -40651,20 +40705,33 @@ impl OrchRegistry {
                 // a token record) must not clobber usage we already captured —
                 // otherwise a kill could zero a session's spend. Refresh the
                 // identity fields but keep the richer usage.
-                let new_empty = snap.source == "none"
-                    && snap.cost_usd.is_none()
-                    && snap.input_tokens
-                        + snap.output_tokens
-                        + snap.cache_creation_tokens
-                        + snap.cache_read_tokens
-                        == 0;
-                let old_has_data = existing.source != "none"
-                    || existing.cost_usd.is_some()
-                    || existing.input_tokens
-                        + existing.output_tokens
-                        + existing.cache_creation_tokens
-                        + existing.cache_read_tokens
-                        > 0;
+                //
+                // **"Empty" is a property of the FIGURES, never of the source**
+                // (#2167). This used to read `source == "none"`, which let the
+                // one fallback that reports a zero — a `statusline` parse on a
+                // subscription/Max account, where the CLI prints `$0.00`
+                // whatever the real spend was — overwrite a `transcript` row
+                // carrying millions of real tokens with zeros. Every guard
+                // arriving here has to read the same rule (CLAUDE.md, "a guard
+                // reads every one of its inputs by one rule"), and a source
+                // label is not a figure.
+                //
+                // Residual, stated because it is not closed: a statusline read
+                // with a NON-zero dollar figure still replaces a token-bearing
+                // row, losing its tokens for a cost estimate. That is the
+                // pre-existing behaviour and a separate call about which of two
+                // partial records is the better one; what changes here is only
+                // that a row saying *nothing at all* stops winning.
+                let tokens_of = |s: &UsageSnapshot| {
+                    s.input_tokens
+                        + s.output_tokens
+                        + s.cache_creation_tokens
+                        + s.cache_read_tokens
+                };
+                let new_empty =
+                    tokens_of(&snap) == 0 && snap.cost_usd.unwrap_or(0.0) <= 0.0;
+                let old_has_data =
+                    tokens_of(&*existing) > 0 || existing.cost_usd.unwrap_or(0.0) > 0.0;
                 if new_empty && old_has_data {
                     existing.agent_id = snap.agent_id;
                     existing.name = snap.name;
@@ -40827,9 +40894,11 @@ impl OrchRegistry {
             .filter(|a| a.group == group && a.status != AgentStatus::Dead)
             .cloned()
             .collect();
-        // Each agent's CLI is per-role (issue #4), so resolve it per agent.
-        // The group-level `cli` in the summary is the group default (workers/
-        // reviewers/planners may each run a different one).
+        // Each agent's CLI is its BLOCK's (#222, corrected from per-ROLE by
+        // #2167), so resolve it per agent below. The group-level `cli` in the
+        // summary is the group default; two blocks of the same kind may each
+        // run a different one, which is exactly the case a per-role resolution
+        // got wrong.
         let rails = self.group(group).map(|g| g.guardrails);
         let cli = rails
             .as_ref()
@@ -40842,7 +40911,7 @@ impl OrchRegistry {
         let mut live_keys: HashSet<String> = HashSet::new();
         let mut fresh: Vec<UsageSnapshot> = Vec::with_capacity(live_agents.len());
         for a in &live_agents {
-            let cli = rails.as_ref().map(|g| g.cli_for(a.role)).unwrap_or("claude");
+            let cli = rails.as_ref().map(|g| g.cli_for_block(&a.block, a.role)).unwrap_or("claude");
             let snap = self.compute_usage_snapshot(a, cli);
             live_keys.insert(snap.key.clone());
             fresh.push(snap);
@@ -43538,19 +43607,21 @@ impl OrchRegistry {
     }
 
     /// Which agent CLI to assume for delivery/usage bookkeeping. For every
-    /// orchestration-group agent this is the group's per-block resolution
-    /// (`Guardrails::cli_for`) exactly as before; a **solo** pane instead
-    /// carries its own CLI directly (`AgentEntry.solo_cli`), since `__solo__`
-    /// is one shared group across panes that may be running different CLIs —
-    /// a group-level lookup can't answer this for them. Falls back to
-    /// `"claude"` only when neither source has an answer (should not happen
-    /// for a live agent).
+    /// orchestration-group agent this is the resolution keyed on THIS agent's
+    /// own block (`Guardrails::cli_for_block`) — not on its class's default
+    /// block, which is what this used to ask and is a different question the
+    /// moment a roster declares two blocks of one kind (#2167); a **solo** pane
+    /// instead carries its own CLI directly (`AgentEntry.solo_cli`), since
+    /// `__solo__` is one shared group across panes that may be running
+    /// different CLIs — a group-level lookup can't answer this for them. Falls
+    /// back to `"claude"` only when neither source has an answer (should not
+    /// happen for a live agent).
     fn cli_for_agent(&self, a: &AgentEntry) -> String {
         if let Some(cli) = &a.solo_cli {
             return cli.clone();
         }
         self.group(&a.group)
-            .map(|g| g.guardrails.cli_for(a.role).to_string())
+            .map(|g| g.guardrails.cli_for_block(&a.block, a.role).to_string())
             .unwrap_or_else(|| "claude".to_string())
     }
 
@@ -47084,7 +47155,7 @@ impl OrchRegistry {
             let groups = self.groups.lock_safe();
             groups.get(&a.group).is_some_and(|g| {
                 should_confirm_copilot_autopilot(
-                    g.guardrails.cli_for(a.role),
+                    g.guardrails.cli_for_block(&a.block, a.role),
                     g.guardrails.auto_ops || a.role == Role::Planner,
                     delivery.confirms_autopilot_dialog(),
                 )

@@ -36207,6 +36207,185 @@ fn mark_dead_captures_usage_from_transcript() {
     assert_eq!(usage["lifetime_cost_basis"], "estimated");
 }
 
+// ---------- #2167: an agent's CLI is its BLOCK's, not its class default's ----------
+
+/// The `rails()` roster with the class-default worker block pinned to opencode
+/// and a SECOND worker block, `worker-adv`, on claude.
+///
+/// **The ORDERING is the fixture.** `Guardrails::cli_for(Role::Worker)` asks
+/// "what does this class's DEFAULT block run" and answers `opencode` here,
+/// while a pane spawned from `worker-adv` runs claude. A roster declaring one
+/// block per class cannot tell those two questions apart — which is exactly why
+/// every pre-#2167 usage test stayed green while every claude delegate in a
+/// two-block class was being read as an opencode one.
+fn rails_two_worker_blocks_cheap_first() -> Guardrails {
+    let mut g = rails();
+    let w = g.blocks.iter_mut().find(|b| b.kind == Role::Worker).expect("default roster has a worker");
+    w.cli = "opencode".into();
+    w.model = String::new();
+    g.blocks.push(workflow::Block {
+        id: "worker-adv".into(),
+        name: "worker-adv".into(),
+        kind: Role::Worker,
+        cli: "claude".into(),
+        model: "opus".into(),
+        prompt: None,
+        profile: None,
+        allow: vec![],
+        role_hint: None,
+        effort: String::new(),
+        context: String::new(),
+        remote: None,
+    });
+    g
+}
+
+#[test]
+fn a_second_block_of_a_class_resolves_its_own_cli_not_the_class_default() {
+    let g = rails_two_worker_blocks_cheap_first().clamped();
+    // The class question and the agent question have different answers, and both
+    // are pinned: a "fix" that made `cli_for` return the pane's CLI would be a
+    // different (and wrong) change — `cli_for` still answers about the class,
+    // `cli_for_block` about one agent.
+    assert_eq!(g.cli_for(Role::Worker), "opencode", "the class default is the FIRST worker block");
+    assert_eq!(g.cli_for_block("worker-adv", Role::Worker), "claude", "a named block runs its own CLI");
+    assert_eq!(g.cli_for_block("worker", Role::Worker), "opencode", "...including when that IS the default");
+    // A block id this roster does not declare — renamed, dropped, or an
+    // `AgentRecord` persisted before #222 with an empty `block` — falls back to
+    // the class default, which is what every caller got before.
+    assert_eq!(g.cli_for_block("gone", Role::Worker), "opencode");
+    assert_eq!(g.cli_for_block("", Role::Worker), "opencode");
+}
+
+#[test]
+fn a_claude_pane_reads_its_transcript_when_the_class_default_block_runs_another_cli() {
+    // #2167. The pane is `worker-adv` (claude); the class default is opencode.
+    // Resolving the CLI from the ROLE hands `compute_usage_snapshot` "opencode",
+    // so its claude arm never runs, the opencode store has no such session, and
+    // the row lands as `none`/`statusline` with zero tokens — for a session
+    // whose transcript is sitting on disk the whole time.
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let g = reg.create_group("C:/tmp/repo-2167", rails_two_worker_blocks_cheap_first()).unwrap();
+
+    let rails = reg.group(&g.id).unwrap().guardrails;
+    assert_eq!(rails.cli_for(Role::Worker), "opencode", "fixture: the class default disagrees");
+
+    let w = reg
+        .spawn_agent_ex(&g.id, Role::Worker, Some("worker-adv".into()), "w", "task", false, None, None, None, None, None)
+        .unwrap();
+    assert_eq!(w.block, "worker-adv");
+    // The SPAWN path already resolved per-block (`workflow::cli_of(&block, ..)`),
+    // which is why the pane has a claude session id at all: the two halves
+    // disagreed, and only the reader was wrong.
+    let sid = w.session_id.clone().expect("a claude block pre-assigns a session id");
+
+    // A worktree-cwd project folder, mixed separators and all — the shape #2167
+    // first suspected. It is a NON-REGRESSION witness, not the cause:
+    // `claude_transcript_path` scans every folder under the projects root and
+    // never derives a slug, so this name is found exactly as `C--tmp-repo` is.
+    let encoded = proj.path().join("C--Projects-loomux-worktrees-agent-rev-1919");
+    fs::create_dir_all(&encoded).unwrap();
+    fs::write(
+        encoded.join(format!("{sid}.jsonl")),
+        format!(
+            "{}\n{}\n",
+            json!({"type":"user","message":{"content":"hi"}}),
+            json!({"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8",
+                "usage":{"input_tokens":1000,"output_tokens":500,
+                         "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+        ),
+    )
+    .unwrap();
+
+    // The live path (`compute_group_usage`) and the exit path (`mark_dead`)
+    // resolved the CLI separately and were wrong separately, so both are pinned.
+    let live = reg.group_usage(&g.id);
+    let live_row = live["agents"].as_array().unwrap().iter()
+        .find(|a| a["id"] == w.id.as_str()).expect("live worker on the roster");
+    assert_eq!(live_row["source"], "transcript", "live poll must read the claude transcript");
+    assert_eq!(live_row["tokens"]["total"].as_u64(), Some(1500));
+
+    reg.mark_dead(&w.id, Some(0));
+    let usage = reg.group_usage(&g.id);
+    let row = usage["agents"].as_array().unwrap().iter()
+        .find(|a| a["id"] == w.id.as_str()).expect("dead worker captured");
+    assert_eq!(row["source"], "transcript", "mark_dead must read it too");
+    assert_eq!(row["tokens"]["total"].as_u64(), Some(1500));
+    assert_eq!(usage["lifetime_tokens"].as_u64(), Some(1500));
+}
+
+#[test]
+fn a_zero_dollar_statusline_row_never_overwrites_captured_transcript_tokens() {
+    // #2167, second half. `merge_usage_entry` used to call a row "empty" by its
+    // SOURCE (`== "none"`), so the one fallback that reports a genuine zero — a
+    // statusline parse on a subscription/Max account, where the CLI prints
+    // `$0.00` whatever was really spent — replaced a transcript row's real
+    // tokens with zeros.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo-2167-merge", rails()).unwrap();
+    reg.upsert_usage_snapshot(&g.id, usage_snap("s1", "w-1", 1.25, 1000, 500));
+    assert_eq!(reg.group_usage(&g.id)["lifetime_tokens"].as_u64(), Some(1500),
+        "control: the transcript row really is in the store before the clobber");
+
+    let mut bare = usage_snap("s1", "w-1", 0.0, 0, 0);
+    bare.source = "statusline".into();
+    bare.estimated = false;
+    bare.model = None;
+    reg.upsert_usage_snapshot(&g.id, bare);
+
+    let after = reg.group_usage(&g.id);
+    assert_eq!(after["lifetime_tokens"].as_u64(), Some(1500),
+        "a row carrying no figures at all must not win over one that has them");
+    assert!((after["lifetime_cost_usd"].as_f64().unwrap() - 1.25).abs() < 1e-9);
+
+    // Negative control — "keep the old row" is not the answer either: a read
+    // that really did come back richer still replaces.
+    reg.upsert_usage_snapshot(&g.id, usage_snap("s1", "w-1", 2.50, 2000, 1000));
+    assert_eq!(reg.group_usage(&g.id)["lifetime_tokens"].as_u64(), Some(3000));
+}
+
+#[test]
+fn the_disclosed_residual_holds_a_priced_statusline_row_still_replaces_tokens() {
+    // #2167 review, premortem. The fix above narrows "empty" to the FIGURES, and
+    // the residual it deliberately leaves is stated in `merge_usage_entry`, in
+    // `doc/design/group-cost-tracking.md` and in the PR body: a statusline read
+    // carrying a NON-zero dollar figure still replaces a token-bearing row,
+    // trading exact tokens for a price-table estimate.
+    //
+    // This pins the BLIND SPOT ITSELF (CLAUDE.md: "a documented escape hatch is
+    // a counterfactual — only a test that performs the edit pins it"). Without
+    // it the suite pins only the arms that work, and the disclosure could go
+    // false — in either direction — with nothing red to say so.
+    //
+    // It matters more after the fix, not less: the transcript row this can now
+    // destroy carries the millions of tokens the collector was previously
+    // failing to capture at all. The trigger is an account that pays per token
+    // (the CLI prints a real figure rather than the `$0.00` a subscription
+    // shows) on a tick where the transcript read misses.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo-2167-residual", rails()).unwrap();
+    reg.upsert_usage_snapshot(&g.id, usage_snap("s1", "w-1", 1.25, 1000, 500));
+    assert_eq!(reg.group_usage(&g.id)["lifetime_tokens"].as_u64(), Some(1500),
+        "control: the transcript row is in the store first");
+
+    // What an API-key account's statusline parse produces: no tokens, a real
+    // dollar figure. `new_empty` is false because `cost_usd > 0`, so it wins.
+    let mut priced = usage_snap("s1", "w-1", 0.42, 0, 0);
+    priced.source = "statusline".into();
+    priced.estimated = false;
+    priced.model = None;
+    reg.upsert_usage_snapshot(&g.id, priced);
+
+    let after = reg.group_usage(&g.id);
+    assert_eq!(after["lifetime_tokens"].as_u64(), Some(0),
+        "RESIDUAL, not a bug report: a priced statusline row still replaces the \
+         tokens. If this ever reads 1500, the residual was closed and every \
+         surface that discloses it has gone stale — fix the prose, not this test.");
+    assert!((after["lifetime_cost_usd"].as_f64().unwrap() - 0.42).abs() < 1e-9);
+}
+
 // ---------- session_digest (#250/#324 slice B, gate tightened in slice D) ----------
 //
 // Slice B shipped an interim worker-kind-wide gate (role_hint hadn't landed
