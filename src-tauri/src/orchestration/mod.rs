@@ -28427,16 +28427,7 @@ impl OrchRegistry {
         let tag = source.tag();
         // Validated before the lock, and a bad reason settles nothing: the
         // audit records what was turned away rather than half-dismissing a row.
-        let reason = match humanq::validate_dismiss_reason(reason) {
-            Ok(r) => r,
-            Err(e) => {
-                self.audit(group, "human", "question-reject", json!({
-                    "id": id, "source": tag, "op": "dismiss",
-                    "reason": "invalid-dismiss-reason", "detail": e,
-                }));
-                return Err(e);
-            }
-        };
+        let reason = reason.map(str::trim).filter(|r| !r.is_empty()).map(str::to_string);
         let question = {
             let _guard = self.questions_lock.lock_safe();
             let mut questions = self.questions(group)?;
