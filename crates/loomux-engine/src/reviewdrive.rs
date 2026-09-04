@@ -3168,13 +3168,46 @@ fn decide_ci_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) 
 /// it — the property [`HeldReason::StateStalled`] states, and the reason that
 /// arm is an add rather than a max is argued there.
 ///
-/// **The residual is a worker pane that DIES here.** #1961's exit read is asked
-/// only in `fix-wait` (`rdtick`'s `worker_exit`), so a pane killed while the
-/// drive waits in `ci-wait` is not seen as `Unresumable` on the next tick; that
-/// drive waits out `fix_timeout_minutes` and parks `held(fix-stalled)`, which
-/// is bounded and named but is the slower notice. Disclosed rather than closed:
-/// widening the exit read is an S3 change to what a tick observes, and this
+/// **`fix_timeout_minutes` cannot push that bound past the backstop**, which is
+/// why this arm needs no counterpart to [`state_bound_ms`]'s `review-wait`
+/// residual: `parse_workflow` runs the knob through `clamp_expires_minutes`, so
+/// the largest value a workflow file can produce is 240 minutes and the sum
+/// tops out at 330 against a twelve-hour `drive_timeout_minutes`. The engine
+/// deliberately does not re-clamp the timeouts ([`DriveLimits::clamped`] takes
+/// only the counters), so a caller building limits directly can still exceed
+/// it — and there the age answers first, exactly as `review-wait`'s residual
+/// describes. Pinned at the ceiling by
+/// `the_ci_wait_bound_funds_the_receipts_wait_instead_of_preempting_it`.
+///
+/// # Two residuals, both bounded and both recoverable by the resume
+///
+/// **A worker pane that DIES here.** #1961's exit read is asked only in
+/// `fix-wait` (`rdtick`'s `worker_exit`), so a pane killed while the drive
+/// waits in `ci-wait` is not seen as `Unresumable` on the next tick; that drive
+/// waits out `fix_timeout_minutes` and parks `held(fix-stalled)`, which is
+/// bounded and named but is the slower notice. Disclosed rather than closed:
+/// widening the exit read is an S3 change to what a tick OBSERVES, and this
 /// slice changes what `decide` does with what it is already given.
+///
+/// **A worker that pushes and reports inside ONE tick window.** Both facts
+/// reach the same tick, [`decide_fix_wait`]'s arc 7 outranks the report on
+/// purpose ("the code moved and CI is what has to answer next"), and `rdtick`
+/// clears the signal on every arc — so the report is spent on the arc and this
+/// state waits for one that will not come, to `held(fix-stalled)`. It is not
+/// closed here because a `WorkerSignal` is a word and not a timestamp: the same
+/// `Done` beside a moved head is equally consistent with *reported, then
+/// pushed*, where the report is about the pre-push tree and honouring it would
+/// brief a lane over exactly the unfinished revision #1875 is about. Failing
+/// toward a bounded hold rather than toward that defect is the direction this
+/// slice takes everywhere, and the ordering is uncommon here by construction —
+/// the worker persona forbids `report(done)` before the matrix is re-read, and
+/// the matrix takes twenty to thirty minutes against a thirty-second tick.
+///
+/// **Both clear on the first tick after `drive_review`**, which is what §2.2
+/// requires of a hold whose cause is a wait: arc 11 re-enters `ci-wait` from
+/// `held`, so [`DriveEntry::advance`] assigns [`DriveEntry::fix_pushed`] false
+/// and the next green takes arc 2 with nothing further asked of the worker.
+/// Pinned by `a_resume_out_of_fix_stalled_briefs_on_the_next_green`.
 fn decide_fix_receipts(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> DriveStep {
     match facts.worker {
         // Nothing to hand back to. Checked first, exactly as in
@@ -4959,7 +4992,13 @@ mod tests {
     /// expires, and the hold naming the pane to read would never fire at all.
     ///
     /// The two knobs are the two sides of the constant: 60 (the stock value,
-    /// under it) and 240 (over it, which is where a `max` and an add differ).
+    /// under it) and 240 (over it, which is where a `max` and an add differ —
+    /// and the CEILING, since `parse_workflow` runs this knob through
+    /// `clamp_expires_minutes`, so no workflow file can ask for more). At that
+    /// ceiling the sum is 330 minutes, comfortably inside the twelve-hour
+    /// backstop, which is why this arm needs no counterpart to `review-wait`'s
+    /// overtake residual — that one is unbounded in the LANE COUNT, and this
+    /// one has a single clamped term.
     #[test]
     fn the_ci_wait_bound_funds_the_receipts_wait_instead_of_preempting_it() {
         for minutes in [60u64, 240] {
@@ -4983,7 +5022,61 @@ mod tests {
                 "at fix_timeout_minutes={minutes} the wait-specific hold is what fires; \
                  under `max(constant, knob)` this is `state-stalled` at 240"
             );
+            assert!(
+                bound < minutes_ms(limits.drive_timeout_minutes),
+                "…and the sum stays inside the backstop at the ceiling the workflow \
+                 parser clamps to, so this arm owes no overtake residual"
+            );
         }
+    }
+
+    /// **The two residuals `decide_fix_receipts` discloses are recoverable by
+    /// the remedy their own notice prints**, which §2.2 requires of every hold
+    /// whose cause is a wait — and which a hold on a signal that will never
+    /// arrive would otherwise fail: a resume that only restarted the clocks
+    /// would re-hold an hour later, for ever.
+    ///
+    /// This is the counterfactual for the disclosure, performed rather than
+    /// argued (CLAUDE.md: a documented escape hatch is only pinned by a test
+    /// that performs the edit). Arc 11 re-enters `ci-wait` from `held`, so
+    /// `advance` assigns `fix_pushed` false — it is the ASSIGNMENT, not a
+    /// clock, that makes the resume work, and a `set` would leave the drive
+    /// waiting on the same absent report.
+    ///
+    /// The pre-state is the hold itself, so the test cannot pass by resuming a
+    /// drive that was never stuck.
+    #[test]
+    fn a_resume_out_of_fix_stalled_briefs_on_the_next_green() {
+        let limits = DriveLimits::default();
+        let mut e = pushed_fix_entry();
+        let stalled = DriveFacts {
+            now_ms: e.state_since_ms + minutes_ms(limits.fix_timeout_minutes),
+            ci: CiObservation::Green,
+            worker: WorkerSignal::Silent,
+            ..facts_at("head-b")
+        };
+        assert_eq!(
+            decide(&e, &stalled, &limits),
+            DriveStep::held(HeldReason::FixStalled),
+            "the pre-state: a drive really parked on the wait this test is about"
+        );
+        e.take(&DriveStep::held(HeldReason::FixStalled), stalled.now_ms).unwrap();
+
+        // Arc 11: `drive_review` resumes it, hours later — a human takes their
+        // time over a hold, so the resume must not depend on any clock.
+        let resumed_at = stalled.now_ms + minutes_ms(300);
+        e.advance(DriveState::CiWait, None, None, resumed_at).unwrap();
+        assert!(!e.fix_pushed, "the resume leaves no outstanding report to wait for");
+        assert_eq!(
+            decide(
+                &e,
+                &DriveFacts { now_ms: resumed_at + 1_000, ..stalled },
+                &limits
+            ),
+            DriveStep::to(DriveState::ReviewWait),
+            "the very next green briefs, with nothing further asked of a worker that \
+             may have said its piece already"
+        );
     }
 
     #[test]

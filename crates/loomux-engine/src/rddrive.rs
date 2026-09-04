@@ -993,11 +993,19 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
         // holds. Any other state is impossible — `decide` proposes this hold
         // from exactly those two — and reads as the `fix-wait` sentence, which
         // is the older and more general of the pair.
+        // **"nothing from it since" and not "did not report"**, because the
+        // drive cannot honestly claim the second. A worker that reported done
+        // and pushed inside one tick window has BOTH facts read on the same
+        // tick, arc 7 outranks the report, and the arc clears the signal — so
+        // the drive genuinely has heard nothing since the push, and saying it
+        // never reported would be a false claim about a worker that did. The
+        // sentence states what the drive observed; `decide_fix_receipts`
+        // carries the residual and why a resume clears it on the first tick.
         HeldReason::FixStalled if f.held_state == Some(DriveState::CiWait) => format!(
-            "HELD — the worker pushed{at} and did not report the fix finished inside \
-             the fix timeout; the driver is holding the reviewer lanes until it does, \
+            "HELD — the worker pushed{at} and the driver has heard nothing from it since, \
+             for a whole fix timeout; the reviewer lanes are held until it reports done, \
              so the PR body stops moving under them.{session} drive_review resumes the \
-             drive, cancel_review_drive stops it."
+             drive and briefs on the next green, cancel_review_drive stops it."
         ),
         HeldReason::FixStalled => format!(
             "HELD — the worker neither pushed nor reported inside the fix timeout{at}.\
