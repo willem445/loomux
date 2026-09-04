@@ -93,12 +93,13 @@ pane's session lives on the far-end machine.
 Renaming the pane updates the name recorded against the session, so the session
 browser shows what you called it.
 
-**One thing worth knowing.** Claude Code panes have a session id from the
-moment they start, but Copilot CLI and OpenCode mint theirs a little later, on
-their first turn. A note you write on one of those before its first prompt is
-held in memory and attached as soon as orrerix learns the id — but if you
-restart the app in that window, that note is lost. The overlay says so while it
-applies.
+**One thing worth knowing.** Some agent CLIs get their session id the moment
+they start, because orrerix puts it on the command line — Claude Code and pi do
+this. Others mint their own a little later, on their first turn; Copilot CLI
+and OpenCode are the ones that do that today. A note you write on one of the
+latter *before* its first prompt is held in memory and attached as soon as
+orrerix learns the id — but if you restart the app in that window, that note is
+lost. The overlay says so while it applies.
 
 ### The file editor and git panes
 

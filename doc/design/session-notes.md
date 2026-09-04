@@ -182,6 +182,16 @@ notes dialog says so on a pending record. Persisting them would need a stable
 key on `PersistedPane` — a `tabs.json` schema widening plus `tabstore` decode /
 encode / tests — which was rejected for v1 and is the named follow-up.
 
+**Which CLIs that is, stated as a property rather than a list.** The exposed
+set is *every harness whose session id is not on its own launch line* — the
+ones that mint after boot and reach `adoptSessionId` through #440's reconciler
+or #1563's `orch-session-learned`. At the time of writing that is copilot and
+opencode; claude and pi (`doc/design/pi.md`) pre-mint a UUID and pass it as
+`--session-id`, so their panes are never pending at all. Written as a property
+because the list has already moved once: pi arrived while this change was in
+review, and a sentence naming three CLIs would have gone quietly false rather
+than simply out of date.
+
 ## The sessions tab: two controls, not one
 
 The human asked for an explicit "my own sessions" ⇄ "orchestration sessions"
