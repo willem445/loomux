@@ -6544,7 +6544,7 @@ pub fn pi_session_cwd_in_dir(dir: &Path, session_id: &str) -> Result<Option<Stri
 /// wrong one: a truncated read cannot parse as JSON, so the session still
 /// lists and still says its workspace is unknown, which is the answer a
 /// header-less file already gets.
-const PI_SESSION_HEADER_MAX_BYTES: u64 = 64 * 1024;
+const PI_SESSION_HEADER_MAX_BYTES: u64 = 8;
 
 /// The filename extension of the contract file a pi block's
 /// `--append-system-prompt` points at.
