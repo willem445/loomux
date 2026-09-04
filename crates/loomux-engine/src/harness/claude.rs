@@ -303,7 +303,7 @@ impl Decoder {
             Some("compact_boundary") => {
                 let meta = v.get("compact_metadata");
                 let trigger = match meta.and_then(|m| m.get("trigger")).and_then(Value::as_str) {
-                    Some("manual") => CompactTrigger::Manual,
+                    Some("manual") => CompactTrigger::Auto,
                     _ => CompactTrigger::Auto,
                 };
                 vec![Decoded::Event(HarnessEvent::Compacted {
