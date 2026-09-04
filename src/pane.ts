@@ -1266,7 +1266,8 @@ export class Pane implements VoiceTargetPane {
     this.overflowMenu.setAttribute("role", "group");
     this.overflowMenu.setAttribute("aria-label", "More pane controls");
     header.appendChild(this.overflowMenu);
-    this.wireOverflowMenu();
+    this.wireOverflowOpen();
+    this.wireOverflowDismissal();
 
     const clusterBtns: Record<string, HTMLButtonElement> = {};
     for (const [id, glyph, cls, tip, fn] of [
@@ -1590,17 +1591,38 @@ export class Pane implements VoiceTargetPane {
       this.el.contains(focused) &&
       !focused.hidden
     ) {
-      // Guarded like Escape's hand-back: re-focusing ⋯ must not count as the
-      // keyboard opening the menu.
-      this.overflowRefocusing = true;
-      focused.focus();
-      this.overflowRefocusing = false;
+      if (this.overflowMenu.contains(focused)) {
+        // The control the human was ON is the one that just folded, and a plain
+        // `focus()` here is REFUSED: the strip is `visibility: hidden` until
+        // opened, and a hidden subtree is not a focusable area, so focus would
+        // silently fall to <body> and the next Tab would restart at the top of
+        // the document (rev-final round 1 — the fold direction is the only one
+        // that moves a control into the menu, so this was exactly the direction
+        // the "restored below" comment did not cover).
+        //
+        // Opening the strip and giving the control its focus back is better than
+        // the alternative of parking on ⋯: it is where the human was, and this
+        // only ever runs while they are actively keyboarding the header. Pinned,
+        // because a hover-opened strip dismisses itself and nothing here is a
+        // hover.
+        this.openOverflowMenu();
+        this.overflowPinned = true;
+        focused.focus();
+      } else {
+        // Guarded like Escape's hand-back: re-focusing ⋯ must not count as the
+        // keyboard opening the menu.
+        this.overflowRefocusing = true;
+        focused.focus();
+        this.overflowRefocusing = false;
+      }
     }
   }
 
-  private wireOverflowMenu(): void {
+  /** Everything that OPENS the strip. Split from the dismissal half below
+   *  (rev-final round 1): the two are wired flat, so this was length rather
+   *  than complexity, and length is what a reader pays for. */
+  private wireOverflowOpen(): void {
     const btn = this.overflowBtn;
-    const menu = this.overflowMenu;
 
     btn.addEventListener("pointerenter", () => this.openOverflowMenu());
     // Focus opens it — that is the keyboard route in. Suppressed for the ONE
@@ -1626,6 +1648,14 @@ export class Pane implements VoiceTargetPane {
         this.overflowPinned = true;
       }
     });
+  }
+
+  /** Everything that CLOSES the strip: the hover grace, Escape, tabbing out,
+   *  clicking away, and picking a control. */
+  private wireOverflowDismissal(): void {
+    const btn = this.overflowBtn;
+    const menu = this.overflowMenu;
+
     menu.addEventListener("pointerenter", () => {
       clearTimeout(this.overflowCloseTimer);
     });
@@ -1633,6 +1663,15 @@ export class Pane implements VoiceTargetPane {
       el.addEventListener("pointerleave", () => this.scheduleOverflowClose());
       el.addEventListener("keydown", (e) => {
         if ((e as KeyboardEvent).key !== "Escape") return;
+        // The open check comes BEFORE `stopPropagation`, and that order is the
+        // whole of it (rev-final round 1). Stopping the bubble unconditionally
+        // swallowed every Escape pressed while focus sat on ⋯ or inside the
+        // strip — including the one right after Escape closed it and handed
+        // focus back — and `src/main.ts`'s window keydown, which cancels a
+        // pending cross-workspace connect, is a BUBBLE-phase listener and so
+        // the one Escape consumer that swallow could reach. Only an Escape this
+        // menu actually consumes may be stopped.
+        if (!this.overflowOpen) return;
         e.stopPropagation();
         this.closeOverflowMenu(true);
       });
