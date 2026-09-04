@@ -316,10 +316,11 @@ be rearranged in place:
   so you can tell a Copilot pane from a Claude one across a wall of terminals
   without reading the titles. Each CLI orrerix ships support for has its own hue
   (Claude terracotta, Codex teal, Copilot blue, opencode green, Gemini indigo,
-  Hermes mauve, Ante citron); anything else keeps the violet that just means
-  "an agent". The same colours mark the CLI chips in the session list. Agents with
-  a recognisable mark show it; everything else shows a
-  lettered badge with the program's initial (`C` for Claude, `O` for opencode),
+  Hermes mauve, Ante citron, pi cyan); anything else keeps the violet that just
+  means "an agent". The same colours mark the CLI chips in the session list.
+  Agents with a recognisable mark show it; everything else shows a
+  lettered badge with the program's initial (`C` for Claude, `O` for opencode,
+  `P` for pi),
   and `?` if orrerix couldn't make out what was launched. Hover it for the program
   name. A plain shell pane has no agent, so it carries no mark at all. An **SSH
   pane** shows the CLI its saved connection runs on the far end — not `ssh`,
