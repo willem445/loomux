@@ -1275,10 +1275,13 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
 
   **The playbook rather than `orchestrator.md`, and the choice was measured rather than
   preferred.** The issue offered either surface. The resident core is paid on every model call
-  and sits under a 45,000-byte budget with 193 bytes of margin at the blob this branch was cut
-  from, so a step of this length would not have fitted there — and `the_resident_core_is_under_the_byte_budget`
-  would have caught it as a red rather than as a judgement. The playbook is on-demand and has
-  no such budget. Both surfaces re-bless this directory either way; the brief's premise that the
+  and sits under a 45,000-byte budget; at blob `487cde19` it is 44,990 bytes, so the margin is
+  **10 bytes** and this 8-line step could not have gone there —
+  `the_resident_core_is_under_the_byte_budget` would have caught it as a red rather than as a
+  judgement. (Dated to the BLOB, not a commit: this branch first measured 193 bytes of margin,
+  and #2181 spent all but 10 of it while this PR was open. A blob hash survives the rebase that
+  invalidates every SHA, and names what to re-measure on when it moves.) The playbook is
+  on-demand and has no such budget. Both surfaces re-bless this directory either way; the brief's premise that the
   playbook is not fixture-pinned is wrong for this tree, and is recorded here so the next
   implementer does not act on it.
 
