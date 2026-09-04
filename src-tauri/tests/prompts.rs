@@ -323,6 +323,9 @@ fn the_orchestrators_findings_policy_survives_in_substance() {
         (disposition, "the disposition step", "names a defect",
          "…UNLESS the finding names a defect — a wrong value, an unreachable arm, a claim the \
           code contradicts — which routes as blocking despite its non-blocking label"),
+        (disposition, "the disposition step", "a deferral at any round",
+         "the round-agnostic deferral licence — a deferral is available at ANY round and always \
+          costs the three things — did not die with the round ≥ 2 scoping (#2181 rev-final W2)"),
         (disposition, "the disposition step", "a finding that contradicts the change's",
          "the blocking-REGARDLESS call: a finding contradicting the change's own stated rationale \
           means the change does not do what it claims"),

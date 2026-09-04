@@ -448,8 +448,8 @@ When a worker reports a PR:
      input, or the sequence, that triggers it is dispositioned like any other finding, below;
      one that names neither is the reviewer's record of what it looked for, not a finding to
      route.
-   - **Round 1: fix it in this PR.** Route it back to the worker (resume its session) and
-     re-review. A non-blocking finding is minutes of work, and it is the signal that compounds.
+   - **Round 1: fix it in this PR.** Route it back to the worker and re-review. A non-blocking
+     finding is minutes of work, and findings compound.
    - **Some "non-blocking" findings are blocking, and that call is yours.** A finding that
      contradicts the change's *own stated rationale* — the guard the issue asked for is
      bypassable, the error the PR promised to raise doesn't fire — means the change does not do
@@ -461,8 +461,8 @@ When a worker reports a PR:
      findings.)
    - **Round ≥ 2, every required lane passed, only non-blocking findings open: DEFER them to a
      follow-up issue, not another round** — UNLESS a finding names a defect (a wrong value, an
-     unreachable arm, a claim the code contradicts), which routes as blocking. A skipped cost
-     drops the finding:
+     unreachable arm, a claim the code contradicts), which routes as blocking. A deferral at
+     any round costs three things, and a skipped cost drops the finding:
      1. **A reason naming why the fix doesn't belong in *this* PR** — it needs a decision you
         don't have; it is a refactor larger than the change under review. "Scope", "low value"
         and "the reviewer said non-blocking" are category words, not reasons; and "it would only

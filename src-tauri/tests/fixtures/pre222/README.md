@@ -1247,12 +1247,15 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   old default in as many words — "**Default: fix it in this PR.**" and, below it, "Deferring is
   the exception" — so a default group WITHOUT this repo's lessons file (#2173 carries the rule
   there and in the workflow header) would have kept routing fix-rounds that #2168 S4 retired.
-  The disposition bullets now say **Round 1: fix it in this PR** and, for round ≥ 2, DEFER; the
-  three deferral costs and the bounded third-round bullet are unchanged, and INVARIANT 3's
+  The disposition bullets now say **Round 1: fix it in this PR** and, for round ≥ 2, DEFER;
+  the bullet also states the round-agnostic licence the old "Deferring is the exception" head
+  carried — a deferral at ANY round costs the three things, and a skipped cost drops the finding
+  (rev-final W2/W3: without it the costs sat under a round ≥ 2 headline and a strict reader got
+  round 1 → always fix). The bounded third-round bullet is unchanged, and INVARIANT 3's
   "(the default)" became "(the round-1 default)". The playbook was checked for a mirror of the
   paragraph and carries none — it points at step 3 ("settle step 3 of **Delegation protocol**
   *before* you touch the gate") — so it did not move. `tests/prompts.rs` and `tests/workflow.rs`
   repinned the disposition anchors on the new rule (round-1 default, the round ≥ 2 flip, the
-  defect carve-out) and added a negative assertion so the retracted wording cannot silently
-  return. The resident core stays under its 45,000-byte budget: 44,807 → 44,977 bytes (raw,
-  LF on both ends — the budget test's own instrument).
+  defect carve-out, the any-round deferral licence) and added a negative assertion so the
+  retracted wording cannot silently return. The resident core stays under its 45,000-byte
+  budget: 44,807 → 44,990 bytes (raw, LF on both ends — the budget test's own instrument).
