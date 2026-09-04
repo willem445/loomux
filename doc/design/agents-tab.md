@@ -231,6 +231,132 @@ loomux's own doing and clears itself, a `reported` pane waits on its
 orchestrator rather than on the human (#2367), and a finished turn is not
 something anyone is blocked on.
 
+`tab` (#2371) is the tab the reading was taken from, and it is the one field on
+`PaneFacts` the pane does not derive — see the next section.
+
+## Grouping and order (#2371)
+
+The list groups its rows under the tab they live in, with a header carrying the
+tab's name, and offers the human a choice of which group comes first.
+
+### The tab is supplied by the caller, not derived by the pane
+
+`PaneFacts.tab` is a `TabRef` — `{ id, title, index }` — and `Pane.facts(tab)`
+takes it as an argument. That is a fact about the object graph rather than a
+shortcut: a `Workspace` owns a `Grid` and a `Grid` owns its panes, with no
+back-reference the other way, so a `Pane` genuinely cannot answer "which tab am
+I in".
+
+The one caller that needs the answer already has it. The Agents view's `facts()`
+dep reaches every pane *by* walking `tabs.tabs`, so it is holding the workspace
+— and its position in the strip — at the moment it asks. Passing it in keeps
+`facts()`'s contract intact (no geometry, no IPC, no timer, safe on a hidden
+tab) where a lookup would have to walk the whole tab set once per pane to
+recover something the enumeration already knew. Every other caller — the pane
+Notes rows (#2116), `main.ts`'s focus walk — passes nothing and gets `null`,
+which is a complete answer for a caller that groups nothing.
+
+`index` is the strip position, and the header reads `title`. The two are
+separate on purpose:
+
+- **Groups are KEYED on `id`.** The human may legally name two tabs the same
+  thing, and a rename must re-label a group rather than split or merge one. A
+  title-keyed grouping shows two headers for one tab during the tick where a
+  rename has reached one pane's reading and not another's.
+- **Groups are ORDERED on `index`, never on `title`.** The strip order is an
+  arrangement the human made by dragging (`dropTargetIndex`, #379). Alphabetical
+  order would silently reshuffle the whole list on a rename, which is a list
+  reordering itself in response to something that was not about order.
+
+### `groupRows(rows, order)` — grouping is unconditional, `order` picks the first group
+
+`groupRows` is a pure projection in `agentrows.ts`: rows in, `[{ tab, rows }]`
+out, no DOM and no clock. Two decisions are worth stating.
+
+**Grouping is always on.** The headers are what make the fleet read by where it
+lives, so they are not something you have to switch an order to see — and making
+them unconditional is what gives `"state"` a *defined* group order instead of an
+accidental one. `order` decides only which group you read first; `sortRows`
+orders the rows inside every group, in both orders, so "most wants you" never
+means something different inside one tab than inside another.
+
+| `order` | group order | tie |
+| --- | --- | --- |
+| `"state"` | the group holding the most urgent row first (`rows[0]`, which `sortRows` has already put there) | strip order |
+| `"tab"` | strip order outright (`TabRef.index`) | — |
+
+**A tab with no rows produces no group, by construction.** The buckets are built
+from the rows, so a tab this call never saw cannot appear — there is no filter
+step that might miss one. `visibleGroups` applies the filter chip *before*
+grouping, which is the same rule read from the other end: a tab whose every row
+was filtered out loses its header too, with no second mechanism to keep in step.
+
+**The headerless group** collects rows whose reading named no tab. It renders no
+header — there is nothing to call it, and an invented "Other" would be a claim —
+and the two orders treat it differently on purpose: under `"tab"` it has no
+strip position, so it goes last; under `"state"` it is ranked like any other
+group, because a headerless group holding a wedged pane is still a wedged pane
+and burying it under a tab whose worst row is `idle` would hide urgency for the
+sake of tidiness. No production caller produces one today — `main.ts` always
+names a tab — so it is a defensive case, pinned rather than assumed.
+
+### The order is one `localStorage` key, and deliberately not a `BoardPrefsStore`
+
+`src/agentorder.ts` holds the choice under one key. It is **not** built on
+`BoardPrefsStore`, and the reason is what that class is for: `boardprefs.json`
+is ONE file shared by every group, so a save publishes every other group's
+record and must never run against a handle nobody has read (#1299). This key
+holds one scalar belonging to one viewer. There is no in-memory handle that
+could be stale and no other tenant in the key to lose, so the invariant is
+satisfied structurally — wrapping a synchronous single-value API in an async
+read-before-write store would ship the *shape* of that protection with none of
+the hazard it protects against.
+
+What does apply is guarding every access. A private window, cleared site data,
+or a browser refusing storage makes the accessor itself throw, and the unit
+tests run under `node --test` where `localStorage` does not exist at all — so a
+read that cannot happen answers the default and a write that cannot happen is
+dropped. An unrecognised stored value also reads as the default *without being
+rewritten*: scrubbing a word a newer build stored would lose the human's choice
+the moment they opened an older build.
+
+### Rendering: two keyed maps, one flat walk
+
+`AgentsView` walks the sequence the groups spell out — header, its rows, next
+header — placing each element after the previous one only when it is not already
+there. That is the rule the ungrouped list already followed and it is what keeps
+a re-order cheap: a group whose rows did not move inside it costs one
+`insertBefore` for the header and none for the rows, so the working spinner's
+CSS animation is never taken back to frame 0.
+
+Headers are keyed by tab id and rows by pane key, in **two** maps, because their
+lifetimes differ: a row survives its tab's header disappearing (the human moved
+the pane) and a header survives every one of its rows being replaced. Both are
+keyed rather than rebuilt for the reason the filter chips are — a subtree the
+keyboard is standing in, rebuilt once a second, drops focus to `<body>`.
+
+**No PTY resize, on any of it.** The panel is `#sessions`, which is in flow
+already; nothing here changes its width, and switching order or filter moves
+elements inside `.sessions-inner` only. Constraint 1 is untouched.
+
+### The row's agent-type mark
+
+`agentRowMark(row)` is one call — `agentMark({ knownCli: row.harness })` — and
+that is the whole design. `harness` is the CLI loomux already knows this pane
+runs (`agentCli` off the launch line, or an SSH profile's declared far-end CLI),
+which is exactly `agentMark`'s `knownCli` input, so a CLI added tomorrow shows up
+as itself. A `harness === "claude" ? … : …` here would be the #722/#841 defect:
+the fourth CLI silently inheriting the third one's badge. `null` falls out of the
+resolver's own rule rather than being a case here — a row with no harness has no
+launch line to read, and a row of `?` badges over every terminal is noise dressed
+as information.
+
+**Residual.** `AgentRow` does not carry remoteness, so an SSH pane whose profile
+declares no `defaultCli` reads `harness: null` and draws nothing, where the pane
+*header* draws the neutral "remote — agent CLI unknown" badge for the same pane.
+Both decline to name a CLI; the header is the surface that can afford to explain
+why, and the row's identity line already says what the pane is.
+
 ## Slice B: the tab, the view, and the two things it is wired to
 
 Slice B ships the UI: `src/leftpanel.ts` + `src/leftpanelmodel.ts` (the tab
