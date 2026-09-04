@@ -727,15 +727,7 @@ pub fn walk_pi_session_files<T>(root: &Path, mut visit: impl FnMut(&Path) -> Opt
     let entries = fs::read_dir(root).ok()?;
     let mut nested: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        // The override layout: a session file sitting directly in the root.
-        if is_session_file(&path) {
-            if let Some(found) = visit(&path) {
-                return Some(found);
-            }
-        } else {
-            nested.push(path);
-        }
+        nested.push(entry.path());
     }
     // The default layout: one directory per cwd. Walked second, and only over
     // the entries the flat pass did not already claim, so neither shape pays a
