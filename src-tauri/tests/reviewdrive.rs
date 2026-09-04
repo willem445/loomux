@@ -1390,16 +1390,29 @@ fn a_verification_brief_announces_itself_on_every_path_that_grants_it() {
         .expect("the lane records its pass");
         if !has_record {
             // The undriven-to-driven shape, reached the way the drive itself
-            // reaches it: a re-drive pushes a fresh `DriveEntry` with no lanes,
-            // so the next brief is rendered with `entry.lane(block) == None`
-            // while the verdict FILE still carries the pass.
+            // reaches it: a re-drive replaces the terminal entry, and the
+            // brief is then rendered with `entry.lane(block)` failing
+            // `rd_lane_brief`'s filter while the verdict FILE still carries the
+            // pass.
+            //
+            // **The axis is `at_head`, not the presence of a record**, and the
+            // first cut of this fixture asserted the wrong one (CI read at
+            // `ac7e413e`: `left: 1, right: 0`). #2153 carries each lane's
+            // CONVERSATION across a re-drive — `reseeded` keeps the session and
+            // clears every per-revision field — so the new entry has a record
+            // whose `at_head` is empty, which is what
+            // `.filter(|l| !l.at_head.is_empty())` rejects. Same branch, same
+            // defect; only the fixture's spelling of the precondition was off.
             let session = driven_worker_session(&reg, &group);
             reg.cancel_review_drive(&group, 1758, "test");
             reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 30_000);
-            assert_eq!(
-                live_lanes(&reg, &group).len(),
-                0,
-                "the fixture must reach the no-record shape, or this row proves nothing"
+            assert!(
+                live_lanes(&reg, &group)
+                    .iter()
+                    .all(|l| l["at_head"].as_str().unwrap_or_default().is_empty()),
+                "the fixture must reach the shape where `rd_lane_brief`'s filter yields None, \
+                 or this row proves nothing: {:?}",
+                live_lanes(&reg, &group)
             );
         }
 
