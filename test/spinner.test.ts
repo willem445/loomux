@@ -43,10 +43,29 @@ function blockAt(index: number, what: string): string {
   assert.fail(`${what}'s block is unterminated`);
 }
 
+/** The body of the ONE block opening with `head` (which must be `g`-flagged).
+ *
+ *  Uniqueness is asserted, not assumed (#2259 review round 2, rev-std premortem
+ *  2). An earlier draft took the FIRST brace-matched block under the head, which
+ *  grades whichever copy happens to come first in source order: a
+ *  `.pixel-spinner-strip` rule added later inside an at-rule above the real one
+ *  would be the thing every assertion here judged, while the rule that actually
+ *  paints the app moved untested — green, silent, and wrong. That is the same
+ *  arbitrary-member defect as reading one `prefers-reduced-motion` block out of
+ *  several (#1327/#1344), which this file already shipped once. So a second
+ *  definition fails LOUDLY here and the reader is told to say which one is
+ *  meant. */
 function cssBlock(head: RegExp): string {
-  const open = head.exec(CSS);
-  assert.ok(open, `src/styles.css must contain ${String(head)}`);
-  return blockAt(open.index, String(head));
+  assert.ok(head.global, `${String(head)} must be g-flagged, or the count below reads 1 always`);
+  const opens = [...CSS.matchAll(head)];
+  assert.equal(
+    opens.length,
+    1,
+    `src/styles.css has ${opens.length} blocks matching ${String(head)} — this assertion grades ` +
+      `exactly one, so zero is a rule that moved and more than one is a rule this test would ` +
+      `pick arbitrarily between`
+  );
+  return blockAt(opens[0].index, String(head));
 }
 
 /** EVERY block opening with `head` (which must be `g`-flagged).
@@ -192,7 +211,7 @@ test("the markup is inert: no script, no external reference", () => {
 // were describing.
 
 test("the stylesheet steps the strip once per frame, over the sprite's own width", () => {
-  const strip = cssBlock(/^\.pixel-spinner-strip\s*\{/m);
+  const strip = cssBlock(/^\.pixel-spinner-strip\s*\{/gm);
   const name = /animation:\s*([\w-]+)\s/.exec(strip);
   assert.ok(name, `.pixel-spinner-strip must animate something; block was:\n${strip}`);
 
@@ -207,7 +226,7 @@ test("the stylesheet steps the strip once per frame, over the sprite's own width
 
   // The keyframes block this animation actually names — not a block whose name
   // is assumed, so renaming one half is caught rather than stepped over.
-  const frames = cssBlock(new RegExp(String.raw`^@keyframes\s+${name[1]}\s*\{`, "m"));
+  const frames = cssBlock(new RegExp(String.raw`^@keyframes\s+${name[1]}\s*\{`, "gm"));
   const shifts = translateXs(frames, `@keyframes ${name[1]}`);
   // The instrument before its finding: a parse that matched nothing would agree
   // with every implementation, including one that translates nothing at all.
@@ -233,7 +252,7 @@ test("the viewBox window is one cell, so exactly one frame is visible at a time"
   assert.equal(Number(viewBox[1]), SPINNER_CELL);
   assert.equal(Number(viewBox[2]), SPINNER_CELL);
 
-  const frames = cssBlock(/^@keyframes\s+pixel-spin\s*\{/m);
+  const frames = cssBlock(/^@keyframes\s+pixel-spin\s*\{/gm);
   const total = translateXs(frames, "@keyframes pixel-spin").reduce(
     (a, b) => Math.max(a, Math.abs(b)),
     0

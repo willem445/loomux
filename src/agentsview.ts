@@ -203,6 +203,18 @@ export class AgentsView {
     }
     for (const [filter, btn] of [...this.chips]) {
       if (seen.has(filter)) continue;
+      // HAND FOCUS ON BEFORE THE ELEMENT GOES (#2259 review round 2, rev-std
+      // finding 2). Keying the chips cured the once-a-second blur, but not this
+      // narrower form of it: a chip whose count reaches 0 while it is not the
+      // selected one is genuinely removed, and if the keyboard user happened to
+      // be standing on it, focus drops to `<body>` and the next Tab restarts
+      // traversal from the top of the document.
+      //
+      // The selected chip is the destination because it is the one element here
+      // that always exists — `filterChips` keeps it at count 0, which is the
+      // same guarantee that stops a filter becoming unclearable. It is still in
+      // the map at this point: it was in `seen`.
+      if (btn.contains(document.activeElement)) this.chips.get(this.filter)?.focus();
       btn.remove();
       this.chips.delete(filter);
     }
