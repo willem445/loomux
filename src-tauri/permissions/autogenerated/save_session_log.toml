@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-session-log"
+description = "Enables the save_session_log command without any pre-configured scope."
+commands.allow = ["save_session_log"]
+
+[[permission]]
+identifier = "deny-save-session-log"
+description = "Denies the save_session_log command without any pre-configured scope."
+commands.deny = ["save_session_log"]

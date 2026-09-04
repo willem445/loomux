@@ -1,19 +1,20 @@
 //! Durable UI state persisted across launches — the project-tab set (#63),
 //! since #370 app-wide terminal settings, since #887 the user's SSH
-//! connection profiles, and since #1270 the task board's view preferences. All
-//! four are app-global — `boardprefs.json` holds one record PER GROUP, but the
-//! group id is a map key inside the blob and never a path — so they live
-//! directly under the app data dir as
-//! `tabs.json`/`settings.json`/`sshprofiles.json`/`boardprefs.json`, siblings of
-//! `orchestration/` and `logs/` — the same `<data dir>/loomux/…` tree the rest
-//! of the app's durable state uses (see `OrchRegistry::default_root`,
-//! `obs::logs_dir`).
+//! connection profiles, since #1270 the task board's view preferences, and
+//! since #2116 orrerix's own sessions log. All five are app-global —
+//! `boardprefs.json` holds one record PER GROUP and `sessionlog.json` one PER
+//! SESSION, but the group/session id is a map key inside the blob and never a
+//! path — so they live directly under the app data dir as
+//! `tabs.json`/`settings.json`/`sshprofiles.json`/`boardprefs.json`/`sessionlog.json`,
+//! siblings of `orchestration/` and `logs/` — the same `<data dir>/loomux/…`
+//! tree the rest of the app's durable state uses (see
+//! `OrchRegistry::default_root`, `obs::logs_dir`).
 //!
 //! Each blob is an OPAQUE JSON string the frontend owns the schema for
 //! (`src/tabstore.ts` / `src/settings.ts` / `src/sshprofile.ts` /
-//! `src/boardprefs.ts` encode/decode and validate their own shape — this file
-//! never parses any of them beyond "is it JSON at all"). The backend's job here
-//! is narrow but critical, and identical for all four:
+//! `src/boardprefs.ts` / `src/sessionlog.ts` encode/decode and validate their
+//! own shape — this file never parses any of them beyond "is it JSON at all").
+//! The backend's job here is narrow but critical, and identical for all five:
 //!
 //!  1. **Atomic writes.** Serialize to a sibling temp file, then rename over the
 //!     target. A bare `fs::write` truncates the file in place, so a crash / kill
@@ -51,10 +52,10 @@ static WRITE_TICKET: AtomicU64 = AtomicU64::new(0);
 
 /// The newest ticket already durably written, per path — the high-water mark
 /// [`write_atomic_seq`] compares against. Keyed by path because `tabs.json`,
-/// `settings.json`, `sshprofiles.json` and `boardprefs.json` are independent
-/// files with independent save gestures; a slow settings write must not make a
-/// tab save look stale. A `Vec` and not a `HashMap`: it holds four entries in
-/// production, and a linear scan of four is not worth a hasher.
+/// `settings.json`, `sshprofiles.json`, `boardprefs.json` and `sessionlog.json`
+/// are independent files with independent save gestures; a slow settings write
+/// must not make a tab save look stale. A `Vec` and not a `HashMap`: it holds
+/// five entries in production, and a linear scan of five is not worth a hasher.
 static WRITE_HIGH_WATER: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
 
 /// Take the next dispatch ticket. Called by a save command **before** its first
@@ -171,6 +172,31 @@ fn ssh_profiles_path() -> PathBuf {
 /// single-assembly-point rule (CLAUDE.md constraint 6) is untouched by it.
 fn board_prefs_path() -> PathBuf {
     state_dir().join("boardprefs.json")
+}
+
+/// Absolute path of orrerix's own sessions log (#2116).
+///
+/// A sibling file for the same reason `boardprefs.json` is one: a multi-entry
+/// keyed structure with its own lifecycle (one record per harness session,
+/// evicted by `src/sessionlog.ts`) does not belong inside `settings.json`'s
+/// flat bag of app-wide scalars.
+///
+/// **What it is not.** It is not the harness's own session log. Claude Code,
+/// Copilot CLI and OpenCode each keep their own transcripts/stores, the
+/// sessions browser lists sessions by SCANNING those, and orrerix never writes
+/// one. This is the sidecar: the pane name the human chose and the notes they
+/// wrote — things the harness has no idea about. Losing it loses those and
+/// nothing else; every session still lists.
+///
+/// It is also not a group directory. A basic (non-orchestration) pane has no
+/// group, so a note keyed there would have two homes depending on how its pane
+/// was started.
+///
+/// **The session id is a JSON map key inside the blob and never a path.** This
+/// function takes no argument and joins one constant file name, so the
+/// single-assembly-point rule (CLAUDE.md constraint 6) is untouched by it.
+fn session_log_path() -> PathBuf {
+    state_dir().join("sessionlog.json")
 }
 
 /// Atomically write `contents` to `path`: create the parent dir, write a unique
@@ -335,6 +361,32 @@ pub async fn save_board_prefs(contents: String) -> Result<(), String> {
         .await
 }
 
+/// Read orrerix's own sessions log (#2116) as an opaque JSON string, or `null`
+/// on first run / a quarantined corrupt file — `src/sessionlog.ts` degrades
+/// that to an empty log, so every session row falls back to its transcript
+/// title and carries no notes, exactly like `load_ui_tabs`/`tabstore.ts`.
+///
+/// **Reentrancy.** Identical to [`load_ui_tabs`], on its own sibling file.
+#[tauri::command]
+pub async fn load_session_log() -> Option<String> {
+    crate::blocking::run_blocking(|| load_or_quarantine(&session_log_path())).await
+}
+
+/// Persist orrerix's sessions log (an opaque JSON string produced by
+/// `src/sessionlog.ts`), atomically. Same best-effort contract as
+/// `save_ui_tabs`: a failed write just means the last note or rename is not
+/// durable until the next one, and `SessionLogStore` keeps the newer value in
+/// memory so the next gesture re-offers it.
+///
+/// **Reentrancy.** Same ticket as [`save_ui_tabs`], against its own path's
+/// high-water mark — none of the five files gate each other.
+#[tauri::command]
+pub async fn save_session_log(contents: String) -> Result<(), String> {
+    let ticket = next_write_ticket();
+    crate::blocking::run_blocking(move || write_atomic_seq(&session_log_path(), &contents, ticket))
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,14 +524,19 @@ mod tests {
     }
 
     #[test]
-    fn the_four_state_files_are_distinct_siblings() {
+    fn the_five_state_files_are_distinct_siblings() {
         // The failure this catches is a copy-paste one, and it is destructive:
         // `ssh_profiles_path` was written by duplicating `settings_path`, and a
         // duplicate that kept the old file name would make every profile save
         // silently overwrite the user's `settings.json` (atomically, durably,
         // with no error anywhere). Pure path math — nothing is read or written.
-        let (tabs, settings, ssh, board) =
-            (tabs_path(), settings_path(), ssh_profiles_path(), board_prefs_path());
+        let (tabs, settings, ssh, board, log) = (
+            tabs_path(),
+            settings_path(),
+            ssh_profiles_path(),
+            board_prefs_path(),
+            session_log_path(),
+        );
         assert_eq!(ssh.file_name().unwrap(), "sshprofiles.json");
         assert_ne!(ssh, tabs, "profiles must not write over the tab set");
         assert_ne!(ssh, settings, "profiles must not write over app settings");
@@ -495,6 +552,16 @@ mod tests {
         assert_ne!(board, settings, "board view must not write over app settings");
         assert_ne!(board, ssh, "board view must not write over the SSH profiles");
         assert_eq!(board.parent(), tabs.parent());
+        // #2116's fifth file, added the same way and so exposed to the same
+        // copy-paste failure: a duplicated path fn that kept the old name would
+        // make every note the human writes silently overwrite their board view
+        // preferences.
+        assert_eq!(log.file_name().unwrap(), "sessionlog.json");
+        assert_ne!(log, tabs, "the sessions log must not write over the tab set");
+        assert_ne!(log, settings, "the sessions log must not write over app settings");
+        assert_ne!(log, ssh, "the sessions log must not write over the SSH profiles");
+        assert_ne!(log, board, "the sessions log must not write over the board view");
+        assert_eq!(log.parent(), tabs.parent());
     }
 
     #[test]

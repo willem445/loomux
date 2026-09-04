@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-load-session-log"
+description = "Enables the load_session_log command without any pre-configured scope."
+commands.allow = ["load_session_log"]
+
+[[permission]]
+identifier = "deny-load-session-log"
+description = "Denies the load_session_log command without any pre-configured scope."
+commands.deny = ["load_session_log"]

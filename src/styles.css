@@ -2406,19 +2406,27 @@ button.orch-item:active { transform: translateX(2px) scale(0.995); }
 .issues-form-body { min-height: 120px; resize: vertical; line-height: 1.5; }
 .issues-form-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
-/* -- Issues ⇄ PRs segmented toggle in the header -- */
-.issues-mode {
+/* -- Issues ⇄ PRs segmented toggle in the header, and the sessions sidebar's
+   Mine ⇄ Orchestration one (#2116) -- one visual language for "two views of
+   one list, pick one", so the two selectors share every rule and the sessions
+   one adds only the placement it needs (it sits in a padded column, not a
+   header row). -- */
+.issues-mode, .sessions-mode {
   flex: none; display: flex; border: 1px solid var(--line); border-radius: 6px;
   overflow: hidden;
 }
-.issues-mode-tab {
+.sessions-mode { margin: 0 12px 10px; }
+.issues-mode-tab, .sessions-mode-tab {
   background: var(--surface-0); border: none; color: var(--ink-dim);
   font: inherit; font-size: 11.5px; font-weight: 600;
   padding: 3px 10px; cursor: pointer;
 }
-.issues-mode-tab + .issues-mode-tab { border-left: 1px solid var(--line); }
-.issues-mode-tab:hover:not(.on) { color: var(--ink); }
-.issues-mode-tab.on { background: var(--accent); color: var(--surface-0); }
+.sessions-mode-tab { flex: 1 1 0; padding: 5px 10px; }
+.issues-mode-tab + .issues-mode-tab,
+.sessions-mode-tab + .sessions-mode-tab { border-left: 1px solid var(--line); }
+.issues-mode-tab:hover:not(.on),
+.sessions-mode-tab:hover:not(.on) { color: var(--ink); }
+.issues-mode-tab.on, .sessions-mode-tab.on { background: var(--accent); color: var(--surface-0); }
 
 /* PR head-branch chip in a row's meta line. */
 .issues-branch {

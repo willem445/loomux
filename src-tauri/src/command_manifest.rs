@@ -182,7 +182,7 @@ pub const APP_COMMANDS: &[&str] = &[
     // obs (1)
     "take_startup_notice",
     "liveness_stamp",
-    // uistate (8)
+    // uistate (10)
     "load_ui_tabs",
     "save_ui_tabs",
     "load_settings",
@@ -191,6 +191,8 @@ pub const APP_COMMANDS: &[&str] = &[
     "save_ssh_profiles",
     "load_board_prefs",
     "save_board_prefs",
+    "load_session_log",
+    "save_session_log",
     // voice (3)
     "voice_start",
     "voice_stop",

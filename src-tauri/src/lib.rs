@@ -347,6 +347,8 @@ pub fn run() {
             uistate::save_ssh_profiles,
             uistate::load_board_prefs,
             uistate::save_board_prefs,
+            uistate::load_session_log,
+            uistate::save_session_log,
             voice::voice_start,
             voice::voice_stop,
             voice::voice_cancel,
