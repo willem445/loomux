@@ -1022,7 +1022,10 @@ enum Advance {
 fn fold_appended(cursor: &mut TranscriptCursor, verify_anchor: bool) -> std::io::Result<Advance> {
     let mut file = fs::File::open(&cursor.path)?;
     let mut bytes_read = 0u64;
-    if verify_anchor && !cursor.anchor.is_empty() {
+    // SCRATCH MUTATION M7 (#2126 P3 round 2, red-before-green): the anchor
+    // re-read is disabled, so a rewrite that does not shrink the file is folded
+    // onto a stale offset. Never merged.
+    if false && verify_anchor && !cursor.anchor.is_empty() {
         let start = cursor.offset.saturating_sub(cursor.anchor.len() as u64);
         let mut got = vec![0u8; cursor.anchor.len()];
         let read = file.seek(SeekFrom::Start(start)).is_ok() && file.read_exact(&mut got).is_ok();
