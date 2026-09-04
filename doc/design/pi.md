@@ -688,7 +688,8 @@ launcher memoizes its own probes.
 **No measured time is recorded here, and that is deliberate.** The worst case
 is structural (two 8 s timeouts, off-thread); the typical case is pi answering
 from a warm cache in well under a second, and MEASURING it means running a
-real pi, which constraint 3 forbids an agent. The live check is §F8 above.
+real pi, which constraint 3 forbids an agent. The live check is item 7 of
+"Still for the human (live only)" above.
 
 **The curated row stays `[INHERIT_MODEL]`, probed or not.** pi has no
 vendor-neutral alias (§Knobs), so anything loomux curated would be a stale
