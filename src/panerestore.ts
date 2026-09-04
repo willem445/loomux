@@ -739,7 +739,19 @@ const COPILOT_SOLO_MCP_RE = new RegExp(
  *  that. (A pi line the human typed with their OWN `--mcp-config` is the
  *  residual: it is stripped and re-minted rather than preserved. Stated in
  *  `doc/design/pi.md`; the same trade claude's group has always made, one flag
- *  narrower.) */
+ *  narrower.)
+ *
+ *  **`--mcp-config` is not pi's own flag, and that matters to whoever sets
+ *  `CliCaps::mcp_argv_seam`** (review round 1, finding 3). pi core at
+ *  `b79e4cc8` does not know it and rejects unregistered flags outright
+ *  (`SOURCE` `main.ts`: "Unknown option --<x>"); it is registered by the
+ *  third-party `pi-mcp-adapter` package (`ADAPTER` `index.ts`:
+ *  `pi.registerFlag("mcp-config", …)`). So on a machine without that extension
+ *  installed, a solo pi launch that has been minted a channel identity boots
+ *  into an unknown-flag error rather than a pane. Nothing in THIS module can
+ *  prevent that — this side only ever removes the flag — so it is named here
+ *  and owned by the slice that decides to emit it: the seam row and the
+ *  adapter-presence question belong to #2126 P1. */
 const PI_SOLO_MCP_RE = new RegExp(`(^|\\s)--mcp-config\\s+(${QUOTED_OR_BARE_VALUE})(?=\\s|$)`);
 
 /** Remove a recorded agent command's solo channel-identity MCP flags (#439):

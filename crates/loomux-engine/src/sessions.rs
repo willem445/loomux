@@ -645,7 +645,9 @@ pub fn pi_sessions_root_from(
 
 /// `pub`: `collect_pi_candidates` stayed in `src-tauri` and routes through this
 /// same testable root lookup rather than a second, untestable `dirs::home_dir()`
-/// inline — the gap #457 closed for claude, not reopened for pi.
+/// inline — the gap #457 closed for claude, not reopened for pi. It also routes
+/// through [`walk_pi_session_files`], so the two consumers of a pi store cannot
+/// disagree about where its files are — the drift review round 1 found.
 pub fn pi_sessions_root() -> Option<PathBuf> {
     if let Some(r) = PI_SESSIONS_ROOT_OVERRIDE.with(|c| c.borrow().clone()) {
         return Some(r);
@@ -681,27 +683,88 @@ fn pi_file_suffix(session_id: &PathSegment) -> String {
 /// the first assistant response (`SOURCE` `session-manager.ts`), so an id this
 /// returns `Ok(None)` for may still be a live pane's — the same "no transcript
 /// until prompted" fact `doc/design/session-id-learning.md` records for claude.
+/// Walk every session file a pi store can hold, in **both** layouts pi writes,
+/// calling `visit` on each and stopping at its first `Some` (#2126, review
+/// round 1 finding 1).
+///
+/// # The two layouts, and why tolerating both is the fix rather than a hedge
+///
+/// pi's default store nests one level — `<root>/--<cwd>--/<ts>_<id>.jsonl`
+/// (`DOCS` `session-format.md` §File Location). **Under `--session-dir` or
+/// `PI_CODING_AGENT_SESSION_DIR` it does not**: the named directory is used
+/// verbatim and files land FLAT in it, with no per-cwd segment at all —
+/// `SessionManager.create` takes `dir = normalizePath(sessionDir)` when one is
+/// supplied (`SOURCE` `core/session-manager.ts:1521`), `newSession` joins
+/// `<that dir>/<ts>_<id>.jsonl` (`:954`), and pi's own `list` reads it with a
+/// FLAT `readdir` (`listSessionsFromDir`, `:824`) while only the no-override
+/// `listAll` walks subdirectories (`:1670`).
+///
+/// The first version of this scanner walked two levels unconditionally, so for
+/// anyone with the environment variable set every `.jsonl` was `read_dir`-ed as
+/// if it were a directory, failed, and was skipped — **zero rows, and a by-id
+/// lookup answering `Ok(None)`, i.e. "no such session", for a session that
+/// exists.** That is precisely the failure class this whole slice exists to fix
+/// (probe the wrong shape; the miss reads as absent), reproduced one store
+/// layout over.
+///
+/// Both shapes are accepted unconditionally rather than selected by which root
+/// won, for three reasons: the resolver would have to carry a second return
+/// value through the test seam to say which; a store that has been used BOTH
+/// ways (a human who set the variable after a while, or unset it) still lists
+/// everything; and there is nothing to lose, because pi writes no `.jsonl`
+/// directly under a default root and no directory under an override root, so
+/// each arm finds nothing where the other one owns the layout.
+///
+/// **No cwd filtering, deliberately.** pi's own `list` filters an override
+/// store's sessions against the header `cwd` because it is answering "what can
+/// I resume from HERE". Both callers here are answering something else — the
+/// browser lists every session and shows each one's own cwd, and the by-id
+/// lookup is keyed on the id — so a filter would only hide real rows.
+/// `pub` for the same reason as [`tidy_title`]: `collect_pi_candidates` stayed
+/// in `src-tauri` and is the other caller.
+pub fn walk_pi_session_files<T>(root: &Path, mut visit: impl FnMut(&Path) -> Option<T>) -> Option<T> {
+    let is_session_file = |p: &Path| p.extension().and_then(|e| e.to_str()) == Some("jsonl");
+    let entries = fs::read_dir(root).ok()?;
+    let mut nested: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // The override layout: a session file sitting directly in the root.
+        if is_session_file(&path) {
+            if let Some(found) = visit(&path) {
+                return Some(found);
+            }
+        } else {
+            nested.push(path);
+        }
+    }
+    // The default layout: one directory per cwd. Walked second, and only over
+    // the entries the flat pass did not already claim, so neither shape pays a
+    // failed `read_dir` per file of the other.
+    for project in nested {
+        let Ok(files) = fs::read_dir(&project) else {
+            continue; // not a directory, and not a `.jsonl` either — ignore it
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if is_session_file(&path) {
+                if let Some(found) = visit(&path) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn find_pi_session_cwd(root: &Path, session_id: &PathSegment) -> Result<Option<String>, String> {
     if !root.exists() {
         return Ok(None); // pi has never run here — nothing recorded, not an error
     }
     let suffix = pi_file_suffix(session_id);
-    let entries = fs::read_dir(root).map_err(|e| format!("cannot read {}: {e}", root.display()))?;
-    for project in entries.flatten() {
-        let Ok(files) = fs::read_dir(project.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if name.ends_with(&suffix) {
-                return Ok(Some(scan_pi_jsonl(&path).cwd));
-            }
-        }
-    }
-    Ok(None)
+    Ok(walk_pi_session_files(root, |path| {
+        let name = path.file_name().and_then(|s| s.to_str())?;
+        name.ends_with(&suffix).then(|| scan_pi_jsonl(path).cwd)
+    }))
 }
 
 /// What one pi session file's head-scan yielded.

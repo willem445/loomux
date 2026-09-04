@@ -292,3 +292,62 @@ fn a_malformed_line_never_costs_a_pi_session_its_cwd() {
 
     assert_eq!(find_session_cwd("pi", "ragged").unwrap().as_deref(), Some("/home/dev/ragged"));
 }
+#[test]
+fn a_pi_store_named_by_the_env_override_is_read_in_the_FLAT_layout_pi_writes_there() {
+    // REVIEW ROUND 1, FINDING 1 — and the same failure class this whole slice
+    // exists to fix, one store layout over.
+    //
+    // pi nests one directory per cwd under its DEFAULT root, and does NOT under
+    // an explicit `--session-dir` / `PI_CODING_AGENT_SESSION_DIR`: the named
+    // directory is used verbatim and files land flat in it (`SOURCE`
+    // `core/session-manager.ts:1521` `dir = normalizePath(sessionDir)`, `:954`
+    // `join(getSessionDir(), <ts>_<id>.jsonl)`; pi's own `list` reads it with a
+    // flat `readdir`, `:824`).
+    //
+    // The first version of this scanner walked two levels unconditionally, so
+    // every `.jsonl` in an override store was `read_dir`-ed as a directory,
+    // failed, and was skipped — the lookup then answered `Ok(None)`, i.e. "no
+    // such session", for a session that exists.
+    let s = seam();
+    let path = s.pi.join("20260901T090000_flat-1.jsonl");
+    fs::write(
+        &path,
+        "{\"type\":\"session\",\"version\":3,\"id\":\"flat-1\",\"cwd\":\"/srv/work\"}\n\
+         {\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        find_session_cwd("pi", "flat-1").unwrap().as_deref(),
+        Some("/srv/work"),
+        "a session file sitting directly in the sessions root must be found"
+    );
+
+    // The suffix rule still applies in this layout — it is the same matcher,
+    // not a looser second one.
+    assert_eq!(find_session_cwd("pi", "1").unwrap(), None);
+    assert_eq!(find_session_cwd("pi", "20260901T090000").unwrap(), None);
+}
+
+#[test]
+fn one_pi_store_can_hold_both_layouts_at_once() {
+    // A human who sets `PI_CODING_AGENT_SESSION_DIR` partway through, or unsets
+    // it, ends up with both shapes under one root. Neither may hide the other —
+    // which is why the walker accepts both unconditionally rather than picking a
+    // shape from whichever root won.
+    let s = seam();
+    fs::write(
+        s.pi.join("20260901T090000_flat-1.jsonl"),
+        "{\"type\":\"session\",\"version\":3,\"id\":\"flat-1\",\"cwd\":\"/srv/flat\"}\n",
+    )
+    .unwrap();
+    write_session(&s.pi, "--home-dev-nested--", "20260902T090000", "nested-1", "/home/dev/nested", &["hi"]);
+
+    assert_eq!(find_session_cwd("pi", "flat-1").unwrap().as_deref(), Some("/srv/flat"));
+    assert_eq!(find_session_cwd("pi", "nested-1").unwrap().as_deref(), Some("/home/dev/nested"));
+
+    // A non-session file in the root is not mistaken for either — and, being a
+    // file rather than a directory, must not cost the nested walk anything.
+    fs::write(s.pi.join("notes.txt"), "not a session").unwrap();
+    assert_eq!(find_session_cwd("pi", "nested-1").unwrap().as_deref(), Some("/home/dev/nested"));
+}
