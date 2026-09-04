@@ -508,10 +508,13 @@ pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionU
 /// `cacheWrite` -> `cache_creation_tokens` is the same rename opencode's
 /// mapping makes: tokens written INTO the cache, which is what Claude's
 /// `cache_creation_input_tokens` counts.
+// SCRATCH MUTATION M3 (#2126 P3 red-before-green): `reasoning` IS folded into
+// `output_tokens`, the way `opencode_session_usage` folds its own reasoning
+// bucket — the double-count this mapping exists to refuse. Never merged.
 fn pi_tokens(usage: &Value) -> TokenUsage {
     TokenUsage {
         input_tokens: u64_field(usage, "input"),
-        output_tokens: u64_field(usage, "output"),
+        output_tokens: u64_field(usage, "output") + u64_field(usage, "reasoning"),
         cache_creation_tokens: u64_field(usage, "cacheWrite"),
         cache_read_tokens: u64_field(usage, "cacheRead"),
     }
