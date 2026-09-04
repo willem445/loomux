@@ -2858,13 +2858,16 @@ mod tests {
             drop(_hook); // restore before the assertions and before releasing the serial lock
 
             // Select THIS panic's own record by content, never by enumeration
-            // order: the planted record above is a legitimate member of the
-            // directory's `crash-*` set, so the old first-match `find` could
-            // return it. The message is the selector — the assertions below
-            // pin the thread name and the host version, which the foreign
-            // record does not carry, so the selection cannot make them
-            // vacuous. A MISSING record still fails at the `expect`.
-            let crash = fs::read_dir(tmp.path())
+            // order. The candidates are collected and sorted first so the
+            // planted foreign record is PROVABLY the first `crash-*` entry —
+            // a regression back to first-match selection then reddens here on
+            // every run, deterministically, instead of only when the OS
+            // happens to enumerate the foreign record first (#2366). The
+            // message is the selector — the assertions below pin the thread
+            // name and the host version, which the foreign record does not
+            // carry, so the selection cannot make them vacuous. A MISSING
+            // record still fails at the `expect`.
+            let mut candidates: Vec<PathBuf> = fs::read_dir(tmp.path())
                 .unwrap()
                 .flatten()
                 .map(|e| e.path())
@@ -2873,6 +2876,10 @@ mod tests {
                         .and_then(|n| n.to_str())
                         .is_some_and(|n| n.starts_with("crash-"))
                 })
+                .collect();
+            candidates.sort();
+            let crash = candidates
+                .into_iter()
                 .find(|p| {
                     fs::read_to_string(p).is_ok_and(|b| b.contains("synthetic background crash"))
                 })
@@ -2891,9 +2898,12 @@ mod tests {
             // _context` pins the format; this pins that the hook is what
             // carries the value there.
             assert!(body.contains("version: 9.9.9-test"), "carries the host's app version");
-            // The panic also drops a breadcrumb.
+            // The panic also drops a breadcrumb — this test's OWN line, not
+            // just any "panic" text: a concurrent planted panic elsewhere in
+            // the binary would drop its own crumb into this file if it ran
+            // inside the hook window (#2366 review N2).
             let crumbs = fs::read_to_string(tmp.path().join("breadcrumbs.log")).unwrap();
-            assert!(crumbs.contains("panic"));
+            assert!(crumbs.contains("panic thread=crash-test-worker"));
         });
     }
 
