@@ -260,30 +260,20 @@ fn collect_pi_candidates(out: &mut Vec<Candidate>) {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
             // The id is everything after the LAST `_` — `rsplit_once`, not
             // `split_once`: pi's timestamp segment contains no `_` today, but a
             // left split would silently start returning the timestamp if it ever
             // did, and an id is the one field a resume command cannot be wrong
-            // about.
-            let Some((_, id)) = stem.rsplit_once('_') else {
-                continue;
+            // about. Owned before the push, so nothing borrows `path` across the
+            // move into the `Candidate`.
+            let id = match path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.rsplit_once('_')) {
+                Some((_, id)) if !id.is_empty() => id.to_string(),
+                _ => continue,
             };
-            if id.is_empty() {
-                continue;
-            }
             let Some((modified_ms, len)) = candidate_meta(&path) else {
                 continue;
             };
-            out.push(Candidate {
-                path,
-                source: "pi",
-                id: Some(id.to_string()),
-                modified_ms,
-                len,
-            });
+            out.push(Candidate { path, source: "pi", id: Some(id), modified_ms, len });
         }
     }
 }
