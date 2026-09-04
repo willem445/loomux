@@ -22,6 +22,7 @@ use loomux_lib::orchestration::mailbox;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::queue;
+use loomux_lib::orchestration::mergeq;
 use loomux_lib::orchestration::report;
 use loomux_lib::orchestration::reviewdrive;
 use loomux_lib::orchestration::workflow;
