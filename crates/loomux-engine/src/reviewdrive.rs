@@ -3141,7 +3141,6 @@ fn decide_ci_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) 
         // worker back through arc 3, where `decide_fix_wait`'s own ladder
         // already answers every worker signal, and `Pending`/`Unknown` wait as
         // they always did.
-        CiObservation::Green if entry.fix_pushed() => decide_fix_receipts(entry, facts, limits),
         // Arc 2.
         CiObservation::Green => DriveStep::to(DriveState::ReviewWait),
         // Arc 3, spending a CI attempt — or parking, when the budget is gone.
