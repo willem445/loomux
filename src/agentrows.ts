@@ -12,7 +12,7 @@
 // this module decides what it MEANS. The split is the point: `pane.ts` owns
 // where the facts come from, this module owns what they add up to.
 
-import { attentionPresentation, DECISION_REASONS } from "./attention.ts";
+import { attentionPresentation, DECISION_REASONS, REPORT_REASONS } from "./attention.ts";
 import { ACTIVITY_FLOOR_BYTES, type ActivitySnapshot } from "./paneactivity.ts";
 
 /** One pane's whole reading, as plain data. Produced by `Pane.facts()`.
@@ -72,18 +72,20 @@ export type AgentState =
   | "held"
   | "attention"
   | "question"
+  | "reported"
   | "turn-done"
   | "idle"
   | "working";
 
 // Neither reason class is re-listed here, and that is the whole point:
-// `attentionPresentation(reason).urgent` and `DECISION_REASONS` both come from
-// `attention.ts`, so adding a reason there stays ONE edit. An earlier draft kept
-// a hand-maintained copy of the decision set in this module, which meant a
-// reason added over there would render a chip while silently missing the
-// `question` rung and undercounting the badge (#2195 review, rev-std finding 2).
-// `test/attention.test.ts` pins that every known reason is classified exactly
-// once, so a new reason cannot default quietly into the wrong rung either.
+// `attentionPresentation(reason).urgent`, `DECISION_REASONS` and `REPORT_REASONS`
+// all come from `attention.ts`, so adding a reason there stays ONE edit. An
+// earlier draft kept a hand-maintained copy of the decision set in this module,
+// which meant a reason added over there would render a chip while silently
+// missing the `question` rung and undercounting the badge (#2195 review,
+// rev-std finding 2). `test/attention.test.ts` pins that every known reason is
+// classified exactly once, so a new reason cannot default quietly into the
+// wrong rung either.
 
 /** Precedence for `sortRows` — most-wants-you first. Index in this array IS
  *  the ladder's own order, so a state added to `AgentState` without a rung
@@ -91,12 +93,13 @@ export type AgentState =
 const STATE_ORDER: Record<AgentState, number> = {
   attention: 0,
   question: 1,
-  held: 2,
-  "turn-done": 3,
-  working: 4,
-  idle: 5,
-  dormant: 6,
-  dead: 7,
+  reported: 2,
+  held: 3,
+  "turn-done": 4,
+  working: 5,
+  idle: 6,
+  dormant: 7,
+  dead: 8,
 };
 
 /** Read a pane's facts as one state. A precedence ladder: the FIRST rung that
@@ -120,16 +123,19 @@ export function deriveAgentState(facts: PaneFacts): AgentState {
   // 3. Held: loomux is withholding a delivery to this pane (#246). Above
   //    attention because it is a state loomux ITSELF created and can explain.
   if (facts.held !== null) return "held";
-  // 4/5. The backend's attention reading, split by urgency at `attention.ts`'s
-  //    own line: urgent means wedged and it will not un-wedge itself.
+  // 4/5/6. The backend's attention reading, split by class at `attention.ts`'s
+  //    own line: urgent means wedged and it will not un-wedge itself; a decision
+  //    waits on the human's own pace; a report (#2367) waits on the ORCHESTRATOR
+  //    — nothing is owed by the human, so it takes its own rung below question.
   const reason = facts.attention?.reason ?? null;
   if (reason !== null && attentionPresentation(reason).urgent) return "attention";
   if (reason !== null && DECISION_REASONS.has(reason)) return "question";
-  // 6. Turn done: either the scan says `waiting` right now, or it said so at
+  if (reason !== null && REPORT_REASONS.has(reason)) return "reported";
+  // 7. Turn done: either the scan says `waiting` right now, or it said so at
   //    some point and nothing has since disproved it (the latch — see
   //    `paneactivity.ts` for why the focus ack must not disprove it).
   if (reason === "waiting" || facts.activity.atPrompt) return "turn-done";
-  // 7. Idle. TWO conditions, and the first is common to every pane kind on
+  // 8. Idle. TWO conditions, and the first is common to every pane kind on
   //    purpose (#2195 review B1). A pane painting above the floor is not idle,
   //    whatever else is true of it — hoisted out of the branches rather than
   //    repeated inside one of them, because a guard that reads a signal on one
@@ -148,7 +154,7 @@ export function deriveAgentState(facts: PaneFacts): AgentState {
       facts.orch !== null ? facts.activity.rosterIdle === true : facts.activity.lastHumanInputMs === null;
     if (quietlyIdle) return "idle";
   }
-  // 8. Working is the DEFAULT, and the honest reading of it is "no evidence of
+  // 9. Working is the DEFAULT, and the honest reading of it is "no evidence of
   //    a prompt" rather than "measured to be busy". The docs say so.
   return "working";
 }
@@ -203,7 +209,8 @@ export function sortRows(rows: readonly AgentRow[]): AgentRow[] {
 /** How many rows are actually waiting on the human — the badge number. The two
  *  states that mean "a person must do something", and no others: `held` is
  *  loomux's own doing and clears itself, `turn-done` is a finished turn nobody
- *  is blocked on, and `dead`/`dormant` want nothing. */
+ *  is blocked on, and `reported` (#2367) is waiting on the ORCHESTRATOR, not on
+ *  the human — a report never raises the badge. `dead`/`dormant` want nothing. */
 export function needsYouCount(rows: readonly AgentRow[]): number {
   return rows.filter((r) => r.state === "attention" || r.state === "question").length;
 }

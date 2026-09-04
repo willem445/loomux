@@ -142,10 +142,11 @@ wins, and each rung is a strictly more urgent claim than the one below it.
 | 2 | `dormant` | a restore placeholder |
 | 3 | `held` | `held !== null` — loomux is withholding a delivery (#246) |
 | 4 | `attention` | the reason is urgent per `attention.ts` (`held-dialog`, `blocked`, `stranded`) |
-| 5 | `question` | the reason is in `attention.ts`'s `DECISION_REASONS` (`question`, `gate`, `report`) |
-| 6 | `turn-done` | the reason is `waiting` **or** the latch is set |
-| 7 | `idle` | output under the floor, AND — orch pane: the roster says idle; other panes: never prompted, ever |
-| 8 | `working` | everything else |
+| 5 | `question` | the reason is in `attention.ts`'s `DECISION_REASONS` (`question`, `gate`) |
+| 6 | `reported` | the reason is in `attention.ts`'s `REPORT_REASONS` (`report`) — waiting on the ORCHESTRATOR, not on a human decision (#2367) |
+| 7 | `turn-done` | the reason is `waiting` **or** the latch is set |
+| 8 | `idle` | output under the floor, AND — orch pane: the roster says idle; other panes: never prompted, ever |
+| 9 | `working` | everything else |
 
 It takes **no clock**. Everything time-dependent — whether the output window has
 lapsed, how many bytes are in it — is already resolved by
@@ -226,8 +227,9 @@ different claim from `0`. `sortRows` orders by state urgency then by name, so
 the order inside one state is stable as states change around it;
 `matchesFilter` backs the filter chips; `needsYouCount` counts the two states a
 person must act on (`attention`, `question`) and is the badge number — `held` is
-loomux's own doing and clears itself, and a finished turn is not something
-anyone is blocked on.
+loomux's own doing and clears itself, a `reported` pane waits on its
+orchestrator rather than on the human (#2367), and a finished turn is not
+something anyone is blocked on.
 
 ## Slice B: the tab, the view, and the two things it is wired to
 

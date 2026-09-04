@@ -102,8 +102,12 @@ const LADDER: { why: string; state: AgentState; facts: PaneFacts }[] = [
     facts: facts({ attention: { reason: "gate", detail: "task is review" } }),
   },
   {
-    why: "a report is a question-class reason, not an urgent one",
-    state: "question",
+    // #2367: a `report` reason means the agent called `report(...)` and is
+    // waiting on the ORCHESTRATOR — the header chip already words it
+    // "✓ reported". It is not a human decision, so it gets its own rung
+    // instead of reading as `question`.
+    why: "a report waits on the orchestrator, not on a human decision",
+    state: "reported",
     facts: facts({ attention: { reason: "report", detail: null } }),
   },
   {
@@ -232,7 +236,7 @@ test("the ladder's fixtures vary every field the predicate reads", () => {
   const reached = new Set(LADDER.map((r) => r.state));
   assert.deepEqual(
     [...reached].sort(),
-    ["attention", "dead", "dormant", "held", "idle", "question", "turn-done", "working"],
+    ["attention", "dead", "dormant", "held", "idle", "question", "reported", "turn-done", "working"],
     "the ladder corpus no longer covers every AgentState",
   );
 });
@@ -253,6 +257,9 @@ test("the ladder walks down in precedence order", () => {
     { patch: { ...every }, state: "held" },
     { patch: { ...every, held: null }, state: "attention" },
     { patch: { ...every, held: null, attention: { reason: "gate", detail: null } }, state: "question" },
+    // #2367: the reported rung sits between question and turn-done — the agent
+    // has called in, but nothing is waiting on the human.
+    { patch: { ...every, held: null, attention: { reason: "report", detail: null } }, state: "reported" },
     { patch: { ...every, held: null, attention: { reason: "waiting", detail: null } }, state: "turn-done" },
     { patch: { ...every, held: null, attention: null }, state: "turn-done" },
     {
@@ -389,12 +396,15 @@ test("sortRows orders by state urgency, then by name, without mutating its input
     row("gamma", "dead"),
     row("delta", "turn-done"),
     row("epsilon", "question"),
+    // #2367: pins the reported rung's position in STATE_ORDER — after
+    // question, before turn-done.
+    row("kappa", "reported"),
   ];
   const before = input.map((r) => r.name);
   const out = sortRows(input);
   assert.deepEqual(
     out.map((r) => r.name),
-    ["beta", "epsilon", "delta", "alpha", "zeta", "gamma"],
+    ["beta", "epsilon", "kappa", "delta", "alpha", "zeta", "gamma"],
   );
   assert.deepEqual(input.map((r) => r.name), before, "sortRows must not reorder the caller's array");
 });
@@ -403,6 +413,9 @@ test("needsYouCount counts the two states a person must act on", () => {
   const rows = [
     row("a", "attention"),
     row("b", "question"),
+    // #2367: a reported pane waits on the ORCHESTRATOR, not on the human —
+    // it must not raise the badge.
+    row("i", "reported"),
     row("c", "held"),
     row("d", "turn-done"),
     row("e", "working"),
@@ -413,8 +426,11 @@ test("needsYouCount counts the two states a person must act on", () => {
   // Non-vacuous by construction: the corpus holds one row per state, so a
   // predicate that counted nothing (or everything) fails here rather than
   // passing on an empty list.
-  assert.equal(rows.length, 8);
+  assert.equal(rows.length, 9);
   assert.equal(needsYouCount(rows), 2);
+  // The positive control for the exclusion above: a question row DOES count,
+  // so the assertion is about `reported` and not about some other field.
+  assert.equal(needsYouCount([row("i", "reported"), row("b", "question")]), 1);
   assert.equal(needsYouCount([]), 0);
   assert.equal(needsYouCount([row("a", "working")]), 0);
 });

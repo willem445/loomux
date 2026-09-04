@@ -46,7 +46,8 @@ makes it the active pane there, and focuses the terminal.
 | State | What it means |
 | --- | --- |
 | **needs you** | The pane is wedged and will not un-wedge itself — blocked, stranded on an unsubmitted prompt, or held on a dialog. |
-| **question** | The agent is asking you something: a question, a gate, or a report waiting on your read. |
+| **question** | The agent is asking you something: a question or a gate. |
+| **reported** | The agent has called in — its report is waiting on its orchestrator, not on you. The same word the pane header's chip uses. |
 | **held** | Orrerix is withholding a delivery to this pane because its input box looks occupied. It clears itself. |
 | **turn done** | The agent finished and is parked at its prompt. See the caveat below. |
 | **working** | No evidence of a prompt. This is the default reading, and it is honest about being one — see below. |
@@ -97,8 +98,9 @@ one you have selected, which stays so you can always get back out of it.
 The number on the **agents** button and on the tab is how many panes are in
 **needs you** or **question**: the two states where a person has to do
 something. It is visible with the panel closed, which is the point of counting
-it. `held` is orrerix's own doing and clears itself; a finished turn is not
-blocking anyone; and nothing is waiting on a dormant or exited pane.
+it. `held` is orrerix's own doing and clears itself; a **reported** pane is
+waiting on its orchestrator, not on you; a finished turn is not blocking
+anyone; and nothing is waiting on a dormant or exited pane.
 
 ## The spinner
 
