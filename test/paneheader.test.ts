@@ -374,21 +374,34 @@ test("at the narrowest width EVERY control is in the menu and ⋯ is the row", (
   assert.deepEqual(fit({ headerWidth: SQUEEZED_W }).inline, ["min", "max"]);
 });
 
-test("no width leaves the header with nothing to click", () => {
-  // The bug, stated as the property that forbids it. Swept rather than sampled,
-  // because the failure was at ONE end of the range and a sample of three widths
-  // is exactly what missed it.
-  const reachable: string[] = [];
-  for (let w = 0; w <= FULL_W + 200; w++) {
+test("the row's demand falls monotonically with the width, down to ONE control", () => {
+  // The bug, stated as the property that forbids it — and stated as DEMAND
+  // rather than as "the row is never empty", which was already true of the
+  // policy #2335 reports. #2191's ladder bottomed out at ⋯ + minimize +
+  // maximize: three fixed-width buttons plus the chips, which is wider than a
+  // minimum-width pane's header box, so the row overflowed and `.pane`'s
+  // `overflow: hidden` clipped all three. This module cannot see a pixel being
+  // clipped; what it CAN promise is that narrowing the header never asks the row
+  // to hold more, and that the bottom of the ladder asks it to hold one button.
+  const demand = (w: number) => {
     const plan = fit({ headerWidth: w });
-    if (!plan.folded && plan.inline.length === 0) reachable.push(`w=${w}`);
+    return plan.inline.length + (plan.folded ? 1 : 0);
+  };
+  // Swept rather than sampled: the failure was at ONE end of the range, which is
+  // exactly what a sample of three widths misses. `w = 0` is excluded because it
+  // is the not-laid-out carry, which is a different question (pinned below).
+  const climbs: string[] = [];
+  let previous = demand(FULL_W + 200);
+  for (let w = FULL_W + 200; w >= 1; w--) {
+    const d = demand(w);
+    if (d > previous) climbs.push(`w=${w}`);
+    previous = d;
   }
-  assert.deepEqual(reachable, [], "these widths render neither a control nor the ⋯ button");
-  // Positive control: the sweep really did read plans at both ends of the range,
-  // so an empty result is a clean sweep and not an empty one.
-  assert.equal(fit({ headerWidth: 0 }).folded, false, "w=0 carries the unfolded BASE stage");
-  assert.equal(fit({ headerWidth: 1 }).folded, true);
-  assert.equal(fit({ headerWidth: FULL_W + 200 }).folded, false);
+  assert.deepEqual(climbs, [], "narrowing the header must never ask the row to hold MORE");
+  // Positive control for that empty result: the sweep really did read both ends,
+  // and they are different — an unchanged demand would satisfy "no climbs" too.
+  assert.equal(demand(FULL_W + 200), CONTROLS.length, "a wide row holds every control");
+  assert.equal(demand(1), 1, "the narrowest row is the ⋯ button and nothing else");
 });
 
 // ------------------------------------------------------------- the menu's rows

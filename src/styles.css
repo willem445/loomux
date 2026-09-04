@@ -1122,30 +1122,35 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane-btn.pane-overflow { width: 25px; font-size: 14px; }
 .pane.header-folded .pane-btn.pane-overflow,
 .pane-btn.pane-overflow[aria-expanded="true"] { opacity: 1; }
-/* ---------- the narrowest header (#2335) ---------- */
+/* ---------- the header row SHRINKS; it never overflows (#2335) ---------- */
+/* Every `.pane-btn` is `flex: none` and so are the status chips, so a row that
+   does not fit did not shrink — it OVERFLOWED, and `.pane`'s own
+   `overflow: hidden` clipped whatever hung off the right end. At the narrowest
+   widths that was the whole control cluster, ⋯ included: a pane header with no
+   reachable control at all, which is what #2335 reports.
+   `src/paneheader.ts` can decide what the row CONTAINS; only flexbox can promise
+   it FITS, so that promise is made here — the row's non-control chrome is
+   shrinkable, and the deficit comes out of the CLI mark, the role badge and the
+   chips before it comes out of a control. `.pane-queue` is excluded because it
+   declares its own, much heavier, shrink weight for a reason this rule would
+   silently overwrite (`flex: 0 100 auto` — see its own block above);
+   `.pane-title` and `.pane-meta` already shrink exactly like this, so naming
+   them here changes nothing and keeps the rule a shape rather than a list of
+   chips that a seventh one would fall out of. */
+.pane-header > *:not(.pane-btn):not(.pane-overflow-menu):not(.pane-queue) {
+  flex-shrink: 1; min-width: 0; overflow: hidden;
+}
+
+/* ---------- the narrowest rung (#2335) ---------- */
 /* One rung below the fold: the window-control cluster has gone into the menu
-   too, and so has the pane name. Two rules make "the ⋯ button is reachable at
-   EVERY width" true rather than merely intended.
-     1. The name leaves the row. It is `display: none` rather than allowed to
-        ellipsise further because a name clipped to one glyph carries nothing and
-        still spends the ~20px the ⋯ needs; `.pane-overflow-menu`'s first row
-        carries it instead, with the rename gesture attached.
-     2. Every other header child becomes SHRINKABLE. `.pane-btn` and the status
-        chips are `flex: none`, so without this the row does not shrink — it
-        OVERFLOWS, and `.pane`'s own `overflow: hidden` clips whatever hangs off
-        the right end. Once the cluster has folded, the thing hanging off the
-        right end is the ⋯ itself, which is exactly the bug #2335 reports. The
-        policy in `src/paneheader.ts` can decide what the row CONTAINS; only
-        flexbox can promise it FITS, so that promise is made here.
-   The ⋯ button is the one child exempted, so the deficit is taken out of the CLI
-   mark, the role badge and the chips (which ellipsise or clip) before anything is
-   taken out of the one control left. Pure header chrome: the header's height is
+   too, so the only `.pane-btn` left in the row is the ⋯ the rule above exempts.
+   The pane name goes with the cluster rather than ellipsising further — a name
+   clipped to one glyph carries nothing and still spends the ~20px the ⋯ needs —
+   and `.pane-overflow-menu`'s first row carries it instead, with the rename
+   gesture attached. Pure header chrome: the header's height is
    `--pane-header-h` at every rung, so `.pane-term`'s box never moves and no PTY
    is resized (CLAUDE.md constraint 1). */
 .pane.header-minimal .pane-title { display: none; }
-.pane.header-minimal .pane-header > *:not(.pane-btn.pane-overflow):not(.pane-overflow-menu) {
-  flex-shrink: 1; min-width: 0; overflow: hidden;
-}
 
 /* The menu's name row. Not an icon button — it is the pane name, so it is
    text-shaped and takes the menu's whole width rather than sitting in the icon

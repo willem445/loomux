@@ -1693,12 +1693,15 @@ export class Pane implements VoiceTargetPane {
     }
     this.overflowBtn.hidden = !folded;
     this.el.classList.toggle("header-folded", folded);
-    // `minimal` is the rung where the name leaves the row; the CSS class is what
-    // takes it out and what makes every remaining non-⋯ header child
-    // shrinkable, so flexbox absorbs the deficit instead of overflowing the row
-    // and clipping the one control left (#2335). Header chrome only: the header's
-    // height is fixed, so `.pane-term` does not move and no PTY is resized
-    // (constraint 1).
+    // `minimal` is the rung where the name leaves the row, and this class is what
+    // takes it out — a name clipped to one glyph carries nothing and still spends
+    // the room ⋯ needs, so the menu's first row carries it instead (#2335). That
+    // the row FITS is a separate promise and a separate rule: `styles.css` makes
+    // every non-control header child shrinkable at every width, so flexbox
+    // absorbs the deficit rather than overflowing and letting `.pane`'s
+    // `overflow: hidden` clip the controls off the right end. Header chrome only:
+    // the header's height is fixed at every rung, so `.pane-term` does not move
+    // and no PTY is resized (constraint 1).
     this.el.classList.toggle("header-minimal", plan.title === "hidden");
     const menuIds = overflowMenuIds(plan);
     this.renameEntry.hidden = !menuIds.includes(RENAME_ENTRY_ID);
@@ -3181,9 +3184,11 @@ export class Pane implements VoiceTargetPane {
   setName(name: string): void {
     this.name = name;
     this.titleEl.textContent = name;
-    // The name is priority chrome that ELLIPSISES rather than folding (#2191),
+    // The name is priority chrome that ELLIPSISES rather than folding at every
+    // rung but the narrowest, where it moves into the menu instead (#2191, #2335),
     // so the tooltip has to carry the full one — on a narrow pane the rendered
-    // text is the only place it appears, and it is cut. The rename hint stays,
+    // text is cut, and it is the only place the name appears until the narrowest
+    // rung hands it to `renameEntry`. The rename hint stays,
     // second: the tooltip's job is now "what is this pane called", and the
     // gesture is the footnote.
     this.titleEl.title = name ? `${name} — double-click to rename (F2)` : "Double-click to rename (F2)";

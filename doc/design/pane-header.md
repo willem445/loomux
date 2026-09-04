@@ -8,29 +8,46 @@ complaint #2191 was filed for.
 
 The answer is an **overflow fold**: below a threshold the header keeps a
 priority set inline and collapses everything else into one `⋯` button whose
-hover/focus menu carries the rest.
+hover/focus menu carries the rest. Below *that* it keeps going — #2335 reported
+a minimum-width header showing neither the window controls nor the `⋯`, so the
+fold is a four-rung ladder ending with the `⋯` button alone.
 
 `src/paneheader.ts` decides *whether*; `src/pane.ts` moves the elements;
 `.pane-overflow-menu` in `src/styles.css` is the strip. This note carries the
 three decisions that are not obvious from any of them.
 
-## The priority order
+## The priority order, and the ladder it produces
 
-Inline at every width:
+There is one priority order, and every fold decision is a step down it. Last
+thing dropped first:
 
-1. **The pane name.** It is what makes a wall of agents legible, and it is also
-   the pane's drag handle — `Grid.onPointerDown` refuses to start a reorder from
-   a button, so the name is what a human grabs to move a pane. It ellipsises
-   rather than folding, and never below `TITLE_MIN_W` (56px, ~8 characters at the
-   header's 11.5px type). Because the rendered text is then cut, `setName` puts
-   the **full** name in the element's `title`.
-2. **Minimize.**
-3. **Maximize.**
+1. **The `⋯` button.** Once it is in the row it is never taken out again: it is
+   the only route to everything that folded, so dropping it is what left #2335's
+   minimum-width header with no reachable control at all.
+2. **Minimize and maximize** — the `priority: true` set in `Pane`'s
+   `headerControls` registry.
+3. **The pane name's readable floor** (`TITLE_MIN_W`, 56px, ~8 characters at the
+   header's 11.5px type). The name is what makes a wall of agents legible and it
+   is also the pane's drag handle — `Grid.onPointerDown` refuses to start a
+   reorder from a button, so the name is what a human grabs to move a pane.
+   It still gives way before a control does, because truncating a name degrades
+   gracefully (`setName` puts the **full** name in the element's `title`, and the
+   menu's name row carries it once the row does not) where folding a control
+   costs a whole extra gesture. Spend the cheap thing first.
+4. **Everything else**, in header order: the six orchestration toggles (tasks,
+   needs-you, audit, timeline, group, fold-group), open-in-editor, the three
+   overlay toggles (issues, git, file editor), per-session notes (#2116), both
+   splits, and **close**.
 
-Everything else folds, in header order: the six orchestration toggles (tasks,
-needs-you, audit, timeline, group, fold-group), open-in-editor, the three overlay
-toggles (issues, git, file editor), per-session notes (#2116), both splits, and
-**close**.
+`planHeaderFit` turns that order into a **ladder** of four progressively
+narrower rows, each reached only when the one above it stops fitting:
+
+| rung | the row holds | the name |
+| --- | --- | --- |
+| `full` | every control | on its floor |
+| `folded` | `⋯` + minimize + maximize | on its floor |
+| `squeezed` | `⋯` + minimize + maximize | floor released — ellipsises freely |
+| `minimal` | `⋯` alone | out of the row; the menu's first row carries it |
 
 A control that only some panes have — notes is the first — is registered like
 any other and left `hidden` where it does not apply. `syncHeaderOverflow` reads
@@ -47,6 +64,49 @@ button on a 300px pane is the failure mode, not the fix. If that reads wrong in
 use, moving a control between the two sets is one `priority` flag in
 `Pane`'s `headerControls` registry and nothing else: the policy takes the set as
 data, and the menu, the measurement and the tests all follow it.
+
+## The narrowest rung, and the promise only flexbox can make (#2335)
+
+At `minimal` the pane name leaves the row outright rather than being clipped
+further. A name cut to one glyph carries no information and still spends the
+~20px the `⋯` needs, so it moves into the menu instead, as its first row: the
+label *is* the current name and pressing it starts the same rename that F2 and a
+double-click on the header name start. `overflowMenuIds` derives that row from
+the plan (`title === "hidden"`) rather than taking it as a separate input, so
+"the row has no name" and "the menu offers one" are one decision asked once.
+
+The policy can only decide what the row **contains**. What #2335 actually
+reported is a row that contained the right things and still showed none of them:
+`.pane-btn` and the status chips are `flex: none`, so a row that does not fit
+does not shrink — it *overflows*, and `.pane`'s own `overflow: hidden` clips
+whatever hangs off the right end. Once the window-control cluster has folded,
+the thing hanging off the right end is the `⋯` itself.
+
+So the fitting half of the promise is made in CSS, and deliberately **not** under
+`.pane.header-minimal`: every header child that is not a control becomes
+`flex-shrink: 1; min-width: 0; overflow: hidden` at *every* width, so flexbox
+takes the deficit out of the CLI mark, the role badge and the chips before it
+takes anything out of a control. Scoping it to the narrowest rung would leave the
+rung above it — where the row is `⋯` + minimize + maximize and the chrome is
+still `flex: none` — overflowing exactly as before. `.pane-queue` is excluded
+because it declares a much heavier shrink weight of its own (#814/#894), which a
+blanket `flex-shrink: 1` would silently overwrite.
+
+`.pane.header-minimal` then does one thing: take the name out of the row. Since
+every control has folded by then, the only `.pane-btn` left is the `⋯`, which the
+rule above exempts — so it is the one item in the row that cannot be shrunk. The
+header's height is `--pane-header-h` at every rung either way, so `.pane-term`'s
+box never moves and no PTY is resized — constraint 1 holds at the narrowest rung
+for exactly the reason it holds at the others.
+
+**The residual, stated rather than claimed away.** The policy's arithmetic counts
+one gap per item and gives the name no gap of its own, so at `squeezed` its
+demand is up to one `HEADER_GAP_W` (6px) below what the row really needs. In that
+band the *rightmost* control — maximize, since `⋯` sits at the head of the
+cluster in DOM order — can lose a pixel or two off its right edge before the
+ladder drops to `minimal`. The `⋯` cannot be the one clipped: it is leftmost of
+the three, so anything that reaches it has already taken the other two, and by
+then `minimal` has fired.
 
 ## Why the menu is an overlay
 
@@ -85,9 +145,9 @@ the transform then slides the laid-out box and costs layout nothing.
 
 This is the part that looks like a transition convenience and is not.
 
-`planHeaderFit` decides from `fullWidth` — the width the row *would* need with
-every control inline. For that decision to be stable, `fullWidth` must not depend
-on the current fold state. Three things make it independent:
+`planHeaderFit` prices each rung of the ladder from the width that rung's row
+*would* need. For those decisions to be stable, none of those widths may depend
+on the rung we are currently on. Three things make them independent:
 
 - the pane name contributes a constant floor, never its rendered width, which
   flexbox shrinks;
@@ -110,10 +170,12 @@ entirely rather than folded.
 
 ## Hysteresis, and why it is the second line of defence
 
-Fold when the full set stops fitting; unfold only when there is `HYSTERESIS_W`
-(24px) of **spare** room. Both thresholds read the same state-independent
-`fullWidth`, so the dead band between them is the whole of the hysteresis: a
-width oscillating inside it cannot change the state, whichever side it came from.
+Drop a rung the moment its row stops fitting; climb back up only when there is
+`HYSTERESIS_W` (24px) of **spare** room. That asymmetry is applied between every
+adjacent pair of rungs, not just at #2191's one threshold, and every rung's
+demand is state-independent (above), so the dead band between two rungs is the
+whole of the hysteresis: a width oscillating inside it cannot change the rung,
+whichever side it came from.
 
 That is deliberately belt-and-braces. The invariant above is what makes the
 decision stable; the dead band is what keeps a slowly-dragged divider from
@@ -121,28 +183,42 @@ toggling the icon set once per frame as it crosses a single threshold.
 
 ## All-or-nothing, not progressive
 
-The non-priority set folds together. Progressive folding — shedding one icon at a
-time as the header narrows — packs more into the row, at the cost of a menu whose
-contents change every 25px. A human who has learned where the git icon sits in
+Each rung folds its whole set together. Progressive folding — shedding one icon
+at a time as the header narrows — packs more into the row, at the cost of a menu
+whose contents change every 25px. A human who has learned where the git icon sits in
 the menu should find it in the same place at every narrow width. The ask asked
 for the same thing ("everything else aggregates into a single overflow icon"),
-and the predictable version is also the one with a single threshold to make
-non-flapping.
+and the predictable version is also the one with a handful of thresholds to make
+non-flapping rather than one per icon.
 
 ## Refusals
 
-Two widths never fold, whatever the header measures:
+**A rung that buys nothing is not on the ladder.** Each candidate is kept only
+if it is *strictly narrower* than the last rung kept above it, which is one rule
+covering three cases that used to be argued separately:
 
-- **Folding would not save room.** The `⋯` button is wider than one `.pane-btn`
-  (25px against 23px), so a header with a single foldable control — a welcome
-  pane, whose only control is its ✕ — is left alone rather than having its one
-  control hidden behind a wider button. This one guard also covers the degenerate
-  case where every control is priority; an explicit "nothing to fold" early
-  return was written, found to redden no test under mutation, and removed.
-- **The header has no measurable width.** A pane in an inactive project tab is
-  `display: none`, so everything measures 0. Guessing "fold" there would fold
-  every pane in a hidden tab; the previous state is carried instead, and the next
-  real measurement decides.
+- The `⋯` button is wider than one `.pane-btn` (25px against 23px), so a header
+  with a single foldable control — a welcome pane, whose only control is its ✕ —
+  would spend room to hide its one control. Both folding rungs are dropped for
+  that pane, so its ✕ stays in the row and clickable at *every* width. The 25px
+  is load-bearing, not cosmetic; `OVERFLOW_BTN_W` in `pane.ts` says so.
+- A header whose controls are all priority has nothing to fold, so `folded` is
+  dropped — but `minimal` is not, because folding the priority set is exactly
+  what buys the room down there. That is the case #2335 was filed for.
+- `squeezed` is dropped when the name floor is already zero.
+
+An explicit "nothing to fold" early return was written for the first of those,
+found to redden no test under mutation, and removed; this guard already decides
+it. It runs *before* the width check, so a header with nothing worth folding can
+never be carried into a folded state that would render an overflow button over
+an empty menu.
+
+**A header with no measurable width** is the other refusal. A pane in an
+inactive project tab is `display: none`, so everything measures 0. Guessing
+"fold" there would fold every pane in a hidden tab; the current rung is carried
+instead, and the next real measurement decides. A rung that is not on this
+pane's ladder is not carried — it drops to the widest, which is the
+empty-menu case above.
 
 ## What detects the change
 

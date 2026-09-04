@@ -35,9 +35,18 @@ of them, each with the tooltip and the action it had in the header.
 This is automatic and there is no setting: widen the pane, or close a side panel,
 and the icons come back to the row. The threshold has some slack in it on
 purpose, so dragging a divider slowly across it settles rather than flickering.
-The pane name is only ever shortened with an ellipsis — hover it for the full
-one. The strip floats *over* the terminal, so nothing about folding resizes or
-repaints what your shell is showing.
+At this width the pane name is only shortened with an ellipsis — hover it for the
+full one. The strip floats *over* the terminal, so nothing about folding resizes
+or repaints what your shell is showing.
+
+Keep going and the pane reaches its narrowest, where even that row does not fit.
+The last thing to be given up is the **`⋯`** button itself, which stays in the
+header and stays clickable at every width: the name goes first (out of the row
+entirely, rather than clipped to a character or two), and then minimize and
+maximize join everything else in the strip. At that point the strip's first row
+*is* the pane's name — press it to rename, exactly as double-clicking the name in
+the header does. So there is never a width at which a pane has no control you can
+reach.
 
 ### Pane kinds
 

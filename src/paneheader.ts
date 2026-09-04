@@ -31,11 +31,13 @@
 /** Gap between two adjacent header items (`.pane-header { gap: 6px }`). */
 export const HEADER_GAP_W = 6;
 
-/** Floor reserved for the pane name before anything folds. The name is priority
- *  chrome — it is what makes a wall of agents legible, and it is also the pane's
- *  drag handle (`Grid.onPointerDown` refuses to start a reorder from a button),
- *  so it may ellipsise but must never be squeezed to nothing. ~8 characters plus
- *  the ellipsis at the header's 11.5px type. */
+/** Floor reserved for the pane name while the ladder's top two rungs are in
+ *  play. The name is priority chrome — it is what makes a wall of agents legible,
+ *  and it is also the pane's drag handle (`Grid.onPointerDown` refuses to start a
+ *  reorder from a button) — so it holds this much until nothing else will give:
+ *  the `squeezed` rung releases the floor and lets it ellipsise freely, and only
+ *  `minimal` takes it out of the row (#2335), where the menu's name row carries
+ *  it instead. ~8 characters plus the ellipsis at the header's 11.5px type. */
 export const TITLE_MIN_W = 56;
 
 /** Fallback width for a control whose box could not be measured (a pane whose
