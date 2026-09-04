@@ -26,8 +26,12 @@
 //! constraint cannot be violated the usual way — but a renderer that re-emitted
 //! its transcript on a width change would produce **the same damage by a
 //! different road**, and a worse one, because grepping for the resize call would
-//! not find it. So this module emits forward only: no cursor movement, no erase,
-//! no carriage return. [`no_output_can_rewrite_the_screen`] is the pin.
+//! not find it. So this module emits forward only: no cursor movement, no
+//! erase, and no **bare** carriage return — a `CR` that is not part of a `CRLF`
+//! is the one that returns the cursor without advancing.
+//! [`no_output_can_rewrite_the_screen`] is the pin, and it bans that shape
+//! specifically; an earlier version banned every `CR`, which forbade the line
+//! ending this module is required to emit (see [`NEWLINE`]).
 //!
 //! # What it deliberately does not do
 //!
@@ -51,6 +55,32 @@ use super::{
 /// in a `Write`) would push everything else off the screen. The full value is in
 /// the pane's event log either way.
 pub const TOOL_PREVIEW_BYTES: usize = 120;
+
+/// The line ending every emit site in this module uses — **`CRLF`, not a bare
+/// `LF`**, and it is load-bearing rather than pedantic.
+///
+/// These bytes end at `this.term.write(chunk)` (`src/pane.ts`) on a `Terminal`
+/// built without `convertEol`, which xterm.js defaults to `false`. With it
+/// false a bare `LF` is an **INDEX** — down one row, column untouched — so
+/// every line staircases rightward and the transcript composes into something
+/// no terminal would show. A PTY never exposes this, because ConPTY and a POSIX
+/// pty in `ONLCR` both deliver `CRLF`; a *synthesized* stream has to do it
+/// itself. `painted()` in `src-tauri/tests/orchestration.rs` states the same
+/// rule for the same reason on the fixture side, and the two existing
+/// loomux-authored injections into a pane go through `term.writeln`, which
+/// appends `CRLF` for them.
+///
+/// **This is not in tension with the forward-only rule above.** A `CR` that is
+/// part of a `CRLF` is a newline; only a *bare* `CR` — one not followed by `LF`
+/// — returns the cursor without advancing, which is what can repaint a line.
+/// [`no_output_can_rewrite_the_screen`] bans exactly that, and an earlier
+/// version of it banned every `CR`, which forbade this fix and would have left
+/// a green suite asserting the defect as the contract.
+///
+/// Fixing this by setting `convertEol: true` on the shared `Terminal` was
+/// rejected: that terminal is every pane's, so it would change how a real PTY
+/// pane parses a lone `LF` too.
+const NEWLINE: &str = "\r\n";
 
 /// Dim, for loomux's own annotations.
 const DIM: &str = "\x1b[2m";
@@ -208,7 +238,7 @@ impl Renderer {
     fn wrapped(&mut self, out: &mut String, s: &str) {
         for c in s.chars() {
             if self.col >= self.cols {
-                out.push('\n');
+                out.push_str(NEWLINE);
                 self.col = 0;
             }
             out.push(c);
@@ -219,14 +249,14 @@ impl Renderer {
     /// Start a new line unless already at column 0.
     fn newline(&mut self, out: &mut String) {
         if self.col > 0 {
-            out.push('\n');
+            out.push_str(NEWLINE);
             self.col = 0;
         }
     }
 
     /// Start a new line even at column 0 — a blank line the model asked for.
     fn hard_newline(&mut self, out: &mut String) {
-        out.push('\n');
+        out.push_str(NEWLINE);
         self.col = 0;
     }
 }
@@ -329,7 +359,41 @@ mod tests {
                 },
             ],
         );
-        assert!(!out.contains('\r'), "no carriage return: {out:?}");
+        // A BARE carriage return — one not followed by `LF` — is what can
+        // repaint a line, and it is what this bans. An earlier version banned
+        // every `\r`, which is the wrong rule stated with the right words: it
+        // forbade the CRLF this module must emit (see `NEWLINE`), so it would
+        // have reddened on the fix and left a green suite asserting the defect
+        // as the contract.
+        let bytes: Vec<char> = out.chars().collect();
+        for (i, c) in bytes.iter().enumerate() {
+            if *c == '\r' {
+                assert_eq!(
+                    bytes.get(i + 1),
+                    Some(&'\n'),
+                    "a bare CR at {i} can return the cursor without advancing, \
+                     which repaints the line: {out:?}"
+                );
+            }
+        }
+        // The other direction, and the one that actually broke: a lone `LF` is
+        // an INDEX on a terminal without `convertEol`, so every line after it
+        // staircases. Every newline this module emits must be a full CRLF.
+        for (i, c) in bytes.iter().enumerate() {
+            if *c == '\n' {
+                assert_eq!(
+                    if i == 0 { None } else { bytes.get(i - 1) },
+                    Some(&'\r'),
+                    "a lone LF at {i} — the transcript staircases from here: {out:?}"
+                );
+            }
+        }
+        // Positive control for the pair above: this output really does contain
+        // newlines, so neither loop is passing over a string with none.
+        assert!(
+            out.matches("\r\n").count() >= 3,
+            "the two assertions above must have had CRLFs to inspect: {out:?}"
+        );
         for seq in ["\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D", "\x1b[H", "\x1b[J", "\x1b[K", "\x1b[s", "\x1b[u"] {
             assert!(
                 !out.contains(seq),
@@ -370,7 +434,10 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(out, "abcdefghij\nklmno", "wrapped at 10, not per event: {out:?}");
+        assert_eq!(
+            out, "abcdefghij\r\nklmno",
+            "wrapped at 10, not per event, and the break is a CRLF: {out:?}"
+        );
     }
 
     #[test]
@@ -382,7 +449,7 @@ mod tests {
                 delta: "one\n\ntwo".into(),
             }],
         );
-        assert_eq!(out, "one\n\ntwo");
+        assert_eq!(out, "one\r\n\r\ntwo");
     }
 
     #[test]
@@ -402,7 +469,10 @@ mod tests {
             }],
         );
         let body = out.replace(DIM, "").replace(RESET, "");
-        let drawn: Vec<&str> = body.split('\n').filter(|l| !l.is_empty()).collect();
+        // Split on the CRLF this module emits, not on a bare `\n`: splitting on
+        // `\n` leaves a `\r` on every part, so an empty line reads as non-empty
+        // and the count below silently stops meaning "lines drawn".
+        let drawn: Vec<&str> = body.split(NEWLINE).filter(|l| !l.is_empty()).collect();
         assert_eq!(drawn.len(), 1, "a tool call must draw exactly one line: {drawn:?}");
         assert!(drawn[0].starts_with("> Bash("), "{drawn:?}");
         assert!(
@@ -557,7 +627,10 @@ mod tests {
                 delta: "abc".into(),
             }],
         );
-        assert_eq!(out, "a\nb\nc", "zero is treated as one column, not as twenty");
+        assert_eq!(
+            out, "a\r\nb\r\nc",
+            "zero is treated as one column, not as twenty"
+        );
         // The control: a real narrow width is honoured exactly, so the floor
         // above cannot be creeping upward unnoticed.
         let out = render_all(
@@ -567,6 +640,6 @@ mod tests {
                 delta: "abcdef".into(),
             }],
         );
-        assert_eq!(out, "abc\ndef");
+        assert_eq!(out, "abc\r\ndef");
     }
 }

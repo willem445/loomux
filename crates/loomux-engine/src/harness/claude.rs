@@ -1064,12 +1064,38 @@ mod tests {
             );
         }
 
-        // And it is NOT turn-scoped: a compaction between turns must not open
-        // one, or every compaction would invent a turn nobody took.
-        assert!(
-            !out.iter()
-                .any(|e| matches!(e, Decoded::Event(HarnessEvent::TurnStarted { .. }))),
-            "a compact boundary must not open a turn: {out:?}"
+        // And it is not turn-scoped, asserted where the loop can actually
+        // violate it. An earlier version of this test ended with a post-loop
+        // `assert!` that `out` held no `TurnStarted` — a tautology, because
+        // `out` was still the whole-vector `assert_eq!` above, which had already
+        // fixed the vector to exactly one `Compacted`. The property that IS
+        // violable is what a compaction does to a turn already open: it must
+        // neither close it nor open a second one, or a session that compacts
+        // mid-turn would split one turn's usage across two.
+        let mut d = Decoder::new();
+        let opened = d.decode_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"before"}]}}"#,
+        );
+        assert_eq!(opened[0], Decoded::Event(HarnessEvent::TurnStarted { turn: TurnId(0) }));
+        let during = d.decode_line(
+            r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto"}}"#,
+        );
+        assert_eq!(
+            during.len(),
+            1,
+            "a compaction mid-turn emits only itself: {during:?}"
+        );
+        let after = d.decode_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"after"}]}}"#,
+        );
+        assert_eq!(
+            after,
+            vec![Decoded::Event(HarnessEvent::Text {
+                turn: TurnId(0),
+                delta: "after".into()
+            })],
+            "the turn open before the compaction must still be open after it, \
+             with no second TurnStarted: {after:?}"
         );
     }
 
