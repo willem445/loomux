@@ -85,7 +85,7 @@ impl Renderer {
     /// rendered as though it were the pane's own.
     pub fn new(cols: u16) -> Self {
         Renderer {
-            cols: (cols as usize).max(1),
+            cols: (cols as usize).max(20),
             col: 0,
         }
     }
