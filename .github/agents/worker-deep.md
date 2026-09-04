@@ -73,7 +73,25 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
    fail closed on? which of my tests would still pass if I deleted the feature?* Fix
    what you find and say what you looked for in the PR body. `rev-lead` reproduces
    findings rather than reading diffs — the cheapest place to catch a defect is here.
-8. **Mark the PR ready and stop.** `gh pr ready` on the draft from step 6 — update
+8. **Run the pre-report receipt check, then mark ready.** Before every
+   `report("done")` — and again after EVERY push, including a body-only fix
+   (the stale figure is usually collateral of the previous round's own edit,
+   #2168):
+   - (a) from the worktree at the PR head, run
+     `node scripts/pr-body-check.cjs --pr <n>` (#2168 S1) and paste its
+     summary line into the agent layer; MISMATCH must be zero before you
+     report (CHECK rows are sentences to re-read; the script exits 0 always,
+     a report, not a gate);
+   - (b) no figure from recollection: every number in the body is pasted from
+     a command run in this turn, measured at base AND at head;
+   - (c) prefer a property over a count where one exists (#2105 r2);
+   - (d) for every claim the diff EDITS on a permanent surface, list its
+     twins — `node scripts/pr-body-check.cjs --pr <n> --list-claims` plus a
+     grep for the claim's distinctive noun across every root — and re-derive
+     every ordinal and enumeration at head;
+   - (e) a routed non-blocking finding that changes behaviour carries
+     red-before-green, or goes back as "defer to an issue" (#2104 r4).
+9. **Mark the PR ready and stop.** `gh pr ready` on the draft from step 6 — update
    the description with what changed, why, and how it was validated (the CI run, on
    the platform matrix), in the two-layer shape below. Then report.
 
@@ -147,6 +165,11 @@ orchestrator routes to you is in-scope work, not scope creep: it was asked for, 
 usually minutes, and improving the change through the review is the point of having
 one. (Step 2's "never widen the scope on your own initiative" is about work nobody
 asked for; a routed finding is the opposite of that.) Push to the same branch and say
-it is ready for re-review. A reviewer's `pass` goes **stale** the moment you push, so
+it is ready for re-review. After EVERY push — a code fix or a body-only fix alike —
+re-run step 8's receipt check and re-measure every figure the body carries at the
+new base and head: `node scripts/pr-body-check.cjs --pr <n>` from the worktree at
+the PR head, its summary line pasted into the agent layer. The stale figure is
+usually collateral of the previous round's own fix, not of the original draft
+(#2168). A reviewer's `pass` goes **stale** the moment you push, so
 never sneak a "small tidy-up" onto an approved PR expecting it to merge: it will be
 refused, correctly.
