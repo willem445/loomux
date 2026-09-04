@@ -3490,17 +3490,27 @@ impl ReviewVerdict {
     /// pass at this head — see [`body_verified`]. A pass with **no** digest is
     /// covered by neither: unknown is never "unbound, therefore fine".
     ///
-    /// Delegation additionally requires this pass to be bound to the head that
-    /// would merge, which is the whole of what makes it safe: the verification
-    /// lane read the body, and the code this pass approved has not moved since
-    /// it approved it. Without that clause a `pass` from three commits ago
-    /// would ride in on someone else's body review.
+    /// **Both arms require the pass to be bound to the head that would merge**,
+    /// and the delegation arm is the one where that is load-bearing: the
+    /// verification lane read the BODY, and what makes standing in for this
+    /// reviewer honest is that the CODE it approved has not moved since. Without
+    /// it a `pass` from three commits ago would ride in on someone else's body
+    /// review.
+    ///
+    /// It is asked here rather than left to the caller because the two callers
+    /// ask it in different places and one of them did not (#2168 E2, first CI
+    /// read). `mergeq::body_unchanged` filters `!reviewed(head)` before this
+    /// line, so for the gate the clause is a no-op; `reviewdrive`'s
+    /// `lane_pass_settles` had no such filter, and a `pass` bound to a head the
+    /// worker had already fixed read as settling the revision in front of the
+    /// drive — arc 8 skipping the very lane #1871 B1 exists to re-open. A
+    /// predicate whose safety depends on where it is called is not a predicate.
     pub fn pass_covers_body(&self, head: &str, now: Option<&str>, verified: bool) -> bool {
-        if self.verdict != Verdict::Pass || self.body_digest.is_empty() {
+        if self.verdict != Verdict::Pass || self.body_digest.is_empty() || !self.reviewed(head) {
             return false;
         }
         let Some(now) = now.filter(|d| !d.is_empty()) else { return false };
-        self.body_digest == now || (verified && self.reviewed(head))
+        self.body_digest == now || verified
     }
 }
 

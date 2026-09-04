@@ -6252,18 +6252,27 @@ mod tests {
             DriveStep::to(DriveState::GateCheck)
         );
 
-        // **The control on the one axis that carries it.** The same round with
-        // rev-std's pass recorded WITHOUT the mark — an ordinary re-review that
-        // happens to sit at the current digest — still owes lane 1 a brief. An
-        // implementation that accepted any newer pass would answer `gate-check`
-        // here too, and would have weakened `body-unchanged` for every repo.
+        // **The control, on the axis that carries the saving: WHICH step comes
+        // back.** The same round with rev-std's pass recorded WITHOUT the mark
+        // — an ordinary re-review that happens to sit at the current digest —
+        // still owes lane 1 a brief, where the marked round above went straight
+        // to `gate-check`. An implementation that accepted any newer pass would
+        // answer `gate-check` here too, and would have weakened
+        // `body-unchanged` for every repo, driver or no driver.
+        //
+        // The brief it gets is itself a verification round, and that is right
+        // rather than a leak: every required lane has a `pass` bound to this
+        // head, so nothing about the CODE is outstanding and what rev-final is
+        // owed is the body. The grant it carries is simply not needed here —
+        // rev-std's pass already sits at the current digest — which is why the
+        // discriminator in this test is the index and not the flag.
         let unmarked = vec![
             lane_fact("rev-std", Some(Verdict::Pass), "head-a", "d2"),
             lane_fact("rev-final", Some(Verdict::Pass), "head-a", "d1"),
         ];
         assert_eq!(
             decide(&e, &with(unmarked), &limits),
-            DriveStep::OpenLane { index: 1, verify: false }
+            DriveStep::OpenLane { index: 1, verify: true }
         );
 
         // And the delegation is bounded by the HEAD it was granted at: once the
@@ -6588,6 +6597,34 @@ mod tests {
         let all_good = vec![lane_fact("rev-std", Some(Verdict::Pass), "head-a", "d1")];
         assert_eq!(first_stale_lane(&all_good, "head-a", Some("d1")), 1);
         assert_eq!(first_stale_lane(&[], "head-a", Some("d1")), 0);
+
+        // **#2168 E2's delegation never reaches across a head, and this is the
+        // row that pins it here rather than in the gate.** The assertion at the
+        // top of this test is what caught the first cut, where
+        // `pass_covers_body`'s direct arm compared digests without asking
+        // whether the pass was bound to the head that would merge: rev-final's
+        // `pass` at `head-OLD` carried digest `d1`, so it read as settling
+        // `head-a` and arc 8 walked straight past the lane #1871 B1 exists to
+        // re-open. The gate's own loop filters that case out one line earlier,
+        // so only the driver could reach it — a predicate whose safety depends
+        // on where it is called.
+        let across_heads = vec![
+            verified_lane_fact("rev-std", "head-a", "d2"),
+            lane_fact("rev-final", Some(Verdict::Pass), "head-OLD", "d1"),
+        ];
+        assert_eq!(
+            first_stale_lane(&across_heads, "head-a", Some("d2")),
+            1,
+            "a verification of the body may stand in for a pass at THIS head, never for one \n             recorded against code the branch has left"
+        );
+        // The positive control: the same two lanes with rev-final's pass bound
+        // to the live head — so the row above is the head deciding, not a
+        // delegation that never fires.
+        let same_head = vec![
+            verified_lane_fact("rev-std", "head-a", "d2"),
+            lane_fact("rev-final", Some(Verdict::Pass), "head-a", "d1"),
+        ];
+        assert_eq!(first_stale_lane(&same_head, "head-a", Some("d2")), 2);
     }
 
     #[test]
