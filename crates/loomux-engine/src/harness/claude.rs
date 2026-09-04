@@ -301,6 +301,7 @@ impl Decoder {
                 })]
             }
             Some("compact_boundary") => {
+                self.open_turn = None;
                 let meta = v.get("compact_metadata");
                 let trigger = match meta.and_then(|m| m.get("trigger")).and_then(Value::as_str) {
                     Some("manual") => CompactTrigger::Manual,
