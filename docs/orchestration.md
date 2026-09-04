@@ -2595,8 +2595,33 @@ always did, and the audit log says so (`rd-lane-resume-failed`) with what refuse
 the driver waits for that reviewer and hands it the update, rather than starting a second one
 beside it — two panes reviewing one round is two reviews paid for and one verdict slot to put them
 in. The refusal is on the audit log as `rd-lane-duplicate-refused`, naming the pane that already
-has the round. A new *commit* is a different matter: there the reviewer in flight is reading code
-that no longer exists, so a successor is opened for the new revision exactly as before.
+has the round. **"Still writing" means the pane is actually working.** A reviewer that has finished its turn is
+idle, and an idle pane is one the driver would rather type into than replace — so if it turns out
+not to be typeable-into (parked behind a prompt, or with something already queued for it), its
+session is reopened in a fresh pane instead. Before this those two rules could deadlock on one
+pane: too unsettled to type into, too alive to replace, which is what happens on every round whose
+fix was to the PR body alone, because the commit never moves. A new *commit* is a different matter
+again: there the reviewer in flight is reading code that no longer exists, so a successor is opened
+for the new revision exactly as before.
+
+**Driving the same PR again keeps the reviewers you already paid for.** When a drive ends and you
+start another one on the same PR — the usual shape: the gate is satisfied, you decide what to do
+with the findings, then you drive again at the new head — each reviewer's conversation is carried
+over, so it comes back to a PR it has already read instead of starting cold — and it is asked
+again in its own words: "your previous verdict was `pass` at that commit; here is what changed
+since". Nothing the previous drive concluded counts toward the new one; every lane still has to
+answer at the new head before the gate is satisfied. A reviewer whose session can no longer be
+reopened simply starts fresh, as it always did.
+
+**A reviewer's pane going away is noticed, not waited out.** If a lane's pane is killed — by you,
+by the idle reaper, or because the CLI exited — the driver sees it on the next tick and reopens
+that reviewer's session in a fresh pane, rather than sitting there waiting for a verdict that can
+no longer arrive. The audit log records it as `rd-lane-reopened`, naming the pane that went — and who
+ended it, where orrerix knows (a pane that exited on its own says nothing about who). This matters most right after a `cap-refused` notice, which asks you to free a slot by
+killing an idle delegate: a lane that has finished its turn looks idle, and before this killing one
+cost the drive a full hour of silence. A lane whose panes keep dying still parks on
+`held(lane-stalled)` at the usual timeout, measured from when the lane was first asked — replacing
+a pane does not buy it another hour.
 
 **Drives and the merge queue do not overlap, and the exclusion is deliberately not symmetric.** A
 PR with a LIVE drive cannot be queued, and a PR with a queue entry that has not finished cannot be

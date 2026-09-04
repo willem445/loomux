@@ -911,6 +911,106 @@ pub struct LaneRecord {
     pub extra: BTreeMap<String, Value>,
 }
 
+impl LaneRecord {
+    /// This lane's **memory**, carried onto a fresh drive of the same PR and
+    /// nothing else (#2153).
+    ///
+    /// **The gap is the cross-drive boundary, and it is the ordinary path.**
+    /// Inside a live drive the resume is complete: `rd_lane_session` falls back
+    /// from the record to the roster to the merged records, so even a killed
+    /// lane pane resumes its conversation. But lane memory lives only on the
+    /// entry, and `drive_review` on a PR whose previous entry is TERMINAL drops
+    /// that entry and pushes a `DriveEntry::new` with `lanes: []` — so the
+    /// sequence a satisfied gate is designed to produce (satisfied →
+    /// orchestrator dispositions the findings → re-drive) spawned every lane
+    /// cold. Measured on PR #2141: two lanes with live, resolvable sessions
+    /// that had already read the PR once, both re-opened `resumed=false`, on
+    /// the round where the warm session is cheapest.
+    ///
+    /// **What is kept is the conversation and what §7 owns; what is dropped is
+    /// every claim about a revision THIS BUILD CAN NAME.** `briefed_head`,
+    /// `briefed_digest`, `last_verdict`, `at_head` and `spawned_ms` all describe
+    /// the drive that ended, so carrying any of them would have the first tick
+    /// either wait on a brief nobody sent or read a stale verdict as this
+    /// round's answer.
+    ///
+    /// **`extra` is the disclosed exception, and the qualifier above is what
+    /// makes this doc honest** (#2169 review 2, premortem 2). That field is by
+    /// construction the lane fields this build has no name for
+    /// ([`ReviewDrivesState`]), and it is carried across rather than dropped
+    /// because "a field a newer build wrote is not this build's to erase" is
+    /// the rule the whole passthrough exists for — an older binary that
+    /// silently deleted one would be the data-loss this type is designed to
+    /// prevent. The residual is the mirror of that: if a FUTURE build stores a
+    /// revision-scoped lane field in `extra`, an older binary performing the
+    /// re-drive carries that build's claim about the round that just ended into
+    /// the new one, and cannot know it did. No test can reach it — a fixture
+    /// would have to invent a field the code does not know — so it is stated
+    /// here and its trigger named: **any new per-revision lane field must be
+    /// cleared in this function at the same time it is added.** Every field
+    /// this build knows about is named above, so that check is a read of one
+    /// function rather than a search.
+    /// `lane_open_for` is then false for every head, which is what makes the
+    /// first tick BRIEF each lane rather than wait on it.
+    ///
+    /// **That is a claim about the RECORD, not about what the brief says.** The
+    /// verdict FILE outlives the drive that produced it, and the tick re-reads
+    /// it through the gate's own parser as it does on every other tick — so
+    /// [`DriveEntry::record_verdict_seen`] re-derives `last_verdict`/`at_head`
+    /// from the file before the brief is built, and a lane that really did
+    /// answer gets the §5.5 delta template naming the head it answered at. That
+    /// is #2109's point rather than a leak past this one: a reviewer is asked
+    /// again in its own conversation instead of being replaced by a stranger who
+    /// is told what "its" previous verdict had been. What clearing the pair buys
+    /// is that the new entry asserts nothing this drive has not itself read —
+    /// so a first tick whose verdict file is absent or unreadable brief this
+    /// lane as new rather than as having answered.
+    ///
+    /// **The pane moves to `prior_agents` rather than staying current.** It is
+    /// still this drive's to intercept — a reviewer finishing its previous
+    /// round must not report to the orchestrator as if undriven — but it is no
+    /// longer the pane the drive would speak to, and [`DrivenPane::current`] is
+    /// exactly that distinction. Leaving it as `agent` would also make
+    /// `rd_live_lane_pane` treat it as a duplicate and `pane_dead` treat its
+    /// death as this drive's, both of which are claims about a round that is
+    /// over.
+    ///
+    /// `spawned_ms` goes to zero: it is the `lane-stalled` anchor, and a lane
+    /// that has not been briefed has not been silent.
+    ///
+    /// **`session` is passed in rather than copied off this record**, and that
+    /// is #2109's lesson applied one boundary over: `LaneRecord::session` is
+    /// what the spawn RETURNED, which is a session id only on a CLI that
+    /// pre-assigns one, so a copilot or opencode lane carries `""` for its whole
+    /// life and its conversation lives on the pane and the roster row instead.
+    /// A seed built from this field alone would therefore drop exactly the lanes
+    /// #2109 was about. The caller resolves it through `rd_lane_session` — the
+    /// one function that knows all three sources — and hands the answer here.
+    pub fn reseeded(&self, session: &str) -> LaneRecord {
+        let mut prior = self.prior_agents.clone();
+        prior.push(self.agent.clone());
+        LaneRecord {
+            block: self.block.clone(),
+            session: session.to_string(),
+            agent: String::new(),
+            // `""` as the "superseding" pane, which `retain_panes` treats as no
+            // pane at all — it drops empties either way, so nothing is excluded
+            // by it and the dedup and ordering still apply.
+            prior_agents: retain_panes(prior, ""),
+            last_verdict: None,
+            at_head: String::new(),
+            briefed_head: String::new(),
+            briefed_digest: String::new(),
+            spawned_ms: 0,
+            // Preserved for `ReviewDrivesState`'s reason: a field a newer build
+            // wrote is not this build's to drop. **This is the one thing here
+            // that is NOT re-derived**, and the doc above names the residual it
+            // leaves and the trigger that would close it.
+            extra: self.extra.clone(),
+        }
+    }
+}
+
 /// Which side of a drive an agent is — the answer §7's interception asks of
 /// every incoming `report` and `review_verdict`.
 ///
@@ -1947,6 +2047,12 @@ impl DriveEntry {
     /// reads as "cannot tell" rather than as drift.
     /// **The superseded pane is carried, not dropped** — see
     /// [`LaneRecord::prior_agents`].
+    ///
+    /// **`spawned_ms` is the `lane-stalled` ANCHOR the caller chose, not a
+    /// clock read** (#2163). For an ordinary brief it is `now`; for the re-open
+    /// of a lane whose pane DIED it is the anchor the previous brief set, so
+    /// replacing a dead pane cannot hand the lane a fresh hour of silence.
+    /// [`lane_stall_anchor`] is that choice, made in one place.
     pub fn open_lane(
         &mut self,
         block: &str,
@@ -1954,7 +2060,7 @@ impl DriveEntry {
         agent: &str,
         head: &str,
         body_digest: Option<&str>,
-        now_ms: u64,
+        spawned_ms: u64,
     ) {
         let prior = self.lane(block).map(|l| {
             let mut p = l.prior_agents.clone();
@@ -1975,7 +2081,7 @@ impl DriveEntry {
             at_head: String::new(),
             briefed_head: head.to_string(),
             briefed_digest: body_digest.unwrap_or_default().to_string(),
-            spawned_ms: now_ms,
+            spawned_ms,
             extra,
         });
     }
@@ -2457,12 +2563,37 @@ pub enum GateOutcome {
     Unreadable,
 }
 
-/// One lane's live reading: the block the gate named, and the verdict file as
-/// `workflow::parse_verdict_file` returned it (or `None` for no verdict yet).
+/// One lane's live reading: the block the gate named, the verdict file as
+/// `workflow::parse_verdict_file` returned it (or `None` for no verdict yet),
+/// and whether the pane this drive recorded for that lane is GONE.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaneFact {
     pub block: BlockId,
     pub verdict: Option<ReviewVerdict>,
+    /// **The recorded pane is positively [`AgentStatus::Dead`]** (#2163) — the
+    /// lane-side twin of the `worker_exit` observation `fix-wait` has had since
+    /// #1961, and read for the same reason: `review-wait` waits for a verdict
+    /// that a dead pane can never produce.
+    ///
+    /// Before this the exit was observed only for the worker and only in
+    /// `fix-wait` — this module's own comment said so, and gave the reason as
+    /// "`review-wait` has `lane-stalled` for its own panes". That bound is
+    /// `lane_timeout_minutes` (60 at stock knobs) measured from the brief, so a
+    /// reviewer pane killed at minute twelve left the drive silent for
+    /// forty-eight more with no rd-* row at all — measured on PR #2140, and
+    /// reached on the driver's OWN advice, since a `cap-refused` notice tells
+    /// an orchestrator to kill an idle delegate and a lane that has finished
+    /// its turn is on that list.
+    ///
+    /// **`false` is "we could not check" as well as "it is alive"**, and the
+    /// fail direction is deliberate: the same asymmetry
+    /// [`DriveEntry::forget_dead_panes`] states, resolved the same way
+    /// `rd_pane_exit` resolves it — only a positive `Dead` counts, so an
+    /// emptied agent map (a restart) re-opens nothing.
+    ///
+    /// A lane with no record, or one whose record carries no pane, is `false`:
+    /// there is no pane to be dead, and the lane is opened by the ordinary path.
+    pub pane_dead: bool,
 }
 
 /// Everything [`decide`] is allowed to know. Read by the tick, immediately
@@ -2615,6 +2746,78 @@ pub fn lane_open_for(rec: &LaneRecord, head: &str, body_digest: Option<&str>) ->
             rec.briefed_digest == now
         }
         _ => true,
+    }
+}
+
+/// The `lane-stalled` anchor [`DriveEntry::open_lane`] must be given for the
+/// brief about to be sent — `now_ms` for an ordinary one, and the anchor
+/// already on the record when this brief is only REPLACING a dead pane (#2163).
+///
+/// **The re-open must not re-arm the clock, and that is what bounds the
+/// re-open.** `decide_review_wait` re-opens a lane whose recorded pane is
+/// `Dead`, so a pane that dies on every spawn would be replaced on every tick
+/// for as long as the drive lives if each replacement started the silence
+/// timer over. Preserving the anchor makes `lane-stalled` reachable through the
+/// loop: the lane parks at `lane_timeout_minutes` from the ORIGINAL brief,
+/// naming itself, and the notice's own remedy (read that pane) is the right one.
+///
+/// **It is also the more honest reading of the field.** `spawned_ms` anchors a
+/// SILENCE test — `decide_review_wait`'s stall arm exempts a lane that has
+/// answered — and a pane dying and being replaced does not make a lane less
+/// silent about the head it was asked about. Re-arming would be the
+/// defeat-your-own-bound shape `decide`'s empty-head guard describes.
+///
+/// **Only for a replacement at the SAME REVISION, and the revision is the full
+/// `(head, digest)` key** — [`lane_open_for`], the one place that comparison is
+/// written. A lane with no record, or one whose recorded pane is alive (an
+/// ordinary re-brief, a reuse fall-through), gets `now_ms` too: nothing about
+/// those is a replacement.
+///
+/// **The digest half is not decoration, and keying on the head alone was an
+/// asymmetry** (#2169 review 2, N1). This module treats `(head, digest)` as ONE
+/// revision key — §5.2 says so in as many words, `lane_open_for` implements it,
+/// and a verdict binds to both — so a head-only test here answered "same round"
+/// for a case the rest of the module calls a new one: a lane briefed at
+/// `(H, d1)` whose pane dies, followed by a BODY-ONLY fix moving the digest to
+/// `d2`, re-opens with a reviewer that has read nothing and inherits the
+/// original anchor. Fifty minutes in, that fresh reviewer had nine minutes
+/// before `held(lane-stalled)` — while the *same* body-only fix under a LIVE
+/// idle pane re-arms to `now` and gets the full window, which is the same
+/// revision getting two different clocks depending on whether a pane happened
+/// to die.
+///
+/// **And the bound does not need the digest case.** The runaway this exists to
+/// stop is a pane that dies on every spawn, which loops on the tick's own clock
+/// with nothing else moving; a digest only moves when a human or a worker edits
+/// the PR body, so it cannot drive a loop. Widening the exception to a new
+/// revision therefore costs the bound nothing.
+///
+/// An **unknown** live digest does not re-arm: `lane_open_for` reads "we could
+/// not check" as still-open rather than as drift, which is the same asymmetry
+/// [`ReviewVerdict::body_changed`] encodes and the fail-safe direction here —
+/// one transient `gh` failure to read a PR body must not hand every dying lane
+/// a fresh hour.
+///
+/// A recorded anchor of `0` is a pre-field row, which is "unset" rather than
+/// "the epoch"; it takes `now_ms` for the same reason `fix_handback_ms == 0`
+/// means ancient rather than unset elsewhere in this module.
+pub fn lane_stall_anchor(
+    rec: Option<&LaneRecord>,
+    head: &str,
+    body_digest: Option<&str>,
+    pane_dead: bool,
+    now_ms: u64,
+) -> u64 {
+    match rec {
+        Some(r)
+            if pane_dead
+                && !head.is_empty()
+                && lane_open_for(r, head, body_digest)
+                && r.spawned_ms != 0 =>
+        {
+            r.spawned_ms
+        }
+        _ => now_ms,
     }
 }
 
@@ -2889,7 +3092,31 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                 {
                     DriveStep::held(HeldReason::LaneStalled)
                 }
-                Some(rec) if lane_open_for(rec, &facts.head, digest) => DriveStep::Wait,
+                // **A lane whose pane is GONE is not a lane to wait for**
+                // (#2163). `lane_open_for` answers "was this lane asked about
+                // this revision", which stays true forever after the pane that
+                // was asked has exited — so a killed reviewer left this state
+                // waiting on a verdict nothing could produce, with `lane-stalled`
+                // an hour away and not one rd-* row in between.
+                //
+                // Read AFTER the stall arm, and the ordering is the bound. A
+                // pane that dies on every spawn would otherwise be re-opened for
+                // ever: this arm answers first on every tick, so the stall arm
+                // would never be evaluated. Below it, and with the re-open
+                // PRESERVING `spawned_ms` (see [`lane_stall_anchor`]), a lane
+                // whose panes keep dying still reaches `lane_timeout_minutes`
+                // from the ORIGINAL brief and parks `held(lane-stalled)` naming
+                // it — which is the true statement about that lane anyway: it
+                // has been silent about this head for an hour.
+                //
+                // What the re-open costs is one pane on a session the lane
+                // already has, which `rd_lane_session` resolves from the record,
+                // the roster or the merged records; a session that no longer
+                // resolves falls to the existing `rd-lane-resume-failed` →
+                // fresh-spawn path.
+                Some(rec) if lane_open_for(rec, &facts.head, digest) && !lane.pane_dead => {
+                    DriveStep::Wait
+                }
                 // **The cap's starvation is reported before another spawn is
                 // proposed** (#2109). The tick stamps
                 // `cap_starved_since_ms` on the first lane spawn the
@@ -4151,6 +4378,9 @@ mod tests {
                 summary: String::new(),
                 ts_ms: 0,
             }),
+            // The overwhelmingly common reading, so it is the helper's default
+            // and `pane_dead` is set by the one test that is about it (#2163).
+            pane_dead: false,
         }
     }
 
@@ -4336,8 +4566,9 @@ mod tests {
     /// something else — a human re-tasking it, another drive taking it over. The
     /// re-brief the moved digest calls for cannot be delivered (the reuse arm
     /// needs an idle pane) and must not be spawned beside it (#2109's duplicate
-    /// refusal), while `lane-stalled` is exempt because the lane did answer. So
-    /// the drive retries and audits two rows a tick.
+    /// refusal, which #2162 narrowed to exactly this busy case), while
+    /// `lane-stalled` is exempt because the lane did answer. So the drive
+    /// retries and audits two rows a tick.
     ///
     /// **What #2110 changed is the exit, and only the exit.** #2109 disclosed
     /// this gap and said closing it needs a per-lane refusal clock, "which
@@ -4415,6 +4646,188 @@ mod tests {
             DriveStep::held(HeldReason::StateStalled),
             "…and time in `review-wait` is what ends it now, where before #2110 nothing \
              but the twelve-hour age could"
+        );
+    }
+
+    /// **#2153: a re-drive carries the CONVERSATION and nothing that describes a
+    /// revision.**
+    ///
+    /// Every field is asserted, and that is deliberate rather than exhaustive
+    /// for its own sake: this record is what the next drive's first tick decides
+    /// from, and each field it must NOT carry produces a different wrong answer.
+    /// A carried `briefed_head`/`briefed_digest` makes `lane_open_for` true, so
+    /// the first tick waits on a brief nobody sent; a carried `last_verdict` and
+    /// `at_head` make `lane_has_answered` true, so the delta template describes
+    /// a round that is over and the duplicate guard reads the previous drive's
+    /// pane as holding this one; a carried `spawned_ms` starts `lane-stalled`
+    /// counting from a brief in another drive's lifetime; and a carried `agent`
+    /// makes a pane the new drive never spoke to its CURRENT one.
+    #[test]
+    fn a_reseeded_lane_keeps_its_session_and_its_owned_panes_and_no_claim_about_a_revision() {
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.open_lane("rev-std", "sess-1", "rev-4", "head-a", Some("d1"), 1_000);
+        e.open_lane("rev-std", "sess-1", "rev-9", "head-a", Some("d1"), 2_000);
+        assert!(e.record_verdict_seen("rev-std", Verdict::Fail, "head-a"));
+        let before = e.lane("rev-std").expect("the fixture's own premise").clone();
+        assert_eq!(before.prior_agents, vec!["rev-4".to_string()], "the fixture: one supersede");
+
+        let after = before.reseeded("sess-resolved");
+        assert_eq!(after.block, "rev-std", "the lane is the same lane");
+        assert_eq!(
+            after.session, "sess-resolved",
+            "and it carries the session the CALLER resolved, not the one on the record — a \
+             lane on a CLI that mints its session after boot has `\"\"` here for its whole \
+             life, and seeding off this field would drop exactly those lanes (#2109)"
+        );
+        assert_eq!(
+            after.agent, "",
+            "the previous drive's pane is not this drive's CURRENT one — leaving it here \
+             would have the duplicate guard read it as holding this round and `pane_dead` \
+             read its death as this drive's"
+        );
+        assert_eq!(
+            after.prior_agents,
+            vec!["rev-4".to_string(), "rev-9".to_string()],
+            "…but both panes are still OWNED, oldest first, so a reviewer finishing the \
+             previous round is intercepted rather than reporting as if undriven (§7)"
+        );
+        assert_eq!(after.last_verdict, None, "the previous drive's answer is not this one's");
+        assert_eq!(after.at_head, "", "…and nothing may claim this lane has answered here");
+        assert_eq!(after.briefed_head, "", "…nor that it has been asked");
+        assert_eq!(after.briefed_digest, "");
+        assert_eq!(after.spawned_ms, 0, "a lane that has not been briefed has not been silent");
+    }
+
+    /// **#2163: a lane whose pane is GONE is re-opened, not waited for — and
+    /// the stall arm still outranks that.**
+    ///
+    /// `lane_open_for` answers "was this lane ASKED about this revision", which
+    /// stays true for ever after the pane that was asked has exited. So a killed
+    /// reviewer left `review-wait` waiting on a verdict nothing could produce
+    /// until `lane-stalled` an hour later — measured on PR #2140 as 25+ minutes
+    /// with no rd-* row at all, and reached on the driver's own advice.
+    ///
+    /// **The live arm is the control, and it is not decoration**: without it an
+    /// implementation that re-opened on every tick regardless of the pane would
+    /// pass the dead arm and destroy the wait this state is made of.
+    ///
+    /// **The ordering arm is the BOUND.** A pane that dies on every spawn must
+    /// not be replaced for ever; the stall arm is read first, so a lane whose
+    /// panes keep dying reaches `lane_timeout_minutes` — from the ORIGINAL
+    /// brief, which is what [`lane_stall_anchor`] preserves — and parks
+    /// `held(lane-stalled)` naming itself. Asserting it here is what makes that
+    /// bound a property rather than a hope.
+    #[test]
+    fn a_lane_whose_pane_died_is_re_opened_and_a_live_one_is_still_waited_for() {
+        let limits = DriveLimits::default();
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-a".into();
+        e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000);
+        let facts = |dead: bool, now: u64| DriveFacts {
+            now_ms: now,
+            required_lanes: Some(vec![LaneFact {
+                pane_dead: dead,
+                ..lane_fact("rev-std", None, "", "")
+            }]),
+            ..facts_at("head-a")
+        };
+
+        assert_eq!(
+            decide(&e, &facts(false, 2_000), &limits),
+            DriveStep::Wait,
+            "the control: a lane open at this revision with a LIVE pane is one to wait for, \
+             and re-opening it would be a second reviewer per tick"
+        );
+        assert_eq!(
+            decide(&e, &facts(true, 2_000), &limits),
+            DriveStep::OpenLane { index: 0 },
+            "a lane whose recorded pane is gone is one to re-open — `lane_open_for` says it \
+             was ASKED, which a dead pane cannot un-say and cannot answer"
+        );
+
+        // The bound on a pane that keeps dying: past the lane timeout the stall
+        // arm answers first, and it is reached because the re-open preserves the
+        // anchor rather than re-arming it.
+        let stalled = 1_000 + minutes_ms(limits.lane_timeout_minutes);
+        assert_eq!(
+            decide(&e, &facts(true, stalled - 1), &limits),
+            DriveStep::OpenLane { index: 0 },
+            "…one tick short, so the hold below is the timeout and not a coincidence"
+        );
+        assert_eq!(
+            decide(&e, &facts(true, stalled), &limits),
+            DriveStep::held(HeldReason::LaneStalled),
+            "…and the silence bound still outranks the re-open, which is what stops a pane \
+             that dies on every spawn from being replaced for ever"
+        );
+    }
+
+    /// **#2163: replacing a dead pane keeps the silence clock where it was.**
+    ///
+    /// [`lane_stall_anchor`] is what makes the bound in the test above
+    /// REACHABLE: `open_lane` writes whatever anchor it is given, so a re-open
+    /// that passed `now` would restart `lane-stalled` on every death and the
+    /// loop would run until the drive's own age bound.
+    ///
+    /// Six rows, each killing an implementation the others let through. Always
+    /// returning `now_ms` fails row 1; always returning the record's value fails
+    /// rows 2, 3 and 5; ignoring the head fails row 2.
+    ///
+    /// **Rows 3 and 4 are #2169 review 2's N1, and the first version of this
+    /// table did not have them** — that is the finding, not a footnote. Four
+    /// rows read as discriminating while leaving the DIGEST half of the
+    /// revision key untested, because the function took no digest at all: a
+    /// head-only implementation passed every one of them. Row 3 is the case
+    /// that exposed (a lane whose pane died, then a body-only fix moving the
+    /// digest, inheriting an anchor a reviewer that has read nothing did not
+    /// earn); row 4 is its own control, so "re-arm whenever the digest does not
+    /// match" — which would re-arm on an unreadable body too — cannot pass row 3
+    /// by being wrong in the other direction.
+    ///
+    /// A test that cannot express an axis is a test that does not pin it, and
+    /// the missing axis was in the SIGNATURE rather than in the rows.
+    #[test]
+    fn a_dead_panes_replacement_inherits_the_stall_anchor_and_a_new_round_does_not() {
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000);
+        let rec = || e.lane("rev-std");
+
+        let d1 = Some("d1");
+        let observed = vec![
+            ("dead pane, same revision", lane_stall_anchor(rec(), "head-a", d1, true, 9_000)),
+            ("dead pane, new head", lane_stall_anchor(rec(), "head-b", d1, true, 9_000)),
+            // The row #2169 review 2 (N1) showed was unpinned: same head, moved
+            // DIGEST. A head-only implementation answers 1_000 here and passes
+            // every other row in this table unchanged.
+            ("dead pane, moved digest", lane_stall_anchor(rec(), "head-a", Some("d2"), true, 9_000)),
+            // …and its own control: an UNKNOWN live digest is "we could not
+            // check", not drift, so it still inherits. Without this row an
+            // implementation that re-armed on any non-matching digest — `None`
+            // included — passes the row above.
+            ("dead pane, digest unknown", lane_stall_anchor(rec(), "head-a", None, true, 9_000)),
+            ("live pane, same revision", lane_stall_anchor(rec(), "head-a", d1, false, 9_000)),
+            ("no record at all", lane_stall_anchor(None, "head-a", d1, true, 9_000)),
+        ];
+        let expected = vec![
+            // The replacement inherits the silence this lane has already spent.
+            ("dead pane, same revision", 1_000),
+            // A new revision is a new round, owed the full window — and the
+            // revision is the FULL key, so either half moving is a new one.
+            ("dead pane, new head", 9_000),
+            ("dead pane, moved digest", 9_000),
+            ("dead pane, digest unknown", 1_000),
+            // Not a replacement — an ordinary re-brief re-arms, as it always has.
+            ("live pane, same revision", 9_000),
+            ("no record at all", 9_000),
+        ];
+        assert_eq!(
+            observed, expected,
+            "each row is (fixture, the `spawned_ms` the next brief must carry). A `9_000` on \
+             row 1 hands a lane whose pane keeps dying a fresh hour on every death, so \
+             `lane-stalled` never fires and nothing per-lane bounds the loop. A `1_000` on \
+             the `new head`, `moved digest` or `live pane` rows stalls a lane that has not \
+             been silent at all — and on `moved digest` it does so to a reviewer that has \
+             read nothing, while the same body-only fix under a live pane gets a full window."
         );
     }
 

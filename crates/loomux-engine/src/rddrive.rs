@@ -484,13 +484,33 @@ pub mod audit_action {
     /// looks like on this log too.
     pub const LANE_RESUME_FAILED: &str = "rd-lane-resume-failed";
     /// A lane spawn was refused because this block already has a LIVE pane
-    /// briefed at this head (#2109) — the duplicate, named rather than opened.
+    /// **working on** this head (#2109, narrowed by #2162) — the duplicate,
+    /// named rather than opened.
+    ///
+    /// "Working" rather than merely live is not a restatement: a pane that has
+    /// finished its turn is idle, the reuse arm's readiness decline can only
+    /// ever name an idle pane, and refusing a replacement for one that had just
+    /// been declined left the drive with no lane at all.
     ///
     /// Distinct from [`REFUSED`], which is a tool-call refusal from §5.1's
     /// closed vocabulary; this is a spawn the driver declined to make. Carries
     /// `block`, `head` and the `pane` that already holds the round, because
     /// the refusal's only other visible effect is a tick that did nothing.
     pub const LANE_DUPLICATE_REFUSED: &str = "rd-lane-duplicate-refused";
+    /// A lane was re-opened because the pane this drive recorded for it had
+    /// **died** (#2163), carrying the dead `pane`, who ended it (`killed_by`,
+    /// `null` where orrerix does not know) and the `agent` that replaced it.
+    ///
+    /// Its own action rather than a [`LANE_SPAWNED`] detail, for [`CI_RED`]'s
+    /// reason: a reader asking "did this drive ever lose a reviewer pane" must
+    /// not have to match every row where it did not. It says what a
+    /// `rd-lane-spawned … resumed=true` alone cannot — that the previous pane
+    /// is gone and who ended it — which is the whole of what an orchestrator
+    /// that has just killed an idle delegate needs to read.
+    ///
+    /// The row is written on the SPAWN succeeding, never on the intent: a
+    /// re-open that the cap refuses has re-opened nothing.
+    pub const LANE_REOPENED: &str = "rd-lane-reopened";
     /// A lane's verdict was read at this revision.
     pub const VERDICT: &str = "rd-verdict";
     /// The worker's session was resumed with a hand-back brief.

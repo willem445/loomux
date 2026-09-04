@@ -34,8 +34,8 @@ use loomux_lib::orchestration::mqdriver::CmdOut;
 use loomux_lib::orchestration::rddrive::RdRunner;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    pane_delivery_readiness, AgentStatus, Caller, Delivery, GroupId, Guardrails, Launch,
-    OrchRegistry, PaneNotReady, RdDriveReport, Role, TaskPatch,
+    pane_delivery_readiness, AgentStatus, Caller, Delivery, ExitInitiator, GroupId, Guardrails,
+    Launch, OrchRegistry, PaneNotReady, RdDriveReport, Role, TaskPatch,
 };
 use serde_json::json;
 
@@ -103,6 +103,10 @@ fn lane_fact(block: &str, v: Option<Verdict>, at_head: &str, digest: &str) -> La
             summary: String::new(),
             ts_ms: 0,
         }),
+        // #2163's axis, defaulted to the common reading; the tick fills it from
+        // the entry and the agent map, and the tests that are ABOUT it drive a
+        // real pane to `Dead` through the seam rather than setting it here.
+        pane_dead: false,
     }
 }
 
@@ -5750,6 +5754,399 @@ fn a_block_that_already_has_a_live_pane_at_this_head_is_refused_a_second_lane() 
         rows_for(&reg, &group, "rd-lane-duplicate-refused").len(),
         1,
         "so no second refusal was recorded either"
+    );
+}
+
+// ── #2162: a declined pane is not a pane that is still reviewing ────────────
+
+/// **#2162.** A round whose fix is BODY-ONLY re-opens its lane instead of
+/// deadlocking on the very pane the reuse arm has just declined.
+///
+/// The measured failure (PR #2140, v1.3.0-beta6) is two guards composing, each
+/// right alone and both about ONE pane. `rd_reuse_pane` declined the lane's own
+/// pane on readiness — the #2089 class, `unconfirmed` — and #2109's duplicate
+/// guard then refused a replacement because that same pane was "live … briefed
+/// at this head", which is true precisely because a body-only fix cannot move
+/// the head. Too unconfirmed to reuse and too live to replace: 38 minutes with
+/// no lane open, the same three rows every tick, `lane-stalled` structurally
+/// unreachable because its arm exempts the lane that has answered, and a human
+/// in the end killing the pane.
+///
+/// **The fixture reproduces the incident's own state, not a shortcut to it.**
+/// The reuse arm only ever considers an IDLE pane, so `rd-reuse-declined`
+/// appearing at all proves the pane was idle — this lane therefore reports
+/// (which is what stamps `idle_since_ms`) and its last delivery is on record as
+/// not having landed, which is the exact pair the audit rows on #2162 show.
+/// Both PR-body seams are set, because `review_verdict` digests what `pr_body`
+/// answers while the drive digests what `observe_pr` read: left unset the
+/// verdict records an EMPTY digest, `body_changed` answers "cannot tell", the
+/// stale `fail` reads as CURRENT, and the drive hands the worker back a second
+/// time instead of ever reaching the re-brief.
+///
+/// **The negative control is `a_block_that_already_has_a_live_pane_at_this_head_
+/// is_refused_a_second_lane`**, which moves the same body under the same head
+/// with the one difference that decides — that lane's pane never went idle.
+/// Duplicating its assertions here would make a red ambiguous between the two.
+#[test]
+fn a_body_only_fix_round_re_opens_the_lane_whose_pane_went_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, lane) = lane_round_one(&reg, &repo, &gh);
+    reg.set_pr_body_override(Some("b".to_string()));
+    assert!(
+        reg.agent(&lane).expect("the lane is on the roster").idle_since_ms.is_none(),
+        "the control: a lane spawned WITH a brief is working, and a working pane is what \
+         #2109's refusal is for"
+    );
+
+    // The lane answers `fail` at HEAD_A and then reports, which is what ends its
+    // turn and stamps the idle signal the reuse arm reads.
+    let reviewer = Caller {
+        agent_id: lane.clone(),
+        group: group.clone(),
+        role: Role::Reviewer,
+        role_hint: None,
+    };
+    dispatch(
+        &reg,
+        &reviewer,
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "fail", "summary": "fail - one stale byte count" } }),
+    )
+    .expect("the lane records its verdict");
+    dispatch(
+        &reg,
+        &reviewer,
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "request_changes", "note": "one stale byte count", "ref": "#1758" } }),
+    )
+    .expect("the lane reports, which ends its turn");
+    assert!(
+        reg.agent(&lane).expect("the lane is on the roster").idle_since_ms.is_some(),
+        "the fixture's premise: that pane has finished its turn"
+    );
+    // …and its last delivery is on record as not having landed, so the reuse
+    // arm will decline it. This is the pane's own pty, which a reuse candidate
+    // must have.
+    with_pane(&reg, &lane, 7002);
+    make_pane_ready(&reg, 7002, false);
+
+    // Arc 5: the fail routes, spending a round, and the worker is handed back.
+    let handed = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, worker) = handed
+        .handbacks
+        .first()
+        .cloned()
+        .expect("a current fail hands the PR back to its worker");
+    assert_eq!(status_state(&reg, &group), "fix-wait");
+
+    // The fix is BODY-ONLY: the body moves, the head does not.
+    gh.set_body("b2");
+    reg.set_pr_body_override(Some("b2".to_string()));
+    dispatch(
+        &reg,
+        &Caller { agent_id: worker, group: group.clone(), role: Role::Worker, role_hint: None },
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "done", "note": "body fixed", "ref": "#1758" } }),
+    )
+    .expect("a driven worker reports");
+
+    // Arc 8 back to `review-wait` at the same head…
+    reg.rd_drive_group_with(&group, &gh, 40_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "review-wait",
+        "the fixture's premise: arc 8 returns at an UNCHANGED head, which is the only \
+         shape this defect has"
+    );
+
+    // …and the very next tick must open the lane again rather than refuse it.
+    let reopened = reg.rd_drive_group_with(&group, &gh, 50_000);
+    let (_pr, _b, lane2) = reopened.lanes_opened.first().cloned().unwrap_or_else(|| {
+        panic!(
+            "the pane the reuse arm just declined was then refused as a duplicate of itself \
+             — the #2162 deadlock. duplicate refusals: {:?}",
+            rows_for(&reg, &group, "rd-lane-duplicate-refused")
+        )
+    });
+    let declined = rows_for(&reg, &group, "rd-reuse-declined");
+    assert_eq!(
+        declined.len(),
+        1,
+        "the deadlock's other half must really have happened, or this test is about a pane \
+         nobody tried to reuse: {declined:?}"
+    );
+    assert_eq!(declined[0]["pane"], json!(lane), "…and it is THIS lane's pane: {declined:?}");
+    assert_eq!(declined[0]["reason"], json!("unconfirmed"), "…for the incident's own reason");
+    assert!(
+        rows_for(&reg, &group, "rd-lane-duplicate-refused").is_empty(),
+        "one pane cannot be both too unsettled to type into and too busy to replace: {:?}",
+        rows_for(&reg, &group, "rd-lane-duplicate-refused")
+    );
+    assert_ne!(lane2, lane, "the delta goes to a pane that will read it");
+
+    // The conversation is kept — what makes this a resume rather than a fresh
+    // reviewer paying for a cold PR read.
+    let rows = lane_spawn_rows(&reg, &group);
+    assert_eq!(rows.len(), 2, "one spawn per round, and exactly two rounds: {rows:?}");
+    assert_eq!(rows[1]["resumed"], json!(true), "the re-brief is a resume: {rows:?}");
+    assert_eq!(
+        rows[1]["session"], rows[0]["session"],
+        "…of the SAME conversation, not a new one that happens to be filed as a resume: \
+         {rows:?}"
+    );
+
+    // §7 still owns the pane the re-brief superseded: a late report from it is
+    // consumed rather than reaching the orchestrator as if undriven. That is
+    // `prior_agents` doing its job across a supersede the refusal used to make
+    // impossible.
+    dispatch(
+        &reg,
+        &reviewer,
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "done", "note": "a late word from the superseded pane", "ref": "#1758" } }),
+    )
+    .expect("a superseded lane may still report");
+    assert!(
+        !delivered_texts(&reg, &group).iter().any(|t| t.contains("a late word")),
+        "the superseded pane's late report reached the orchestrator's pane"
+    );
+}
+
+// ── #2153: a re-drive keeps the lanes' conversations ────────────────────────
+
+/// **#2153.** A drive started on a PR whose previous drive is over resumes each
+/// lane's conversation instead of spawning it cold — and a lane whose session
+/// can no longer be reopened still falls through to a fresh pane, on the record.
+///
+/// The gap is the CROSS-DRIVE boundary, and it is the ordinary path rather than
+/// an edge: satisfied → the orchestrator dispositions the findings → re-drive is
+/// the sequence a satisfied gate is designed to produce. Lane memory lives only
+/// on the entry, and `drive_review` replaces a terminal entry with a
+/// `DriveEntry::new`, so it went with it. Measured on PR #2141: both lanes
+/// re-opened `resumed=false` although each had a live, resolvable session that
+/// had already read the PR once.
+///
+/// **The gone-session arm is the control**, and it is not decoration: without it
+/// this test passes under an implementation that seeded a session it never
+/// checked and then reported every fresh spawn as a resume. It also pins the
+/// fail direction — toward a COLD lane, never toward a brief on a conversation
+/// that is not there.
+#[test]
+fn a_re_drive_resumes_each_lanes_conversation_and_a_lost_one_still_opens_fresh() {
+    // (arm, resumed on the re-drive's first lane open, `rd-lane-resume-failed` rows)
+    type Row = (&'static str, bool, usize);
+    let mut observed: Vec<Row> = Vec::new();
+
+    for arm in ["warm", "session-gone"] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let (group, session) = driven(&reg, &repo, &gh);
+        let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+        with_pane(&reg, &orch.id, 7001);
+        reg.set_pr_head_override(Some(HEAD_A.to_string()));
+        reg.set_pr_body_override(Some("b".to_string()));
+
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+        let (_pr, _b, lane) =
+            first.lanes_opened.first().cloned().unwrap_or_else(|| panic!("{arm}: lane 0 opens"));
+        assert_eq!(
+            lane_spawn_rows(&reg, &group)[0]["resumed"],
+            json!(false),
+            "{arm}: the control — a first round is never a resume"
+        );
+
+        // The lane passes, the gate is satisfied, and the drive ends.
+        dispatch(
+            &reg,
+            &Caller {
+                agent_id: lane.clone(),
+                group: group.clone(),
+                role: Role::Reviewer,
+                role_hint: None,
+            },
+            "tools/call",
+            &json!({ "name": "review_verdict", "arguments": {
+                "pr": "1758", "verdict": "pass", "summary": "pass - nothing blocking" } }),
+        )
+        .unwrap_or_else(|e| panic!("{arm}: the lane records: {e:?}"));
+        reg.rd_drive_group_with(&group, &gh, 30_000); // review-wait -> gate-check
+        reg.rd_drive_group_with(&group, &gh, 40_000); // gate-check -> satisfied
+        assert!(
+            reg.review_drive_status(&group)["drives"].as_array().is_some_and(|d| d.is_empty()),
+            "{arm}: the fixture's premise — the previous drive really is TERMINAL, which is \
+             the only state that reaches the replace branch: {}",
+            reg.review_drive_status(&group)
+        );
+
+        if arm == "session-gone" {
+            // The same refusal a reaped worktree produces: the recorded
+            // workspace is gone, so the resume cannot be performed (#338/#359).
+            let cwd = reg.agent(&lane).expect("the lane is on the roster").cwd;
+            std::fs::remove_dir_all(&cwd).expect("take the lane's workspace away");
+        }
+
+        // The orchestrator dispositioned the findings, the worker pushed, and
+        // the PR is driven again.
+        gh.set_facts("OPEN", HEAD_B);
+        reg.set_pr_head_override(Some(HEAD_B.to_string()));
+        let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 50_000);
+        assert_eq!(out["driving"], json!(true), "{arm}: the re-drive was refused: {out}");
+
+        reg.rd_drive_group_with(&group, &gh, 60_000);
+        let again = reg.rd_drive_group_with(&group, &gh, 70_000);
+        assert!(
+            !again.lanes_opened.is_empty(),
+            "{arm}: the re-drive must brief its lane at the new head: {:?}",
+            rows_for(&reg, &group, "rd-refused")
+        );
+        let rows = lane_spawn_rows(&reg, &group);
+        assert_eq!(rows.len(), 2, "{arm}: one spawn per round: {rows:?}");
+        observed.push((
+            arm,
+            rows[1]["resumed"] == json!(true),
+            rows_for(&reg, &group, "rd-lane-resume-failed").len(),
+        ));
+
+        if arm == "warm" {
+            assert_eq!(
+                rows[1]["session"], rows[0]["session"],
+                "…and on the SAME conversation the first drive opened: {rows:?}"
+            );
+            // **The RECORD carries no verdict and the BRIEF still does, and
+            // both are right.** `reseeded` clears `last_verdict`/`at_head`
+            // because the new entry may not assert something this drive has not
+            // read; the tick then re-reads the live verdict FILE, which outlives
+            // the drive that produced it, and `record_verdict_seen` re-derives
+            // the pair from it before the brief is built. So a lane that really
+            // did answer gets the delta template naming the head it answered at
+            // — which is #2109's whole point, a reviewer asked again in its own
+            // conversation rather than replaced by a stranger. Asserting the
+            // first-call template here would be asserting that a warm reviewer
+            // is told nothing about what it already said.
+            let delta = lane_brief(&reg, &again.lanes_opened[0].2);
+            assert!(
+                delta.starts_with("DELTA on PR #1758"),
+                "a lane whose own previous verdict is still on file is asked again in its \
+                 own conversation, not briefed as a stranger: {delta}"
+            );
+            assert!(
+                delta.contains(&format!("at head {HEAD_A}")),
+                "…naming the revision it answered about: {delta}"
+            );
+            assert!(delta.contains(HEAD_B), "…and the one it is asked about now: {delta}");
+        }
+    }
+
+    let expected: Vec<Row> = vec![
+        ("warm", true, 0),
+        // The fail direction is toward a cold lane, and it is audited rather
+        // than silent — a fresh pane is what "there was no session" looks like
+        // on this log too.
+        ("session-gone", false, 1),
+    ];
+    assert_eq!(
+        observed, expected,
+        "each row is (arm, the re-drive's first lane open was a resume, \
+         `rd-lane-resume-failed` rows). A `false` on the warm arm is the whole of #2153: a \
+         reviewer that has already read this PR paying for a cold read on the round where \
+         its warm session is cheapest. A `true` on the gone arm is a row claiming a resume \
+         that did not happen."
+    );
+}
+
+// ── #2163: a dead lane pane is observed in `review-wait`, not waited out ────
+
+/// **#2163.** A reviewer lane whose pane has died is re-opened on the next
+/// tick, on its own session, rather than waited out to `lane-stalled`.
+///
+/// Measured on PR #2140 (v1.3.0-beta6): the rev-final lane's pane was killed at
+/// 20:12 by the orchestrator — on the driver's OWN advice, since a
+/// `cap-refused` notice says to kill an idle delegate — and the drive then sat
+/// in `review-wait` with no rd-* row for the PR for 25+ minutes. A pane exit was
+/// observed only for the WORKER and only in `fix-wait`; the code's own comment
+/// gave the reason as "`review-wait` has `lane-stalled` for its own panes",
+/// which is true and is `lane_timeout_minutes` away, anchored at the brief
+/// rather than at the death.
+///
+/// **The live arm is the control**, and it is the half that makes the dead arm
+/// mean anything: an implementation that re-opened every lane on every tick
+/// would satisfy the first assertion and destroy the wait `review-wait` is made
+/// of. Both arms are collected and compared once, so one run says what each did
+/// rather than stopping at the first.
+#[test]
+fn a_dead_lane_pane_is_re_opened_next_tick_and_a_live_one_is_left_alone() {
+    // (arm, panes opened on the tick after, `rd-lane-reopened` rows)
+    type Row = (&'static str, usize, usize);
+    let mut observed: Vec<Row> = Vec::new();
+
+    for arm in ["live", "dead"] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let (group, _orch, lane) = lane_round_one(&reg, &repo, &gh);
+        assert_eq!(lane_spawn_rows(&reg, &group).len(), 1, "{arm}: one lane, round one");
+
+        if arm == "dead" {
+            // The incident's own cause: an orchestrator's `kill_agent`. The
+            // initiator is stamped through the real recorder rather than being
+            // faked onto the record, so the `killed_by` asserted below is the
+            // field `kill_agent` writes and not a literal this test invented.
+            reg.record_exit_initiator(&lane, ExitInitiator::Orchestrator);
+            assert!(reg.mark_agent_dead_for_test(&lane), "{arm}: the fixture's own premise");
+        }
+        // Nothing else moves: same head, same body, no verdict. The ONE axis is
+        // whether that pane is still alive.
+        let next = reg.rd_drive_group_with(&group, &gh, 30_000);
+        observed.push((
+            arm,
+            next.lanes_opened.len(),
+            rows_for(&reg, &group, "rd-lane-reopened").len(),
+        ));
+
+        if arm == "dead" {
+            let rows = lane_spawn_rows(&reg, &group);
+            assert_eq!(rows.len(), 2, "the replacement is a spawn row of its own: {rows:?}");
+            assert_eq!(
+                rows[1]["resumed"],
+                json!(true),
+                "…and it RESUMES the lane's conversation — a reviewer that has read this PR \
+                 once must not pay for a cold read because its pane was killed: {rows:?}"
+            );
+            let re = rows_for(&reg, &group, "rd-lane-reopened");
+            assert_eq!(re[0]["pane"], json!(lane), "the row names the pane that went");
+            assert_eq!(
+                re[0]["killed_by"],
+                json!("orchestrator"),
+                "…and who ended it, which is what an orchestrator that has just killed an \
+                 idle delegate needs to read: {re:?}"
+            );
+            assert_eq!(re[0]["head"], json!(HEAD_A));
+            assert_eq!(re[0]["block"], json!("rev-std"));
+        }
+    }
+
+    let expected: Vec<Row> = vec![
+        // A live pane mid-review is waited for. Without this row a driver that
+        // re-opened unconditionally passes the one below.
+        ("live", 0, 0),
+        ("dead", 1, 1),
+    ];
+    assert_eq!(
+        observed, expected,
+        "each row is (arm, panes opened on the tick after, `rd-lane-reopened` rows). A `0` on \
+         the dead arm is the drive waiting on a verdict nothing can produce until \
+         `lane-stalled` an hour later; a `1` on the live arm is a second reviewer per tick."
     );
 }
 

@@ -1113,7 +1113,14 @@ impl OrchRegistry {
         let lanes: Vec<reviewdrive::LaneFact> = routed
             .required
             .iter()
-            .map(|b| reviewdrive::LaneFact { block: b.clone(), verdict: verdicts.get(b).cloned() })
+            .map(|b| reviewdrive::LaneFact {
+                block: b.clone(),
+                verdict: verdicts.get(b).cloned(),
+                // Filled by the caller (#2163): whether a lane's recorded pane
+                // is dead is a fact about the ENTRY and the agent map, and this
+                // function is deliberately given neither — it reads the gate.
+                pane_dead: false,
+            })
             .collect();
         let notices: Vec<rddrive::LaneNotice> = lanes
             .iter()
@@ -1191,6 +1198,22 @@ impl OrchRegistry {
         // that pane carries the session, the block and the cwd — the three
         // `spawn_agent(resume_session:)` needs.
         let prior = self.rd_lane_session(group, entry.lane(block));
+        // #2163: the `lane-stalled` anchor this brief must carry. A brief that
+        // is only REPLACING a dead pane at the same REVISION — the full
+        // `(head, digest)` key, which is why the digest is passed — keeps the
+        // anchor the original brief set; see `lane_stall_anchor` for why that
+        // is both the honest reading of a silence clock and the thing that
+        // bounds a pane which dies on every spawn. Computed here, before
+        // `open_lane` replaces the record it reads.
+        let pane_dead =
+            entry.lane(block).is_some_and(|rec| self.rd_dead_lane_pane(rec).is_some());
+        let anchor = reviewdrive::lane_stall_anchor(
+            entry.lane(block),
+            &brief.head,
+            brief.body_digest_opt(),
+            pane_dead,
+            now,
+        );
         // **The resume names the lane's own block** (#1961). A resume that
         // named neither `kind` nor `block` reached `spawn_agent_bound`, which
         // has no session-inheritance rule of its own and falls straight through
@@ -1264,6 +1287,12 @@ impl OrchRegistry {
         // pins the gap and that exit; closing it properly still wants the
         // per-lane clock.
         //
+        // **#2162 narrowed this refusal and left that residual where it is.** A
+        // pane the reuse arm DECLINED is idle by construction, and refusing a
+        // replacement for it deadlocked the drive — so `rd_live_lane_pane` now
+        // refuses only a pane that is still WORKING. The residual above is the
+        // busy case, which is exactly what this refusal still covers.
+        //
         // **A head change is deliberately not covered.** There the recorded pane
         // is reviewing a revision the drive has moved past, its verdict binds to
         // a head that is gone, and superseding it is what `prior_agents` exists
@@ -1279,7 +1308,7 @@ impl OrchRegistry {
                 "pane": pane,
             }));
             Err(format!(
-                "lane {block} already has a live pane ({pane}) briefed at this head; \
+                "lane {block} already has a live pane ({pane}) working on this head; \
                  refusing to open a second reviewer for the same round"
             ))
         };
@@ -1340,7 +1369,7 @@ impl OrchRegistry {
                 (sp.id, sp.session_id.unwrap_or_default(), false)
             }
         };
-        entry.open_lane(block, &session_id, &agent, &brief.head, brief.body_digest_opt(), now);
+        entry.open_lane(block, &session_id, &agent, &brief.head, brief.body_digest_opt(), anchor);
         Ok(RdLaneOpen { agent, session: session_id, resumed })
     }
 
@@ -1409,6 +1438,38 @@ impl OrchRegistry {
     /// supersede: after a push the recorded pane is reviewing a revision the
     /// drive has moved past, and opening its successor is what
     /// [`reviewdrive::LaneRecord::prior_agents`] exists for.
+    ///
+    /// **And live is not enough: the pane must be WORKING** (#2162). #2109's own
+    /// subject is "a pane still writing the review it was briefed for", and
+    /// `idle_since_ms` is the registry's answer to exactly that — the same half
+    /// of `idle_pane_on_session`'s conjunction, which asks "does this agent have
+    /// work". An IDLE pane has none: it took the brief, finished its turn and
+    /// reported, and there is no second review for a second pane to duplicate.
+    ///
+    /// Without this the guard composed with `rd_reuse_pane`'s readiness decline
+    /// into a hard deadlock, and the two are about ONE pane. Reuse only ever
+    /// declines a pane that is idle (`idle_pane_on_session` filters on
+    /// `idle_since_ms` before the readiness test, so an `rd-reuse-declined` row
+    /// PROVES the pane was idle), and this refusal then named that same pane as
+    /// live and briefed at this head — which it was, because a body-only fix
+    /// cannot move the head. Too unconfirmed to reuse and too live to replace:
+    /// measured on PR #2140 as 38 minutes with no lane open, the same three rows
+    /// every tick, ended by a human killing the pane. Since a body-only fix is
+    /// #1875's whole class, that was the common case rather than a corner.
+    ///
+    /// **The two conditions do not overlap, which is why this costs #2109
+    /// nothing.** The reuse arm considers only idle panes; this refusal now
+    /// protects only busy ones — and busy is what the measured duplicate was
+    /// (`rev-1825` and `rev-1826` both reviewing PR #2104's round 2, the second
+    /// spawned while the first was still writing). An idle pane that is
+    /// delivery-READY never reaches here at all: the reuse arm types the delta
+    /// into it and `rd_open_lane` returns before this is asked.
+    ///
+    /// **What is left over is unchanged**: a lane whose pane went busy on
+    /// something else — a human re-tasking it, another drive taking it over —
+    /// is still refused, still with no per-lane clock, and still bounded by
+    /// `review-wait`'s state bound where it has answered and by `lane-stalled`
+    /// where it has not.
     fn rd_live_lane_pane(
         &self,
         lane: Option<&reviewdrive::LaneRecord>,
@@ -1419,7 +1480,9 @@ impl OrchRegistry {
             return None;
         }
         match self.agent(&lane.agent) {
-            Some(a) if a.status != AgentStatus::Dead => Some(lane.agent.clone()),
+            Some(a) if a.status != AgentStatus::Dead && a.idle_since_ms.is_none() => {
+                Some(lane.agent.clone())
+            }
             _ => None,
         }
     }
@@ -1538,6 +1601,39 @@ impl OrchRegistry {
                 tail_snippet(&tail, 200)
             )
         })
+    }
+
+    /// This lane's recorded pane, when it is **dead**, and who ended it
+    /// (#2163) — `(pane, killed_by)`, with `killed_by` `None` where orrerix
+    /// does not know.
+    ///
+    /// The lane-side twin of [`rd_pane_exit`](Self::rd_pane_exit), and it
+    /// answers a pair rather than a sentence because its two consumers want
+    /// different things: `decide_review_wait` wants the BOOLEAN (this lane
+    /// cannot be waited for), and the `rd-lane-reopened` row wants the two
+    /// facts an orchestrator that has just killed an idle delegate reads —
+    /// which pane went, and whether it was its own doing.
+    ///
+    /// **`Dead` and nothing else counts**, on `rd_pane_exit`'s own argument:
+    /// an agent this registry has no record of is "we could not check", and an
+    /// emptied map (a restart) must not re-open every lane in the group.
+    ///
+    /// An empty recorded pane answers `None` — a lane seeded across a re-drive
+    /// (#2153) carries a session and no pane, and there is nothing there to be
+    /// dead.
+    fn rd_dead_lane_pane(
+        &self,
+        lane: &reviewdrive::LaneRecord,
+    ) -> Option<(String, Option<&'static str>)> {
+        let id = lane.agent.trim();
+        if id.is_empty() {
+            return None;
+        }
+        let a = self.agent(id)?;
+        if a.status != AgentStatus::Dead {
+            return None;
+        }
+        Some((id.to_string(), a.killed_by.map(|who| who.as_str())))
     }
 
     /// The block a driver-initiated resume of `session` must run under (#1961).
@@ -2149,6 +2245,37 @@ impl OrchRegistry {
             // of the two states that land here can read it at all.
             (reviewdrive::GateOutcome::NotEvaluated, None, Vec::new())
         };
+        // **The lane-side twin of `worker_exit` below** (#2163). A pane exit was
+        // observed only for the worker and only in `fix-wait`, on the argument
+        // that "`review-wait` has `lane-stalled` for its own panes" — which is
+        // true and is an HOUR away, measured from the brief rather than from the
+        // death. A reviewer pane killed twelve minutes into its round left the
+        // drive silent for forty-eight more with no rd-* row at all.
+        //
+        // Read here rather than in `rd_gate_facts` because it is a fact about
+        // the ENTRY (which pane this lane recorded) and the agent map, and that
+        // function is given neither on purpose. `_` on a lane the entry has no
+        // record for: there is no pane to be dead.
+        //
+        // **Filled for EVERY required lane, though `decide_review_wait` consults
+        // only `first_stale_lane`'s `k`** (#2169 review 2, premortem 1). That is
+        // deliberate rather than an oversight: `LaneFact` is a per-lane reading
+        // of the world, and one whose fields were populated only for whichever
+        // lane happened to be selected would be a struct whose meaning depends
+        // on its index — so a later change that reads another lane's entry
+        // would silently read a `false` nobody wrote. The cost is one agent-map
+        // lookup per required lane per tick. Lanes open strictly sequentially
+        // today, so nothing else can reach a non-`k` lane; this keeps that a
+        // property of the DECISION rather than of the facts it is handed.
+        let required = required.map(|mut lanes| {
+            for l in lanes.iter_mut() {
+                l.pane_dead = state
+                    .entry(pr)
+                    .and_then(|e| e.lane(&l.block))
+                    .is_some_and(|rec| self.rd_dead_lane_pane(rec).is_some());
+            }
+            lanes
+        });
         let signal = self.rd_signal(group, pr);
         let messaged_by = signal.messaged_by.clone();
         // **The driver watches the pane it resumed** (#1961), and only where
@@ -2158,9 +2285,15 @@ impl OrchRegistry {
         // A `done` or a `blocked` already in hand outranks it — a worker that
         // reported and then exited is a worker that finished, and reading its
         // exit as a failure would throw away the arc its own report earned.
-        // Nor is this asked in any other state: `review-wait` has
-        // `lane-stalled` for its own panes, and a worker pane exiting outside a
+        // Nor is this asked in any other state: a worker pane exiting outside a
         // hand-back is not this drive's business.
+        //
+        // **This used to add "`review-wait` has `lane-stalled` for its own
+        // panes", and that was the whole of #2163.** It is true and it is an
+        // HOUR away, anchored at the brief rather than at the death, so a
+        // reviewer pane killed twelve minutes in cost forty-eight more of
+        // silence. `LaneFact::pane_dead` above is the lane-side observation
+        // that answers it on the next tick instead.
         let worker_exit = (here == reviewdrive::DriveState::FixWait
             && signal.worker == reviewdrive::WorkerSignal::Silent)
             .then(|| state.entry(pr).map(|e| e.worker_agent.clone()).unwrap_or_default())
@@ -2299,9 +2432,21 @@ impl OrchRegistry {
                 // skips a load-bearing write is how the reachable one gets
                 // broken later.
                 let block = brief.required.get(*index).cloned().unwrap_or_default();
+                // #2163: read BEFORE the open, which replaces the record this
+                // asks about — and turned into a row only on the `Ok` arm,
+                // because a re-open the cap refused has re-opened nothing.
+                let replaced = entry.lane(&block).and_then(|rec| self.rd_dead_lane_pane(rec));
                 match self.rd_open_lane(group, entry, &block, &brief, limits, now) {
                     Ok(RdLaneOpen { agent, session, resumed }) => {
                         entry.lane_index = *index;
+                        if let Some((pane, killed_by)) = replaced {
+                            out.audits.push((
+                                rddrive::audit_action::LANE_REOPENED,
+                                json!({ "pr": pr, "block": block, "head": brief.head,
+                                        "pane": pane, "killed_by": killed_by,
+                                        "agent": agent, "resumed": resumed }),
+                            ));
+                        }
                         // #2109: a lane opened is the refusal run ending. Not
                         // folded into `advance` — opening a lane is not an arc
                         // (§2.1), so there is no transition here to hang it on.
@@ -2960,6 +3105,45 @@ impl OrchRegistry {
                 for (dropped_pr, text) in superseded {
                     dropped_notices.push((dropped_pr, text));
                 }
+                // **The lanes' CONVERSATIONS survive the entry that held them**
+                // (#2153). Lane memory lives only here, so dropping the entry
+                // used to drop it — and the sequence a satisfied gate is
+                // designed to produce (satisfied, the orchestrator dispositions
+                // the findings, a re-drive at the new head) is the ordinary
+                // path, not an edge. Measured on PR #2141: two lanes with live,
+                // resolvable sessions that had already read the PR once, both
+                // re-opened `resumed=false`, on the round where the warm session
+                // is cheapest.
+                //
+                // Read BEFORE the `retain` that discards them, and through
+                // `rd_lane_session` rather than off `LaneRecord::session`: that
+                // field is what the spawn RETURNED, which is a session id only
+                // on a CLI that pre-assigns one, so seeding from it alone would
+                // drop exactly the copilot and opencode lanes #2109 was about.
+                // A lane with no session to carry from any of the three sources
+                // is seeded not at all — an absent record is already "open this
+                // one fresh", and a seeded record with nothing to resume would
+                // only make `rd_open_lane` audit a resume failure for a session
+                // that was never recorded.
+                //
+                // A seeded session that no longer resolves needs nothing here:
+                // `rd_open_lane`'s existing `rd-lane-resume-failed` arm audits
+                // the fall-through and spawns fresh, exactly as it does for a
+                // lane reaped inside a live drive.
+                //
+                // `rd_lane_session` under `rd_state_lock` is the established
+                // order, not a new one: `rd_step_entry` runs the whole
+                // load-decide-store — that call and the spawn after it included
+                // — under this same lock (§2.4).
+                let seeded: Vec<reviewdrive::LaneRecord> = state
+                    .entries
+                    .iter()
+                    .filter(|e| e.pr == pr)
+                    .flat_map(|e| e.lanes.iter())
+                    .filter_map(|l| {
+                        self.rd_lane_session(group, Some(l)).map(|s| l.reseeded(&s))
+                    })
+                    .collect();
                 state.entries.retain(|e| e.pr != pr);
                 // **The clock is the caller's, and that is what makes the age
                 // bound testable at all.** `started_ms` is the anchor §2.2
@@ -2968,13 +3152,22 @@ impl OrchRegistry {
                 // the two on different scales: `age_ms` saturated to zero for
                 // every synthetic clock, so `drive-stalled` could not fire in a
                 // test and never had. That is most of why B2 shipped.
-                state.entries.push(reviewdrive::DriveEntry::new(
+                let mut fresh = reviewdrive::DriveEntry::new(
                     pr,
                     &session,
                     on_behalf_of,
                     reviewdrive::Counters::seeded(rounds_already_spent),
                     now,
-                ));
+                );
+                // #2153. Assigned after construction rather than threaded
+                // through `DriveEntry::new`, which is arc 1 — a drive is CREATED
+                // with no lanes, and a constructor that could be handed some
+                // would make "a fresh drive has reviewed nothing" a caller's
+                // discipline instead of the type's. The counters stay as
+                // `rounds_already_spent` says: a warm conversation is not a
+                // spent round.
+                fresh.lanes = seeded;
+                state.entries.push(fresh);
             }
             if reviewdrive::store_state(&dir, &state).is_err() {
                 return self.rd_refuse(group, pr, r::STATE_UNWRITABLE);
