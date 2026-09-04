@@ -119,7 +119,19 @@ export function isOperatorSession(role: RoleOnly | undefined): boolean {
  *  which would put a number on a toggle that is not currently hiding anything.
  *
  *  Never mutates its input, and preserves input order: the caller's array is
- *  the store's own list, already sorted newest-first by the scan. */
+ *  the store's own list, already sorted newest-first by the scan.
+ *
+ *  ONE GUARD BELOW IS REDUNDANT TODAY, AND IS KEPT ON PURPOSE. The delegate
+ *  branch is gated on `mode === "orchestration"`, and deleting that clause
+ *  reddens nothing (measured: mutation M14 on the #2116 PR, whole suite green)
+ *  -- because every row that survives step 1 in `mine` has NO recorded role,
+ *  and `isOperatorSession(undefined)` is `true`, so the branch could not fire
+ *  there anyway. That redundancy is a COUPLING, not a fact: the day
+ *  `isOperatorSession` stops reading "no recorded role" as an operator -- a
+ *  defensible reading once the mode split exists -- the unguarded form would
+ *  hide every row in `mine` and count them behind a toggle that cannot reveal
+ *  them. The clause states the composition rule where the rule lives instead of
+ *  leaning on a sibling predicate's default. */
 export function partitionSessions<T>(
   sessions: readonly T[],
   roleOf: (s: T) => RoleOnly | undefined,

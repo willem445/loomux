@@ -14,6 +14,11 @@ import {
 // recorded role a human restarts by hand.
 
 test("a session with no orchestration identity is the human's own and is shown", () => {
+  // #2116 leans on this beyond its own contract: `partitionSessions`' delegate
+  // branch is gated on the orchestration mode, and that gate is redundant only
+  // BECAUSE an unrecorded row reads as an operator here. If this ever flips,
+  // read the "ONE GUARD BELOW IS REDUNDANT TODAY" note in `sessionfilter.ts`
+  // before deleting anything that then looks dead.
   assert.equal(isOperatorSession(undefined), true);
 });
 
