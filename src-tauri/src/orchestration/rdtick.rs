@@ -1882,8 +1882,29 @@ impl OrchRegistry {
                     "changed"
                 };
                 let moved = if rec.at_head == brief.head {
+                    // **What this half says changed at #2168 E1.** Until then
+                    // the commonest cause of a body-only re-brief was the
+                    // worker pasting its CI receipts after the checks settled —
+                    // #1875's class, one re-record round on every code PR of
+                    // that session — and a reviewer's right move was to skim.
+                    // `decide_ci_wait` no longer briefs a lane at a head its
+                    // worker pushed until that worker has reported the fix
+                    // finished, so what reaches here after a hand-back is an
+                    // edit somebody made on purpose, and the right move is to
+                    // read it.
+                    //
+                    // **Scoped to "after a hand-back", which is the whole of
+                    // what is provable here.** E1 gates the `ci-wait` arc on
+                    // arc 7, so the claim holds for every revision this drive
+                    // handed back; it does NOT hold for the drive's first pass
+                    // over a head it never handed back, where the receipts race
+                    // is unchanged. A flat sentence would be the wider claim,
+                    // and this brief lands in a reviewer's pane as fact.
                     "What moved: the head has not moved and the PR body has. Re-read the body, \
-                     not the diff."
+                     not the diff — the body is what a squash merge commits, so text that moved \
+                     there is text nobody has passed. After a hand-back the driver waits for the \
+                     worker's report(done) before opening this lane, so a body move you see \
+                     following one is a deliberate edit rather than CI receipts landing late."
                         .to_string()
                 } else {
                     // **What this brief does NOT claim.** orrerix does not

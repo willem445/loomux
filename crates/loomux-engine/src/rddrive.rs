@@ -981,6 +981,24 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
              resume or cancel_review_drive to stop.",
             f.lane, pane_of(&f.lane_agent),
         ),
+        // **Two shapes, because since #2168 E1 this hold has two sites and one
+        // sentence cannot be true of both.** From `fix-wait` the worker did
+        // nothing at all; from `ci-wait` it pushed — which is a thing it DID —
+        // and then never said the round was finished, and an orchestrator
+        // reading "neither pushed nor reported" about a head that visibly moved
+        // is being told something false about the one fact it would act on. The
+        // remedy is the same pane either way, so this stays one reason with one
+        // line rather than a sixteenth exit; what differs is what the line
+        // reports, which is the same call `state_clause` makes for the two time
+        // holds. Any other state is impossible — `decide` proposes this hold
+        // from exactly those two — and reads as the `fix-wait` sentence, which
+        // is the older and more general of the pair.
+        HeldReason::FixStalled if f.held_state == Some(DriveState::CiWait) => format!(
+            "HELD — the worker pushed{at} and did not report the fix finished inside \
+             the fix timeout; the driver is holding the reviewer lanes until it does, \
+             so the PR body stops moving under them.{session} drive_review resumes the \
+             drive, cancel_review_drive stops it."
+        ),
         HeldReason::FixStalled => format!(
             "HELD — the worker neither pushed nor reported inside the fix timeout{at}.\
              {session} drive_review resumes the drive, cancel_review_drive stops it."
