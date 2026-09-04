@@ -5861,7 +5861,10 @@ pub fn cli_extra_env(cli: &str, cfg: &Path) -> Vec<(String, String)> {
         // `pi_repo_mcp_exposure` and documented as an open residual in
         // `doc/design/pi.md`. Setting the variable here would not harden this
         // pane; it would point it at somebody else's file.
-        "pi" => vec![(PI_SKIP_VERSION_CHECK_ENV.to_string(), "1".to_string())],
+        "pi" => vec![
+            (PI_SKIP_VERSION_CHECK_ENV.to_string(), "1".to_string()),
+            ("PI_MCP_CONFIG_MODE".to_string(), "exclusive".to_string()),
+        ],
         _ => Vec::new(),
     }
 }
