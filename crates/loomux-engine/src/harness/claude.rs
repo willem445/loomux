@@ -598,8 +598,7 @@ pub fn permission_answer_unavailable(req: &RequestId, decision: Decision) -> Str
 pub fn interrupt_unavailable() -> String {
     "interrupt is not wired: the `interrupt` control-request envelope is \
      undocumented and this baseline has no SIGINT — see \
-     doc/design/harness-adapters.md §9 item 4. close_input() is the documented \
-     alternative that IS available."
+     doc/design/harness-adapters.md §9 item 4. there is no alternative."
         .to_string()
 }
 
