@@ -8200,7 +8200,7 @@ fn build_agent_argv_matches_command_line() {
     // Every adapter, not just the two the matrix started with: an arm only one
     // of the two builders emits is precisely the drift this exists to catch,
     // and a CLI absent from the list is an arm nobody is checking.
-    for cli in ["claude", "copilot", "gemini", "opencode", "totally-unknown-cli"] {
+    for cli in ["claude", "copilot", "gemini", "opencode", "pi", "totally-unknown-cli"] {
         for auto_ops in [false, true] {
             // Every tier, not just the two that existed before #462 — a
             // middle tier that only one of the two forms emits is exactly the
@@ -50268,14 +50268,33 @@ fn every_cli_row_explains_both_knobs() {
         assert!(!row.effort_note.is_empty(), "{} must say why its effort set is what it is", row.cli);
         assert!(!row.context_note.is_empty(), "{} must say why its context set is what it is", row.cli);
     }
-    // The vendor facts this round rests on, asserted rather than assumed: only
-    // claude has a loomux-usable seam for either knob today.
-    assert_eq!(cli_caps("claude").unwrap().effort_levels, EFFORT_LEVELS);
+    // The vendor facts this round rests on, asserted rather than assumed.
+    //
+    // EFFORT and CONTEXT are no longer the same list of CLIs, and that split is
+    // the point of asserting them separately rather than as "only claude has a
+    // seam": pi's --thinking is a session-scoped flag over a SUPERSET of
+    // loomux's five levels (#2126), so two CLIs can set effort, while claude is
+    // still alone on context because the [1m] suffix has no analogue anywhere
+    // else.
+    for cli in ["claude", "pi"] {
+        assert_eq!(
+            cli_caps(cli).unwrap().effort_levels,
+            EFFORT_LEVELS,
+            "{cli} has a session-scoped flag for every level loomux can ask for"
+        );
+    }
     assert_eq!(cli_caps("claude").unwrap().context_variants, CONTEXT_VARIANTS);
-    for cli in ["copilot", "gemini"] {
-        let caps = cli_caps(cli).unwrap();
-        assert!(caps.effort_levels.is_empty(), "{cli} has no flag/env seam for effort");
-        assert!(caps.context_variants.is_empty(), "{cli}'s context window is not loomux-settable");
+    for cli in ["copilot", "gemini", "opencode", "pi"] {
+        assert!(
+            cli_caps(cli).unwrap().context_variants.is_empty(),
+            "{cli}'s context window is model-determined, not loomux-settable"
+        );
+    }
+    for cli in ["copilot", "gemini", "opencode"] {
+        assert!(
+            cli_caps(cli).unwrap().effort_levels.is_empty(),
+            "{cli} has no flag/env seam for effort"
+        );
     }
 }
 

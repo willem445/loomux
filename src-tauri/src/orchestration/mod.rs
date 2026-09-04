@@ -44399,11 +44399,19 @@ impl OrchRegistry {
         if cli == "pi" {
             let cfg = pi_mcp_config_json(port, token, &pi_server_name(&agent_seg));
             fs::write(&path, cfg).map_err(|e| e.to_string())?;
-            // pi creates the session FILE lazily (on the first assistant
-            // response) but not the directory `--session-dir` names, and a
-            // pane whose store cannot be opened does not boot — so this is an
-            // error, not a best-effort mkdir, exactly like opencode's db dir
-            // above.
+            // pi WOULD create this directory itself — `SessionManager`'s
+            // constructor `mkdirSync`s it when persisting — so this is not
+            // load-bearing for the pane's boot, and claiming otherwise would
+            // be a claim the vendor's source contradicts.
+            //
+            // It is an error rather than a best-effort mkdir for a different
+            // and smaller reason: an unwritable group dir is a real fault, and
+            // finding it HERE fails the spawn visibly, next to the config
+            // write that would fail for the same cause, instead of surfacing
+            // several turns later as a session pi could not persist. The
+            // resume lookup is separately tolerant of the directory being
+            // absent (`pi_session_cwd_in_dir` answers "not found"), so nothing
+            // downstream depends on this having run.
             fs::create_dir_all(self.pi_sessions_dir(group)).map_err(|e| e.to_string())?;
             // Measure-and-warn, once per spawn, and NEVER a refusal — see
             // `pi_repo_mcp_exposure`. Best-effort by construction: it returns
