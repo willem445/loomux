@@ -32,9 +32,11 @@ import {
   MAX_NOTE_LEN,
   NoteDrafts,
   noteDraftIsPristine,
+  noteWriteFeedback,
   notesEmptyState,
   orderedNotes,
   type NoteTarget,
+  type NoteWriteOutcome,
   type SessionNote,
 } from "./notesmodel.ts";
 import type { SessionLogStore } from "./sessionlog.ts";
@@ -105,6 +107,12 @@ export function openNotes(spec: NotesDialogSpec): Promise<void> {
     // been typing when they last closed this.
     input.value = drafts.get(spec.target);
 
+    // `.dlg-error` is shown by the `visible` CLASS, not by the `hidden`
+    // attribute — the rule is `display: none` until then, so an attribute
+    // toggle would leave it invisible forever (`promptModal` carries the same
+    // note, and the same trap).
+    const error = el("div", "dlg-error");
+
     const counter = el("div", "notes-counter");
     const actions = el("div", "dlg-actions");
     const closeBtn = el("button", "dlg-btn", "Close");
@@ -124,6 +132,26 @@ export function openNotes(spec: NotesDialogSpec): Promise<void> {
       const near = left <= 200;
       counter.textContent = near ? `${left} left` : "";
       counter.classList.toggle("visible", near);
+    };
+
+    /** React to what a write actually DID.
+     *
+     *  Ignoring this is how a note is lost outright: `declined-unread` means
+     *  the store recorded nothing anywhere, and the box has already been
+     *  cleared, so the human's text would be gone with nothing said. The two
+     *  failure shapes need different handling — `notesmodel.ts` owns which is
+     *  which, so the wording and the give-it-back decision are testable
+     *  without a DOM. */
+    const reportWrite = (outcome: NoteWriteOutcome, attempted: string): void => {
+      const { message, restoreDraft } = noteWriteFeedback(outcome);
+      if (restoreDraft && noteDraftIsPristine(input.value)) {
+        // Only if the human has not started typing something else in the
+        // meantime — their newer text outranks the one we are handing back.
+        input.value = attempted;
+        reflectDraft();
+      }
+      error.textContent = message ?? "";
+      error.classList.toggle("visible", message !== null);
     };
 
     const renderList = (): void => {
@@ -154,7 +182,10 @@ export function openNotes(spec: NotesDialogSpec): Promise<void> {
             );
             if (!ok) return;
             if (sessionId === null) spec.store.deletePendingNote(paneKeyOf(spec.target), note.id);
-            else await spec.store.deleteNote(sessionId, note.id, now());
+            // A delete has no text to hand back, so `attempted` is empty — the
+            // point here is the MESSAGE: a `failed` delete leaves the note on
+            // disk, and a `declined-unread` one never happened at all.
+            else reportWrite(await spec.store.deleteNote(sessionId, note.id, now()), "");
           })();
         });
         row.append(text, when, del);
@@ -172,7 +203,10 @@ export function openNotes(spec: NotesDialogSpec): Promise<void> {
       input.value = "";
       drafts.clear(spec.target);
       reflectDraft();
-      void spec.store.addNote(spec.target, text, now());
+      error.classList.remove("visible");
+      void spec.store
+        .addNote(spec.target, text, now())
+        .then((outcome) => reportWrite(outcome, text));
     };
 
     input.addEventListener("input", reflectDraft);
@@ -188,7 +222,7 @@ export function openNotes(spec: NotesDialogSpec): Promise<void> {
     addBtn.addEventListener("click", submit);
     closeBtn.addEventListener("click", close);
 
-    dlg.append(head, subtitle, list, input, actions);
+    dlg.append(head, subtitle, list, input, error, actions);
     overlay.appendChild(dlg);
     overlay.addEventListener("mousedown", (e) => {
       if (e.target === overlay) close();

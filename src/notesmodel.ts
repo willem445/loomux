@@ -83,6 +83,64 @@ export function notesEmptyState(sessionId: string | null): string {
     : "No notes yet for this session.";
 }
 
+/** What a note write did. Declared here rather than in `sessionlog.ts` for the
+ *  same reason `NoteTarget` is: the store returns one and the dialog has to
+ *  react to one, so a single definition keeps them from drifting.
+ *
+ *  `declined-unread` is the one that matters most to a human: the store refused
+ *  to publish because it has never successfully read the file, so **nothing was
+ *  recorded anywhere** — not on disk, not in memory. `failed` is the opposite
+ *  shape: the note IS in memory and on screen, but the save did not land. */
+export type NoteWriteOutcome =
+  | "saved"
+  | "unchanged"
+  | "pending"
+  | "declined-unread"
+  | "failed";
+
+/** What the dialog must tell the human, and whether it owes them their text
+ *  back.
+ *
+ *  WHY THIS EXISTS. The obvious wiring — clear the box, fire the write, ignore
+ *  the result — loses a note outright on `declined-unread`: the store returns
+ *  before it mutates anything, so the note reaches neither disk nor the list,
+ *  and the box the human typed it into has already been emptied. Every
+ *  individual step succeeds and nothing anywhere says a word. So the outcome is
+ *  read, and the two failure shapes are told apart:
+ *
+ *   - `declined-unread` — nothing was recorded. Give the text back, so the
+ *     human can try again without retyping it.
+ *   - `failed` — the note IS in memory and on screen; only the save missed.
+ *     Giving the text back would duplicate a note they can see. Say so instead;
+ *     the store keeps the newer value, so the next write re-offers it.
+ *
+ *  `saved`, `pending` and `unchanged` are silent: the first two are success (a
+ *  pending note is held deliberately and the empty state already explains it),
+ *  and `unchanged` is unreachable from a non-pristine draft — it is listed so
+ *  the union is exhaustive rather than defaulted. */
+export function noteWriteFeedback(outcome: NoteWriteOutcome): {
+  message: string | null;
+  restoreDraft: boolean;
+} {
+  switch (outcome) {
+    case "declined-unread":
+      return {
+        message:
+          "Could not read the notes file, so nothing was saved — your text is back in the box. Try again.",
+        restoreDraft: true,
+      };
+    case "failed":
+      return {
+        message: "Could not write the notes file. This note is here for now, but is not saved yet.",
+        restoreDraft: false,
+      };
+    case "saved":
+    case "pending":
+    case "unchanged":
+      return { message: null, restoreDraft: false };
+  }
+}
+
 /** A stable string for a target, so a draft survives a close and reopen and two
  *  targets can never share one. It is a MAP KEY and is never joined onto a
  *  path — the `s:` / `p:` prefixes exist so a session id and a pane key that

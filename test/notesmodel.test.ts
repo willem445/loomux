@@ -6,10 +6,12 @@ import {
   MAX_NOTE_LEN,
   NoteDrafts,
   noteDraftIsPristine,
+  noteWriteFeedback,
   normalizeNoteText,
   notesEmptyState,
   orderedNotes,
   targetKey,
+  type NoteWriteOutcome,
   type SessionNote,
 } from "../src/notesmodel.ts";
 
@@ -148,6 +150,56 @@ test("the editor's seed and the pristine predicate answer the same question", ()
   // button enabled.
   const drafts = new NoteDrafts();
   assert.equal(noteDraftIsPristine(drafts.get({ sessionId: "fresh" })), true);
+});
+
+// ---- what a write outcome owes the human ----
+
+test("a declined write hands the text back — nothing was recorded anywhere", () => {
+  // The data-loss case. The store returns before it mutates anything, so the
+  // note reaches neither disk nor the list; the box has already been cleared,
+  // so without this the human's text is simply gone, silently.
+  const { message, restoreDraft } = noteWriteFeedback("declined-unread");
+  assert.equal(restoreDraft, true);
+  assert.notEqual(message, null);
+  assert.match(message!, /nothing was saved/i);
+});
+
+test("a failed SAVE says so but does NOT hand the text back", () => {
+  // The opposite shape, and the reason these are two branches rather than one
+  // "it went wrong": the note IS in memory and on screen here, so restoring
+  // the box would leave the human looking at a note plus a copy of its text,
+  // and re-submitting would duplicate it.
+  const { message, restoreDraft } = noteWriteFeedback("failed");
+  assert.equal(restoreDraft, false);
+  assert.notEqual(message, null);
+  assert.match(message!, /not saved yet/i);
+});
+
+test("the two failure messages are different — they ask for different things", () => {
+  assert.notEqual(noteWriteFeedback("declined-unread").message, noteWriteFeedback("failed").message);
+});
+
+test("success is silent, and no outcome is left to a default", () => {
+  // Exhaustive over the union rather than over the two happy values: a new
+  // outcome added to `NoteWriteOutcome` must be given a branch, and this list
+  // is what makes forgetting one visible.
+  const all: NoteWriteOutcome[] = ["saved", "unchanged", "pending", "declined-unread", "failed"];
+  const silent = all.filter((o) => noteWriteFeedback(o).message === null);
+  assert.deepEqual(silent, ["saved", "unchanged", "pending"]);
+  for (const o of all) {
+    // Non-vacuity: every outcome must actually reach a branch and return an
+    // object, so this cannot pass by the function throwing or returning
+    // undefined for the ones it was never taught.
+    assert.equal(typeof noteWriteFeedback(o).restoreDraft, "boolean", o);
+  }
+});
+
+test("only the declined outcome asks for the text back", () => {
+  const all: NoteWriteOutcome[] = ["saved", "unchanged", "pending", "declined-unread", "failed"];
+  assert.deepEqual(
+    all.filter((o) => noteWriteFeedback(o).restoreDraft),
+    ["declined-unread"]
+  );
 });
 
 test("the empty state for a known session and for a pending pane say different things", () => {

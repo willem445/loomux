@@ -205,6 +205,27 @@ conflates two questions, and the human asked for an explicit control.
 that surface in a view the human asked to be "my own sessions". The user docs
 say where it went.
 
+## What the dialog does when a write does not land
+
+The store's outcome is READ, not discarded, and the two failure shapes are told
+apart — `noteWriteFeedback` in `notesmodel.ts` owns which is which, so the
+wording and the give-it-back decision are testable without a DOM.
+
+| outcome | what actually happened | what the dialog does |
+| --- | --- | --- |
+| `saved` | on disk | nothing |
+| `pending` | held in memory against `Pane.key`, deliberately | nothing — the empty state already explains it |
+| `unchanged` | a no-op (unreachable from a non-pristine draft) | nothing |
+| `failed` | the note IS in memory and on screen; the save missed | says the note is not saved yet, and does NOT hand the text back — that would leave a note beside a copy of its own text, and re-submitting would duplicate it |
+| `declined-unread` | **nothing was recorded anywhere** — the store returned before mutating, because it has never read the file | hands the text back into the box and says so |
+
+The last row is the one this section exists for. The obvious wiring — clear the
+box, fire the write, ignore the result — loses that note outright: it reaches
+neither disk nor the list, the box has already been emptied, every individual
+step succeeded, and nothing anywhere says a word. The text is only handed back
+if the human has not started typing something else in the meantime; their newer
+text outranks the one being restored.
+
 ## The recorded pane name on a session row
 
 A session row already shows the transcript title. The recorded pane name is an

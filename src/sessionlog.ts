@@ -36,10 +36,16 @@ import {
   normalizeNoteText,
   orderedNotes,
   type NoteTarget,
+  type NoteWriteOutcome,
   type SessionNote,
 } from "./notesmodel.ts";
 
-export { MAX_NOTE_LEN, type NoteTarget, type SessionNote } from "./notesmodel.ts";
+export {
+  MAX_NOTE_LEN,
+  type NoteTarget,
+  type NoteWriteOutcome,
+  type SessionNote,
+} from "./notesmodel.ts";
 
 /** Schema version of the persisted blob. Bumped only when an existing key
  *  changes MEANING — a new per-record or per-note key is preserved verbatim by
@@ -267,7 +273,7 @@ export interface SessionLogIo {
  *  written — distinct from `saved` so a caller, and a test, can tell "nothing to
  *  do" from "done". `pending` means the note was held in memory against a pane
  *  with no session id yet. */
-export type SessionLogWrite = "saved" | "unchanged" | "pending" | "declined-unread" | "failed";
+export type SessionLogWrite = NoteWriteOutcome;
 
 /** Reads and writes the whole `sessionlog.json` blob, holding the invariant
  *  that makes one shared file safe for many sessions.
