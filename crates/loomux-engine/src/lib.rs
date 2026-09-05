@@ -653,11 +653,35 @@
 //! reads correct and is not. What stays in `src-tauri` is the wiring only the
 //! registry can do — the state lock, the spawns, the deliveries, the board
 //! note — the same line the queue draws between [`mqdriver`] and its caller.
+//!
+//! [`harness`] (#84 slice R1) is the fourth, and the first that is not a piece
+//! of the existing core at all: it is how loomux drives an agent CLI that can
+//! *report* what it did, instead of one whose output has to be scraped off a
+//! terminal. `doc/design/harness-adapters.md` is its contract, human-reviewed
+//! before a line of it was written (PR #2193).
+//!
+//! It is here for the same reason [`reviewdrive`] is, one step further along.
+//! Every part of it — the event vocabulary, the stream-json decoder, the VT
+//! renderer, the per-pane event log — is `serde_json` plus `std`, and all of it
+//! is the kind of code that reads correct and is not: a decoder over a union of
+//! ~35 message types, a usage figure whose two halves have different scopes, and
+//! a renderer that must never rewrite what it drew. The daemon
+//! (`doc/design/remote-engine-daemon.md`) needs exactly this and cannot link
+//! Tauri to get it.
+//!
+//! **R1 is a LEAF: nothing calls it yet.** The spawn path, the `driver:`
+//! workflow key, the permission registry and the MCP tool are R2, and keeping
+//! them out is what lets this land parallel with the A4 chain without touching
+//! `src-tauri/src/orchestration/mod.rs`. Two methods on
+//! [`harness::AgentPane`] therefore **refuse** rather than pretend —
+//! [`harness::claude::permission_answer_unavailable`] and
+//! [`harness::claude::interrupt_unavailable`] each name what would lift them.
 
 pub mod brand;
 pub mod budget;
 pub mod fsatomic;
 pub mod groupid;
+pub mod harness;
 pub mod intake;
 pub mod lessons;
 pub mod locks;

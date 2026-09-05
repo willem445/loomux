@@ -519,6 +519,18 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
             "a.id is a minted roster id, never caller-supplied",
             "let agent_id = format!(\"{}-{seq}\", block.prefix());",
         ),
+        // The per-pane harness event log (#84 R1). `EventLog` holds its agent id
+        // as a `PathSegment` FIELD and interpolates that value directly, rather
+        // than binding it to a `&str` first — so the typed value sits at the
+        // interpolation this scan reads, not one line above it. The proof pins
+        // the only constructor that can put a value in that field, which is what
+        // makes the row checkable: the field's own declaration would still read
+        // `agent: PathSegment` if a second constructor took a `String`.
+        (
+            "self.dir.join(format!(\"{}.events.{n}.jsonl\", self.agent))",
+            "EventLog::segment_path — the agent id is a `PathSegment` field, set only by `open`",
+            "pub fn open(dir: &Path, agent: PathSegment) -> std::io::Result<Self> {",
+        ),
         // The crash-log name used to be a row here ("not an identifier at all —
         // a formatted timestamp"). #1219 removed the site rather than the
         // property: the panic hook's first phase may not touch `core::fmt` (a
