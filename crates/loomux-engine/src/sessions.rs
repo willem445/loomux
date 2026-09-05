@@ -1456,7 +1456,7 @@ pub fn scan_codex_jsonl(path: &Path) -> CodexSessionHead {
     // Bounded on BOTH axes — see `CODEX_HEAD_MAX_BYTES`. The `take` is what
     // makes the line budget a size budget too: without it one base64 image
     // line is read whole, however big it is.
-    let reader = BufReader::new(file.take(CODEX_HEAD_MAX_BYTES));
+    let reader = BufReader::new(file);
     for line in reader.lines().take(CODEX_HEAD_MAX_LINES as usize).map_while(Result::ok) {
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
