@@ -39645,7 +39645,13 @@ impl OrchRegistry {
     /// built-in, because the two have different right answers (`gh.rs` falls back
     /// to the REPO's file for the first and must not for the second).
     pub fn guardrails_of(&self, group: &GroupId) -> Option<Guardrails> {
-        self.groups.lock_safe().get(group).map(|g| g.guardrails.clone())
+        Some(
+            self.groups
+                .lock_safe()
+                .get(group)
+                .map(|g| g.guardrails.clone())
+                .unwrap_or_default(),
+        )
     }
 
     /// This group's resolved veto spelling (#778) — `guardrails.intake.hold`,
