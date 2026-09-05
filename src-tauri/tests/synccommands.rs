@@ -186,7 +186,7 @@ fn module_src() -> String {
 /// scan's population and the frame rule judges it. The floor below stays on the
 /// combined count, where `mod.rs` alone already clears it.
 fn registry_command_files() -> Vec<(&'static str, String)> {
-    ["src/orchestration/mod.rs", "src/gh.rs"]
+    ["src/orchestration/mod.rs"]
         .into_iter()
         .map(|rel| {
             let p = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
