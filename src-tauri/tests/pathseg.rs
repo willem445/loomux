@@ -578,9 +578,9 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
         // strands, which is what makes it a checked claim rather than a promise.
         (
             "format!(\"{}/{name}.yml\", workflows_dir(repo))",
-            "workflow_path_named(repo, &WorkflowName) — the one assembly point for a named \
+            "workflows_dir_file(repo, &WorkflowName) — the one assembly point for a named \
              workflow's path",
-            "pub fn workflow_path_named(repo: &str, name: &WorkflowName) -> String {",
+            "fn workflows_dir_file(repo: &str, name: &WorkflowName) -> String {",
         ),
         // These two interpolate a locally-parsed `PathSegment` rather than the
         // raw parameter. The binding name is a hint, not the evidence — the

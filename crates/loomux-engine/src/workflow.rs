@@ -281,11 +281,22 @@ pub fn workflow_path_named(repo: &str, name: &WorkflowName) -> String {
     if name.is_default() && Path::new(repo).join(workflow_path(repo)).is_file() {
         return workflow_path(repo).to_string();
     }
-    // **The one place a workflow name becomes a file name**, which is why this
-    // function takes `&WorkflowName` rather than `&str`: the signature is what
-    // holds the property, and `src-tauri/tests/pathseg.rs` allowlists this line
-    // on the strength of it. `workflow_file_named` joins the result onto the
-    // repo root; there is no second assembly point to keep in step.
+    workflows_dir_file(repo, name)
+}
+
+/// One name's path UNDER [`workflows_dir`], asked without the `default` special
+/// case — which is what [`list_workflows`] needs for a row it read out of that
+/// directory. `workflow_path_named` answers "the file this name RESOLVES to",
+/// and for `default` beside a plain `workflow.yml` that is a different file;
+/// a listing row that borrowed that answer would name the file that SHADOWED it
+/// rather than itself (found by CI, not by reading).
+///
+/// **The one place a workflow name becomes a file name**, which is why it takes
+/// `&WorkflowName` rather than `&str`: the signature is what holds the
+/// property, and `src-tauri/tests/pathseg.rs` allowlists this line on the
+/// strength of it. `workflow_file_named` joins the repo root onto
+/// `workflow_path_named`'s result, so there is no second assembly point.
+fn workflows_dir_file(repo: &str, name: &WorkflowName) -> String {
     format!("{}/{name}.yml", workflows_dir(repo))
 }
 
@@ -370,7 +381,9 @@ pub fn list_workflows(repo: &str) -> WorkflowListing {
                     continue;
                 }
             };
-            let rel = workflow_path_named(repo, &name);
+            // The directory's own answer, never `workflow_path_named`'s — see
+            // `workflows_dir_file`.
+            let rel = workflows_dir_file(repo, &name);
             seen.insert(name.as_str().to_string(), read_entry(&path, name, rel));
         }
     }
@@ -384,8 +397,9 @@ pub fn list_workflows(repo: &str) -> WorkflowListing {
     if plain.is_file() {
         if let Some(shadowed) = seen.remove(DEFAULT_WORKFLOW_NAME) {
             listing.findings.push(format!(
-                "both {plain_rel} and {} declare the workflow named '{DEFAULT_WORKFLOW_NAME}' —                  {plain_rel} is the one that is read",
-                shadowed.path
+                "both {plain_rel} and {shadowed} declare the workflow named \
+                 '{DEFAULT_WORKFLOW_NAME}' — {plain_rel} is the one that is read",
+                shadowed = shadowed.path
             ));
         }
         seen.insert(
@@ -5128,6 +5142,43 @@ mod tests {
             "findings: {:?}",
             listing.findings
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every listing finding is ONE PARAGRAPH, pinned as a SHAPE beside the
+    /// content the tests above pin.
+    ///
+    /// CLAUDE.md's rule, and it earned its place here rather than being
+    /// precautionary: the ambiguity finding shipped with a `\` line
+    /// continuation that had not survived authoring, so it carried an
+    /// eighteen-space run mid-sentence with no newline at all. The
+    /// `contains(…)` assertions above did not see it — no asserted substring
+    /// straddled the break — and it reached CI only because a *different*
+    /// assertion in the same test happened to print the whole string.
+    ///
+    /// Both shapes, because they are different failures: a `\n` plus
+    /// indentation ships the source's leading spaces; a continuation that
+    /// collapsed leaves the same run of spaces with no `\n`.
+    #[test]
+    fn every_listing_finding_is_one_paragraph() {
+        let root = temp_repo("one-paragraph");
+        // Every finding this function can produce, in one listing.
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("Plain"));
+        write_at(&root, ".orrerix/workflows/default.yml", &wf_doc("Shadowed"));
+        write_at(&root, ".orrerix/workflows/my.workflow.yml", &wf_doc("Dotted"));
+        let listing = list_workflows(root.to_str().unwrap());
+
+        // Positive control: an empty findings list satisfies every assertion in
+        // the loop below just as well.
+        assert_eq!(listing.findings.len(), 2, "{:?}", listing.findings);
+        for m in &listing.findings {
+            assert!(!m.contains('\n'), "a finding must not carry a newline: {m:?}");
+            assert!(
+                !m.contains("          "),
+                "a finding must not carry a ten-space run — a `\\` continuation that \
+                 collapsed leaves one with no newline to notice: {m:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
