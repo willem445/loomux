@@ -1891,14 +1891,44 @@ export interface WorkflowGateStatus {
   missing_blocks: string[];
 }
 
-/** The group's current workflow-mode status — the single shape both
- *  `orch_workflow_status` and `orch_set_advanced_orchestrator`'s return use,
- *  so the lifecycle chrome and the toggle's own confirm can never disagree.
+/** Why a group's pinned roster and its workflow file have diverged (#1689),
+ *  or `null` when they have not. The pinned roster is what RUNS — deliberately
+ *  (#222 rev-11 F2) — so this is a badge, never a prompt to re-read the file
+ *  behind the human's back. Applying the workflow again is what adopts it, and
+ *  that is a confirmed action. */
+export interface WorkflowDrift {
+  /** The backend's own wording, shared word-for-word with the
+   *  `workflow-changed-since-launch` audit row so the badge and the trail
+   *  cannot say different things about one divergence. */
+  note: string;
+  /** The block ids the file resolves to NOW. Empty when the file is gone or no
+   *  longer validates — the group is running blocks its repo no longer
+   *  declares. */
+  on_disk_blocks: string[];
+}
+
+/** The group's current workflow-mode status — the single shape
+ *  `orch_workflow_status`, `orch_set_advanced_orchestrator` and
+ *  `orch_apply_workflow` all return, so the lifecycle chrome, the toggle's own
+ *  confirm and a switch's confirm can never disagree.
  *  `gate` is `null` whenever `advanced` is off, or on but the repo's workflow
  *  declares no `merge` gate. */
 export interface WorkflowStatus {
   advanced: boolean;
   name: string;
+  /** Which workflow this group RUNS (#1689) — always present, and `"default"`
+   *  for every group launched before named workflows existed. Distinct from
+   *  `name` above, which is the file's own cosmetic `name:` field and is empty
+   *  whenever the toggle is off. */
+  workflow: string;
+  /** Every workflow name the repo declares, sorted (#1689) — a names-only
+   *  directory walk, so a name here is not a promise that the file parses. The
+   *  picker's `workflowList` read is what carries per-file errors. */
+  available: string[];
+  /** Set when the pinned roster and the active file have diverged (#1689);
+   *  `null` when they agree, and `null` whenever the toggle is off, because a
+   *  group running the built-in roster has no declared file to drift from. */
+  drift: WorkflowDrift | null;
   /** The repo's default branch name (#581) — `"main"`, never `"origin/main"`.
    *  `null` when loomux could not resolve it, which readers must treat as
    *  UNKNOWN and never as "so this base isn't the default branch": the board's
@@ -1956,6 +1986,95 @@ export const workflowStatus = (groupId: string): Promise<WorkflowStatus | null> 
  *  would return. */
 export const setAdvancedOrchestrator = (groupId: string, on: boolean): Promise<WorkflowStatus> =>
   invoke<WorkflowStatus>("orch_set_advanced_orchestrator", { groupId, on });
+
+// ---------- switching a live group's workflow (#1689 slice B) ----------
+//
+// Consent-preserving: nothing here applies anything on its own. `workflowSwitchPreview`
+// is the read the confirmation modal is built from, and `applyWorkflow` is the
+// action a human authorizes from it — the SAME resolution runs behind both, so
+// the diff shown and the diff applied are one value.
+
+/** One block row that differs between the running roster and the one a switch
+ *  would install. `fields` are the workflow file's own key spellings (`cli`,
+ *  `model`, `prompt`, …), sorted, so the modal names what the human would
+ *  edit. */
+export interface RosterBlockChange {
+  id: string;
+  fields: string[];
+}
+
+/** What a switch would change (#1689). Empty on every axis is a real answer —
+ *  see `WorkflowSwitchPreview.empty`. */
+export interface RosterDiff {
+  added: string[];
+  /** Ids the new roster drops. A pane already running under one keeps running;
+   *  a bare resume of its session is refused after the apply. */
+  removed: string[];
+  changed: RosterBlockChange[];
+  gate_changed: boolean;
+  /** The resolved intake label vocabulary differs (#382) — it drifts
+   *  independently of the roster, so a switch can change the human's own hold
+   *  label without touching a block. */
+  intake_changed: boolean;
+  /** The orchestrator block's effective CLI differs, which is the one change a
+   *  live switch cannot make — see `WorkflowSwitchPreview.refusal`. */
+  orchestrator_cli_changed: boolean;
+}
+
+/** What `applyWorkflow(name)` would do, without doing it (#1689) — the payload
+ *  the group header's Review & apply modal renders. */
+export interface WorkflowSwitchPreview {
+  /** The name that would become active. */
+  name: string;
+  /** The name that is active now. */
+  from: string;
+  /** The repo-relative file `name` resolves to. */
+  path: string;
+  /** The file's own `name:` field — display prose, never an identifier. */
+  display_name: string;
+  /** Nothing would change. The modal says so rather than offering an empty
+   *  confirmation. */
+  empty: boolean;
+  /** Set when the switch cannot be applied to a live group however the human
+   *  answers — today, only a change to the orchestrator block's CLI, because
+   *  that pane is already running a program. The diff is returned beside it, so
+   *  the modal explains rather than just refusing. */
+  refusal: string | null;
+  /** Keys on the orchestrator block that the apply writes to `group.json` but
+   *  that the RUNNING pane will not pick up until it is resumed (`model`,
+   *  `effort`, `context`). Empty is the common case. */
+  next_resume: string[];
+  diff: RosterDiff;
+  /** The roster the switch would install, resolved exactly as a launch would
+   *  resolve it. */
+  blocks: WorkflowStatusBlock[];
+  /** The gate the new file declares, with `satisfiable`/`missing_blocks`
+   *  computed against the roster ABOVE — so the modal can say "this gate names
+   *  a reviewer the new roster cannot spawn" before the human clicks. */
+  gate: WorkflowGateStatus | null;
+}
+
+/** Read-only: what applying `name` to this group would change (#1689 slice B).
+ *
+ *  Rejects — with a message naming why — when workflow mode is off for the
+ *  group, when `name` is not a usable workflow name, and when the file it names
+ *  is absent or will not parse. A resolved preview whose `refusal` is set is a
+ *  different thing: the switch is understood and cannot be applied live. */
+export const workflowSwitchPreview = (groupId: string, name: string): Promise<WorkflowSwitchPreview> =>
+  invoke<WorkflowSwitchPreview>("orch_workflow_switch_preview", { groupId, name });
+
+/** Apply a named workflow to a LIVE group (#1689 slice B) — human action,
+ *  never agent-triggered, and only ever from a confirmation built on
+ *  `workflowSwitchPreview`.
+ *
+ *  Swaps the roster for FUTURE spawns, rewrites `group.json`, reconciles the
+ *  group dir's instruction files and re-arms the merge gate. Agents already
+ *  live keep the block they were spawned under; a bare resume of a session
+ *  whose block the new roster dropped is refused. Rejects on the same
+ *  conditions the preview does, plus the preview's own `refusal`. Resolves to
+ *  the same shape a following `workflowStatus` read would return. */
+export const applyWorkflow = (groupId: string, name: string): Promise<WorkflowStatus> =>
+  invoke<WorkflowStatus>("orch_apply_workflow", { groupId, name });
 
 // ---------- merge queue (#581 slice F): READ-ONLY visibility ----------
 //
