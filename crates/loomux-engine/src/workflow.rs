@@ -229,8 +229,11 @@ pub struct Block {
     /// it, for a short list of exceptions enumerated in
     /// `doc/design/liaison.md` — two narrow (`session_digest` to `process`,
     /// `review_verdict` away from `liaison`) and two widen toward that same
-    /// `liaison`, both otherwise orchestrator-only (`group_usage`; and
-    /// `ask_human`, the pose only). A repo still
+    /// `liaison`, both orchestrator-only for every other hint-carrying class
+    /// (`group_usage`; and `ask_human`, the pose only). `Role::Lead` also holds
+    /// `group_usage`, but through its own enumerated surface rather than
+    /// through any hint (#2519) — no hint can reach that class, since no
+    /// workflow file can name it. A repo still
     /// cannot grant itself anything by writing one: it picks from a closed set
     /// and loomux's code decides the effect.
     /// `None` is today's behavior, byte for byte.

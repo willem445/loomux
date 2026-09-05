@@ -1666,7 +1666,9 @@ fn tool_defs(
     // argument does not carry it.
     //
     // `group_usage` (#891 S2), which every other tier reaches only through
-    // `require_orchestrator`. "What is this group costing?" is one of the
+    // `require_orchestrator` — except `Role::Lead` (#2519), which holds it on
+    // this same argument, opted in at the arm rather than by widening the gate.
+    // "What is this group costing?" is one of the
     // questions the pane exists to answer, and the alternative is the human
     // asking the orchestrator to interrupt its own dispatch loop and relay a
     // number the registry already has. It is a READ of an aggregate scoped to
@@ -1839,14 +1841,20 @@ fn caller_is_liaison(caller: &Caller) -> bool {
 /// rather than the hint alone.
 ///
 /// A SEPARATE function from [`require_orchestrator`] on purpose, not a hint arm
-/// added inside it: that one gates roughly twenty tools — `spawn_agent`,
-/// `send_prompt`, `kill_agent`, `set_state`, every board write, the whole merge
-/// queue — and a widening written there would widen all of them at once, which
-/// is precisely the accident a capability widening must not be one edit away
-/// from. **This function widens nothing on its own**: it is opted into one call
-/// site at a time, so its blast radius is exactly the arms that name it — two
-/// today, each argued in `doc/design/liaison.md` on its own terms. Adding a
-/// third is an edit to that arm and to that note, never to this function.
+/// added inside it: that one gates a dozen-odd tools — `set_state`, every board
+/// write, `withdraw_question`, the whole merge queue, the review driver — and a
+/// widening written there would widen all of them at once, which is precisely
+/// the accident a capability widening must not be one edit away from. (#2519
+/// moved the six fleet-control tools — `spawn_agent`, `send_prompt`,
+/// `get_output`, `kill_agent`, `focus_agent`, `rename_agent` — off that gate and
+/// onto [`require_spawner`], which is the same separation argument applied a
+/// second time, from the other direction.) **This function widens nothing on
+/// its own**: it is opted into one call site at a time, so its blast radius is
+/// exactly the arms that name it — two today, each argued in
+/// `doc/design/liaison.md` on its own terms. Adding a third is an edit to that
+/// arm and to that note, never to this function; `group_usage`'s own arm opts
+/// `Role::Lead` in beside it (#2519) for exactly that reason rather than
+/// widening this.
 ///
 /// `what` is the capability being refused, in the refusal's own words
 /// ("usage aggregation", "posing a question to the human"), because a shared

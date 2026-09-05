@@ -105,7 +105,9 @@ past a couple of entries, *that* is the trigger to revisit — not aesthetics.
 ## Three hint-keyed capability rules, in two directions
 
 `review_verdict` is **withheld** from the liaison; `group_usage` and `ask_human`
-— both otherwise orchestrator-only — are **offered** to it. All three are argued
+— both orchestrator-only for every other class that carries a hint — are
+**offered** to it. (`Role::Lead` also holds `group_usage`, on this section's own
+argument rather than through any hint: #2519, `doc/design/lead-pane.md`.) All three are argued
 separately below because they are separate arguments: closing a fail-open window
 and widening a capability answer to different bars, and the two widenings answer
 to different bars again (one is a read, one is a write), so a note that presented
@@ -144,7 +146,9 @@ ask and no agent answer (`human-questions.md`).
 "How is it going" is the question this pane exists to answer, and "what is this
 costing" is that question with a number in it. `group_usage` aggregates the
 group's tokens and estimated dollars — the figure a human actually asks for
-mid-session — and it was `require_orchestrator`-only, so without this rule the
+mid-session — and it was `require_orchestrator`-only when this rule was written
+(#2519 later gave `Role::Lead` the same read on the same argument, at that
+arm rather than through this gate), so without this rule the
 human's own pane has to ask the orchestrator to interrupt its dispatch loop and
 relay a number the registry already holds. That round trip is the noise this
 whole feature exists to remove.
@@ -165,11 +169,16 @@ Granted at the two layers this tool has, and keyed on the **conjunction**
    pane that is never shown a tool never calls it.
 2. `mcp::call_tool`'s `group_usage` arm — `require_orchestrator_or_liaison`,
    a function of its own rather than a hint arm inside `require_orchestrator`.
-   That one gates roughly twenty tools, including `spawn_agent`, `send_prompt`
-   and every board write; a widening written there would widen all of them at
-   once. The separate function widens nothing on its own: it is opted into one
-   call site at a time, so its blast radius is exactly the arms that name it —
-   `group_usage` and, since #1091 slice E, `ask_human`.
+   That one gates a dozen-odd tools, including `set_state` and every board
+   write; a widening written there would widen all of them at once. The
+   separate function widens nothing on its own: it is opted into one call site
+   at a time, so its blast radius is exactly the arms that name it —
+   `group_usage` and, since #1091 slice E, `ask_human`. (#2519 moved
+   `spawn_agent`, `send_prompt`, `get_output`, `kill_agent`, `focus_agent` and
+   `rename_agent` off `require_orchestrator` onto `require_spawner`, so this
+   paragraph no longer names them; and it opted `Role::Lead` into
+   `group_usage` **at the arm** rather than widening this function, for the
+   same one-call-site-at-a-time reason. See `doc/design/lead-pane.md`.)
 
 There is no third layer, and the absence is structural rather than an omission:
 `OrchRegistry::group_usage` takes a group and no caller, because the only
