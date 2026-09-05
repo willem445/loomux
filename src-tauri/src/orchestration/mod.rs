@@ -37223,9 +37223,6 @@ impl OrchRegistry {
             if a.role != Role::Lead {
                 return Err("lead_bind is only for lead panes".into());
             }
-            if a.pty_id.is_some() {
-                return Err(format!("lead {agent_id} is already bound to a terminal"));
-            }
             a.pty_id = Some(pty_id);
             a.status = AgentStatus::Running;
             a.group.clone()
