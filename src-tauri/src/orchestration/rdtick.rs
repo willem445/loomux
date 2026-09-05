@@ -1496,10 +1496,15 @@ impl OrchRegistry {
             brief.body_digest_opt(),
             anchor,
             verify,
-            // #2509. Carried from the step, never re-derived here — see
-            // `LaneRecord::briefed_body_only`, and `briefed_verify` one
-            // argument up for why a grant is derived exactly once.
-            body_only,
+            // MUTATION (#2509 red-before-green S2): the STEP's mark is dropped
+            // at the seam, so the rule below still exists in full and the
+            // record it reads is never written. The engine's own unit tests
+            // build lane records directly and must stay GREEN here; only the
+            // fake-runner tests, which go through this call, may redden.
+            {
+                let _ = body_only;
+                false
+            },
         );
         Ok(RdLaneOpen { agent, session: session_id, resumed, scope })
     }
