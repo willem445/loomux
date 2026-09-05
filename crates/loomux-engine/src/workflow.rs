@@ -5721,6 +5721,11 @@ mod tests {
         // line deleted from that function is caught by a test rather than by
         // nothing. `id` is the join key and `kind` is covered separately (a
         // kind change on one id is a legal edit of a block's class).
+        // Each row is the WHOLE pair of extra key lines, not a delta against a
+        // shared base: `RawBlock` is `deny_unknown_fields` and serde refuses a
+        // DUPLICATE key outright, so a base that pre-declared `cli:` made the
+        // `cli` row an unparseable document rather than a comparison.
+        const CLAUDE: &str = "    cli: claude\n";
         let rows: &[(&str, &str, &str)] = &[
             ("name", "    name: Alpha\n", "    name: Beta\n"),
             ("cli", "    cli: claude\n", "    cli: copilot\n"),
@@ -5728,12 +5733,15 @@ mod tests {
             ("prompt", "    prompt: One.\n", "    prompt: Two.\n"),
             ("profile", "", "    profile: .github/agents/w.md\n"),
             ("allow", "", "    allow: [\"Bash(gh pr view)\"]\n"),
-            ("effort", "", "    effort: high\n"),
-            ("context", "", "    context: 1m\n"),
-            ("remote", "", "    remote: buildbox\n"),
+            // effort:/context:/remote: are only legal on a CLI that can carry
+            // them, so both sides declare `cli: claude` and only the key under
+            // test moves.
+            ("effort", CLAUDE, "    cli: claude\n    effort: high\n"),
+            ("context", CLAUDE, "    cli: claude\n    context: 1m\n"),
+            ("remote", CLAUDE, "    cli: claude\n    remote: buildbox\n"),
         ];
         for &(key, a, b) in rows {
-            let base = "  - id: w\n    kind: worker\n    cli: claude\n";
+            let base = "  - id: w\n    kind: worker\n";
             let old = parse_workflow(&diff_doc(&format!("{base}{a}"), "")).unwrap();
             let new = parse_workflow(&diff_doc(&format!("{base}{b}"), "")).unwrap();
             let d = roster_diff("claude", side(&old), side(&new));
