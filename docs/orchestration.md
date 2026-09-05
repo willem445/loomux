@@ -1517,10 +1517,9 @@ mechanically by the `gh` shim — before `gh pr merge` can succeed. See
 [`doc/design/workflows.md`](https://github.com/willem445/orrerix/blob/main/doc/design/workflows.md)
 for the full design.
 
-**More than one workflow per repo.** A repo can declare several and pick one per
-group. `.orrerix/workflow.yml` is the workflow named `default`; every
-`<name>.yml` under `.orrerix/workflows/` is a workflow named `<name>`, in the
-same format:
+**More than one workflow per repo.** A repo can declare several.
+`.orrerix/workflow.yml` is the workflow named `default`; every `<name>.yml`
+under `.orrerix/workflows/` is a workflow named `<name>`, in the same format:
 
 ```
 .orrerix/
@@ -1530,20 +1529,28 @@ same format:
     solo-fast.yml         # the workflow named "solo-fast"
 ```
 
+**Picking one per group lands with #1689 slice D1.** Today a group runs
+`default` — which is `.orrerix/workflow.yml` — unless its `group.json` pins a
+name by hand; the launcher has no workflow control yet. What is true now is
+everything below: the layout, the naming rule, and how a name resolves to a
+file.
+
 A name may use letters, digits, `-` and `_` only, and it is what the file is
 called — `review-heavy.yml` is the workflow `review-heavy`. Anything else (a dot
 in the name, a path separator, a leading `-`, a Windows device name like `CON`)
-is refused rather than quietly corrected, and orrerix says so instead of leaving
-the file out of the list without explanation. `.loomux/workflows/` is read when
-`.orrerix/workflows/` is absent, the same way `.loomux/workflow.yml` is.
+is refused rather than quietly corrected: the file is simply not a workflow, and
+orrerix records why alongside the listing rather than dropping it without a
+word. (Nothing renders that listing for you yet — it reaches the screen with
+slice D1.) `.loomux/workflows/` is read when `.orrerix/workflows/` is absent,
+the same way `.loomux/workflow.yml` is.
 
 The workflow a group runs is recorded with the group, next to the roster it
 produced, so a resumed orchestration comes back on the same file. A repo that
 has only `.orrerix/workflow.yml` is unaffected in every respect: it has one
 workflow, it is called `default`, and nothing under `workflows/` is ever opened.
 If you have *both* a `workflow.yml` and a `workflows/default.yml`, the plain
-`workflow.yml` is the one that is read and orrerix tells you the other one is
-being shadowed — rename it rather than leaving two files claiming one name.
+`workflow.yml` is the one that is read — rename the other rather than leaving
+two files claiming one name.
 
 **On `.orrerix/` and `.loomux/`.** The config dir used to be `.loomux/`, and a repo
 that still has one keeps working with no action: each file — `workflow.yml`,

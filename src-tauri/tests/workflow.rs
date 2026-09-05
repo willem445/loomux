@@ -10669,24 +10669,92 @@ fn the_workflow_path_a_delegate_is_told_about_is_the_groups_own_file() {
 /// scan is what noticed: the stale-row assertion below refused to carry a row
 /// that matched nothing, rather than letting the count go quietly wrong.
 ///
+/// **Three spellings, not one.** This slice rerouted one `load_workflow` site,
+/// EIGHT `workflow_path` sites and one `workflow_file_exists` site; all three
+/// functions are still `pub` and still answer only for `default`, so a trigger
+/// watching `load_workflow` alone would have been blind to the nine likelier
+/// regressions (rev-final round 2, finding 2 — the scan's own doc had disclosed
+/// a *different* limit while missing this one). Adding an audit line or a
+/// template var as `workflow::workflow_path(&g.repo)` type-checks, reads
+/// naturally, and is exactly what eight lines in `mod.rs` said one commit ago;
+/// a group running `b.yml` would then be told in its own audit trail that it
+/// runs `.orrerix/workflow.yml`.
+///
 /// A textual scan, with the limits that implies — it reads call TEXT, so a
 /// caller that bound the function to a local first would be invisible. What it
-/// is defence in depth over is a NEW group-scoped reader being added against
-/// `workflow::load_workflow`, which is how the reroute would realistically
-/// erode; the compiler cannot help there, because both functions exist and both
+/// is defence in depth over is a NEW group-scoped reader being added against one
+/// of those three, which is how the reroute would realistically erode; the
+/// compiler cannot help there, because all of them exist and all of them
 /// type-check.
 #[test]
 fn only_the_argued_residuals_still_read_the_default_workflow_directly() {
+    /// The default-only spellings this watches. Each is matched with its
+    /// trailing `(` so a NAMED sibling — `workflow_path_named(`,
+    /// `workflow_file_named(` — does not collide with its default-only parent;
+    /// `workflow_file` is deliberately the prefix rather than `workflow_file(`,
+    /// so `workflow_file_exists(` is caught too, at the cost of matching
+    /// `workflow_file_named(`, which the allowlist then answers for.
+    const DEFAULT_ONLY: &[&str] = &[
+        "workflow::load_workflow(",
+        "workflow::workflow_path(",
+        "workflow::workflow_file",
+    ];
+
     /// `(file, call text, why it is not group-scoped)`.
     const RESIDUALS: &[(&str, &str, &str)] = &[
         (
             "gh.rs",
             "loomux_engine::workflow::load_workflow(repo)",
-            "hold_label takes a REPO, not a group: the gh shim's label allow-list is resolved \
-             before any group is in hand, and a group's own intake profile is pinned in \
-             `guardrails.intake` at launch anyway",
+            "hold_label takes a REPO, not a group — the gh shim resolves its writable label \
+             allow-list before any group is in hand. REPO-SCOPED BY CONSTRUCTION, AND WRONG \
+             THE MOMENT A GROUP CAN RUN A WORKFLOW WITH A DIFFERENT `intake.labels.hold`: \
+             `hold_label_of(group)` reads the group's own profile while `allowed_labels`, \
+             `label_spec_for` and `gh_label_vocabulary_sync` all resolve `default`'s, so the \
+             human's one-click veto would stop working for exactly the group that renamed it. \
+             Unreachable at this head (nothing but a hand-edited group.json pins a name); \
+             #1689 slice D1's picker is what makes it reachable, and it is D1's to close",
+        ),
+        (
+            "mod.rs",
+            "workflow::workflow_file_named(&repo, n).is_file()",
+            "not a residual at all — the NAMED sibling, caught only because the trigger matches \
+             the `workflow::workflow_file` prefix so that `workflow_file_exists(` cannot slip \
+             past it. Listed rather than excluded by a narrower pattern, because a pattern \
+             tuned to miss this line would also miss the function it is guarding against",
         ),
     ];
+
+    // Positive control, run against the SAME predicate the sweep below uses:
+    // `found.is_empty()` is also what a trigger matching nothing produces, and
+    // widening it from one pattern to three (rev-final round 2) is exactly when
+    // a typo would go unnoticed.
+    let triggers = |line: &str| DEFAULT_ONLY.iter().any(|s| line.contains(s));
+    for must in [
+        "(\"WORKFLOW_PATH\", workflow::workflow_path(&g.repo)),",
+        "if workflow::workflow_file_exists(repo) {",
+        "match workflow::load_workflow(&g.repo) {",
+    ] {
+        assert!(triggers(must), "the trigger must catch a default-only reader: {must}");
+    }
+    // The near-miss half: a pattern loose enough to flag every NAMED sibling
+    // would flag the whole reroute and be switched off within a week. Two of the
+    // three are excluded by their trailing `(`.
+    for sibling in [
+        "workflow::workflow_path_named(repo, name)",
+        "workflow::load_workflow_named(repo, name)",
+    ] {
+        assert!(!triggers(sibling), "a NAMED sibling must not read as default-only: {sibling}");
+    }
+    // `workflow_file_named` is the third, and it DOES trigger — stated rather
+    // than excused. `workflow::workflow_file` is deliberately a prefix so that
+    // `workflow_file_exists(` cannot slip past, and that catches the named
+    // sibling too; its `RESIDUALS` row is what answers for it, which is why
+    // that row exists at all.
+    assert!(
+        triggers("workflow::workflow_file_named(&repo, n).is_file()"),
+        "the prefix that catches workflow_file_exists( necessarily catches this too — if it \
+         stops doing so, the RESIDUALS row for it goes stale and this test says which"
+    );
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
@@ -10702,7 +10770,7 @@ fn only_the_argued_residuals_still_read_the_default_workflow_directly() {
             if t.starts_with("//") {
                 continue;
             }
-            if !t.contains("workflow::load_workflow(") {
+            if !DEFAULT_ONLY.iter().any(|s| t.contains(s)) {
                 continue;
             }
             match RESIDUALS.iter().position(|(f, call, _)| *f == name && t.contains(call)) {

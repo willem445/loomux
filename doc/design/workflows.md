@@ -2604,6 +2604,15 @@ exactly the terms `.loomux/workflow.yml` is discovered — `brand::resolve_repo_
 which is `resolve_repo_file`'s rule asked of directories rather than a second
 rule. Neither is ever renamed on the repo's behalf (`doc/design/rebrand-filesystem.md`).
 
+**Case is significant, and on a case-insensitive filesystem that is a known
+hazard rather than a decision.** `seen` is keyed by the exact stem and
+`is_default()` compares `== "default"`, so `workflows/Default.yml` beside
+`.orrerix/workflow.yml` lists as a second, separate row and triggers no shadow
+finding — while on Windows it is the *same file* as `workflows/default.yml` and
+on Linux it is not. Advisory-only today, because nothing but a hand-edited
+`group.json` can pin either name; it becomes a picker showing a duplicate row in
+slice D1, which is where it should be closed (raised in #2603 review round 2).
+
 **Both `workflow.yml` and `workflows/default.yml` is possible, and the plain
 file wins.** `list_workflows` reports it as a *listing finding* naming both
 paths; nothing is blocked, because a workflow file must never be able to stop a
@@ -2680,10 +2689,28 @@ role templates are pinned and were not touched.
 (`src-tauri/tests/workflow.rs`), which is default-deny over `src-tauri/src` and
 fails when a row goes stale:
 
-- `gh.rs::hold_label(repo)` — the `gh` shim's label allow-list is resolved from
-  a REPO, before any group is in hand. A group's own intake profile is pinned in
-  `guardrails.intake` at launch anyway, so this is not a group-scoped question
-  wearing a repo-scoped signature.
+- `gh.rs::hold_label(repo)` — the `gh` shim resolves its **writable label
+  allow-list** from a REPO, before any group is in hand.
+
+  **Repo-scoped by construction, and it becomes WRONG the moment a group can run
+  a workflow with a different `intake.labels.hold`.** The first version of this
+  entry said the divergence was safe because "a group's own intake profile is
+  pinned in `guardrails.intake` at launch anyway" — which is the reason the two
+  spellings *diverge*, not a reason the divergence is harmless (rev-final round
+  2, finding 3). `hold_label_of(group)` reads the group's own profile and feeds
+  the panel, the intake poller and the contract prose; `allowed_labels`,
+  `label_spec_for` and `gh_label_vocabulary_sync` all resolve `default`'s file.
+  A group running `review-heavy.yml` with `hold: do-not-touch` beside a
+  `workflow.yml` declaring `agent-hold` would have its panel honour
+  `do-not-touch` while the issues view offers `agent-hold`, the allow-list
+  refuses `do-not-touch`, and `label_spec_for` will not create it — the human's
+  one-click veto silently failing for exactly the group that renamed it, which
+  is the failure #778 exists to prevent.
+
+  **Unreachable at this head**: nothing but a hand-edited `group.json` can pin a
+  non-`default` name (slice A ships no picker). Slice D1's picker is what makes
+  it reachable, so closing it is D1's, and the `RESIDUALS` row says so in those
+  words rather than leaving a future reader to re-derive it.
 
 The plan predicted two, and `orch_workflow_preview_sync` with no `name` was the
 second. It stopped being one in this same slice: gaining the optional `name`
@@ -2739,7 +2766,8 @@ sweep exists to stop.
 
 ### What slice A deliberately did not do
 
-- **No launcher argument.** `create_orchestration`'s wire shape is unchanged;
+- **No launcher argument, and `docs/orchestration.md` says so in its own tense.**
+  `create_orchestration`'s wire shape is unchanged;
   `Guardrails.workflow` is how a caller pins a name, and the launcher's picker
   is slice D1's. A `PromoteConfig` has no workflow field either — a fresh
   promote runs `default`, a reattaching one restores what is on disk.
