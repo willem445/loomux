@@ -287,10 +287,11 @@ pub fn classify_ssh_add_chunk(chunk: &str, at_line_start: bool) -> SshAddEvent {
     // refused a launch with the key never offered (#2397 review W3). The two
     // templates are disjoint — the retry says `try again for`, not `Enter
     // passphrase for` — so testing the ask first is total, not a tie-break.
-    if chunk.contains("Enter passphrase for") {
+    // [scratch #2594 R7] the asks anchored too, which the asymmetry forbids.
+    if starts_a_line(chunk, "Enter passphrase for", at_line_start) {
         return SshAddEvent::Prompt;
     }
-    if chunk.contains("Bad passphrase, try again for") {
+    if starts_a_line(chunk, "Bad passphrase, try again for", at_line_start) {
         return SshAddEvent::BadPassphrase;
     }
     if starts_a_line(chunk, "Identity added", at_line_start) {
