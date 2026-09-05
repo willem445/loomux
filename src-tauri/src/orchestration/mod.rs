@@ -57035,19 +57035,24 @@ pub async fn orch_lead_prepare(
 /// Bind a just-spawned lead pane's pty to the `AgentEntry` `orch_lead_prepare`
 /// created, and type its kickoff. See `OrchRegistry::lead_bind`.
 ///
-/// Synchronous and framed, exactly like `orch_solo_bind`: it is bookkeeping
-/// plus a queue admission, with no file writes to keep off the GUI thread, and
-/// `mutating_command` is the containment barrier every synchronous command in
-/// this module owes (`tests/synccommands.rs`).
+/// **Off-thread (#762), unlike its sibling `orch_solo_bind`, and the difference
+/// is the kickoff.** `solo_bind` is three in-memory writes and no I/O, so it
+/// runs inline on the webview thread inside a `mutating_command` frame. This
+/// one additionally DELIVERS: `deliver_prompt` appends an audit row, persists
+/// the pane's queue and may start a drainer thread — disk work the GUI thread
+/// must not pay for, and the reason every other command in this module that
+/// delivers (`orch_steer`) is `async` too. Being `async` also puts it outside
+/// `synccommands.rs`'s population by construction: Tauri spawns an async body
+/// onto the runtime rather than running it in the WebView2 COM frame, so an
+/// unwind there is a task failure and not a process abort.
 #[tauri::command]
-pub fn orch_lead_bind(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_lead_bind(
+    app: AppHandle,
     agent_id: String,
     pty_id: u32,
 ) -> Result<(), String> {
-    OrchRegistry::mutating_command("orch_lead_bind", || Err(COMMAND_REFUSED.to_string()), || {
-        reg.lead_bind(&agent_id, pty_id)
-    })
+    let reg = reg_of(&app);
+    run_blocking(move || reg.lead_bind(&agent_id, pty_id)).await
 }
 /// End a whole orchestration: kill all its agents and (optionally) remove
 /// their worktrees. Human-initiated, destructive, audited — the frontend
