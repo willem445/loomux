@@ -18022,6 +18022,15 @@ pub enum ExitInitiator {
     /// report. `reviewdrive::releasable` is the closed rule and
     /// `OrchRegistry::release_driven_pane` is the only thing that stamps this.
     DriverRelease,
+    /// The LEAD pane of this delegate's group, by dying (#2519). A lead group
+    /// has no root once its lead is gone, so its helpers are ended with it —
+    /// `OrchRegistry::end_lead_children` is the only thing that stamps this.
+    ///
+    /// Demoted for a reason the other three do not have: there is nobody left
+    /// to prompt. The pane an exit notice would be typed into is the one whose
+    /// death caused the exit, so a `Prompt` here is a delivery whose only
+    /// possible outcome is a dropped notice.
+    LeadExit,
 }
 
 impl ExitInitiator {
@@ -18030,6 +18039,7 @@ impl ExitInitiator {
             ExitInitiator::Orchestrator => "orchestrator",
             ExitInitiator::IdleTimeout => "idle-timeout",
             ExitInitiator::DriverRelease => "driver-release",
+            ExitInitiator::LeadExit => "lead-exit",
         }
     }
 }
@@ -18084,7 +18094,8 @@ pub fn exit_notice_route(initiator: Option<ExitInitiator>) -> ExitNoticeRoute {
     match initiator {
         Some(ExitInitiator::Orchestrator)
         | Some(ExitInitiator::IdleTimeout)
-        | Some(ExitInitiator::DriverRelease) => ExitNoticeRoute::AuditOnly,
+        | Some(ExitInitiator::DriverRelease)
+        | Some(ExitInitiator::LeadExit) => ExitNoticeRoute::AuditOnly,
         // Crash, watchdog-driven death, an agent quitting unexpectedly, a
         // human closing the pane — nobody in this process asked for it.
         None => ExitNoticeRoute::Prompt,
@@ -37461,11 +37472,11 @@ impl OrchRegistry {
     /// pane that crashed. What must happen either way is that no helper
     /// outlives its lead; the rest is the frontend's gesture to ask for.
     ///
-    /// `ExitInitiator::Human` on each child, because that is who ended them —
-    /// by closing the pane, or by whatever ended its CLI. It is what routes
-    /// their exit notices to the audit log rather than at a prompt
-    /// (`exit_notice_route`), which matters here: the pane those notices would
-    /// be typed into is the one that just died.
+    /// `ExitInitiator::LeadExit` on each child, because that is what ended them.
+    /// It is what routes their exit notices to the audit log rather than at a
+    /// prompt (`exit_notice_route`), which matters here more than for the other
+    /// three initiators: the pane those notices would be typed into is the one
+    /// whose death caused the exit.
     fn end_lead_children(&self, lead: &AgentEntry) {
         let children: Vec<(String, Option<u32>)> = self
             .agents
@@ -37483,7 +37494,7 @@ impl OrchRegistry {
             if let (Some(app), Some(pty)) = (app.as_ref(), pty) {
                 app.state::<crate::pty::PtyManager>().kill(pty);
             }
-            self.record_exit_initiator(&id, ExitInitiator::Human);
+            self.record_exit_initiator(&id, ExitInitiator::LeadExit);
             self.mark_dead(&id, None);
             ended.push(id);
         }
