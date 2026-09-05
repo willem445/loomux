@@ -20,6 +20,7 @@ permissions = [
     "allow-orch-workflow-preview",
     "allow-orch-workflow-list",
     "allow-orch-workflow-status",
+    "allow-orch-workflow-switch-preview",
     "allow-orch-group-watches",
     "allow-orch-lock-state",
     "allow-orch-mailbox-status",
