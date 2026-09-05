@@ -154,6 +154,8 @@ pub const APP_COMMANDS: &[&str] = &[
     "orch_channel_set_sender",
     "orch_solo_prepare",
     "orch_solo_bind",
+    "orch_lead_prepare",
+    "orch_lead_bind",
     "orch_confirm_solo_copilot_autopilot",
     "orch_solo_adopt",
     // cliprobe (1)

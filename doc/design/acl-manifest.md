@@ -74,20 +74,20 @@ codegen generates:
 
 | Set | Commands | Covers |
 |---|---|---|
-| `pty-read` | 3 | `pty_backend_info`, `discover_git_bash`, `dir_info` |
+| `pty-read` | 4 | `pty_backend_info`, `discover_git_bash`, `dir_info` |
 | `pty-control` | 5 | `spawn_pty`, `write_pty`, `kill_pty`, `change_dir`, `resize_pty` |
 | `git-read` | 6 | repo root/log/status/diff/branches/worktree-list |
 | `git-write` | 16 | commit/stage/checkout/discard/fetch/push/pull/merge/rebase/tag/… |
-| `gh-read` | 6 | auth status, issue/PR list and view, lifecycle activity |
+| `gh-read` | 7 | auth status, issue/PR list and view, lifecycle activity |
 | `gh-write` | 4 | issue create/set-labels/comment, PR comment |
 | `gitwatch` | 2 | `git_watch`, `git_unwatch` |
-| `orch-read` | 14 | tasks, audit, session roles, autonomy/usage/summary, channel list, … |
-| `orch-control` | 39 | create/bind/steer/approve/grant-merge/grant-release, task & channel mgmt, autonomy settings, group lifecycle, solo mode |
+| `orch-read` | 25 | tasks, audit, session roles, autonomy/usage/summary, channel list, … |
+| `orch-control` | 58 | create/bind/steer/approve/grant-merge/grant-release, task & channel mgmt, autonomy settings, group lifecycle, solo and lead panes |
 | `fileedit-read` | 5 | read file, list dir, search/list-files jobs |
 | `fileedit-write` | 2 | `ft_write_file`, `ft_replace` |
 | `filemgr-read` | 2 | `fm_list`, `fm_capabilities` |
 | `filemgr-write` | 7 | new folder/file, rename, delete, open, open-with, reveal |
-| `misc` | 10 | session listing, CLI probing, external editor, hashing, startup notice, UI tab state, voice |
+| `misc` | 24 | session listing, CLI probing, external editor, hashing, startup notice, UI tab state, voice |
 
 `src-tauri/permissions/sets/main-ui.toml` aggregates all 14 into one name
 (Tauri resolves a set's `permissions` list recursively, so a set can name
