@@ -38,6 +38,7 @@ import {
   type ViewMode,
 } from "./issuesmodel";
 import { RefreshGate } from "./refreshgate";
+import { scopeChanged, shouldReresolve, resolvedHold } from "./labelvocab.ts";
 
 // gh.rs surfaces its bare "gh-not-found" sentinel from every command, not just
 // auth status (a gh removed mid-session) — map it to the install hint wherever
@@ -51,6 +52,13 @@ function ghErrText(err: unknown): string {
 export interface IssuesViewHost {
   /** The pane's live working directory (from shell integration). */
   getCwd(): string | null;
+  /** The orchestration group this pane belongs to, or null for a plain pane
+   *  (#2663). The veto spelling is a property of the GROUP once one is in
+   *  hand — `guardrails.intake.hold` is what its poller watches, and a group
+   *  that applied a named workflow can be running a different spelling from
+   *  the one its repo's default workflow file declares. Null is the repo
+   *  resolution, which is what every pane got before #2663. */
+  getGroupId(): string | null;
   /** Close the issues view and return to the terminal. */
   onClose(): void;
   /** The view's own header embed button was clicked (#361) — `anchor` (the
@@ -128,11 +136,26 @@ export class IssuesView {
   readonly el: HTMLElement;
 
   private repoRoot: string | null = null;
-  /** This repo's veto spelling (#778), resolved by the backend from its workflow
-   *  config. Starts at the built-in and is replaced when the repo resolves —
-   *  never guessed from a label the list happened to contain. Re-resolved on
-   *  every repo change, because it is a property of the repo, not of the pane. */
+  /** The veto spelling (#778) for this pane's repo AND group, resolved by the
+   *  backend — never guessed from a label the list happened to contain.
+   *
+   *  **Not cached per repo.** An earlier version of this comment said the group
+   *  half needed no re-resolution "because a pane's group is fixed for the life"
+   *  of the pane; the code says otherwise twice over. A pane GAINS a group
+   *  mid-life on #407's in-place promotion (`applyOrchIdentity` runs from
+   *  `respawnFresh`), and this view survives that — it is disposed only with
+   *  the pane. And a fixed group's own vocabulary moves under an open view when
+   *  `apply_workflow` rewrites its `guardrails.intake` (#1689 B). `labelvocab.ts`
+   *  owns when to re-ask and what a failed ask leaves behind; see there for why
+   *  a group re-resolves every refresh while a plain pane still does not. */
   private holdLabel: string = DEFAULT_HOLD;
+  /** What `holdLabel` was last resolved FOR — the pair `labelvocab` compares.
+   *  `repo` trails `repoRoot` by design: it moves only once a resolve for that
+   *  repo has actually been attempted. */
+  private vocabScope: { repo: string | null; group: string | null } = {
+    repo: null,
+    group: null,
+  };
   private issues: GhIssue[] = [];
   private prs: GhPr[] = [];
   /** Which list is showing — issues or pull requests. */
@@ -345,18 +368,31 @@ export class IssuesView {
         this.repoRoot = root;
         this.issues = [];
         this.prs = [];
-        // ...and re-resolve the veto spelling, which is this repo's config, not
-        // the last one's. Resolved BEFORE the gh auth gate below, deliberately:
-        // it reads a file rather than calling `gh`, so a repo with no gh auth
-        // still renders the right button — and a failure here falls back to the
-        // built-in rather than blanking the view, which is what the backend's
-        // allow-list would accept for a repo whose file it also could not read.
+      }
+
+      // Re-resolve the veto spelling when `labelvocab` says the cached one could
+      // be about something else — a different repo, a group this pane did not
+      // have before (#407 promotion), or the same group after an
+      // `apply_workflow` moved its vocabulary out from under an open view.
+      // Resolved BEFORE the gh auth gate below, deliberately: it reads a file or
+      // a registry entry rather than calling `gh`, so a repo with no gh auth
+      // still renders the right button — and a failure here never blanks the
+      // view.
+      const nextScope = { repo: root, group: this.host.getGroupId() };
+      if (shouldReresolve(this.vocabScope, nextScope)) {
+        // A scope change discards the previous answer; within one scope it is
+        // what a blipped call falls back to, rather than silently retracting a
+        // rename. `labelvocab.resolvedHold` owns that rule.
+        const previous = scopeChanged(this.vocabScope, nextScope) ? null : this.holdLabel;
+        let fetched: string | null = null;
         try {
-          this.holdLabel = (await ghLabelVocabulary(root)).hold || DEFAULT_HOLD;
+          fetched = (await ghLabelVocabulary(root, nextScope.group)).hold;
         } catch {
-          this.holdLabel = DEFAULT_HOLD;
+          fetched = null;
         }
         if (this.disposed) return;
+        this.holdLabel = resolvedHold(fetched, previous, DEFAULT_HOLD);
+        this.vocabScope = nextScope;
       }
 
       // gh presence/auth gates everything — one cheap check up front so a
@@ -602,7 +638,15 @@ export class IssuesView {
     this.busy.add(issue.number);
     this.renderList();
     try {
-      await ghIssueSetLabels(this.repoRoot, issue.number, delta.add, delta.remove);
+      // The same `group` the vocabulary was resolved with, so the button and the
+      // backend allow-list cannot disagree (#2663).
+      await ghIssueSetLabels(
+        this.repoRoot,
+        this.host.getGroupId(),
+        issue.number,
+        delta.add,
+        delta.remove
+      );
       // Reflect the change locally so the row updates without a full refetch;
       // the next refresh reconciles with GitHub's truth.
       issue.labels = issue.labels

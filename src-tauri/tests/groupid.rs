@@ -669,84 +669,121 @@ fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
 ///
 /// It is the more valuable of the two guards, because the sink is one function
 /// and the sources are fifty.
+///
+/// **`FILES` is a list because group-taking commands stopped living in one
+/// file** (#2663): `gh.rs` gained two, and a scan pointed at `mod.rs` alone
+/// would have watched nothing where the newest source is. Each file carries its
+/// OWN floor rather than contributing to one total, because a root that stops
+/// being scanned reports zero silently and a shared floor absorbs that — the
+/// same reason CLAUDE.md constraint 6 makes the join scan name every root.
+///
+/// **`Option<String>` is matched as well as `String`**, for the same reason: a
+/// group id a command may omit is still a group id, and `gh.rs`'s two take that
+/// shape. The one pre-existing site of it, `resume_orch_session`'s `group_hint`,
+/// already parses — so widening the parameter match added coverage without
+/// adding a finding, which is what a widening should look like.
 #[test]
 fn every_group_taking_command_parses_its_id_at_the_boundary() {
-    let path = std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/orchestration/mod.rs"
-    ));
-    let src = std::fs::read_to_string(path).unwrap();
-    let lines: Vec<&str> = src.lines().collect();
+    /// Every file holding `#[tauri::command]`s, with the floor of group-taking
+    /// ones each must still yield.
+    ///
+    /// **`gh.rs`'s floor IS its population**, and the two numbers are different
+    /// kinds of thing on purpose (rev-final round 1, finding 1). A floor of 1
+    /// against a population of 2 would have passed with one of the two commands
+    /// renamed out of the shape — `checked == 1 >= 1`, `unparsed` empty because
+    /// the parameter no longer matches, and that command silently unscanned:
+    /// exactly the "a root that stops being scanned reports zero silently"
+    /// argument that split these floors, at half scale. gh.rs has two
+    /// group-taking commands and will have two until someone adds one, so an
+    /// exact floor costs a one-line edit when that happens and catches a rename
+    /// of EITHER until then.
+    ///
+    /// **`mod.rs`'s stays slack** (45 against ~49), and that asymmetry is
+    /// argued rather than left over: it gains and loses group-taking commands
+    /// most rounds, so an exact floor there would fail on every unrelated
+    /// addition and be relaxed within a week — which is how a guard stops
+    /// guarding. Its floor pins that the scan still SEES the class; gh.rs's
+    /// pins the class exactly.
+    const FILES: &[(&str, usize)] = &[("src/orchestration/mod.rs", 45), ("src/gh.rs", 2)];
 
-    let mut checked = 0usize;
     let mut unparsed = Vec::new();
-    let mut i = 0usize;
-    while i < lines.len() {
-        if lines[i].trim() != "#[tauri::command]" {
-            i += 1;
-            continue;
-        }
-        // The command runs from here to the first column-0 `}`.
-        let start = i;
-        let mut end = i + 1;
-        while end < lines.len() && lines[end] != "}" {
-            end += 1;
-        }
-        let body: String = lines[start..=end.min(lines.len() - 1)].join("\n");
+    for (rel, floor) in FILES {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        let src = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = src.lines().collect();
 
-        // A group-shaped `String` PARAMETER (never a `&GroupId` — that is
-        // already proof).
-        //
-        // Matched by SHAPE, not by a list of four names (rev-450 N12): find each
-        // `: String`, walk back over the identifier, and ask whether THAT names a
-        // group. Scans the whole body text, not line ends, because most of these
-        // signatures are one-liners — a line-anchored version of this found 29 of
-        // the 48 and said so.
-        let takes_group_string = {
-            let b = body.as_bytes();
-            let mut found = false;
-            let mut from = 0usize;
-            while let Some(rel) = body[from..].find(": String") {
-                let at = from + rel;
-                let mut s = at;
-                while s > 0 {
-                    let c = b[s - 1] as char;
-                    if c.is_ascii_alphanumeric() || c == '_' {
-                        s -= 1;
-                    } else {
+        let mut checked = 0usize;
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i].trim() != "#[tauri::command]" {
+                i += 1;
+                continue;
+            }
+            // The command runs from here to the first column-0 `}`.
+            let start = i;
+            let mut end = i + 1;
+            while end < lines.len() && lines[end] != "}" {
+                end += 1;
+            }
+            let body: String = lines[start..=end.min(lines.len() - 1)].join("\n");
+
+            // A group-shaped `String` PARAMETER (never a `&GroupId` — that is
+            // already proof).
+            //
+            // Matched by SHAPE, not by a list of four names (rev-450 N12): find
+            // each `: String` / `: Option<String>`, walk back over the identifier,
+            // and ask whether THAT names a group. Scans the whole body text, not
+            // line ends, because most of these signatures are one-liners — a
+            // line-anchored version of this found 29 of `mod.rs`'s 48 and said so.
+            let takes_group_string = [": String", ": Option<String>"].iter().any(|pat| {
+                let b = body.as_bytes();
+                let mut found = false;
+                let mut from = 0usize;
+                while let Some(rel) = body[from..].find(pat) {
+                    let at = from + rel;
+                    let mut s = at;
+                    while s > 0 {
+                        let c = b[s - 1] as char;
+                        if c.is_ascii_alphanumeric() || c == '_' {
+                            s -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let name = &body[s..at];
+                    if name.contains("group") || name == "gid" {
+                        found = true;
                         break;
                     }
+                    from = at + 2;
                 }
-                let name = &body[s..at];
-                if name.contains("group") || name == "gid" {
-                    found = true;
-                    break;
-                }
-                from = at + 2;
-            }
-            found
-        };
+                found
+            });
 
-        if takes_group_string {
-            checked += 1;
-            if !(body.contains("command_group(") || body.contains("GroupId::parse(")) {
-                let name = lines[start..=end.min(lines.len() - 1)]
-                    .iter()
-                    .find(|l| l.contains("pub async fn ") || l.contains("pub fn "))
-                    .map(|l| l.trim().to_string())
-                    .unwrap_or_else(|| format!("(command at line {})", start + 1));
-                unparsed.push(format!("line {}: {name}", start + 1));
+            if takes_group_string {
+                checked += 1;
+                if !(body.contains("command_group(") || body.contains("GroupId::parse(")) {
+                    let name = lines[start..=end.min(lines.len() - 1)]
+                        .iter()
+                        .find(|l| l.contains("pub async fn ") || l.contains("pub fn "))
+                        .map(|l| l.trim().to_string())
+                        .unwrap_or_else(|| format!("(command at line {})", start + 1));
+                    unparsed.push(format!("{rel}:{}: {name}", start + 1));
+                }
             }
+            i = end + 1;
         }
-        i = end + 1;
+
+        assert!(
+            checked >= *floor,
+            "expected at least {floor} group-taking commands in {rel}, found {checked} — the \
+             scan is no longer matching the command shape there. A line-anchored version of \
+             the parameter match once found 29 of `mod.rs`'s 48, and this floor is what said \
+             so; a root that stops being scanned at all reports 0, which a single shared \
+             floor would have absorbed."
+        );
     }
 
-    assert!(
-        checked >= 45,
-        "expected the ~48 group-taking commands, found {checked} — the scan is no longer \
-         matching the command shape. A line-anchored version of the parameter match once \
-         found 29 of them, and this floor is what said so."
-    );
     assert!(
         unparsed.is_empty(),
         "every `#[tauri::command]` taking a group id must parse it at the boundary via \

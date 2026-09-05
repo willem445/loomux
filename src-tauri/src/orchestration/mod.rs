@@ -5321,11 +5321,13 @@ pub struct Guardrails {
     /// from its own `gh issue list` sweep, so a contract still naming
     /// `agent-hold` put a held issue into the plan the human then approved.
     /// The spelling now also reaches the contract (the `{{HOLD_LABEL}}`
-    /// template variable, rendered from this field), and — resolved from the
-    /// repo's workflow file, since the issues view has no group — the
-    /// issues-view toggle and `gh.rs`'s label allow-list. See
-    /// `doc/design/orchestration.md`'s full-autonomy section for why the two
-    /// resolution paths agree.
+    /// template variable, rendered from this field) and the issues-view toggle
+    /// with `gh.rs`'s label allow-list — which read **this field** whenever the
+    /// calling pane has a group, and the repo's `default` workflow file only
+    /// when it does not (#2663; the issues view can be open on a plain pane).
+    /// So for a pane inside a group there is one resolution rather than two.
+    /// See `doc/design/orchestration.md`'s full-autonomy section for the
+    /// no-group arm and for which way the drift case points.
     ///
     /// Available regardless of the toggle: autonomous mode can run with the
     /// built-in roster, so a consumer must always have a profile to read, not
@@ -10321,17 +10323,24 @@ fn blocks_json(blocks: &[workflow::Block]) -> Value {
 /// group.json never met `parse_workflow`, so each label falls back to the
 /// built-in value for its field rather than propagating an unusable string,
 /// same defensive posture as [`read_blocks`]'s unrecognized-`kind` handling.
+///
+/// **The rule is `workflow::usable_intake_label`, which is the workflow
+/// parser's own** (#2663). It used to be a local `sanitize_id` comparison, and
+/// the two had drifted on exactly one value class: `sanitize_id` permits a
+/// leading `-`, so `"hold": "--force"` in a hand-edited group.json was
+/// accepted here and refused by the parser. That was invisible while
+/// `guardrails.intake.hold` reached prose surfaces only; #2663 routes it to a
+/// `gh label create <name>` positional, so the two rules are now one function
+/// with three callers rather than two spellings that agreed by habit (CLAUDE.md
+/// constraint 6's one-validating-constructor posture, applied to a label).
 fn read_intake(g: &Value) -> workflow::IntakeProfile {
     let default = workflow::IntakeProfile::default();
     let Some(i) = g.get("intake") else { return default };
     let source = workflow::intake_source_from_str(i["source"].as_str().unwrap_or(""))
         .unwrap_or(default.source);
     let label = |k: &str, fallback: &str| -> String {
-        let v = i["labels"][k].as_str().unwrap_or("");
-        match workflow::sanitize_id(v) {
-            Some(clean) if clean == v.trim() => clean,
-            _ => fallback.to_string(),
-        }
+        workflow::usable_intake_label(i["labels"][k].as_str().unwrap_or(""))
+            .unwrap_or_else(|| fallback.to_string())
     };
     workflow::IntakeProfile {
         source,
@@ -39617,6 +39626,26 @@ impl OrchRegistry {
         drop(_io);
         let _ = self.deliver_to_orchestrator(group, &auto_release_notice(on), brand::AUDIT_ACTOR);
         Ok(())
+    }
+
+    /// The guardrails this group is RUNNING — its roster, its pinned workflow
+    /// name and its resolved intake profile — or `None` when this registry no
+    /// longer holds the group (it ended, or the id names nothing).
+    ///
+    /// Exists for `gh.rs` (#2663), which has to answer "what is THIS group's
+    /// writable label vocabulary" and had no way to ask. The whole struct rather
+    /// than the one field, because it is the same `&Guardrails` the #1689 pair
+    /// (`load_active_workflow` / `active_workflow_path`) takes, so a caller that
+    /// later needs the group's FILE reaches for that pair instead of growing a
+    /// second accessor beside this one.
+    ///
+    /// **`None` is not "the built-in"**, deliberately, and that is the difference
+    /// from [`hold_label_of`] one line down: a caller that could not find the
+    /// group must be able to tell that apart from a group that resolved to the
+    /// built-in, because the two have different right answers (`gh.rs` falls back
+    /// to the REPO's file for the first and must not for the second).
+    pub fn guardrails_of(&self, group: &GroupId) -> Option<Guardrails> {
+        self.groups.lock_safe().get(group).map(|g| g.guardrails.clone())
     }
 
     /// This group's resolved veto spelling (#778) — `guardrails.intake.hold`,

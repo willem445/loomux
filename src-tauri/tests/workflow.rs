@@ -8633,19 +8633,26 @@ fn a_renamed_veto_reaches_the_contract_the_poller_and_the_allow_list_alike() {
          to apply a label that holds nothing: {state}"
     );
 
-    // 3. The seam the write side stands on. `gh.rs` has no group — the issues
-    //    view is repo-scoped — so it resolves the spelling from the repo's own
-    //    workflow file via `load_workflow`, and its allow-list is only correct
-    //    if that resolution equals the group's. Pinned here because it is the
-    //    one link the two sides' own tests cannot see between them: gh.rs's
-    //    unit tests prove it reads the file, this proves the file is what the
-    //    poller and contract were built from. (The allow-list's own closed-ness
-    //    is `a_resolved_hold_spelling_widens_the_allow_list_by_exactly_one_value`.)
+    // 3. The seam the write side stands on, and #2663 narrowed WHICH side it
+    //    holds up. `gh.rs` takes an `Option<&Guardrails>` now: a pane inside a
+    //    group hands it one and the spelling comes from `guardrails.intake.hold`
+    //    directly, so for THAT caller the two resolutions are one value and
+    //    cannot disagree. A plain pane still passes `None`, and its arm still
+    //    resolves the repo's `default` file — so this agreement is what the
+    //    allow-list's correctness rests on for the no-group caller, which is the
+    //    half a live group cannot cover. Pinned here because it is the one link
+    //    the two sides' own tests cannot see between them. (The allow-list's own
+    //    closed-ness is
+    //    `a_resolved_hold_spelling_widens_the_allow_list_by_exactly_one_value`;
+    //    the group-scoped half is
+    //    `an_applied_workflow_renaming_the_hold_veto_moves_every_label_surface`
+    //    in `tests/orchestration.rs`.)
     let from_file = workflow::load_workflow(&repo.path()).unwrap().unwrap().intake.hold;
     assert_eq!(
         from_file, g.guardrails.intake.hold,
-        "the repo-file resolution gh.rs uses must equal the group's — if these can differ, the \
-         UI writes one spelling while the poller honors another, which is the defect one layer over"
+        "the repo-file resolution a NO-GROUP gh.rs caller uses must equal the group's for a \
+         group launched on that file — if these can differ, a plain pane's issues view writes \
+         one spelling while this group's poller honors another"
     );
 }
 
@@ -8668,6 +8675,54 @@ fn a_group_json_predating_the_hold_label_resolves_to_the_builtin_veto() {
         workflow::builtin_intake_profile().hold,
         "an absent hold key must resolve to the built-in veto label, never to nothing"
     );
+}
+
+/// **A hand-edited `group.json` cannot pin a flag-shaped veto** (#2663).
+///
+/// `guardrails.intake.hold` is the one path into this field that never met
+/// `parse_workflow`, and `read_intake` used to decide it with a local
+/// `sanitize_id` comparison. `sanitize_id` permits a leading `-` (it is the
+/// block-id alphabet, and CLAUDE.md constraint 6 says so out loud), while the
+/// parser's `sanitize_intake_label` refuses one — so the two rules disagreed on
+/// exactly this value class, invisibly, for as long as the field reached prose
+/// surfaces only.
+///
+/// #2663 gives it a `gh label create <name>` POSITIONAL, where a leading dash
+/// is read by cobra as a flag. Both callers now ask
+/// `workflow::usable_intake_label`, which is that same accept condition lifted
+/// out of the parser rather than restated beside it.
+///
+/// The fallback is the BUILT-IN, per field, which is what `read_intake` already
+/// did for every other unusable value — a rejection here must not leave the
+/// group with no veto spelling at all.
+#[test]
+fn a_flag_shaped_hold_in_a_hand_edited_group_json_resolves_to_the_builtin_veto() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&Repo::new().path(), rails()).unwrap();
+    let path = reg.state_root().join(g.id.as_str()).join("group.json");
+
+    let write_hold = |hold: &str| {
+        let mut gj: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        gj["guardrails"]["intake"]["labels"]["hold"] = json!(hold);
+        fs::write(&path, serde_json::to_string_pretty(&gj).unwrap()).unwrap();
+    };
+
+    for evil in ["--force", "-x", "--"] {
+        write_hold(evil);
+        let (_, persisted) = reg.load_group_file(&g.id).unwrap();
+        assert_eq!(
+            persisted.intake.hold,
+            workflow::builtin_intake_profile().hold,
+            "{evil:?} is flag-shaped and must fall back to the built-in veto"
+        );
+    }
+
+    // The positive control, through the SAME write-and-reload path: a rename
+    // that is merely unusual survives it, so the loop above is refusing this
+    // value class rather than refusing every hand-edited spelling.
+    write_hold("do-not-touch");
+    let (_, persisted) = reg.load_group_file(&g.id).unwrap();
+    assert_eq!(persisted.intake.hold, "do-not-touch");
 }
 
 #[test]
@@ -10659,15 +10714,26 @@ fn the_workflow_path_a_delegate_is_told_about_is_the_groups_own_file() {
     assert!(named > 0, "and at least one names b's file");
 }
 
-/// The residual, pinned rather than promised: exactly ONE call site in
-/// `src-tauri/src` still reads the repo's `default` workflow without asking
-/// which one a GROUP runs, and it is repo-scoped rather than group-scoped.
+/// **No call site in `src-tauri/src` reads the repo's `default` workflow
+/// without asking which one a GROUP runs** — the residual is closed (#2663),
+/// and this scan is what keeps it closed.
 ///
-/// The plan predicted two. `orch_workflow_preview_sync` was the second, and it
-/// stopped being one when it gained its optional `name` — its no-name arm now
-/// goes through `load_workflow_named` at `default` like everything else. This
-/// scan is what noticed: the stale-row assertion below refused to carry a row
-/// that matched nothing, rather than letting the count go quietly wrong.
+/// The one `RESIDUALS` row left is not a residual at all: it is the NAMED
+/// sibling `workflow_file_named(`, which the `workflow::workflow_file` prefix
+/// necessarily catches, and it is listed rather than excluded by a narrower
+/// pattern because a pattern tuned to miss it would also miss
+/// `workflow_file_exists(`, the function this is guarding against.
+///
+/// The plan predicted two residuals and both are gone.
+/// `orch_workflow_preview_sync` was the second, and it stopped being one when
+/// it gained its optional `name` — its no-name arm goes through
+/// `load_workflow_named` at `default` like everything else. `gh.rs::hold_label`
+/// was the first, and #2663 closed it the same way: it takes an
+/// `Option<&Guardrails>` now, and its no-group arm reads
+/// `load_active_workflow(repo, &Guardrails::default())` rather than
+/// `workflow::load_workflow(repo)`. Both times this scan is what noticed the
+/// row had gone stale: the assertion below refuses to carry a row that matches
+/// nothing, rather than letting the count go quietly wrong.
 ///
 /// **Three spellings, not one**, and the counts below are measured at both ends
 /// rather than recalled — the first version of this paragraph guessed them and
@@ -10685,12 +10751,24 @@ fn the_workflow_path_a_delegate_is_told_about_is_the_groups_own_file() {
 ///
 /// So **26 sites moved, and 14 of them — every `workflow_path` and every
 /// `workflow_file_exists` — were invisible to a trigger watching
-/// `load_workflow` alone.** All three functions are still `pub` and still answer
-/// only for `default`. Adding an audit line or a template var as
+/// `load_workflow` alone.** All three functions are still `pub` and still
+/// answer only for `default`. Adding an audit line or a template var as
 /// `workflow::workflow_path(&g.repo)` type-checks, reads naturally, and is
 /// exactly what twelve lines in `mod.rs` said one commit ago; a group running
 /// `b.yml` would then be told in its own audit trail that it runs
 /// `.orrerix/workflow.yml`.
+///
+/// **#2663 moved the 27th**, the `head` 1 in the first row above — `gh.rs`'s
+/// `hold_label`. Same instrument, its own base and head:
+///
+/// | spelling | base `a1a0714e` | head | rerouted |
+/// | --- | --- | --- | --- |
+/// | `workflow::load_workflow(` | 1 (`gh.rs`) | 0 | 1 |
+/// | `workflow::workflow_path(` | 0 | 0 | 0 |
+/// | `workflow::workflow_file` | 1 (`mod.rs`, the NAMED sibling) | 1 | 0 |
+///
+/// The last row is the `RESIDUALS` entry below and is expected to stay 1: it is
+/// `workflow_file_named(`, matched only because the trigger is a prefix.
 ///
 /// A textual scan, with the limits that implies — it reads call TEXT, so a
 /// caller that bound the function to a local first would be invisible. **So
@@ -10722,22 +10800,6 @@ fn only_the_argued_residuals_still_read_the_default_workflow_directly() {
 
     /// `(file, call text, why it is not group-scoped)`.
     const RESIDUALS: &[(&str, &str, &str)] = &[
-        (
-            "gh.rs",
-            "loomux_engine::workflow::load_workflow(repo)",
-            "hold_label takes a REPO, not a group — the gh shim resolves its writable label \
-             allow-list before any group is in hand. REPO-SCOPED BY CONSTRUCTION, AND WRONG \
-             THE MOMENT A GROUP CAN RUN A WORKFLOW WITH A DIFFERENT `intake.labels.hold`: \
-             `hold_label_of(group)` reads the group's own profile while `allowed_labels`, \
-             `label_spec_for` and `gh_label_vocabulary_sync` all resolve `default`'s, so the \
-             human's one-click veto would stop working for exactly the group that renamed it. \
-             REACHABLE as of #1689 slice B: apply_workflow pins a name AND rewrites \
-             guardrails.intake from the named file, so this is live for any group that \
-             applies a workflow renaming `hold`. Not reachable by a human GESTURE until \
-             slice D2 wires Review & apply. Closing it means giving gh.rs's three \
-             default-resolving sites a group, which is #2663 and a blocking \
-             prerequisite for slice D2",
-        ),
         (
             "mod.rs",
             "workflow::workflow_file_named(&repo, n).is_file()",

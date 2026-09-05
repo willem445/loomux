@@ -165,22 +165,84 @@ fn module_src() -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
+/// Every file whose `#[tauri::command]`s can reach `Arc<OrchRegistry>` — the
+/// population the frame rule below is default-deny over (#2663, rev-final round
+/// 1, finding 2).
+///
+/// It was `mod.rs` alone until `gh.rs` grew two commands that resolve the
+/// registry (`app.state::<Arc<OrchRegistry>>()`), which is the moment a guard
+/// whose stated purpose is that *the next one cannot forget* went blind to the
+/// file the newest registry-taking commands live in. No violation was hiding
+/// there — every command in `gh.rs` is `async`, so none is in the class at all
+/// — and that is exactly why it had to be added now rather than after one
+/// wasn't.
+///
+/// **`gh.rs` contributes ZERO sync commands, and a zero cannot carry a floor**,
+/// so this list gets no per-file population control the way
+/// `tests/groupid.rs`'s `FILES` does — there is nothing to count. What keeps
+/// that zero meaningful is `gh.rs`'s own
+/// `every_tauri_command_in_this_module_is_async_and_delegates`, which fails if
+/// any command there stops being `async`; the day one does, it lands in this
+/// scan's population and the frame rule judges it. The floor below stays on the
+/// combined count, where `mod.rs` alone already clears it.
+fn registry_command_files() -> Vec<(&'static str, String)> {
+    ["src/orchestration/mod.rs", "src/gh.rs"]
+        .into_iter()
+        .map(|rel| {
+            let p = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let src = std::fs::read_to_string(&p)
+                .unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+            (rel, src)
+        })
+        .collect()
+}
+
 #[test]
 fn every_sync_orchestration_command_is_frame_mandatory_or_cannot_lock() {
-    let src = module_src();
-    let cmds = sync_commands(&src);
+    let files = registry_command_files();
+    assert_eq!(files.len(), 2, "both registry-taking roots must be read");
+
+    let mut total = 0usize;
+    let mut bare = Vec::new();
+    for (rel, src) in &files {
+        total += sync_commands(src).len();
+        // The file is named on every row: a violation in the root that was
+        // added second must not read as one in `mod.rs`.
+        bare.extend(bare_commands(src).into_iter().map(|b| format!("{rel}: {b}")));
+    }
 
     // POPULATION CONTROL. An empty or tiny scan reports no violation, which is
     // byte-identical to one that found nothing wrong — the vacuity shape
     // CLAUDE.md names. The floor is loose on purpose: it pins that the scan
-    // SEES this class, not how big the class happens to be today.
+    // SEES this class, not how big the class happens to be today. Combined
+    // across the roots, because `gh.rs`'s contribution is legitimately zero —
+    // see `registry_command_files` for what keeps that zero honest.
     assert!(
-        cmds.len() >= 8,
-        "the scan found only {} synchronous commands — it has gone blind to the class it guards",
-        cmds.len()
+        total >= 8,
+        "the scan found only {total} synchronous commands across {} file(s) — it has gone \
+         blind to the class it guards",
+        files.len()
     );
 
-    let bare = bare_commands(&src);
+    // PER-ROOT CONTROL, and it is the half the combined floor structurally
+    // cannot give. `gh.rs` contributes ZERO sync commands, so nothing about
+    // `total` moves if that root stops being read at all — deleted from the
+    // list, renamed on disk, or read and yielding nothing because the
+    // attribute spelling changed. Each is indistinguishable from the healthy
+    // state by every assertion above. So assert each root really was opened
+    // and really does carry commands of the shape this scan parses; the
+    // *sync* count staying 0 for `gh.rs` is then a fact about gh.rs rather
+    // than about the instrument.
+    for (rel, src) in &files {
+        let commands = src.matches("#[tauri::command]").count();
+        assert!(
+            commands > 0,
+            "{rel} was read but yielded no `#[tauri::command]` at all — the root is stale or \
+             the attribute spelling moved, and a root that yields nothing is byte-identical \
+             to a clean one"
+        );
+    }
+
     assert!(bare.is_empty(), "{}", bare.join("\n"));
 }
 

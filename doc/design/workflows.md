@@ -2661,7 +2661,7 @@ and then nothing on disk would say which of the two the human consented to.
   restored: the promote modal has no workflow picker, so re-pinning to `default`
   would arm a file the human never chose.
 
-### One pair of readers, and the residual
+### One pair of readers, and the label vocabulary
 
 Every group-scoped reader goes through:
 
@@ -2684,51 +2684,74 @@ messages, and the `{{WORKFLOW_PATH}}` variable rendered into `workflow.md` and
 what makes it legitimate for their text to move for a named workflow; the four
 role templates are pinned and were not touched.
 
-**One residual stays on the `default` file, argued and pinned** by
+**No reader reads the `default` file DIRECTLY** (#2663) — every one goes
+through the pair above — and
 `only_the_argued_residuals_still_read_the_default_workflow_directly`
-(`src-tauri/tests/workflow.rs`), which is default-deny over `src-tauri/src` and
-fails when a row goes stale:
+(`src-tauri/tests/workflow.rs`) is what keeps that true: default-deny over
+`src-tauri/src`, failing both when a new site appears and when an allow-listed
+row goes stale.
 
-- `gh.rs::hold_label(repo)` — the `gh` shim resolves its **writable label
-  allow-list** from a REPO, before any group is in hand.
+The qualifier is load-bearing, not throat-clearing (rev-final round 1, finding
+3): plenty of readers still END UP at `.orrerix/workflow.yml`, including the
+`gh.rs` arm three paragraphs down, because that is what `default` resolves to.
+What the scan forbids is reaching it by a function that can only ever answer
+for `default` — the word its own test name carries.
 
-  **Repo-scoped by construction, and it becomes WRONG the moment a group can run
-  a workflow with a different `intake.labels.hold`.** The first version of this
-  entry said the divergence was safe because "a group's own intake profile is
-  pinned in `guardrails.intake` at launch anyway" — which is the reason the two
-  spellings *diverge*, not a reason the divergence is harmless (rev-final round
-  2, finding 3). `hold_label_of(group)` reads the group's own profile and feeds
-  the panel, the intake poller and the contract prose; `allowed_labels`,
-  `label_spec_for` and `gh_label_vocabulary_sync` all resolve `default`'s file.
-  A group running `review-heavy.yml` with `hold: do-not-touch` beside a
-  `workflow.yml` declaring `agent-hold` would have its panel honour
-  `do-not-touch` while the issues view offers `agent-hold`, the allow-list
-  refuses `do-not-touch`, and `label_spec_for` will not create it — the human's
-  one-click veto silently failing for exactly the group that renamed it, which
-  is the failure #778 exists to prevent.
+The plan predicted two residuals; both are closed, and each was closed the same
+way. `orch_workflow_preview_sync` with no `name` was the second, and it stopped
+being one in slice A itself: gaining the optional `name` routed its no-name arm
+through `load_workflow_named` at `default`, like everything else.
+`gh.rs::hold_label` was the first, and #2663 is its own section below. Both
+times the scan is what said so — its stale-row assertion refused to carry a row
+matching nothing, rather than letting the count go quietly wrong.
 
-  **Reachable as of slice B, and no longer closed by a picker that does not
-  exist.** Slice A could say "nothing but a hand-edited `group.json` pins a
-  name", and that sentence went false the moment `apply_workflow` shipped: an
-  apply pins a name AND rewrites `guardrails.intake` from the named file, so a
-  group that applies a workflow declaring `intake.labels.hold: do-not-touch` is
-  exactly the divergence above — its panel honours `do-not-touch` while
-  `allowed_labels` refuses it and `label_spec_for` will not create it. What
-  slice B did NOT change is who can do it: `orch_apply_workflow` is a command,
-  and no UI calls it until slice D2 wires **Review & apply**, so the reachable
-  path today is a caller of the command rather than a human gesture.
+#### The `gh` shim's writable label allow-list (#2663)
 
-  Closing it means giving the three `default`-resolving sites a group, which is
-  a change to `gh.rs`'s repo-scoped shape and not something an apply should have
-  smuggled in beside itself. It is **#2663**, a blocking prerequisite for slice
-  D2, and it stays a residual here — restated rather than left saying something
-  that is no longer true, with the `RESIDUALS` row carrying the same correction.
+`gh.rs` resolves the labels the issues view may write — the three fixed agent
+go-signals plus the repo-configurable **hold** veto (#778). It used to resolve
+that veto from a REPO, because it had no group to ask, and that made it wrong
+the moment a group could run a workflow with a different `intake.labels.hold`:
+`hold_label_of(group)` reads the group's own profile and feeds the panel, the
+intake poller and the contract prose, while `allowed_labels`, `label_spec_for`
+and `gh_label_vocabulary_sync` all resolved `default`'s file. A group running
+`review-heavy.yml` with `hold: do-not-touch` beside a `workflow.yml` declaring
+`agent-hold` had its panel honour `do-not-touch` while the issues view offered
+`agent-hold`, the allow-list refused `do-not-touch`, and `label_spec_for` would
+not create it — the human's one-click veto silently failing for exactly the
+group that renamed it, which is the failure #778 exists to prevent. Slice A
+recorded it as unreachable ("nothing but a hand-edited `group.json` pins a
+name"); slice B's `apply_workflow` falsified that in the same write that pins a
+name and rewrites `guardrails.intake`.
 
-The plan predicted two, and `orch_workflow_preview_sync` with no `name` was the
-second. It stopped being one in this same slice: gaining the optional `name`
-routed its no-name arm through `load_workflow_named` at `default`, like
-everything else. The scan is what said so — its stale-row assertion refused to
-carry a row matching nothing, rather than letting the count go quietly wrong.
+All three sites take an `Option<&Guardrails>` now, and there is a caller with a
+group to give: `IssuesViewHost::getGroupId()`, supplied by the pane from its own
+`orchGroupId`. `None` — a plain, non-orchestration pane — resolves the repo's
+`default` file through the pair above at `Guardrails::default()`, which is byte
+for byte what every pane got before.
+
+**With a group it reads `guardrails.intake.hold`, and deliberately NOT
+`load_active_workflow(repo, rails)`.** The pair is the right reader for "what
+does this group's file say"; the veto is a different question — "what is this
+group RUNNING" — and the two answers separate exactly under drift. A group runs
+the vocabulary pinned at launch or at an apply; an edit to the file since then
+is audited as `workflow-changed-since-launch` and is deliberately *not* adopted.
+Resolving the veto from the file's current content would hand the human a button
+writing a label that group's own poller is not watching, which is the #778
+failure one layer along. Reading the pinned field also means this arm opens no
+file at all, so there is no second loader here to drift from the pair.
+
+**The trust boundary moves with it.** `allowed_labels`' argument for its one
+configurable entry used to rest on "`gh.rs` does not read group state at all",
+and a hand-edited `group.json` is the one path into `intake.hold` that never met
+`parse_workflow`. So the rule the parser applies — `sanitize_id`'s alphabet plus
+a refusal of a leading `-`, because the hold spelling becomes a **positional**
+argument to `gh label create <name>` — is now `workflow::usable_intake_label`,
+one function asked by the parser, by `group.json`'s reader and by `gh.rs` at the
+argv boundary. The three had already drifted: the reader's local `sanitize_id`
+comparison accepted `--force`, which the parser refuses. An unusable pinned
+spelling falls back to the **built-in**, not to the repo's file: the group's own
+answer is authoritative-but-unusable, and substituting a different file's
+spelling would be a second wrong answer rather than a fix.
 
 It is a textual scan, with the limits that implies: a caller that bound the
 function to a local first would be invisible to it. What it is defence in depth

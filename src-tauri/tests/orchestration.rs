@@ -199,6 +199,7 @@ use loomux_lib::orchestration::{
     // CLI can honor one, and the query the launcher reads them through.
     cli_knobs_json, CONTEXT_VARIANTS, EFFORT_LEVELS,
 };
+use loomux_lib::gh;
 use loomux_lib::pty::{phantom_gate_tick, PtyManager};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -46012,6 +46013,91 @@ fn group_json(reg: &OrchRegistry, g: &GroupInfo) -> Value {
         &fs::read_to_string(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap(),
     )
     .unwrap()
+}
+
+/// **#2663, end to end through the apply that makes it reachable.** `b.yml`
+/// declares `intake.labels.hold: do-not-touch`; `.orrerix/workflow.yml` — the
+/// file this group launched on, and the one `gh.rs` used to resolve for every
+/// caller — declares no `intake:` block at all, so it means `agent-hold`.
+///
+/// The four surfaces that had to agree, and did not: the lifecycle panel
+/// (`autonomy_state_within`'s `hold_label`, which is `hold_label_of(group)` —
+/// the same value the intake poller checks and the contract prose names), the
+/// issues view's vocabulary, the writable allow-list, and the create spec.
+///
+/// Two negative controls, and they answer different questions. **Before the
+/// apply**, the same group on `default` resolves the built-in on every surface —
+/// which is what makes the assertions below detect a MOVE rather than a value
+/// that was always `do-not-touch`. **With no group in hand**, the same repo
+/// still resolves `default`'s file, byte for byte the pre-#2663 answer that a
+/// plain (non-orchestration) pane's issues view gets.
+#[test]
+fn an_applied_workflow_renaming_the_hold_veto_moves_every_label_surface() {
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let path = repo.path().to_string_lossy().to_string();
+    let g = switchable_group(&reg, &repo);
+
+    let panel = |reg: &OrchRegistry| -> String {
+        reg.autonomy_state_within(&g.id, Duration::from_secs(60))["hold_label"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    // ── control 1: this group, before the apply, on `default` ──
+    let before = reg.guardrails_of(&g.id).expect("the registry holds the group");
+    assert_eq!(panel(&reg), "agent-hold");
+    assert_eq!(gh::gh_label_vocabulary_sync(&path, Some(&before)).hold, "agent-hold");
+    assert_eq!(gh::allowed_labels(&path, Some(&before)), gh::allowed_labels(&path, None));
+
+    reg.apply_workflow(&g.id, &wf("b"), None, "human").unwrap();
+
+    // ── the claim: one spelling across all four ──
+    let rails = reg.guardrails_of(&g.id).expect("still held after the apply");
+    let hold = panel(&reg);
+    assert_eq!(hold, "do-not-touch", "the apply rewrote guardrails.intake from b.yml");
+    assert_eq!(
+        gh::gh_label_vocabulary_sync(&path, Some(&rails)).hold,
+        hold,
+        "the issues view must be TOLD the spelling this group's poller watches"
+    );
+    let allowed = gh::allowed_labels(&path, Some(&rails));
+    assert!(
+        gh::validate_labels(&allowed, &[hold.clone()]).is_ok(),
+        "the write path must ACCEPT it: {allowed:?}"
+    );
+    assert!(
+        gh::validate_labels(&allowed, &["agent-hold".to_string()]).is_err(),
+        "and must refuse the spelling this group is no longer running: {allowed:?}"
+    );
+    assert!(
+        gh::label_spec_for(&path, Some(&rails), &hold).is_some(),
+        "and it must be creatable on a repo that has never defined it"
+    );
+
+    // ── control 2: the same repo with no group in hand is unchanged ──
+    assert_eq!(gh::gh_label_vocabulary_sync(&path, None).hold, "agent-hold");
+    assert!(gh::label_spec_for(&path, None, "do-not-touch").is_none());
+    assert_eq!(
+        gh::allowed_labels(&path, None),
+        vec!["agent-ready", "agent-investigation", "agent-managed", "agent-hold"],
+        "a plain pane's issues view still gets the pre-#2663 four-label set"
+    );
+}
+
+/// A group this registry no longer holds is the no-group arm, not a panic and
+/// not a stale answer — the case a pane outlives (an ended orchestration whose
+/// issues view is still open).
+#[test]
+fn a_group_the_registry_no_longer_holds_has_no_guardrails_to_scope_labels_with() {
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    assert!(reg.guardrails_of(&g.id).is_some(), "positive control: it is held now");
+
+    let gone = GroupId::parse("no-such-group").unwrap();
+    assert!(reg.guardrails_of(&gone).is_none());
 }
 
 #[test]
