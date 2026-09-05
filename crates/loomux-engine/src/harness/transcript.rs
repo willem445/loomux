@@ -228,9 +228,6 @@ impl Renderer {
     /// Model text: continues the current line, wraps, honours its own newlines.
     fn text(&mut self, out: &mut String, s: &str) {
         for (i, part) in s.split('\n').enumerate() {
-            if i > 0 {
-                self.hard_newline(out);
-            }
             self.wrapped(out, part);
         }
     }
