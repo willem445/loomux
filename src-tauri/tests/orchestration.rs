@@ -62174,10 +62174,20 @@ fn codex_is_a_spawnable_cli_with_no_containment_ceiling() {
     assert!(caps.orchestration, "codex is spawnable since #2515 C1");
     assert!(SUPPORTED_CLIS.contains(&"codex"), "{SUPPORTED_CLIS:?}");
 
-    // The partition. Derived from `Role::containment()` rather than listed, so
-    // a future class lands on whichever side its own tier puts it on instead of
-    // silently missing from both.
-    for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner, Role::Manager] {
+    // The partition, over `Role::ALL` — not a hand-list, and the difference is
+    // not hypothetical: this loop named five classes when it was written, and
+    // `Role::Lead` (#2519 A) landed on main while this branch was open. A list
+    // would have kept passing while silently not covering the new class.
+    //
+    // `ALL` is the right thing to read because it carries its own completeness
+    // proof — `all_index`'s match is exhaustive, so an eighth variant does not
+    // compile until the array grows — which is exactly what its doc says lets a
+    // test "honestly claim to have covered every class".
+    //
+    // Which SIDE each class lands on is derived from `containment()` rather than
+    // asserted per class, so a future one is classified by its own tier instead
+    // of by whoever edits this test.
+    for role in Role::ALL {
         let allowed = cli_can_host("codex", role);
         let expect_ok = role.containment().rank() <= caps.max_containment.rank();
         assert_eq!(
