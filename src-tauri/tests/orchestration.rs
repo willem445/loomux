@@ -42558,7 +42558,7 @@ fn the_shim_takes_a_body_verification_pass_for_the_lanes_it_supersedes() {
     );
     entry.advance(reviewdrive::DriveState::ReviewWait, None, None, 1_000).unwrap();
     entry.head = HEAD.into();
-    entry.open_lane("rev-security", "s1", "rev-1", HEAD, Some(&edited_digest), 1_500, true);
+    entry.open_lane("rev-security", "s1", "rev-1", HEAD, Some(&edited_digest), 1_500, true, true);
     let mut state = reviewdrive::ReviewDrivesState::default();
     state.entries.push(entry);
     reviewdrive::store_state(&group_dir, &state).unwrap();
@@ -42705,7 +42705,7 @@ fn the_shim_and_the_gate_agree_about_which_passes_a_verification_covers() {
     );
     entry.advance(reviewdrive::DriveState::ReviewWait, None, None, 1_000).unwrap();
     entry.head = HEAD.into();
-    entry.open_lane("rev-security", "s1", "rev-1", HEAD, Some(&now), 1_500, true);
+    entry.open_lane("rev-security", "s1", "rev-1", HEAD, Some(&now), 1_500, true, true);
     let mut state = reviewdrive::ReviewDrivesState::default();
     state.entries.push(entry);
     reviewdrive::store_state(&group_dir, &state).unwrap();

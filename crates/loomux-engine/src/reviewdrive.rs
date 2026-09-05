@@ -695,6 +695,31 @@ pub struct Counters {
     pub review_rounds: u32,
     pub ci_attempts: u32,
     pub rebase_attempts: u32,
+    /// **#2509's one-shot grace — the only field here that is a BOOL rather
+    /// than a count.** Whether this drive has already spent its single extra
+    /// review round for a body-only blocking fail (§2.3).
+    ///
+    /// It is a SEPARATE budget on purpose, and that is the whole of what
+    /// "grace is inside the ceiling" means. `review_rounds` still stops dead at
+    /// `max_review_rounds` and is never bumped past it, so [`MAX_ROUNDS_CEILING`]
+    /// bounds exactly what it bounded before; the extra round is funded from
+    /// here instead, once, which caps a drive at `max_review_rounds + 1` review
+    /// rounds and no more. Funding it out of `review_rounds` was the other
+    /// reading and is vacuous at stock knobs — the default `max_review_rounds`
+    /// IS the ceiling — so the feature would have helped only a repo that had
+    /// lowered its own bound, and never the case it was filed for.
+    ///
+    /// **`serde(default)` here, and NOT on the three counts above.** The
+    /// argument on those is that a defaulted zero silently re-grants a whole
+    /// fresh budget, so the conservative direction is to refuse the file. A
+    /// defaulted `false` grants one round once, and it is also the TRUE reading
+    /// of a file written before this field existed: that drive cannot have
+    /// spent a grace the build that wrote it had never shipped. Refusing to
+    /// parse every in-flight drive at upgrade is the worse failure, and §5.2's
+    /// posture for machine-authored state is that it degrades rather than
+    /// fails loud.
+    #[serde(default)]
+    pub body_only_grace: bool,
     /// Preserved unknown fields — see [`ReviewDrivesState`].
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -726,6 +751,10 @@ pub enum Counter {
     CiAttempts,
     /// Spent on a CONFLICTING mergeability (§2.1's `ci-wait` row).
     RebaseAttempts,
+    /// Spent on a body-only `fail` recorded AT the review bound (#2509) — the
+    /// one-shot grace, and the only variant here that spends a bool rather
+    /// than a count. See [`Counters::body_only_grace`].
+    BodyOnlyGrace,
 }
 
 /// Whether `spent` has reached `bound` — **checked before the bump, never
@@ -746,6 +775,59 @@ pub enum Counter {
 /// none at all and makes the parameter a way to disable the drive.
 pub fn counter_exhausted(spent: u32, bound: u32) -> bool {
     spent >= bound
+}
+
+/// **Does #2509's one-shot grace apply to the `fail` this lane has just
+/// recorded at the review bound?**
+///
+/// A `held(review-limit)` costs the orchestrator three wakes and a hand-written
+/// brief: cancel, resume the worker by hand, re-drive with
+/// `rounds_already_spent`. INVARIANT 9 bounds review rounds so that a reviewer
+/// surfacing one new nit per round cannot run for ever — and a blocking fail on
+/// the PR **body**, at a head that has not moved since a full round was already
+/// spent on it, is not that shape. It is a text edit the worker can make in one
+/// turn with nothing to build and nothing to re-check. PR #2397 reached the
+/// bound on two sentences.
+///
+/// # What it reads, and what it deliberately does not
+///
+/// It reads the **brief this drive sent** — [`LaneRecord::briefed_body_only`],
+/// stamped by [`DriveEntry::open_lane`] from the step that chose the lane — and
+/// never the reviewer's prose, never a word the reviewer could type. #2509
+/// considered a `body_only` parameter on `review_verdict` and rejected it:
+/// `workflow.rs`'s line-5 marker is placed where it is precisely because "a
+/// marker a reviewer could type would be a marker a reviewer could forge", and
+/// a reviewer that can mark its own fail body-only can buy itself a round.
+///
+/// The pair is matched **exactly**, not through [`lane_open_for`]'s
+/// unknown-tolerant comparison, and an empty digest never matches: this is a
+/// grant, and a brief whose revision cannot be pinned grants nothing. That is
+/// [`LaneRecord::briefed_verify`]'s posture one grant over.
+///
+/// # The residual, disclosed and bounded
+///
+/// The mark says the driver **asked** about the body alone, not that the
+/// findings that came back are about the body. A reviewer answering a body-only
+/// re-brief with a code nit it missed a round earlier still earns the grace.
+/// That is the honest cost of deriving the bit rather than trusting a
+/// reviewer's word for it, and it is contained by construction rather than
+/// argued away: at most ONE extra round, once per drive, and only ever on code
+/// that a full review round has already been spent on.
+pub fn body_only_grace_applies(
+    entry: &DriveEntry,
+    block: &str,
+    head: &str,
+    digest: Option<&str>,
+) -> bool {
+    // Spent once and never again — §2.3's "never stacking". Asked FIRST so the
+    // rest reads as the grant's preconditions rather than as its budget.
+    if entry.counters.body_only_grace {
+        return false;
+    }
+    let Some(digest) = digest.filter(|d| !d.is_empty()) else { return false };
+    entry.lane(block).is_some_and(|r| {
+        r.briefed_body_only && r.briefed_head == head && r.briefed_digest == digest
+    })
 }
 
 // ── §5.2 `<group-dir>/review_drives.json` ───────────────────────────────────
@@ -948,6 +1030,38 @@ pub struct LaneRecord {
     /// fields, per the rule stated there.
     #[serde(default)]
     pub briefed_verify: bool,
+    /// **This lane's current brief is about the BODY of a revision whose CODE
+    /// this drive has already reviewed to completion** (#2509) — the head has
+    /// not moved, this lane was already briefed at it, and every required lane
+    /// has ANSWERED at it.
+    ///
+    /// Strictly weaker than [`briefed_verify`](LaneRecord::briefed_verify),
+    /// which it nests inside: that one needs every required lane to have
+    /// *passed*, this one only that each has *spoken*. The gap between them is
+    /// exactly the case #2509 is for — a lane that recorded `fail` on the body,
+    /// whose worker then moved the body and not the head.
+    ///
+    /// Per-revision, like `briefed_head`/`briefed_digest`, and read only
+    /// together with them: it describes the *brief that is out*, never a
+    /// standing property of the lane. It is read at
+    /// [`decide_review_wait`]'s `fail` arm against an exact
+    /// `(briefed_head, briefed_digest)` match rather than through
+    /// [`lane_open_for`]'s unknown-tolerant comparison — same posture as
+    /// `briefed_verify`, and for the same reason: a brief whose revision
+    /// cannot be pinned grants nothing.
+    ///
+    /// **It rides no verdict and reaches no gate.** #2509 considered putting
+    /// the bit on [`ReviewVerdict`](crate::workflow::ReviewVerdict) and did
+    /// not: line 5 of a verdict file is also read by the `gh` shim, and a mark
+    /// the shim did not learn reads there as *no digest*, which makes
+    /// `body-unchanged` refuse a merge it should allow. That is #2308's
+    /// divergence exactly, and this grant needs none of it — the only consumer
+    /// is the driver's own bound.
+    ///
+    /// Cleared by [`LaneRecord::reseeded`] with the rest of the per-revision
+    /// fields, per the rule stated there.
+    #[serde(default)]
+    pub briefed_body_only: bool,
     /// Preserved unknown fields — see [`ReviewDrivesState`].
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -971,11 +1085,13 @@ impl LaneRecord {
     ///
     /// **What is kept is the conversation and what §7 owns; what is dropped is
     /// every claim about a revision THIS BUILD CAN NAME.** `briefed_head`,
-    /// `briefed_digest`, `briefed_verify`, `last_verdict`, `at_head` and
+    /// `briefed_digest`, `briefed_verify`, `briefed_body_only`, `last_verdict`,
+    /// `at_head` and
     /// `spawned_ms` all describe the drive that ended, so carrying any of them
     /// would have the first tick either wait on a brief nobody sent, read a
-    /// stale verdict as this round's answer, or — for `briefed_verify` — stamp
-    /// a fresh verdict with a grant the previous drive made.
+    /// stale verdict as this round's answer, or — for `briefed_verify` and
+    /// `briefed_body_only` — stamp a fresh round with a grant the previous
+    /// drive made.
     ///
     /// **`extra` is the disclosed exception, and the qualifier above is what
     /// makes this doc honest** (#2169 review 2, premortem 2). That field is by
@@ -1046,6 +1162,7 @@ impl LaneRecord {
             briefed_digest: String::new(),
             spawned_ms: 0,
             briefed_verify: false,
+            briefed_body_only: false,
             // Preserved for `ReviewDrivesState`'s reason: a field a newer build
             // wrote is not this build's to drop. **This is the one thing here
             // that is NOT re-derived**, and the doc above names the residual it
@@ -2000,6 +2117,12 @@ impl DriveEntry {
             Some(Counter::ReviewRounds) => self.counters.review_rounds += 1,
             Some(Counter::CiAttempts) => self.counters.ci_attempts += 1,
             Some(Counter::RebaseAttempts) => self.counters.rebase_attempts += 1,
+            // #2509. An ASSIGNMENT to `true` rather than a bump: the grace is
+            // one-shot, and `decide_review_wait` refuses to propose this bump
+            // a second time, so a set here can only ever be idempotent. It
+            // deliberately does NOT touch `review_rounds`, which is what keeps
+            // INVARIANT 9's ceiling meaning what it meant.
+            Some(Counter::BodyOnlyGrace) => self.counters.body_only_grace = true,
             None => {}
         }
         if to == DriveState::FixWait {
@@ -2244,6 +2367,7 @@ impl DriveEntry {
         body_digest: Option<&str>,
         spawned_ms: u64,
         verify: bool,
+        body_only: bool,
     ) {
         let prior = self.lane(block).map(|l| {
             let mut p = l.prior_agents.clone();
@@ -2270,6 +2394,10 @@ impl DriveEntry {
             // chose the lane, and a second derivation at the write would be a
             // second implementation of a capability grant.
             briefed_verify: verify,
+            // #2509, and recorded from the STEP for `briefed_verify`'s reason
+            // one line up: the decision is `decide_review_wait`'s, taken on the
+            // same facts that chose the lane.
+            briefed_body_only: body_only,
             extra,
         });
     }
@@ -2922,7 +3050,17 @@ pub enum DriveStep {
     /// travels on the step rather than being re-derived at the write because it
     /// becomes a grant on the recorded verdict, and a grant derived twice is a
     /// grant that can disagree with itself.
-    OpenLane { index: usize, verify: bool },
+    ///
+    /// `body_only` is #2509, and travels for the same reason: this brief is
+    /// about the BODY of a revision whose CODE this drive has already reviewed
+    /// to completion — the head has not moved, this lane was already briefed at
+    /// it, and every required lane has ANSWERED at it. It is strictly weaker
+    /// than `verify`, which it nests inside (`verify` needs every lane to have
+    /// PASSED), and the gap between the two is the case #2509 exists for: a
+    /// lane that recorded `fail` on the body. It becomes
+    /// [`LaneRecord::briefed_body_only`], which is the ONLY thing the one-shot
+    /// grace below is granted on.
+    OpenLane { index: usize, verify: bool, body_only: bool },
     /// Take one arc, spending `bump` first when there is one.
     Advance {
         to: DriveState,
@@ -3535,6 +3673,37 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                 v.verdict == Verdict::Pass && v.reviewed(&facts.head)
             })
         });
+    // **Is this brief about the BODY of a revision whose CODE is already fully
+    // reviewed?** (#2509.)
+    //
+    // One conjunct weaker than `verify` above and one stronger, and both
+    // differences are load-bearing.
+    //
+    // Weaker: every required lane must have ANSWERED at this head, not passed
+    // at it. That gap IS the case #2509 was filed for — a lane that recorded
+    // `fail` on the PR body, whose worker then moved the body and not the head,
+    // which `verify` can never see because that lane's word is not `pass`.
+    // Measured on PR #2397, which reached `held(review-limit)` on two body
+    // sentences with the code green and unmoved throughout.
+    //
+    // Stronger: THIS lane must already have been briefed at this head. Without
+    // it the very first brief at a head qualifies — every lane can be bound to
+    // a head the moment they have all spoken — and the grace would be granted
+    // for a fail on code nobody had reviewed twice. `briefed_head` is what says
+    // this is a RE-brief, and a re-brief at an unchanged head can only be about
+    // the body: `lane_open_for` is what routed us here, and at an equal head the
+    // digest is the only axis it has left.
+    //
+    // A readable live digest is required for `verify`'s reason: what this
+    // grants is read back against an exact `(briefed_head, briefed_digest)`
+    // pair, and a brief whose revision cannot be pinned grants nothing.
+    let body_only = digest.is_some()
+        && entry
+            .lane(&lane.block)
+            .is_some_and(|r| !r.briefed_head.is_empty() && r.briefed_head == facts.head)
+        && required
+            .iter()
+            .all(|l| l.verdict.as_ref().is_some_and(|v| v.reviewed(&facts.head)));
     // **A verdict decides only if it was recorded about THIS revision**, and the
     // currency test is asked here rather than inside the arms so no future word
     // can be added below without it (#1871 B1).
@@ -3565,10 +3734,20 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
         // A lane recorded `escalate` at this revision: an LLM judgment call, and
         // §3 says the driver never makes one.
         Some(Verdict::Escalate) => DriveStep::held(HeldReason::Escalate),
-        // Arc 5, spending a review round — or parking, when the budget is gone.
+        // Arc 5, spending a review round — or parking, when the budget is gone,
+        // unless #2509's one-shot grace answers first.
         Some(Verdict::Fail) => {
             if counter_exhausted(entry.counters.review_rounds, limits.max_review_rounds) {
-                DriveStep::held(HeldReason::ReviewLimit)
+                // **The grace is asked ONLY at the bound**, which is what makes
+                // it a grace rather than a discount. Below the bound the
+                // ordinary round is spent and `body_only_grace` is untouched, so
+                // a drive that never reaches the bound never consumes it — and a
+                // drive that reaches the bound on a code fail never gets it.
+                if body_only_grace_applies(entry, &lane.block, &facts.head, digest) {
+                    DriveStep::spend(DriveState::FixWait, Counter::BodyOnlyGrace)
+                } else {
+                    DriveStep::held(HeldReason::ReviewLimit)
+                }
             } else {
                 DriveStep::spend(DriveState::FixWait, Counter::ReviewRounds)
             }
@@ -3668,7 +3847,7 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                 _ if entry.cap_starved_for(facts.now_ms).is_some_and(|d| d >= CAP_HOLD_MS) => {
                     DriveStep::held(HeldReason::CapFull)
                 }
-                _ => DriveStep::OpenLane { index: k, verify },
+                _ => DriveStep::OpenLane { index: k, verify, body_only },
             }
         }
     }
@@ -4241,9 +4420,9 @@ mod tests {
     #[test]
     fn re_briefing_a_lane_re_arms_its_stall_clock() {
         let mut e = entry_at(DriveState::ReviewWait);
-        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000, false);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000, false, false);
         assert_eq!(e.lanes.len(), 1);
-        e.open_lane("rev-std", "s1", "rev-1", "head-b", Some("d1"), 9_000, false);
+        e.open_lane("rev-std", "s1", "rev-1", "head-b", Some("d1"), 9_000, false, false);
         // Replaced, not appended: a second record would leave `lane()` reading
         // the first and measuring `lane-stalled` from the original spawn.
         assert_eq!(e.lanes.len(), 1);
@@ -4408,7 +4587,7 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-a".into();
-        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000, false);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000, false, false);
         let blind = DriveFacts {
             required_lanes: Some(vec![lane_fact("rev-std", Some(Verdict::Pass), "head-a", "d1")]),
             head: String::new(),
@@ -4468,7 +4647,7 @@ mod tests {
         assert_eq!(s.counters.ci_attempts, 1);
         // OpenLane needs a spawned session id, so `take` leaves it to S3.
         let mut o = entry_at(DriveState::ReviewWait);
-        o.take(&DriveStep::OpenLane { index: 0, verify: false }, 5_000).unwrap();
+        o.take(&DriveStep::OpenLane { index: 0, verify: false, body_only: false }, 5_000).unwrap();
         assert_eq!(o.state(), DriveState::ReviewWait);
         assert!(o.lanes.is_empty());
     }
@@ -4505,7 +4684,7 @@ mod tests {
         // whether its report reaches the orchestrator by naming a PR number is
         // a delegate that can route around the orchestrator."
         let mut e = entry_at(DriveState::ReviewWait);
-        e.open_lane("rev-std", "s1", "rev-4", "head-a", Some("d1"), 1_000, false);
+        e.open_lane("rev-std", "s1", "rev-4", "head-a", Some("d1"), 1_000, false, false);
         e.worker_agent = "w-7".into();
 
         assert_eq!(e.driven_role("rev-4"), Some(lane_pane("rev-std", true)));
@@ -4524,7 +4703,7 @@ mod tests {
         let mut fresh = entry_at(DriveState::CiWait);
         assert_eq!(fresh.worker_agent, "", "a fresh drive has resumed nobody");
         assert_eq!(fresh.driven_role(""), None);
-        fresh.open_lane("rev-std", "s1", "", "head-a", Some("d1"), 1_000, false);
+        fresh.open_lane("rev-std", "s1", "", "head-a", Some("d1"), 1_000, false, false);
         assert_eq!(fresh.driven_role(""), None, "an unrecorded pane owns no caller");
         // ...and the positive control, so the four `None`s above are the guard
         // and not a method that answers `None` to everything.
@@ -4565,8 +4744,8 @@ mod tests {
         );
 
         // The lane's sibling arc: `open_lane` replaces the record wholesale.
-        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000, false);
-        e.open_lane("rev-std", "s1", "rev-2", "head-b", Some("d1"), 2_000, false);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000, false, false);
+        e.open_lane("rev-std", "s1", "rev-2", "head-b", Some("d1"), 2_000, false, false);
         assert_eq!(e.driven_role("rev-2"), Some(lane_pane("rev-std", true)));
         assert_eq!(
             e.driven_role("rev-1"),
@@ -4619,8 +4798,8 @@ mod tests {
         for i in 0..40 {
             e.record_worker_pane(&format!("w-{i}"));
         }
-        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 0, false);
-        e.open_lane("rev-std", "s1", "rev-2", "head-a", Some("d1"), 1, false);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 0, false, false);
+        e.open_lane("rev-std", "s1", "rev-2", "head-a", Some("d1"), 1, false, false);
 
         // Forty hand-backs and nothing is dropped while every pane is alive:
         // the property a size cap cannot have.
@@ -5748,13 +5927,13 @@ mod tests {
         // Lane 1 not yet briefed: open it.
         assert_eq!(
             decide(&e, &two_lanes(None, None), &limits),
-            DriveStep::OpenLane { index: 0, verify: false }
+            DriveStep::OpenLane { index: 0, verify: false, body_only: false }
         );
         // Lane 1 passed at this (head, digest): move to lane 2 — and note this
         // is NOT a transition, which is why the table has no review-wait arm.
         assert_eq!(
             decide(&e, &two_lanes(Some(Verdict::Pass), None), &limits),
-            DriveStep::OpenLane { index: 1, verify: false }
+            DriveStep::OpenLane { index: 1, verify: false, body_only: false }
         );
         // Both passed: arc 4.
         assert_eq!(
@@ -5816,7 +5995,7 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-a".into();
-        e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000, false);
+        e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000, false, false);
         assert!(e.record_verdict_seen("rev-std", Verdict::Fail, "head-a"));
         let facts = |now: u64| DriveFacts {
             now_ms: now,
@@ -5831,7 +6010,7 @@ mod tests {
         let past_lane = 1_000 + minutes_ms(limits.lane_timeout_minutes) * 2;
         assert_eq!(
             decide(&e, &facts(past_lane), &limits),
-            DriveStep::OpenLane { index: 0, verify: false },
+            DriveStep::OpenLane { index: 0, verify: false, body_only: true },
             "the exemption really does leave this composition unbounded PER LANE — if this \
              ever becomes a lane-named hold, the §8 row disclosing the gap is what needs \
              rewriting"
@@ -5855,7 +6034,7 @@ mod tests {
         );
         assert_eq!(
             decide(&e, &facts(1_000 + bound - 1), &limits),
-            DriveStep::OpenLane { index: 0, verify: false },
+            DriveStep::OpenLane { index: 0, verify: false, body_only: true },
             "…still inside the state bound, so the hold below is that bound and not a \
              coincidence"
         );
@@ -5883,8 +6062,8 @@ mod tests {
     #[test]
     fn a_reseeded_lane_keeps_its_session_and_its_owned_panes_and_no_claim_about_a_revision() {
         let mut e = entry_at(DriveState::ReviewWait);
-        e.open_lane("rev-std", "sess-1", "rev-4", "head-a", Some("d1"), 1_000, false);
-        e.open_lane("rev-std", "sess-1", "rev-9", "head-a", Some("d1"), 2_000, false);
+        e.open_lane("rev-std", "sess-1", "rev-4", "head-a", Some("d1"), 1_000, false, false);
+        e.open_lane("rev-std", "sess-1", "rev-9", "head-a", Some("d1"), 2_000, false, false);
         assert!(e.record_verdict_seen("rev-std", Verdict::Fail, "head-a"));
         let before = e.lane("rev-std").expect("the fixture's own premise").clone();
         assert_eq!(before.prior_agents, vec!["rev-4".to_string()], "the fixture: one supersede");
@@ -5940,7 +6119,7 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-a".into();
-        e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000, false);
+        e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000, false, false);
         let facts = |dead: bool, now: u64| DriveFacts {
             now_ms: now,
             required_lanes: Some(vec![LaneFact {
@@ -5958,7 +6137,7 @@ mod tests {
         );
         assert_eq!(
             decide(&e, &facts(true, 2_000), &limits),
-            DriveStep::OpenLane { index: 0, verify: false },
+            DriveStep::OpenLane { index: 0, verify: false, body_only: false },
             "a lane whose recorded pane is gone is one to re-open — `lane_open_for` says it \
              was ASKED, which a dead pane cannot un-say and cannot answer"
         );
@@ -5969,7 +6148,7 @@ mod tests {
         let stalled = 1_000 + minutes_ms(limits.lane_timeout_minutes);
         assert_eq!(
             decide(&e, &facts(true, stalled - 1), &limits),
-            DriveStep::OpenLane { index: 0, verify: false },
+            DriveStep::OpenLane { index: 0, verify: false, body_only: false },
             "…one tick short, so the hold below is the timeout and not a coincidence"
         );
         assert_eq!(
@@ -6007,7 +6186,7 @@ mod tests {
     #[test]
     fn a_dead_panes_replacement_inherits_the_stall_anchor_and_a_new_round_does_not() {
         let mut e = entry_at(DriveState::ReviewWait);
-        e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000, false);
+        e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000, false, false);
         let rec = || e.lane("rev-std");
 
         let d1 = Some("d1");
@@ -6087,7 +6266,7 @@ mod tests {
         let answered = {
             let mut e = entry_at(DriveState::ReviewWait);
             e.head = "head-a".into();
-            e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000, false);
+            e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000, false, false);
             assert!(
                 e.record_verdict_seen("rev-std", Verdict::Fail, "head-a"),
                 "the fixture must actually record the answer, or this pins nothing"
@@ -6096,7 +6275,7 @@ mod tests {
         };
         assert_eq!(
             decide(&answered, &facts, &limits),
-            DriveStep::OpenLane { index: 0, verify: false },
+            DriveStep::OpenLane { index: 0, verify: false, body_only: true },
             "a reviewer that ANSWERED at this head is not silent — arc 8 owes it the delta \
              re-brief, not a hold naming it as the thing that went quiet"
         );
@@ -6106,7 +6285,7 @@ mod tests {
         let silent = {
             let mut e = entry_at(DriveState::ReviewWait);
             e.head = "head-a".into();
-            e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000, false);
+            e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000, false, false);
             e
         };
         assert_eq!(
@@ -6138,7 +6317,7 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-a".into();
-        e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000, false);
+        e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000, false, false);
         let stale = 1_000 + minutes_ms(limits.lane_timeout_minutes);
         let facts = |now: u64, digest: &str| DriveFacts {
             now_ms: now,
@@ -6159,7 +6338,7 @@ mod tests {
         );
         assert_eq!(
             decide(&e, &facts(stale - 1, "d2"), &limits),
-            DriveStep::OpenLane { index: 0, verify: false },
+            DriveStep::OpenLane { index: 0, verify: false, body_only: false },
             "the negative control: inside the timeout a moved digest is still a re-brief"
         );
     }
@@ -6186,14 +6365,14 @@ mod tests {
         // The control: an un-starved drive proposes the spawn, so every
         // assertion below is about the starvation and not about a lane that
         // could never have opened.
-        assert_eq!(decide(&e, &facts(10_000), &limits), DriveStep::OpenLane { index: 0, verify: false });
+        assert_eq!(decide(&e, &facts(10_000), &limits), DriveStep::OpenLane { index: 0, verify: false, body_only: false });
 
         assert!(e.note_cap_starvation(10_000), "the first refusal of a run stamps the clock");
         // One tick short of the window: still trying, still no orchestrator turn
         // spent on a condition that clears itself.
         assert_eq!(
             decide(&e, &facts(10_000 + CAP_HOLD_MS - 1), &limits),
-            DriveStep::OpenLane { index: 0, verify: false },
+            DriveStep::OpenLane { index: 0, verify: false, body_only: false },
             "a cap that has not refused for the whole window is a back-off, not a hold"
         );
         assert_eq!(
@@ -6401,12 +6580,12 @@ mod tests {
         // bound in three passes with no re-review having happened.
         assert_eq!(
             decide(&e, &at(Verdict::Fail, "head-a"), &limits),
-            DriveStep::OpenLane { index: 0, verify: false },
+            DriveStep::OpenLane { index: 0, verify: false, body_only: false },
             "a fail recorded against a commit that no longer describes the PR must not route"
         );
         assert_eq!(
             decide(&e, &at(Verdict::Escalate, "head-a"), &limits),
-            DriveStep::OpenLane { index: 0, verify: false },
+            DriveStep::OpenLane { index: 0, verify: false, body_only: false },
             "…nor may a stale escalate park the drive on a judgment nobody is being asked for"
         );
         // The digest half of the same key: same head, body moved under it.
@@ -6414,7 +6593,7 @@ mod tests {
             body_digest: Some("d2".into()),
             ..at(Verdict::Fail, "head-b")
         };
-        assert_eq!(decide(&e, &moved, &limits), DriveStep::OpenLane { index: 0, verify: false });
+        assert_eq!(decide(&e, &moved, &limits), DriveStep::OpenLane { index: 0, verify: false, body_only: false });
         // …and "we could not check" is not "it changed", in this direction too.
         let unknown = DriveFacts { body_digest: None, ..at(Verdict::Fail, "head-b") };
         assert_eq!(
@@ -6444,7 +6623,7 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-a".into();
-        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000, false);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000, false, false);
         let facts = DriveFacts {
             required_lanes: Some(vec![lane_fact("rev-std", None, "", "")]),
             now_ms: 1_000 + minutes_ms(limits.lane_timeout_minutes) - 1,
@@ -6472,12 +6651,12 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-b".into();
-        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000, false);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000, false, false);
         let facts = DriveFacts {
             required_lanes: Some(vec![lane_fact("rev-std", None, "", "")]),
             ..facts_at("head-b")
         };
-        assert_eq!(decide(&e, &facts, &limits), DriveStep::OpenLane { index: 0, verify: false });
+        assert_eq!(decide(&e, &facts, &limits), DriveStep::OpenLane { index: 0, verify: false, body_only: false });
     }
 
     #[test]
@@ -6488,7 +6667,7 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-a".into();
-        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("OLD"), 1_000, false);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("OLD"), 1_000, false, false);
         let facts = DriveFacts {
             required_lanes: Some(vec![lane_fact("rev-std", Some(Verdict::Pass), "head-a", "OLD")]),
             body_digest: Some("NEW".into()),
@@ -6497,7 +6676,7 @@ mod tests {
         // …and `verify` is TRUE (#2168 E2): the single required lane has a pass
         // bound to this head, so nothing about the code is outstanding and the
         // brief about to go out is a body-verification delta.
-        assert_eq!(decide(&e, &facts, &limits), DriveStep::OpenLane { index: 0, verify: true });
+        assert_eq!(decide(&e, &facts, &limits), DriveStep::OpenLane { index: 0, verify: true, body_only: true });
     }
 
     #[test]
@@ -6522,12 +6701,12 @@ mod tests {
         // able to discharge the clause for the other.
         assert_eq!(
             decide(&e, &with(stale.clone()), &limits),
-            DriveStep::OpenLane { index: 0, verify: true }
+            DriveStep::OpenLane { index: 0, verify: true, body_only: false }
         );
 
         // S3 sends it; the drive waits rather than moving on to lane 1. That is
         // the whole saving: before #2168 E2 the second lane's turn came next.
-        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d2"), 1_500, true);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d2"), 1_500, true, false);
         assert_eq!(decide(&e, &with(stale.clone()), &limits), DriveStep::Wait);
 
         // rev-std records the verification pass. rev-final's pass at d1 settles
@@ -6561,7 +6740,7 @@ mod tests {
         ];
         assert_eq!(
             decide(&e, &with(unmarked), &limits),
-            DriveStep::OpenLane { index: 1, verify: true }
+            DriveStep::OpenLane { index: 1, verify: true, body_only: false }
         );
 
         // And the delegation is bounded by the HEAD it was granted at: once the
@@ -6604,7 +6783,7 @@ mod tests {
                 &with(vec![std_pass.clone(), lane_fact("rev-final", None, "", "")], Some("d2")),
                 &limits
             ),
-            DriveStep::OpenLane { index: 0, verify: false }
+            DriveStep::OpenLane { index: 0, verify: false, body_only: false }
         );
 
         // A lane whose pass is bound to a head the branch has left reads as
@@ -6623,7 +6802,7 @@ mod tests {
                 ),
                 &limits
             ),
-            DriveStep::OpenLane { index: 0, verify: false }
+            DriveStep::OpenLane { index: 0, verify: false, body_only: false }
         );
 
         // A body orrerix could not read grants nothing: the verdict this brief
@@ -6636,7 +6815,7 @@ mod tests {
                 &with(vec![std_pass.clone(), lane_fact("rev-final", None, "", "")], None),
                 &limits
             ),
-            DriveStep::OpenLane { index: 1, verify: false }
+            DriveStep::OpenLane { index: 1, verify: false, body_only: false }
         );
 
         // The positive control, so the three rows above are the precondition
@@ -6653,7 +6832,7 @@ mod tests {
                 ),
                 &limits
             ),
-            DriveStep::OpenLane { index: 0, verify: true }
+            DriveStep::OpenLane { index: 0, verify: true, body_only: false }
         );
     }
 
@@ -6673,10 +6852,10 @@ mod tests {
             body_digest: Some("NEW".into()),
             ..facts_at("head-a")
         };
-        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("OLD"), 1_000, false);
-        assert_eq!(decide(&e, &facts, &limits), DriveStep::OpenLane { index: 0, verify: true });
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("OLD"), 1_000, false, false);
+        assert_eq!(decide(&e, &facts, &limits), DriveStep::OpenLane { index: 0, verify: true, body_only: true });
         // S3 performs that brief; the drive now waits on the reviewer.
-        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("NEW"), 1_500, true);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("NEW"), 1_500, true, true);
         assert_eq!(decide(&e, &facts, &limits), DriveStep::Wait);
     }
 
@@ -6697,6 +6876,7 @@ mod tests {
             briefed_digest: digest.into(),
             spawned_ms: 0,
             briefed_verify: false,
+            briefed_body_only: false,
             extra: BTreeMap::new(),
         };
         let now = Some("d1");
@@ -7286,7 +7466,7 @@ mod tests {
     fn lane_open_at(head: &str) -> DriveEntry {
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = head.to_string();
-        e.open_lane("rev-std", "sess-lane", "rev-1", head, Some("d1"), 1_000, false);
+        e.open_lane("rev-std", "sess-lane", "rev-1", head, Some("d1"), 1_000, false, false);
         e
     }
 
@@ -7455,7 +7635,7 @@ mod tests {
     #[test]
     fn a_release_refuses_a_lane_whose_session_cannot_be_named() {
         let mut e = entry_at(DriveState::ReviewWait);
-        e.open_lane("rev-std", "", "rev-1", "h1", Some("d1"), 1_000, false);
+        e.open_lane("rev-std", "", "rev-1", "h1", Some("d1"), 1_000, false, false);
         assert_eq!(
             e.release_pane(&DrivenRole::Lane("rev-std".into()), ""),
             None,

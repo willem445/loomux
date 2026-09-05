@@ -537,6 +537,22 @@ pub mod audit_action {
     /// counting reviewer slots must not have to filter worker rows out of its
     /// answer.
     pub const WORKER_RELEASED: &str = "rd-worker-released";
+    /// The drive spent #2509's **one-shot grace**: a blocking `fail` arrived at
+    /// the review bound on a lane briefed about the PR body alone, and the drive
+    /// handed back once more instead of parking `held(review-limit)`.
+    ///
+    /// Carries `pr`, `block` (the lane whose fail earned it), `head`, `round`
+    /// (the review rounds already spent, which is the bound) and `reason`.
+    ///
+    /// Its own action rather than a detail on [`HANDBACK`], for [`CI_RED`]'s
+    /// reason: "this drive got an extra round it would not have had" is the
+    /// thing that happened, and the scorecard question it answers — how often
+    /// does the grace fire, and does it then reach a merge — must not be
+    /// reachable only by filtering hand-backs.
+    ///
+    /// **Written on the arc being TAKEN**, beside the hand-back it funds, never
+    /// on the intent: a grace whose transition the entry refused bought nothing.
+    pub const ROUND_GRACE: &str = "rd-round-grace";
     /// A lane's verdict was read at this revision.
     pub const VERDICT: &str = "rd-verdict";
     /// The worker's session was resumed with a hand-back brief.
@@ -981,11 +997,21 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
              cancel_review_drive stops it.",
             f.lane
         ),
+        // **The grace clause is not decoration** (#2509). At the bound the two
+        // figures are equal whether or not the drive already had its extra
+        // round, so `review_rounds 3/3` is the same string for a drive that has
+        // had three rounds and one that has had four. An orchestrator deciding
+        // whether to spend `reset_counters: true` is deciding how much this PR
+        // has already cost, and that is the fact the numbers cannot carry.
         HeldReason::ReviewLimit => format!(
-            "HELD — review rounds {}/{}{at}; last {} FAIL{summary}.{session} \
+            "HELD — review rounds {}/{}{}{at}; last {} FAIL{summary}.{session} \
              drive_review(pr, session, reset_counters: true) to spend another {}, \
              or take it by hand.",
-            f.counters.review_rounds, f.max_review_rounds, f.lane, f.max_review_rounds,
+            f.counters.review_rounds,
+            f.max_review_rounds,
+            if f.counters.body_only_grace { ", plus a body-only grace round" } else { "" },
+            f.lane,
+            f.max_review_rounds,
         ),
         HeldReason::CiLimit => format!(
             "HELD — CI attempts {}/{}{at}; failing: {}.{session} \

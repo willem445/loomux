@@ -1285,6 +1285,7 @@ impl OrchRegistry {
         limits: &reviewdrive::DriveLimits,
         now: u64,
         verify: bool,
+        body_only: bool,
     ) -> Result<RdLaneOpen, String> {
         if block.is_empty() {
             return Err("no lane at that index".into());
@@ -1495,6 +1496,10 @@ impl OrchRegistry {
             brief.body_digest_opt(),
             anchor,
             verify,
+            // #2509. Carried from the step, never re-derived here — see
+            // `LaneRecord::briefed_body_only`, and `briefed_verify` one
+            // argument up for why a grant is derived exactly once.
+            body_only,
         );
         Ok(RdLaneOpen { agent, session: session_id, resumed, scope })
     }
@@ -1823,8 +1828,9 @@ impl OrchRegistry {
         entry: &mut reviewdrive::DriveEntry,
         brief: &RdBrief,
         limits: &reviewdrive::DriveLimits,
+        grace: bool,
     ) -> Result<String, String> {
-        let text = self.rd_fix_brief(entry, brief, limits);
+        let text = self.rd_fix_brief(entry, brief, limits, grace);
         let session = entry.worker_session.clone();
         if session.is_empty() {
             return Err("this drive has no recorded worker session".into());
@@ -2189,6 +2195,30 @@ impl OrchRegistry {
         }
     }
 
+    /// The sentence #2509's grace round owes the worker it hands back to.
+    ///
+    /// **Because the `{{ATTEMPT}}` numbers cannot say it.** They are
+    /// `review_rounds` of `max_review_rounds`, and a grace round is the one
+    /// hand-back where `review_rounds` has already stopped at the bound — so
+    /// the brief would otherwise read "attempt 3 of 3" for the second time in
+    /// a row, with no account of why there is a second one. A worker that
+    /// cannot tell a grace from a bug in the counter has been told something
+    /// false by omission.
+    ///
+    /// It is also where the worker learns the bound is now REALLY spent: the
+    /// next blocking fail parks the drive whatever it is about.
+    fn grace_clause(grace: bool) -> &'static str {
+        if grace {
+            " This is a GRACE round past the review bound: the last blocking \
+             fail came back on a lane that was re-briefed about the PR body \
+             alone, at a head that had not moved. It is granted once per drive \
+             and is now spent, so the next blocking fail parks the drive \
+             whatever it is about."
+        } else {
+            ""
+        }
+    }
+
     /// Render the worker's hand-back brief (§5.5).
     ///
     /// `{{WHAT}}` is **loomux-authored text chosen from a closed set of three**,
@@ -2200,6 +2230,7 @@ impl OrchRegistry {
         entry: &reviewdrive::DriveEntry,
         brief: &RdBrief,
         limits: &reviewdrive::DriveLimits,
+        grace: bool,
     ) -> String {
         let base = rd_fact(&brief.base);
         let (what, attempt, max) = match brief.ci {
@@ -2239,7 +2270,7 @@ impl OrchRegistry {
                             .clone()
                             .unwrap_or_else(|| brief.failing_lane())
                     )
-                ),
+                ) + Self::grace_clause(grace),
                 entry.counters.review_rounds,
                 limits.max_review_rounds,
             ),
@@ -2757,7 +2788,7 @@ impl OrchRegistry {
                     }
                 }
             }
-            reviewdrive::DriveStep::OpenLane { index, verify } => {
+            reviewdrive::DriveStep::OpenLane { index, verify, body_only } => {
                 // `decide` only ever names an index into the list it was handed,
                 // so `None` is unreachable — and it is handled by falling
                 // THROUGH rather than returning, because an early return here
@@ -2770,7 +2801,9 @@ impl OrchRegistry {
                 // asks about — and turned into a row only on the `Ok` arm,
                 // because a re-open the cap refused has re-opened nothing.
                 let replaced = entry.lane(&block).and_then(|rec| self.rd_dead_lane_pane(rec));
-                match self.rd_open_lane(group, entry, &block, &brief, limits, now, *verify) {
+                match self
+                    .rd_open_lane(group, entry, &block, &brief, limits, now, *verify, *body_only)
+                {
                     Ok(RdLaneOpen { agent, session, resumed, scope }) => {
                         entry.lane_index = *index;
                         if let Some((pane, killed_by)) = replaced {
@@ -2940,7 +2973,37 @@ impl OrchRegistry {
                 out.advanced = Some((*to, *held_reason));
                 match to {
                     reviewdrive::DriveState::FixWait => {
-                        match self.rd_handback(group, entry, &brief, limits) {
+                        // **#2509's grace, read off the STEP and not off the
+                        // counters.** `take` above has already set
+                        // `body_only_grace`, so a second derivation here would
+                        // read `true` on every later hand-back of this drive
+                        // too — which is the grant disagreeing with itself, the
+                        // thing `briefed_verify` is placed on the step to avoid.
+                        // The bump names this arc and nothing else.
+                        let grace = matches!(
+                            step,
+                            reviewdrive::DriveStep::Advance {
+                                bump: Some(reviewdrive::Counter::BodyOnlyGrace),
+                                ..
+                            }
+                        );
+                        // Written BEFORE the hand-back, so a grace whose
+                        // hand-back then fails still shows the round that was
+                        // granted — the arc is what spent it, and `take`
+                        // accepted the arc two screens up. The `rd-handback`
+                        // row that follows on the `Ok` arm is what says the
+                        // worker was actually reached.
+                        if grace {
+                            out.audits.push((
+                                rddrive::audit_action::ROUND_GRACE,
+                                json!({ "pr": pr, "head": brief.head,
+                                        "block": brief.deciding_lane.clone()
+                                            .unwrap_or_else(|| brief.failing_lane()),
+                                        "round": entry.counters.review_rounds,
+                                        "reason": "body-only" }),
+                            ));
+                        }
+                        match self.rd_handback(group, entry, &brief, limits, grace) {
                             Ok(agent) => {
                                 out.handback = Some(agent.clone());
                                 out.audits.push((
@@ -3782,6 +3845,14 @@ impl OrchRegistry {
                         "ci_attempts": e.counters.ci_attempts,
                         "rebase_attempts": e.counters.rebase_attempts,
                     },
+                    // #2509. Published beside the counters rather than inside
+                    // them, because it is not one: `review_rounds` is what this
+                    // drive has spent of INVARIANT 9's budget and stops at the
+                    // bound, while this says whether the one extra round outside
+                    // that budget is still available. An orchestrator reading
+                    // `review_rounds: 3` of 3 on a LIVE drive is looking at the
+                    // grace, and this is the field that says so.
+                    "grace_used": e.counters.body_only_grace,
                     // Derived, never stored: a stored AGE is stale the instant
                     // it is written and meaningless across a restart, which is
                     // the queue's own split between `enqueued_ms` and
