@@ -46103,6 +46103,12 @@ fn the_orchestrator_is_told_which_ids_it_may_spawn_by_now() {
         notice.contains("a bare resume of its session will be refused"),
         "the one consequence the pane cannot discover for itself: {notice}"
     );
+    // #1689 slice C: the notice deliberately names NO tool — the read-back
+    // pointer lives in the kickoff's workflow section (see the design note),
+    // because a notice must stay one paragraph and is a delivery, not the
+    // place an agent is taught a tool. Pin the negative so the clause cannot
+    // drift back in silently.
+    assert!(!notice.contains("list_blocks"), "{notice}");
     assert!(is_one_paragraph(&notice), "a delivered notice is ONE paragraph: {notice:?}");
 }
 
@@ -46777,6 +46783,193 @@ fn workflow_status_shapes_differ_for_a_workflow_group_and_a_builtin_group() {
             "every block in the wire shape must carry id/kind/cli/model/persona: {b}"
         );
     }
+}
+
+// ───────── #1689 slice C: `list_blocks`, the orchestrator's read-back ─────────
+//
+// The switch notice is a delivery, not a record — a compact can take it, while
+// the roster a switch installed outlives any one delivery. The durable half is
+// this orchestrator-only read of the ACTIVE roster, driven here through the real
+// `dispatch()` so both gates (role, membership) are the ones that actually run.
+// The teaching paragraph rides templates/workflow.md — unpinned, behind
+// `workflow_section`'s `roster_is_custom` gate — and its silence on a built-in
+// group is pinned beside the tool tests, on the same fixture the refusals run
+// against.
+
+/// The Caller for the orchestrator `switchable_group` spawned — that helper
+/// keeps the AgentEntry to itself, so resolve the row the roster still carries.
+fn orch_caller_of(reg: &OrchRegistry, g: &GroupInfo) -> Caller {
+    let id = reg
+        .list_agents(&g.id)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["role"] == json!("orchestrator"))
+        .and_then(|a| a["id"].as_str())
+        .unwrap_or_else(|| panic!("no orchestrator in the roster"))
+        .to_string();
+    let a = reg.agent(&id).unwrap();
+    reg.resolve_token(&a.token).unwrap()
+}
+
+fn list_blocks_call(reg: &OrchRegistry, caller: &Caller) -> Value {
+    dispatch(reg, caller, "tools/call", &json!({ "name": "list_blocks", "arguments": {} })).unwrap()
+}
+
+#[test]
+fn list_blocks_after_an_apply_returns_the_new_roster() {
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    let co = orch_caller_of(&reg, &g);
+
+    // Before the switch the read-back answers with the roster the group
+    // launched on — the pre-switch state is part of the contract, not setup.
+    // Driven through dispatch like everything else in this section, so the
+    // tests-first commit compiled and ran against the tree WITHOUT the tool and
+    // reddened on `unknown tool: list_blocks` — a behavioral red, not a
+    // compile error masking one.
+    let before_raw = list_blocks_call(&reg, &co);
+    assert_eq!(before_raw["isError"], json!(false), "{before_raw}");
+    let before: Value =
+        serde_json::from_str(before_raw["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(before["workflow"], json!("default"), "{before}");
+    let before_ids: Vec<&str> =
+        before["blocks"].as_array().unwrap().iter().map(|b| b["id"].as_str().unwrap()).collect();
+    assert_eq!(before_ids, vec!["w-a", "rev-a"], "{before}");
+
+    reg.apply_workflow(&g.id, &wf("b"), None, "human").unwrap();
+
+    // Through the real dispatch, so the role gate and the membership gate are
+    // the shipped ones, not a bypass of them.
+    let after = list_blocks_call(&reg, &co);
+    assert_eq!(after["isError"], json!(false), "{after}");
+    let text: Value =
+        serde_json::from_str(after["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["workflow"], json!("b"), "{text}");
+    assert_eq!(text["name"], json!("focused-b"), "the file's own name: field: {text}");
+    let rows = text["blocks"].as_array().unwrap();
+    let ids: Vec<&str> = rows.iter().map(|b| b["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["w-b", "rev-b"], "the NEW roster, in the file's own order: {text}");
+    // The wire rows are the same `roster_json` shape `workflow_status`
+    // publishes — that is what makes the read-back comparable against the
+    // notice and the human's status payload with no second vocabulary.
+    let by_id = |id: &str| rows.iter().find(|b| b["id"] == json!(id)).unwrap_or_else(|| panic!("{id}: {text}"));
+    for b in rows {
+        assert!(
+            b.get("kind").is_some() && b.get("cli").is_some() && b.get("model").is_some()
+                && b.get("persona").is_some(),
+            "every row must carry id/kind/cli/model/persona: {b}"
+        );
+    }
+    assert_eq!(by_id("rev-b")["persona"], json!(true), "rev-b declares a prompt: {text}");
+    assert_eq!(
+        by_id("w-b")["persona"], json!(false),
+        "presence, not content — w-b declares only a model: {text}"
+    );
+    assert_eq!(by_id("w-b")["model"], json!("sonnet"), "{text}");
+}
+
+#[test]
+fn list_blocks_refuses_a_reviewer_caller_and_stays_unlisted_to_delegates() {
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    let rev = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "t", false, None).unwrap();
+    let cr = reg.resolve_token(&rev.token).unwrap();
+
+    // The real gate: a reviewer's CALL is refused, with the orchestrator-only
+    // wording every require_orchestrator refusal carries.
+    let denied = list_blocks_call(&reg, &cr);
+    assert_eq!(denied["isError"], true, "{denied}");
+    assert!(
+        denied["content"][0]["text"].as_str().unwrap().contains("orchestrator-only"),
+        "{denied}"
+    );
+
+    // …and the cosmetic half: the listing agrees, so a delegate is not even
+    // offered the tool.
+    let listed = dispatch(&reg, &cr, "tools/list", &json!({})).unwrap();
+    let names: Vec<&str> =
+        listed["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(!names.contains(&"list_blocks"), "{names:?}");
+    let orch_listed = dispatch(&reg, &orch_caller_of(&reg, &g), "tools/list", &json!({})).unwrap();
+    let orch_names: Vec<&str> =
+        orch_listed["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(orch_names.contains(&"list_blocks"), "{orch_names:?}");
+}
+
+#[test]
+fn list_blocks_refuses_a_caller_whose_membership_does_not_check_out() {
+    // `require_in_group` on the CALLER'S OWN id, because there is no target
+    // argument to resolve: a forged or mis-routed caller — agent id from one
+    // group, token claiming another — is refused with the same unknown-agent
+    // wording every target-taking tool uses, so the refusal leaks no other
+    // group's roster. The caller is built by hand the same way the liaison
+    // test builds its smuggled one: no producer reaches this state today, and
+    // the pin is against one that does (the remote-engine daemon).
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    let co = orch_caller_of(&reg, &g);
+    let other = reg.create_group("C:/tmp/other-repo", rails()).unwrap();
+
+    let smuggled = Caller {
+        agent_id: co.agent_id.clone(),
+        group: other.id.clone(),
+        role: Role::Orchestrator,
+        role_hint: None,
+    };
+    let denied = list_blocks_call(&reg, &smuggled);
+    assert_eq!(denied["isError"], true, "{denied}");
+    assert!(
+        denied["content"][0]["text"].as_str().unwrap().contains("unknown agent"),
+        "cross-group must be indistinguishable from nonexistent — no id leak: {denied}"
+    );
+
+    // Same wording for an id that is in no registry at all — the second arm of
+    // the same gate, refused before the group is ever consulted.
+    let unregistered = Caller {
+        agent_id: "no-such-agent".into(),
+        group: g.id.clone(),
+        role: Role::Orchestrator,
+        role_hint: None,
+    };
+    let denied = list_blocks_call(&reg, &unregistered);
+    assert_eq!(denied["isError"], true, "{denied}");
+    assert!(
+        denied["content"][0]["text"].as_str().unwrap().contains("unknown agent"),
+        "{denied}"
+    );
+}
+
+#[test]
+fn the_workflow_kickoff_teaches_the_notice_and_the_read_back_only_when_a_roster_is_declared() {
+    // The `advisor_and_process_prose_stays_silent_unless_a_block_declares_the_hint`
+    // rule applied to slice C: a group running the built-in roster must not read
+    // a word about a switch notice or a read-back it will never receive, and the
+    // pinned orchestrator template is untouched — the sentence rides
+    // templates/workflow.md (deliberately not fixture-pinned) behind
+    // `workflow_section`'s `roster_is_custom` gate.
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = reg
+        .create_group(&repo.path().to_string_lossy(), advanced_rails())
+        .unwrap();
+    let custom = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("orchestrator.md"))
+        .unwrap();
+    assert!(custom.contains("[orrerix] workflow switched:"), "{custom}");
+    assert!(custom.contains("list_blocks()"), "{custom}");
+    assert!(!custom.contains("{{"), "{custom}");
+
+    // The built-in roster: silent on both, and the placeholder gate left
+    // nothing raw behind.
+    let (reg2, _d2) = test_registry();
+    let g2 = reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    let builtin =
+        fs::read_to_string(reg2.state_root().join(g2.id.as_str()).join("orchestrator.md")).unwrap();
+    assert!(!builtin.contains("list_blocks"), "{builtin}");
+    assert!(!builtin.contains("workflow switched"), "{builtin}");
 }
 
 // ───────── #385: merge-gate hot-reload ─────────
