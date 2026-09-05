@@ -4,11 +4,10 @@ Started by #2515 slice **C2**, which taught orrerix to read Codex's own rollout
 store: the by-id lookup behind a resume, the Sessions-tab rows, and the frontend
 identity that makes a codex pane adopt a codex session.
 
-**This file is not finished.** C2 owns the sections below. The launch line, the
-profile file orrerix writes, containment, the store watcher and the usage meter
-are #2515's C1 and C3, and each adds its own section here. What is written now is
-written because C2 depends on it; nothing here is a placeholder for a decision
-somebody else will take.
+**Still one section short.** C2 wrote the store sections; C1 added the harness —
+the launch line, the profile file orrerix writes, containment, and the session
+watcher. The **usage meter** is #2515's C3 and adds its own section here.
+Nothing below is a placeholder for a decision somebody else will take.
 
 ## Pins
 
@@ -376,3 +375,322 @@ That makes this arm strictly stronger than pi's neighbour, where a human's own
 orrerix-owned namespace to recognise, and here it does.
 
 What *writes* that profile file, and everything in it, is #2515 C1.
+
+## The harness
+
+Everything from here down is #2515 slice **C1**: what loomux writes for a codex
+pane, the line it launches, how the pane's session is identified, and what was
+deliberately not done.
+
+The pins above cover it too, with one addition. C1 read four things the slice
+plan had wrong or had not reached, and each is recorded on the issue with its
+blob citation rather than only here:
+
+- **`max` IS deliverable.** `ReasoningEffort`'s hand-written `FromStr` maps
+  `"max" => Ok(Self::Max)` beside `none`, `minimal`, `ultra`, `persistent` and a
+  `Custom(String)` catch-all, so codex's effort vocabulary is a strict superset
+  of loomux's five rather than a subset of it.
+- **`-p` names a whole config document.** The flag is
+  `config_profile_v2: Option<ProfileV2Name>`, documented *"Layer
+  `$CODEX_HOME/<name>.config.toml` on top of the base user config"* — **not**
+  the legacy `[profiles.<name>]` table, whose `ConfigProfile` struct has no
+  `projects`, no `mcp_servers` and no `developer_instructions` at all. Every key
+  below depends on that distinction.
+- **A rollout FILE does not exist at boot.** `RolloutRecorder::new`: *"For newly
+  created sessions, this precomputes path/metadata and defers file creation/open
+  until an explicit `persist()` call."*
+- **The trust key is honoured from a profile layer.** The loader folds every
+  layer into `merged_so_far` before it computes the project trust context, and
+  the profile is pushed as a second *user* layer.
+
+## The launch line
+
+    codex -C "<cwd>" -p <profile> [-m <model>] [resume <thread id>]
+
+Four things, and three of them are one thing.
+
+**`-C/--cd <DIR>`, on every line.** *"Tell the agent to use the specified
+directory as its working root."* Without it codex's working root is the
+process's cwd, which for a loomux pane is not the pane's. On a **resume** it is
+doing real work rather than being symmetric for its own sake: resuming a thread
+whose recorded cwd differs from the launch directory makes the TUI *prompt*
+("resume here or there?") when `tui.resume_cwd` is unset, and a prompt on a pane
+loomux is about to type a kickoff into is a lost kickoff.
+
+**`-p <profile>`** carries everything else — see the next section.
+
+**`-m <model>` only when a block pins one.** `default_model("codex", _)` is
+empty, so an unpinned block inherits the `model` key from the human's own
+`~/.codex/config.toml`, and the generated profile deliberately does not name a
+model.
+
+**`resume <thread id>` only on a resume, and LAST.** This is the only session
+identity among loomux's five adapters that is a *subcommand* rather than a flag.
+codex's usage is `codex [OPTIONS] <COMMAND> [ARGS]` and
+`SharedCliOptions::inherit_exec_root_options` gives the subcommand the root
+options written before it — so this order is not a preference, it is the only
+one that works.
+
+A **fresh** spawn names no session at all, because there is nothing to name:
+codex has no opens-or-creates flag, and the id is learned from the store
+afterwards (see §Sessions).
+
+**Not on the line, ever:** `--full-auto` (which does not exist at the pin — its
+only occurrence in `codex-rs` is a test, and the docs call it "a deprecated
+compatibility alias"), the dangerous bypass flag and its `--yolo` alias,
+`--approve-for-me`, and `-s`/`-a`. The last two are the interesting refusal:
+they exist and would work, and emitting them would give a pane a posture its own
+profile disagrees with. Posture belongs to the profile, so the attended and
+unattended lines are byte-identical and the two profiles are not — a pair of
+assertions that is only honest together.
+
+## The profile file
+
+    $CODEX_HOME/<brand>-<agent id>.config.toml
+
+`resolve_profile_v2_config_path` builds it as
+`format!("{profile_name}{CONFIG_PROFILE_V2_SUFFIX}")` against `codex_home`, with
+`CONFIG_PROFILE_V2_SUFFIX = ".config.toml"` — directly under the home, no
+subdirectory. The name is `<brand>-<agent id>` so the sweep below can recognise
+loomux's own files, and `ProfileV2Name`'s alphabet (ASCII alphanumerics, `_`,
+`-`) is *wider* than `PathSegment`'s, so every agent id loomux mints produces a
+selectable name by construction.
+
+### Key order is load-bearing
+
+In TOML every key after a table header belongs to that table. So every top-level
+scalar — `approval_policy`, `sandbox_mode`, `model_reasoning_effort`,
+`developer_instructions` — is emitted **before** the first `[…]` line. Get this
+wrong and nothing fails loudly: codex's strict-config check reports an unknown
+key at best, and at worst the pane boots with none of its posture and no obvious
+cause. `a_codex_profiles_top_level_keys_all_precede_the_first_table_header`
+pins it on POSITION, so a new key added below the fold reddens without anyone
+having to remember the rule.
+
+### Every key, and why
+
+| key | value | why |
+| --- | --- | --- |
+| `approval_policy` | `never` \| `on-request` | the posture. `never` is `AskForApproval::Never`, "Never ask the user to approve commands"; `on-request` prompts, and the attention scan catches the overlay. Unlike pi's, this toggle is real. |
+| `sandbox_mode` | `workspace-write` | the only rung a working agent can use — see §Containment. |
+| `model_reasoning_effort` | a block's `effort:` | omitted entirely when unset: `ReasoningEffort` refuses the empty string outright, so a blank key would fail the *whole* profile rather than be ignored. |
+| `developer_instructions` | the block's role contract | see §The contract. |
+| `[sandbox_workspace_write] network_access` | `true` | off by default under `workspace-write`, and a worker that cannot reach GitHub is not a worker. |
+| `[projects."<cwd>"] trust_level` | `trusted` | see §Trust. |
+| `[mcp_servers.<brand>]` | `url`, timeouts, one header map | loomux's own server, over streamable HTTP. One server contract, six spellings. |
+
+`default_tools_approval_mode = "auto"` is codex's own default, **spelled out
+rather than inherited**: a human's `config.toml` can set a different one
+globally, and an agent whose `report` needs approving has nobody to approve it.
+The profile layer wins over the user layer, so stating it is what makes the
+pane's tool surface independent of their setting.
+
+### Trust: the single most important line
+
+`should_show_trust_screen(config)` is exactly
+`config.active_project.trust_level.is_none()`, and it renders "Do you trust the
+contents of this directory? … 1. Yes, continue 2. No, quit".
+
+A fresh worktree is always a new project root — `find_project_root` walks
+ancestors for a marker, and a worktree's `.git` is a **file**, which the
+`marker == ".git" && metadata.is_directory` skip therefore does not apply to, so
+the walk stops at the worktree rather than continuing to the main clone. Without
+the trust key **every worker pane would boot into that dialog and eat its
+kickoff**.
+
+**Residual, because a reader will look for it.** The key is the pane's `cwd`,
+and codex looks trust up under the project ROOT. Every pane loomux launches is
+*at* a root — a worker's worktree, or the group's repo — so the two coincide
+today. A pane launched in a subdirectory of a repo would find no entry and see
+the dialog. Writing the ancestor chain instead would mean re-implementing the
+vendor's root discovery here; writing the repo root would trust more of the
+human's tree than this pane asked for.
+
+### The token rides the channel the pane HAS
+
+This is the one place a group pane's profile and a solo pane's differ, and the
+difference is forced rather than chosen. #2515's plan D2 said the token "lives
+in the pane ENV, never in the file or on argv". That is right for the pane D2
+was describing and impossible for the other.
+
+| pane | how the token reaches codex | why |
+| --- | --- | --- |
+| **group** | `env_http_headers = { "<header>" = "<VAR>" }`, value exported by `cli_extra_env` | the pane has an environment, so the secret goes there and no token byte is in the file. D2 verbatim. |
+| **solo** | `http_headers = { "<header>" = "<token>" }` | the pane has no environment. |
+
+`solo_prepare` only ever appends a flag string to a command line the human owns
+— it sets no pane environment at all. A solo profile naming a variable nothing
+sets would connect with **no auth header**: every tool call fails, and the pane
+is still advertised `delivery_only: false`, which is exactly the
+advertised-status-disagrees-with-reality defect `solo_prepare`'s own fallback
+arm exists to prevent. Carrying the token in the file is what every other CLI's
+generated config already does, and the file is in a directory that is the
+human's own.
+
+Both shapes are pinned by asserting the ABSENCE of the other as well as the
+presence of their own. Presence alone would pass on a generator that emitted
+both maps, which is the one outcome worse than either: the secret in the file
+*and* a dependency on the variable.
+
+### The contract
+
+codex has no `--append-system-prompt` and no `--agent`, and its
+`model_instructions_file` is the wrong knob — it REPLACES the built-in prompt
+rather than adding to it, which would take the agent's own tool discipline away
+in order to give it a role. The seam is `developer_instructions`, so the
+contract is the only one of loomux's five persona shapes that travels **by
+value** rather than as a path. It never reaches argv, so #417's
+`CreateProcessW` limit — the reason the other four are files — does not apply.
+
+**It is `ContractCarrier::SystemLayerFull`, and that is measured rather than
+assumed.** The key is documented as "inserted as a `developer` role message",
+which sounds like conversation history a compaction would eat. It is not: codex
+reads it from CONFIG into every `TurnContext` and re-inserts it through
+`build_initial_context_with_world_state` on the compaction path itself
+(`start_new_context_window` → `replace_compacted_history`). A compacted codex
+pane recovers its contract from this file with loomux doing nothing.
+
+**The encoding is a multi-line BASIC string, not the `'''` literal the slice
+plan named.** A TOML literal string admits no escapes at all — its content ends
+at the first closing delimiter run and there is nothing one can write instead —
+so "escaping `'''`" means REWRITING the role contract on its way to the agent.
+A contract that reaches the model altered is worse than one that is encoded,
+because the alteration is invisible from both ends. The basic form is lossless
+and total: every `"` becomes `\"` so a delimiter run cannot appear in the body,
+every `\` becomes `\\` so a trailing backslash cannot become a line
+continuation, and every other control character becomes `\uXXXX`, which the
+literal form forbids outright. Newlines stay literal, which is what keeps a
+multi-KB contract readable when a human opens the file.
+
+### Removal, and the sweep
+
+This is the only file loomux writes into a vendor's user directory, so three
+things travel with it: the loomux-branded name, removal with the agent that owns
+it (`mark_dead`), and a startup sweep for anything the removal missed. A file in
+someone else's home that nothing cleans up is #502 by another route.
+
+The sweep applies #464's rule one level down. That sweep already refuses to
+delete anything when it cannot enumerate GROUPS; a group whose `agents.json` is
+individually unreadable is the same ignorance in a smaller scope, and reading it
+as "that group has no agents" would make every one of its panes' profiles look
+orphaned. So a single unreadable roster makes the live-agent set *incomplete*
+and the sweep deletes nothing. A group directory with **no** `agents.json` is
+not that case — that is a group that has never spawned an agent, which is real
+and common, and it genuinely contributes no ids.
+
+## Containment: why the ceiling is `None`
+
+codex's only containment axis is `sandbox_mode`
+(`read-only | workspace-write | danger-full-access`), and its `tools` section
+exposes only `view_image` / `web_search` — there is no way to deny the editing
+tool by name. `read-only` is not a reviewer's tier either: in read-only mode
+codex "can read files and answer questions, but requires approval to make edits,
+**run commands, or access network**", which removes the tests and the `gh` a
+reviewer's job is made of.
+
+The **rules engine** is the one route that could have worked — `prefix_rule(…
+decision="forbidden")` is a real git-mutation deny — and it does not, because
+rules load only from `CODEX_HOME/rules/*.rules` and a project's `.codex/rules/`.
+Neither is per-agent, so loomux cannot give one pane a rule set and its
+neighbour another.
+
+So the ceiling is `Containment::None`: **worker, orchestrator and solo run on
+codex; reviewer and planner are refused by `cli_can_host` at parse time**, with
+`containment_note` quoted into the refusal so a rejected workflow says what is
+actually missing.
+
+#267 stage 2 read all of this correctly and then concluded that loomux would
+never spawn codex at all. That does not follow — `Containment::None` is the
+ceiling every worker and orchestrator block already runs at — and C1 is the
+correction of the conclusion, not of the ceiling.
+
+A `NoEdits` reviewer stays a named follow-up, gated on the live check in §Still
+for the human.
+
+## Sessions: a store watcher, and a contest it refuses
+
+codex has **no public pre-mint flag**: the TUI's `resume_session_id` is
+`#[clap(skip)]` — *"Internal … Set by the top-level `codex resume {SESSION_ID}`
+wrapper; not exposed as a public flag"*. So `premints_session_id` is false and
+codex takes copilot's shape: snapshot the store's thread ids immediately before
+the spawn, then poll for one that was not there.
+
+Three things differ from copilot's watcher, each for a codex reason:
+
+- **A cwd match is REQUIRED, with no newest-wins fallback.** copilot falls back
+  to the newest fresh session because it may not have written a
+  `workspace.yaml` yet, so "no cwd match" there is routinely "not yet". codex
+  writes `cwd` in the rollout's FIRST line, at creation, so a file that exists
+  and does not match this directory is a different pane's session — and binding
+  it would hand this pane somebody else's conversation. Failing to identify is
+  recoverable and visible (`session-untracked` in the audit); a wrong binding is
+  neither.
+- **Two matches is `Contested`, never resolved.** The store is the human's, not
+  the group's, and several panes in one group routinely share a directory. That
+  makes "two rollouts appeared here" a recurring answer rather than an edge
+  case.
+- **The deadline is ten minutes, not ninety seconds.** The rollout file does not
+  exist at boot (see the pin above), so it appears when the pane does some work.
+  A short deadline would leave permanently unidentified every pane whose first
+  turn was late — a kickoff queued behind a busy pane, an attended group the
+  human walked away from — and the failure would look exactly like codex not
+  being installed.
+
+A torn header is `Waiting`, not a wrong binding: the next poll reads it whole.
+
+## Readiness
+
+`ready_marker: None`. A row gets a marker when a pane on it is caught
+painted-but-not-listening (#1591), never speculatively — and codex's own boot
+hazard is not a late input loop but the trust dialog, which the profile answers
+before the pane paints rather than by waiting longer.
+
+## Deliberately not done
+
+- **`-c key=value` on argv.** It would push a TOML inline table and a quoted
+  Windows path key through the command builder's shell string, and the token
+  through the process list: two quoting hazards and one leak, for nothing the
+  profile does not already do.
+- **A project `.codex/config.toml`.** It loads only when the project is
+  *trusted* — and the trust dialog fires before it is read, so it cannot answer
+  the dialog. It also lands in a worktree that a blanket stage-everything
+  commits.
+- **A per-agent `CODEX_HOME`.** It relocates `auth.json` and `config.toml` too,
+  so every pane would boot logged out. This is pi's `PI_CODING_AGENT_DIR`
+  argument reaching the same answer, and it is why the store is not group-local.
+- **The `notify` hook** as a session-id source. It fires at turn END and needs a
+  hook binary loomux does not ship.
+- **`codex exec --json` / the app-server.** Those are not a TUI pane; that is
+  #84's native-protocol track.
+- **`[windows] sandbox`.** Elevated setup is the human's, and getting it wrong
+  costs them a private desktop their credentials are not on.
+- **`tui.alternate_screen`.** A real key, and settable here — a profile-v2 file
+  is strict-validated as a whole `ConfigToml` — but whether to trade codex's
+  alternate screen for scrollback is a live judgement call left to the human.
+
+## Still for the human
+
+Constraint 3 means none of the following can be checked by an agent. Each is a
+place where the design above rests on a claim about someone else's runtime
+rather than someone else's source.
+
+1. **Trust.** Open a group whose worker cwd is a fresh worktree: no "Do you
+   trust the contents of this directory?" dialog, and `/status` shows
+   workspace-write with the workspace trusted.
+2. **Elevated sandbox.** In that pane, a GitHub auth check and a push to a
+   scratch branch both succeed with no overlay under `auto_ops`. Commands run as
+   a separate sandbox user on a private desktop, and the human's `gh`/git
+   credentials may not be visible there.
+3. **Writes outside the tree.** A clean `npm install` in the worktree succeeds —
+   npm/cargo caches and `%TEMP%` are outside the workspace, and under `never`
+   these would be silent task failures. `writable_roots` is the likely first fix.
+4. **MCP.** `/mcp` lists the loomux server as connected, `report(...)` lands, and
+   tools appear unprefixed.
+5. **Resume.** Kill a worker pane and resume it from the Orchestrations list:
+   the same conversation, and no cwd prompt.
+6. **The reviewer ceiling** (the follow-up's gate). In a scratch repo,
+   `codex -s read-only -a never`: ask for the git working-tree status and the
+   open PR list. If both run, the ceiling can rise to `NoEdits`; if either needs
+   approval, it stays `None`.
+7. **Alt screen.** Decide whether `tui.alternate_screen = "never"` belongs in
+   the profile.

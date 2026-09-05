@@ -193,7 +193,8 @@ use loomux_lib::orchestration::{
     CLAUDE_QUESTION_DENY_TOOLS, claude_denies_interactive_question,
     // #267 stage 2: gemini as a reviewer-capable CLI, and the capability table
     // that decides which classes any CLI may host.
-    cli_can_host, cli_caps, cli_extra_env, gemini_policy_toml, gemini_settings_json,
+    cli_can_host, cli_caps, cli_extra_env, codex_profile_toml, gemini_policy_toml,
+    gemini_settings_json, CodexMcpAuth,
     CLI_CAPS, GEMINI_EDIT_DENY_TOOLS, GEMINI_READONLY_DENY_GIT, KNOWN_GEMINI_TOOLS,
     // #687: the per-block model knobs — the capability rows that decide which
     // CLI can honor one, and the query the launcher reads them through.
@@ -8612,18 +8613,82 @@ fn a_gemini_agent_reaches_the_same_loomux_mcp_server_every_other_cli_does() {
 fn a_gemini_panes_env_carries_its_settings_path_and_no_other_clis_does() {
     let cfg = Path::new("C:/data/group/configs/rev-1.json");
     assert_eq!(
-        cli_extra_env("gemini", cfg),
+        cli_extra_env("gemini", cfg, "tok-abc"),
         vec![(
             "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
             "C:/data/group/configs/rev-1.json".to_string()
         )]
     );
-    for other in ["claude", "copilot", "codex", ""] {
+    // gemini's env names a PATH and never a token — asserted explicitly,
+    // because the codex arm below put a secret into this function's output and
+    // "no other CLI's env carries one" is now a property worth stating rather
+    // than an obvious one.
+    assert!(
+        !cli_extra_env("gemini", cfg, "tok-abc").iter().any(|(_, v)| v.contains("tok-abc")),
+        "gemini's settings file carries its own token; the pane env must not"
+    );
+    // `codex` was in this list until #2515 C1, as a member of the class
+    // "delivers its MCP config on argv, so it needs no env". It has left that
+    // class: its config is SELECTED on argv (`-p`) and its token rides the
+    // environment. Per CLAUDE.md the specimen is relocated rather than the
+    // assertion relaxed — the loop below keeps the witnesses that are still
+    // inside the class, and codex gets its own assertions.
+    for other in ["claude", "copilot", "pi", ""] {
         assert!(
-            cli_extra_env(other, cfg).is_empty(),
-            "{other} delivers its MCP config on argv — it must get no extra env"
+            cli_extra_env(other, cfg, "tok-abc").is_empty(),
+            "{other} carries no part of its identity in the pane environment — it must get no \
+             extra env"
         );
     }
+}
+
+/// A codex GROUP pane's token rides the environment, and the variable is the
+/// one its profile names (#2515 C1).
+///
+/// Two halves, and the second is the one with teeth. The profile written by
+/// `write_codex_profile` says `env_http_headers = { … = "ORRERIX_AGENT_TOKEN" }`
+/// and holds no token; this function is what puts the value there. If the two
+/// spellings drift, nothing fails at spawn — the pane boots, connects with no
+/// auth header, and every tool call is refused, which reads to an agent as the
+/// orchestration tools being broken.
+#[test]
+fn a_codex_panes_env_carries_its_token_under_the_name_its_profile_expects() {
+    let cfg = Path::new("C:/Users/x/.codex/orrerix-w-3.config.toml");
+    assert_eq!(
+        cli_extra_env("codex", cfg, "tok-abc"),
+        vec![("ORRERIX_AGENT_TOKEN".to_string(), "tok-abc".to_string())]
+    );
+    // The name is derived from the brand prefix rather than hard-coded twice —
+    // the pairing `CODEX_TOKEN_ENV`'s doc claims.
+    assert_eq!(
+        cli_extra_env("codex", cfg, "tok-abc")[0].0,
+        format!("{}AGENT_TOKEN", brand::ENV_PREFIX)
+    );
+    // The profile's own spelling of that variable, asserted against the same
+    // expression — this is the drift the test exists for.
+    let profile = codex_profile_toml(
+        7777,
+        CodexMcpAuth::EnvVar("ORRERIX_AGENT_TOKEN"),
+        Path::new("C:/repo"),
+        true,
+        "",
+        None,
+    );
+    assert!(
+        profile.contains(&format!("\"{}AGENT_TOKEN\"", brand::ENV_PREFIX)),
+        "the profile must name the variable this function sets:\n{profile}"
+    );
+    // The path is NOT in the env: codex's config reaches it by `-p <name>` on
+    // argv, so a variable naming the file would be a second, unread channel.
+    assert!(
+        !cli_extra_env("codex", cfg, "tok-abc").iter().any(|(_, v)| v.contains(".config.toml")),
+        "codex's config is selected on argv, not named by an environment variable"
+    );
+    // No token, no variable. `solo_prepare`'s no-seam path mints none, and an
+    // empty variable would leave the pane presenting a blank auth header —
+    // which the server refuses in a way that reads like a bug rather than an
+    // absence.
+    assert!(cli_extra_env("codex", cfg, "").is_empty());
 }
 
 /// The [`GEMINI_EDIT_DENY_TOOLS`] pin, same shape and same limits as
