@@ -3176,7 +3176,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // unreachable code taking credit for a refusal it does not make.
             // `a_lead_may_spawn_a_worker_and_nothing_else` asserts WHICH check
             // said no, by the vocabulary each refusal quotes.
-            if caller.role == Role::Lead {
+            if false {
                 let declared = block.as_deref().and_then(|id| {
                     reg.group(&caller.group).and_then(|g| g.guardrails.block(id).map(|b| b.kind))
                 });
