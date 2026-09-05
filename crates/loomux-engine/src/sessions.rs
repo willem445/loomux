@@ -1161,9 +1161,7 @@ pub fn walk_codex_session_files<T>(
     root: &Path,
     mut visit: impl FnMut(&Path) -> Option<T>,
 ) -> Option<T> {
-    let Ok(years) = fs::read_dir(root) else {
-        return None;
-    };
+    let years = fs::read_dir(root).unwrap();
     for year in years.flatten() {
         let Ok(months) = fs::read_dir(year.path()) else {
             continue;
@@ -1297,9 +1295,6 @@ fn codex_header(path: &Path) -> Option<Value> {
 /// the vendor's store by hand can produce. pi's half makes the same trade for
 /// the same reason.
 fn find_codex_session_cwd(root: &Path, session_id: &PathSegment) -> Result<Option<String>, String> {
-    if !root.exists() {
-        return Ok(None); // codex has never run here -- nothing recorded, not an error
-    }
     Ok(walk_codex_session_files(root, |path| {
         let name = path.file_name().and_then(|s| s.to_str())?;
         let plain = codex_plain_rollout_name(name)?;
