@@ -221,8 +221,14 @@ fn a_group_codex_profile_names_the_token_variable_and_a_solo_one_carries_the_tok
         group.contains("env_http_headers = { \"X-Orrerix-Agent\" = \"ORRERIX_AGENT_TOKEN\" }"),
         "{group}"
     );
+    // Matched per LINE, not as a substring, and the first draft of this
+    // assertion got it wrong in the one way that matters: `env_http_headers`
+    // CONTAINS `http_headers`, so `!group.contains("http_headers = {")` fails
+    // against a perfectly correct group profile. A key name that is a suffix of
+    // another key name cannot be excluded by substring at all — the check has to
+    // be anchored at the start of the line, which is where a TOML key sits.
     assert!(
-        !group.contains("http_headers = {"),
+        !group.lines().any(|l| l.trim_start().starts_with("http_headers")),
         "a group profile must not carry a literal header map — that is the solo shape:\n{group}"
     );
 
