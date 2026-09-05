@@ -61327,6 +61327,57 @@ fn pi_launch_flags_per_posture() {
     );
 }
 
+/// codex is a spawnable CLI with no containment ceiling: it hosts the classes
+/// that write, and is refused for every class orrerix denies the editing tools
+/// to (#2515 C1, T1.1).
+///
+/// **THREE refused classes, not the two #2515's plan D1 named.** `Role::Manager`
+/// is `NoEdits` as well (#1161 — a manager must read the codebase to ground its
+/// questioning and must not write it), so it sits above codex's ceiling exactly
+/// as a reviewer does. Nobody had to remember that: `cli_can_host` is one
+/// comparison against an ordered ladder, so the manager is refused by the same
+/// rule. What DID have to be remembered is the PROSE, which said "reviewer or
+/// planner" on four surfaces until this test was written — which is why the
+/// assertion is a partition over EVERY role rather than a list of the ones that
+/// came to mind.
+#[test]
+fn codex_is_a_spawnable_cli_with_no_containment_ceiling() {
+    let caps = cli_caps("codex").expect("codex must have a capability row");
+    assert!(caps.orchestration, "codex is spawnable since #2515 C1");
+    assert!(SUPPORTED_CLIS.contains(&"codex"), "{SUPPORTED_CLIS:?}");
+
+    // The partition. Derived from `Role::containment()` rather than listed, so
+    // a future class lands on whichever side its own tier puts it on instead of
+    // silently missing from both.
+    for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner, Role::Manager] {
+        let allowed = cli_can_host("codex", role);
+        let expect_ok = role.containment().rank() <= caps.max_containment.rank();
+        assert_eq!(
+            allowed.is_ok(),
+            expect_ok,
+            "codex hosting a {role:?} must follow the ladder, not a hand-kept list: {allowed:?}"
+        );
+    }
+    // …and the partition is not degenerate in either direction: something is
+    // hosted and something is refused. Without this the loop above passes
+    // against a `cli_can_host` that answered `Ok` for everything.
+    assert!(cli_can_host("codex", Role::Worker).is_ok());
+    assert!(cli_can_host("codex", Role::Orchestrator).is_ok());
+    for refused in [Role::Reviewer, Role::Planner, Role::Manager] {
+        let err = cli_can_host("codex", refused)
+            .expect_err("codex tops out at Containment::None — this class needs more");
+        // The refusal must QUOTE the measured reason, not say "unsupported":
+        // both surfaces that render it (the parse error and the launcher) read
+        // this string, and a human told only that it is unsupported goes
+        // looking for a setting rather than reading the ceiling.
+        assert!(
+            err.contains(caps.containment_note),
+            "the refusal for {refused:?} must carry the row's own note: {err}"
+        );
+        assert!(err.contains("codex"), "{err}");
+    }
+}
+
 /// The codex launch line, per posture (#2515 C1) — the twin of
 /// `pi_launch_flags_per_posture` above, and it makes the OPPOSITE claim about
 /// the same equality.

@@ -72,7 +72,8 @@ export function isBlockKind(v: string): v is BlockKind {
  *
  *  `codex` (#2515 C1) is the sharpest illustration of that last sentence. It is
  *  in this list — a `cli: codex` worker or orchestrator block spawns — and the
- *  backend still refuses a `codex` reviewer or planner outright, because its
+ *  backend still refuses a `codex` reviewer, planner or manager outright,
+ *  because its
  *  only containment axis is an all-or-nothing `sandbox_mode`. A pane's
  *  validation surface must not try to reproduce that rule; it belongs to
  *  `cli_can_host`, which quotes the measured reason back. */

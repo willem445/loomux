@@ -595,7 +595,8 @@ Neither is per-agent, so loomux cannot give one pane a rule set and its
 neighbour another.
 
 So the ceiling is `Containment::None`: **worker, orchestrator and solo run on
-codex; reviewer and planner are refused by `cli_can_host` at parse time**, with
+codex; reviewer, planner and MANAGER are refused by `cli_can_host` at parse
+time**, with
 `containment_note` quoted into the refusal so a rejected workflow says what is
 actually missing.
 
