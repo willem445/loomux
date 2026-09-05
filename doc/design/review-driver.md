@@ -75,7 +75,7 @@ resumes it; `cancel_review_drive` cancels it), and only `satisfied` and
 | State | Reads | Writes | Leaves for |
 | --- | --- | --- | --- |
 | `ci-wait` | PR head and mergeability (`mqdriver::resolve_pr_detailed`, whose raw output `notify::pr_mergeability_result` classifies — this is how CONFLICTING is learned); checks (`mqdriver::pr_ci_green_detailed` over `notify::pr_checks_result`, which already reads "no checks reported" as pending); **on a head that arrived by arc 7, the worker's intercepted `report` as well** (#2168 E1 — green says the checks settled, not that the round is over) | `head`; `ci_attempts` on a red; `rebase_attempts` on a conflict; `fix_pushed_ms` (§5.2, written by every arc and re-stamped by a further push); `rd-ci-green`, `rd-ci-red` or `rd-conflicting` | `review-wait` on green — **on an arc-7 head, only once the worker has also reported done** (#2168 E1); `fix-wait` on red or conflicting; `held(ci-limit)`, `held(rebase-limit)`, `held(worker-blocked)`, `held(worker-unresumable)`, `held(fix-stalled)` (all three #2168 E1, on an arc-7 head only), `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
-| `review-wait` (lane *k*) | the required lane list at **this** head (`workflow::route_reviewers` over `pr_changed_files`, then `RoutingDecision::gate`); the lane's verdict file via `verdict_map` (`workflow::parse_verdict_file`: line 1 the verdict, line 2 the head it binds to, line 5 the body digest and, since #2168 E2, the `verified-body` mark beside it); the live head and body digest; **whether the pane it recorded for that lane is still alive** (#2163 — the lane-side twin of `fix-wait`'s own exit read, and for the same reason: a dead pane can never produce the verdict this state is waiting for, and `lane-stalled` is an hour away anchored at the brief rather than at the death) | the lane's spawned or resumed session id; the current lane index; **`briefed_verify` when the brief is a body-verification delta** (#2168 E2); `review_rounds` on a `fail`; `cap_starved_since_ms` on a lane spawn the cap refuses (#2109); `rd-lane-spawned`, `rd-lane-resume-failed`, `rd-lane-duplicate-refused`, `rd-lane-reopened`, `rd-verdict` | `gate-check` once the last required lane has passed — **or, after a body-only move, once ONE lane's body-verification pass settles the rest** (#2168 E2); `fix-wait` on a `fail`; `ci-wait` when the head moves under a lane; `held(escalate)`, `held(review-limit)`, `held(lane-stalled)`, `held(cap-full)` (#2109 — the cap has refused this lane for `CAP_HOLD_MS`), `held(routing-unaccountable)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
+| `review-wait` (lane *k*) | the required lane list at **this** head (`workflow::route_reviewers` over `pr_changed_files`, then `RoutingDecision::gate`); the lane's verdict file via `verdict_map` (`workflow::parse_verdict_file`: line 1 the verdict, line 2 the head it binds to, line 5 the body digest and, since #2168 E2, the `verified-body` mark beside it); the live head and body digest; **whether the pane it recorded for that lane is still alive** (#2163 — the lane-side twin of `fix-wait`'s own exit read, and for the same reason: a dead pane can never produce the verdict this state is waiting for, and `lane-stalled` is an hour away anchored at the brief rather than at the death) | the lane's spawned or resumed session id; the current lane index; **`briefed_verify` when the brief is a body-verification delta** (#2168 E2); **`briefed_body_only` when the brief is a re-brief at an unchanged head that every required lane has already answered at** (#2509); `review_rounds` on a `fail`; `body_only_grace` on a body-only `fail` AT the bound, with `rd-round-grace` (#2509); `cap_starved_since_ms` on a lane spawn the cap refuses (#2109); `rd-lane-spawned`, `rd-lane-resume-failed`, `rd-lane-duplicate-refused`, `rd-lane-reopened`, `rd-verdict` | `gate-check` once the last required lane has passed — **or, after a body-only move, once ONE lane's body-verification pass settles the rest** (#2168 E2); `fix-wait` on a `fail`; `ci-wait` when the head moves under a lane; `held(escalate)`, `held(review-limit)`, `held(lane-stalled)`, `held(cap-full)` (#2109 — the cap has refused this lane for `CAP_HOLD_MS`), `held(routing-unaccountable)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
 | `fix-wait` | the worker's intercepted `report`; the live head; **whether the pane it resumed is still alive** (#1961 — a resumed pane that exits before reporting is a hand-back that failed, not a wait, and waiting it out costs a whole `fix_timeout_minutes` on a dead process) | `rd-handback`; `rd-kickback` and `fix_kickback_ms` when it answers a worker's `report(progress)` (#1959) | `ci-wait` when the head moves; `review-wait` on a `report(done)` with the head unchanged (a body-only fix); `held(worker-blocked)`, `held(worker-unresumable)`, `held(cap-refused)` (the hand-back's spawn refused by the live-delegate cap, #1960), `held(fix-stalled)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
 | `gate-check` | the same parsers the shim and the queue read — `route_reviewers`, then `RoutingDecision::gate`, then `mergeq::recheck_gate`, which is `workflow::evaluate_merge_gate(gate, verdicts, Some(head))` plus the `also:` clauses including `body-unchanged` (§4 — one gate decision, so the delegation of #2168 E2 is decided here and in the shim by the same rule) | nothing | `satisfied`; `ci-wait` when the gate is not satisfied for any reason; `held(routing-unaccountable)`, `held(gate-unreadable)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
 | `held{reason}` (parked) | nothing; the tick does not advance it | one `deliver_to_orchestrator` notice and one `rd-held` line, on entry only | `ci-wait` on `drive_review`; `cancelled` on `cancel_review_drive` |
@@ -285,7 +285,7 @@ own delivery arrives by its own path; §7.)
 | --- | --- |
 | `satisfied` | `evaluate_merge_gate` is satisfied at the live head, including every declared `also:` condition |
 | `held(escalate)` | a lane recorded `escalate` |
-| `held(review-limit)` | `review_rounds` reached its bound |
+| `held(review-limit)` | `review_rounds` reached its bound — **and, since #2509, the one body-only grace round is also spent.** At the bound a blocking `fail` on a lane the driver re-briefed about the PR body alone buys one more hand-back instead of this hold, once per drive (§2.3). The notice says so when it fires, because at the bound the two figures are equal either way: `review rounds 3/3` reads identically for a drive that has had three rounds and one that has had four, and an orchestrator deciding whether to spend `reset_counters: true` is deciding how much this PR has already cost |
 | `held(ci-limit)` | `ci_attempts` reached its bound |
 | `held(rebase-limit)` | a second conflict after the one rebase hand-back |
 | `held(lane-stalled)` | a spawned or resumed **reviewer** lane recorded no verdict inside `lane_timeout_minutes`. **Keyed on the head that lane was asked about — but only while it has not ANSWERED at that head** (#2109): the clock used to be read only of a lane still open for this exact `(head, digest)`, so a body edit under a silent reviewer moved the digest, dropped through to a re-brief, and re-armed `spawned_ms` — a reviewer that had said nothing for fifty-nine minutes got another hour on an edit it never read. #2109 makes that reachable rather than theoretical, because the re-brief it produced is now refused while that lane's pane is live; without the re-key such a drive would retry until the `review-wait` state bound — four hours on a one-lane gate at stock knobs, which is the case this row describes — and then the twelve-hour `drive-stalled` (#2110 renumbered which, not whether), on notices that name no lane. The `at_head` half of the key is what keeps this a SILENCE test: a lane that recorded a verdict here and whose worker then made a BODY-ONLY fix returns through arc 8 at the same head with the digest moved, so a head-and-clock-only reading parks the drive on a reviewer that answered promptly — and parks it stuck, since only a re-brief writes `spawned_ms` (review 1 on #2112). What that lane is owed is the delta brief, which resets both `at_head` and `spawned_ms` |
@@ -408,6 +408,71 @@ Three consequences that are decisions, not defaults:
   call twice. This is why `held` is parked rather than terminal (§2.1): a
   terminal state would make the resume a fresh entry, and a fresh entry has no
   counters to carry.
+- **One grace round past the bound, for a body-only fail, once per drive**
+  (#2509). A `held(review-limit)` costs the orchestrator three wakes and a
+  hand-written brief: cancel, resume the worker by hand, re-drive with
+  `rounds_already_spent`. INVARIANT 9 bounds review rounds so that a reviewer
+  surfacing one new nit per round cannot run for ever — and a blocking fail on
+  the PR **body**, at a head that has not moved since a full round was already
+  spent on it, is not that shape. It is a text edit the worker can make in one
+  turn, with nothing to build and nothing to re-check. PR #2397 reached the
+  bound on two sentences, with the code green and unmoved throughout. So the
+  driver hands the worker back one more time instead of parking, records
+  `rd-round-grace`, and publishes `grace_used` on `review_drive_status`.
+
+  **"Inside the ceiling" means the grace is funded from its own budget**, not
+  from `review_rounds`. `counters.body_only_grace` is a bool rather than a
+  count, `review_rounds` still stops dead at `max_review_rounds` and is never
+  bumped past it, and `MAX_ROUNDS_CEILING` therefore bounds exactly what it
+  bounded before. A drive is capped at `max_review_rounds + 1` review rounds and
+  no more. The other reading — spend the grace out of `review_rounds` and let it
+  reach 4 — is *vacuous at stock knobs*, because the default `max_review_rounds`
+  IS the ceiling, so the feature would have helped only a repo that had lowered
+  its own bound and never the case it was filed for.
+
+  **The predicate is the brief the driver SENT, never a word a reviewer could
+  type.** `decide_review_wait` marks a re-brief `body_only` when three things
+  hold: the head has not moved, *this* lane was already briefed at it, and every
+  required lane has **answered** at it. The mark rides the step into
+  `LaneRecord::briefed_body_only`, and `body_only_grace_applies` reads it back
+  against an exact `(briefed_head, briefed_digest)` pair — a brief whose
+  revision cannot be pinned grants nothing, which is `briefed_verify`'s posture
+  one grant over.
+
+  It is one conjunct weaker than #2168 E2's `briefed_verify` and one stronger,
+  and both differences carry weight. Weaker: every required lane must have
+  *answered* at this head, not *passed* at it — and that gap is exactly the case
+  #2509 is for, a lane that recorded `fail` on the body, which `verify` can
+  never see because that lane's word is not `pass`. Stronger: this lane must
+  already have been briefed at this head, or the very first brief at a head
+  would qualify and the grace would be granted on code nobody had reviewed
+  twice. Since `lane_open_for` refuses a re-brief at an equal head unless the
+  digest moved, "re-briefed at an unchanged head" *is* "the body moved and the
+  code did not".
+
+  **Two other designs were considered and are recorded here as rejected, not
+  overlooked.** (A) A `body_only` parameter on `review_verdict`, which is the
+  most literal reading of "the verdict marks itself a body finding". It is
+  refused because `workflow.rs`'s line-5 marker sits where it does precisely so
+  that "a marker a reviewer could type would be a marker a reviewer could
+  forge", and a reviewer able to mark its own fail body-only can buy itself a
+  round — which is INVARIANT 9's own failure mode, granted from the inside. (B)
+  A tool-computed `ReviewVerdict::body_only`, unforgeable and visible in
+  `list_verdicts`, but carried on line 5 of the verdict file — which the `gh`
+  shim also parses. A mark the shim has not learned reads there as *no digest*,
+  so `body-unchanged` refuses a merge it should allow: #2308's cross-half
+  divergence, shipped and retracted twice. The grant this feature needs has one
+  consumer, the driver's own bound, so it never leaves the drive record.
+
+  **The residual, disclosed and bounded.** The mark says the driver *asked*
+  about the body alone, not that the findings that came back are about it. A
+  reviewer answering a body-only re-brief with a code nit it missed a round
+  earlier still earns the grace. That is the honest price of deriving the bit
+  instead of trusting a reviewer's word for it, and it is contained by
+  construction rather than argued away: at most one extra round, once per drive,
+  and only ever on code a full review round has already been spent on. The
+  `escalate` arm is untouched — an escalation at the bound is still §3's
+  judgment hold and costs the grace nothing.
 
 Every wait names both an independent release and a ceiling — the lessons file's
 rule that any suppression driven by a fallible signal must be bounded. There is
@@ -1139,8 +1204,15 @@ review_drive_status()
   -> { enabled: bool,
        drives: [{ pr, state, held_reason?, head, lanes: [{ block, last_verdict? }],
                   counters: { review_rounds, ci_attempts, rebase_attempts },
+                  grace_used: bool,
                   since_ms }] }
 ```
+
+**`grace_used` sits beside the counters rather than inside them, because it is
+not one** (#2509). `review_rounds` is what this drive has spent of INVARIANT 9's
+budget and stops at the bound; this says whether the one round outside that
+budget is still available. An orchestrator reading `review_rounds: 3` of 3 on a
+**live** drive is looking at the grace, and this is the field that says so.
 
 **The split into two classes is `queue_merge`'s, and it is not cosmetic.** That
 tool's own contract separates the queue's declines from "FIVE FURTHER REASONS
@@ -1303,9 +1375,11 @@ group id becomes a path) beside `state.json`, `tasks.json` and
                    "prior_agents": ["rev-2"],
                    "last_verdict": "pass", "at_head": "<sha>",
                    "briefed_head": "<sha>", "briefed_digest": "<digest>",
-                   "spawned_ms": 0, "briefed_verify": false } ],
+                   "spawned_ms": 0, "briefed_verify": false,
+                   "briefed_body_only": false } ],
       "lane_index": 0,
-      "counters": { "review_rounds": 1, "ci_attempts": 0, "rebase_attempts": 0 },
+      "counters": { "review_rounds": 1, "ci_attempts": 0, "rebase_attempts": 0,
+                     "body_only_grace": false },
       "started_ms": 0,
       "fix_handback_ms": 0,
       "fix_kickback_ms": 0,
@@ -1819,7 +1893,8 @@ like `mq-*` and the rest:
 `rd-verdict` · `rd-handback` · `rd-consumed` ·
 `rd-satisfied` · `rd-held` · `rd-resumed` · `rd-cancelled` · `rd-pruned` ·
 `rd-kickback` · `rd-recovered` · `rd-state-unreadable` · `rd-reuse-declined` ·
-`rd-lane-reopened` · `rd-lane-released` · `rd-worker-released`
+`rd-lane-reopened` · `rd-lane-released` · `rd-worker-released` ·
+`rd-round-grace`
 
 Every state transition, every spawn or resume, and every consumed delegate event
 (§7) appears here, each carrying `on_behalf_of`. `rd-started` carries

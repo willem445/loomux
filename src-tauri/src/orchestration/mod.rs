@@ -698,7 +698,14 @@ it never grants what the gate would not, and a completed drive is never a substi
 reviewer's `pass`.
 
 **Counters are INVARIANT 9's, and they clamp toward it and never away.** Three review rounds, three
-CI attempts, one rebase. "Yours count too" is a property of the budget rather than of who spends
+CI attempts, one rebase. **One bounded exception, and it is worth knowing because it saves you a
+wake:** when a round's blocking fail comes back on a lane the driver had re-briefed about the PR
+BODY alone — the head has not moved since a full round was already spent on it, and every required
+lane had already answered about that code — the drive hands the worker back once more rather than
+parking at the bound. Once per drive, never for a fail about the code, and the next blocking fail
+after it parks the drive whatever it is about. It is on the audit log as `rd-round-grace` and on
+`review_drive_status` as `grace_used`, which is the field to read when a live drive shows three
+rounds of three. "Yours count too" is a property of the budget rather than of who spends
 it: if you already reviewed this PR by hand and got a `fail`, pass `rounds_already_spent`, or the
 drive starts at zero and spends three more.
 
