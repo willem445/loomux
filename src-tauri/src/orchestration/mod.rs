@@ -4775,6 +4775,36 @@ impl KickoffOrigin {
     }
 }
 
+/// The workflow file THIS GROUP runs, as a repo-relative path (#1689).
+///
+/// Every group-scoped display, audit and template site goes through this rather
+/// than through `workflow::workflow_path`, which answers only for `default`. The
+/// pair with [`load_active_workflow`]: one resolves the path, the other reads
+/// it, and both take the same two arguments so they cannot resolve differently.
+///
+/// `(repo, &Guardrails)` rather than `&GroupInfo`, deliberately: `create_group_ex`
+/// and `promote_orchestrator_cli` decide which file to read BEFORE a `GroupInfo`
+/// exists, and a second spelling for those would be exactly the drift this
+/// function is here to prevent. A `GroupInfo` caller passes `&g.repo,
+/// &g.guardrails`.
+pub fn active_workflow_path(repo: &str, rails: &Guardrails) -> String {
+    workflow::workflow_path_named(repo, &rails.workflow)
+}
+
+/// Read + validate the workflow file THIS GROUP runs (#1689).
+///
+/// Identical contract to `workflow::load_workflow`, which it generalises:
+/// `Ok(None)` for "no such file", `Err` for "the file is there and will not
+/// parse". A group pinned to `default` — every group that existed before #1689,
+/// and every group in a repo with one workflow file — resolves to exactly the
+/// file `load_workflow` would have opened.
+pub fn load_active_workflow(
+    repo: &str,
+    rails: &Guardrails,
+) -> Result<Option<workflow::Workflow>, Vec<String>> {
+    workflow::load_workflow_named(repo, &rails.workflow)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Guardrails {
     pub max_agents: u32,
@@ -4811,6 +4841,27 @@ pub struct Guardrails {
     /// A *launch* choice, not a live one: it is persisted with the group so a
     /// resumed orchestration comes back with the roster it was launched with.
     pub advanced_orchestrator: bool,
+    /// **Which workflow this group runs** (#1689). The name of a file under
+    /// `.orrerix/workflows/`, or [`workflow::DEFAULT_WORKFLOW_NAME`] — which is
+    /// `.orrerix/workflow.yml`, and which is what a `group.json` written before
+    /// this field existed reads as. A repo with one workflow file therefore
+    /// behaves byte-for-byte as it did before named workflows: the name resolves
+    /// to the same path, and nothing under `workflows/` is ever opened.
+    ///
+    /// **Pinned with the roster, in the same atomic write, and for the same
+    /// reason.** The blocks in `blocks` and the name of the file they came from
+    /// are one fact about a group; a name that lived anywhere else could
+    /// disagree with the roster after a crash, and then nothing on disk would
+    /// say which of the two the human had consented to.
+    ///
+    /// A [`workflow::WorkflowName`] rather than a `String`, so the value cannot
+    /// reach [`workflow::workflow_path_named`] unvalidated — the compiler, not a
+    /// scan, is what stops a hand-edited `group.json` from naming
+    /// `../../../etc/x` (CLAUDE.md constraint 6). `load_group_file` is the one
+    /// place a persisted string becomes one, and an unusable value there falls
+    /// back to `default` rather than failing the load: a group must stay
+    /// rejoinable.
+    pub workflow: workflow::WorkflowName,
     /// Additionally pre-approve `git`/`gh` shell commands for the group's
     /// agents. Never maps to `--dangerously-skip-permissions`: bypass mode
     /// shows a confirm dialog whose default answer is "exit", which the
@@ -32623,6 +32674,22 @@ impl OrchRegistry {
                 // the toggle durable — a resumed orchestration (session browser)
                 // rebuilds its guardrails from here, not from a launcher form.
                 advanced_orchestrator: g["advanced_orchestrator"].as_bool().unwrap_or(false),
+                // #1689: which workflow file this group runs. Absent (every
+                // group.json written before named workflows) or empty → the
+                // `default` name, which resolves to `.orrerix/workflow.yml` —
+                // exactly the file that group has always been running.
+                //
+                // A value that is not a usable name falls back to `default`
+                // rather than failing the load. That is the same posture
+                // `agent_cli` takes two lines up and `clamped()` takes for a
+                // hand-edited roster: a group.json somebody edited by hand must
+                // still rejoin. The refusal that matters is the one at
+                // `WorkflowName::parse`, which is what stops the string from
+                // reaching a path join; nothing here is reachable without it.
+                workflow: g["workflow"]
+                    .as_str()
+                    .and_then(|s| workflow::WorkflowName::parse(s).ok())
+                    .unwrap_or_default(),
                 auto_ops: g["auto_ops"].as_bool().unwrap_or(true),
                 idle_kill_minutes: g["idle_kill_minutes"].as_u64().unwrap_or(0) as u32,
                 max_spawns_per_hour: g["max_spawns_per_hour"].as_u64().unwrap_or(0) as u32,
@@ -32696,12 +32763,13 @@ impl OrchRegistry {
         // (`create_group_ex`) — a group's roster is custom iff its intake
         // profile could be too, so there is no case where blocks reads
         // "built-in" while intake is quietly running something declared.
-        let (now, now_intake, note) = match workflow::load_workflow(repo) {
+        let (now, now_intake, note) = match load_active_workflow(repo, g) {
             Ok(Some(wf)) => {
                 let resolved_intake = wf.intake.clone();
                 let resolved = Guardrails {
                     agent_cli: g.agent_cli.clone(),
                     blocks: wf.blocks,
+                    workflow: g.workflow.clone(),
                     ..Guardrails::default()
                 }
                 .clamped()
@@ -32726,7 +32794,7 @@ impl OrchRegistry {
             Err(_) => (Vec::new(), None, "the file no longer validates"),
         };
         self.audit(id, brand::AUDIT_ACTOR, "workflow-changed-since-launch", json!({
-            "path": workflow::workflow_path(repo),
+            "path": active_workflow_path(repo, g),
             "note": note,
             "running": ids(&g.blocks),
             "on_disk": now,
@@ -32780,13 +32848,18 @@ impl OrchRegistry {
                 rails.blocks = persisted.blocks;
                 rails.agent_cli = persisted.agent_cli;
                 rails.advanced_orchestrator = persisted.advanced_orchestrator;
+                // #1689: the workflow NAME travels with the roster, for the same
+                // reason `agent_cli` does — a reattach that read the roster off
+                // disk and then resolved the orchestrator's CLI from a different
+                // file would answer for a group that does not exist.
+                rails.workflow = persisted.workflow;
             }
         } else if caller.advanced_orchestrator {
             // A fresh group dir with the advanced box ticked: the repo's file is
             // what the launch will run, so it is what this must check. A broken
             // or absent file falls back to the caller's roster, exactly as the
             // launch does.
-            if let Ok(Some(wf)) = workflow::load_workflow(repo) {
+            if let Ok(Some(wf)) = load_active_workflow(repo, &rails) {
                 rails.blocks = wf.blocks;
             }
         }
@@ -32849,6 +32922,11 @@ impl OrchRegistry {
                 guardrails.agent_cli = persisted.agent_cli;
                 guardrails.advanced_orchestrator = persisted.advanced_orchestrator;
                 guardrails.intake = persisted.intake;
+                // #1689: and the name of the file all three came from. The
+                // promote modal has no workflow picker, so without this a
+                // reattached group would be re-pinned to `default` and the next
+                // gate reload would arm a file the human never chose.
+                guardrails.workflow = persisted.workflow;
             }
         }
 
@@ -32894,7 +32972,7 @@ impl OrchRegistry {
             //     Every problem is recorded, not just the first, so one look at
             //     the audit log fixes the file in one pass. The launcher shows
             //     the human the same findings *before* they hit Create.
-            match workflow::load_workflow(repo) {
+            match load_active_workflow(repo, &guardrails) {
                 Ok(Some(wf)) => {
                     // #255: derived from the roster + the (optional) merge gate
                     // while we still hold both — recorded here so a run's capacity
@@ -32903,7 +32981,8 @@ impl OrchRegistry {
                     let capacity_rec =
                         workflow::recommend_capacity(&wf.blocks, wf.gates.get("merge"));
                     self.audit(&id, brand::AUDIT_ACTOR, "workflow-loaded", json!({
-                        "path": workflow::workflow_path(repo),
+                        "path": active_workflow_path(repo, &guardrails),
+                        "workflow": guardrails.workflow.as_str(),
                         "name": wf.name,
                         "blocks": wf.blocks.iter().map(|b| json!({ "id": b.id, "kind": b.kind })).collect::<Vec<_>>(),
                         "gates": wf.gates.keys().collect::<Vec<_>>(),
@@ -32947,7 +33026,7 @@ impl OrchRegistry {
                 Ok(None) => self.sync_merge_gate(&id, None),
                 Err(errors) => {
                     self.audit(&id, brand::AUDIT_ACTOR, "workflow-invalid", json!({
-                        "path": workflow::workflow_path(repo),
+                        "path": active_workflow_path(repo, &guardrails),
                         "errors": errors,
                         "action": "skipped — using the built-in roster",
                     }));
@@ -33028,12 +33107,12 @@ impl OrchRegistry {
             // stops a gate declared under an earlier advanced launch of this same
             // group dir from outliving the toggle that authorized it.
             self.sync_merge_gate(&id, None);
-            if workflow::workflow_file_exists(repo) {
+            if Path::new(repo).join(active_workflow_path(repo, &guardrails)).is_file() {
                 // The repo declares a workflow and this group is deliberately not
                 // running it. Say so in the trail: "my workflow file did nothing" is
                 // otherwise a silent, and very confusing, non-event.
                 self.audit(&id, brand::AUDIT_ACTOR, "workflow-ignored", json!({
-                    "path": workflow::workflow_path(repo),
+                    "path": active_workflow_path(repo, &guardrails),
                     "reason": "the advanced orchestrator is off for this group",
                     "action": "using the built-in roster",
                 }));
@@ -33165,6 +33244,11 @@ impl OrchRegistry {
                 // from an older group.json → false on read, which is exactly what
                 // that group was: a built-in roster.
                 "advanced_orchestrator": info.guardrails.advanced_orchestrator,
+                // #1689: the workflow file this group runs, pinned in the SAME
+                // atomic write as the roster it produced — a name that could
+                // disagree with `blocks` after a crash would leave nothing on
+                // disk saying which the human consented to.
+                "workflow": info.guardrails.workflow.as_str(),
                 "auto_ops": info.guardrails.auto_ops,
                 "idle_kill_minutes": info.guardrails.idle_kill_minutes,
                 "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
@@ -34403,7 +34487,7 @@ impl OrchRegistry {
             // should drop them.
             return Some(BTreeMap::new());
         }
-        match workflow::load_workflow(&g.repo) {
+        match load_active_workflow(&g.repo, &g.guardrails) {
             Ok(Some(wf)) => Some(wf.resources),
             Ok(None) => Some(BTreeMap::new()), // no file: declares nothing
             Err(_) => None,                    // unreadable: hold what we have
@@ -40249,10 +40333,10 @@ impl OrchRegistry {
         let mut loaded_audit: Option<Value> = None;
 
         if on {
-            match workflow::load_workflow(&info.repo) {
+            match load_active_workflow(&info.repo, &info.guardrails) {
                 Ok(Some(wf)) => {
                     loaded_audit = Some(json!({
-                        "path": workflow::workflow_path(&info.repo),
+                        "path": active_workflow_path(&info.repo, &info.guardrails),
                         "name": wf.name,
                         "blocks": wf.blocks.iter().map(|b| json!({ "id": b.id, "kind": b.kind })).collect::<Vec<_>>(),
                         "gates": wf.gates.keys().collect::<Vec<_>>(),
@@ -40267,7 +40351,7 @@ impl OrchRegistry {
                         "{} declares no {} — there is nothing for a live workflow-mode toggle to arm. \
                          Add the file, or leave the toggle off.",
                         info.repo,
-                        workflow::workflow_path(&info.repo)
+                        active_workflow_path(&info.repo, &info.guardrails)
                     ));
                 }
                 Err(errors) => {
@@ -40275,7 +40359,7 @@ impl OrchRegistry {
                         "{}'s {} is invalid, so the workflow-mode toggle refuses to arm a roster it \
                          could not load: {}",
                         info.repo,
-                        workflow::workflow_path(&info.repo),
+                        active_workflow_path(&info.repo, &info.guardrails),
                         errors.join("; ")
                     ));
                 }
@@ -40418,7 +40502,7 @@ impl OrchRegistry {
         // file on a call the publisher makes once a second for every group
         // holding a view lease (the group view's 2 s poll until #1608).
         let declared = if guardrails.advanced_orchestrator {
-            info.as_ref().and_then(|g| workflow::load_workflow(&g.repo).ok().flatten())
+            info.as_ref().and_then(|g| load_active_workflow(&g.repo, &g.guardrails).ok().flatten())
         } else {
             // The toggle being off is authoritative "this group declares
             // nothing", exactly as `board_policy`/`merge_queue_policy` read it
@@ -42860,7 +42944,7 @@ impl OrchRegistry {
             render_template(
             WORKFLOW_TPL,
             &[
-                ("WORKFLOW_PATH", workflow::workflow_path(&g.repo)),
+                ("WORKFLOW_PATH", &active_workflow_path(&g.repo, &g.guardrails)),
                 ("MAX_AGENTS", &g.guardrails.max_agents.to_string()),
                 // A roster can legally declare no reviewer at all (a build-only
                 // workflow). Say that, rather than emitting an empty list and
@@ -43052,7 +43136,7 @@ impl OrchRegistry {
             render_template(
                 BLOCK_TPL,
                 &[
-                    ("WORKFLOW_PATH", workflow::workflow_path(&g.repo)),
+                    ("WORKFLOW_PATH", &active_workflow_path(&g.repo, &g.guardrails)),
                     ("BLOCK_ID", &b.id),
                     ("BLOCK_KIND", b.kind.as_str()),
                     ("MECHANICS_RECAP", mechanics_recap),
@@ -43161,7 +43245,7 @@ impl OrchRegistry {
         // level, and strictly better than this path's pre-#1187 behavior (a
         // literal `{{LOCKS}}`, which carried no guidance either).
         let merge_queue_note = if g.guardrails.advanced_orchestrator
-            && workflow::load_workflow(&g.repo)
+            && load_active_workflow(&g.repo, &g.guardrails)
                 .ok()
                 .flatten()
                 .map(|wf| wf.merge_queue.enabled)
@@ -43187,7 +43271,7 @@ impl OrchRegistry {
         // prose about locks that do not exist is the leak these fragments are
         // conditional to prevent.
         let locks_declared = g.guardrails.advanced_orchestrator
-            && workflow::load_workflow(&g.repo)
+            && load_active_workflow(&g.repo, &g.guardrails)
                 .ok()
                 .flatten()
                 .map(|wf| !wf.resources.is_empty())
@@ -43939,13 +44023,16 @@ impl OrchRegistry {
         before_len == read_len && read_len == after_len
     }
 
-    /// Read the repo's workflow file (`workflow::workflow_path`) for the reload
-    /// path, stability-checked via `workflow_read_is_stable`. `None` for "no file",
+    /// Read the group's ACTIVE workflow file for the reload path,
+    /// stability-checked via `workflow_read_is_stable`. `None` for "no file",
     /// "unreadable", or "caught mid-write" alike — `reload_merge_gate_if_
     /// changed` retains the last-known gate on all three without needing to
     /// tell them apart, the same way it already does for a parse error.
-    fn read_workflow_stably(repo: &str) -> Option<String> {
-        let path = workflow::workflow_file(repo);
+    ///
+    /// #1689: takes the resolved absolute PATH rather than the repo, so the
+    /// caller's `active_workflow_path` is the only place the group's workflow
+    /// name becomes a file — this function cannot re-derive it differently.
+    fn read_workflow_stably(path: &Path) -> Option<String> {
         let before = fs::metadata(&path).ok()?.len();
         let text = fs::read_to_string(&path).ok()?;
         let after = fs::metadata(&path).ok()?.len();
@@ -44017,7 +44104,10 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests (#385/B1 toggle-off race + removal-audit pins)
     pub fn reload_merge_gate_if_changed(&self, id: &GroupId) {
         let Some(info) = self.group(id) else { return };
-        let Some(text) = Self::read_workflow_stably(&info.repo) else { return };
+        // #1689: the group's ACTIVE file, resolved once here and handed down —
+        // the reload arms the gate the human pinned, not `.orrerix/workflow.yml`.
+        let path = Path::new(&info.repo).join(active_workflow_path(&info.repo, &info.guardrails));
+        let Some(text) = Self::read_workflow_stably(&path) else { return };
         let Ok(wf) = workflow::parse_workflow(&text) else { return };
         let armed = self.merge_gate(id);
         let fresh = wf.gates.get("merge").cloned();
@@ -48051,7 +48141,7 @@ impl OrchRegistry {
              to spawn_agent to open one (its kind, CLI, model and persona come from the file):\n{rows}\n\
              The workflow's edges are ADVISORY: they are the declared happy path, not a schedule. \
              You still decide what to run when.",
-            path = workflow::workflow_path(&g.repo),
+            path = active_workflow_path(&g.repo, &g.guardrails),
             rows = rows.join("\n"),
         )
     }
@@ -52288,7 +52378,7 @@ impl OrchRegistry {
         if !g.guardrails.advanced_orchestrator {
             return workflow::MergeQueuePolicy::default();
         }
-        match workflow::load_workflow(&g.repo) {
+        match load_active_workflow(&g.repo, &g.guardrails) {
             Ok(Some(wf)) => wf.merge_queue,
             _ => workflow::MergeQueuePolicy::default(),
         }
@@ -52318,7 +52408,7 @@ impl OrchRegistry {
         if !g.guardrails.advanced_orchestrator {
             return workflow::BoardPolicy::default();
         }
-        match workflow::load_workflow(&g.repo) {
+        match load_active_workflow(&g.repo, &g.guardrails) {
             Ok(Some(wf)) => wf.board,
             _ => workflow::BoardPolicy::default(),
         }
@@ -54745,17 +54835,86 @@ pub fn promote_to_orchestrator_sync(
 /// because the launcher's whole reason for asking is that asking is free. Two
 /// previews of one repo read the same file twice and cannot interact.
 #[tauri::command]
-pub async fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
-    run_blocking(move || orch_workflow_preview_sync(repo, agent_cli)).await
+pub async fn orch_workflow_preview(repo: String, agent_cli: String, name: Option<String>) -> Value {
+    run_blocking(move || orch_workflow_preview_sync(repo, agent_cli, name)).await
+}
+
+/// Every workflow this repo declares (#1689) — the launcher's picker and the
+/// group header's read the same list from here.
+///
+/// Read-only and repo-scoped: it opens `.orrerix/workflows/` (or the legacy
+/// spelling), parses each `<name>.yml`, and creates nothing. A repo with only
+/// `.orrerix/workflow.yml` answers with the single `default` row it has always
+/// effectively had, and a repo with neither answers with an empty list — which
+/// is not an error, it is how you start before you write a file.
+///
+/// `findings` carries what the LISTING could not make sense of, as opposed to
+/// what one file could not parse: a `default` declared twice, a file whose stem
+/// is not a usable name. Advisory — nothing here blocks a launch.
+///
+/// Off-thread (#762 — see [`run_blocking`]): one `read_dir` plus a YAML parse
+/// per file, on a gesture, on the thread that services paint.
+///
+/// **Reentrancy.** Nothing to argue, and for the same reason
+/// [`orch_workflow_preview`] has nothing to argue: it takes no registry state,
+/// holds no lock, writes nothing. Two listings of one repo read the same
+/// directory twice and cannot interact.
+#[tauri::command]
+pub async fn orch_workflow_list(repo: String) -> Value {
+    run_blocking(move || orch_workflow_list_sync(repo)).await
+}
+
+/// The body of [`orch_workflow_list`], as a plain function so the command is a
+/// thin delegation and the tests can exercise it without a Tauri runtime.
+#[doc(hidden)] // pub for integration tests
+pub fn orch_workflow_list_sync(repo: String) -> Value {
+    let listing = workflow::list_workflows(&repo);
+    json!({
+        "workflows": listing.workflows.iter().map(|e| json!({
+            "name": e.name,
+            "path": e.path,
+            // The file's own `name:` — human prose, and empty when the file
+            // will not parse.
+            "display_name": e.display_name,
+            // Spelled the way `orch_workflow_preview` spells it, so the
+            // frontend reads one vocabulary for one question.
+            "valid": e.errors.is_empty(),
+            "errors": e.errors,
+        })).collect::<Vec<_>>(),
+        "findings": listing.findings,
+    })
 }
 
 /// The body of [`orch_workflow_preview`], as a plain function: it is the
 /// launcher's answer to "what would this launch run", and the workflow tests
 /// exercise it directly, without a Tauri runtime.
+/// **`name`** (#1689) picks which of the repo's workflows to preview.
+///
+/// `None` — every caller written before named workflows, and the launcher's own
+/// default — means `default`, which resolves to `.orrerix/workflow.yml` whenever
+/// that file exists: the same file, and the same JSON, byte for byte. A name
+/// that is not a usable one is reported as a validation error on an absent
+/// workflow rather than echoed back into `path`, so nothing untrusted reaches a
+/// display surface through here.
 #[doc(hidden)] // pub for integration tests
-pub fn orch_workflow_preview_sync(repo: String, agent_cli: String) -> Value {
-    let present = workflow::workflow_file_exists(&repo);
-    let (name, blocks, gates, errors, capacity) = match workflow::load_workflow(&repo) {
+pub fn orch_workflow_preview_sync(repo: String, agent_cli: String, name: Option<String>) -> Value {
+    let wanted = match name.as_deref() {
+        None => Ok(workflow::WorkflowName::default_name()),
+        Some(raw) => workflow::WorkflowName::parse(raw),
+    };
+    let rel = match &wanted {
+        Ok(n) => workflow::workflow_path_named(&repo, n),
+        Err(_) => String::new(),
+    };
+    let present = match &wanted {
+        Ok(n) => workflow::workflow_file_named(&repo, n).is_file(),
+        Err(_) => false,
+    };
+    let loaded = match &wanted {
+        Ok(n) => workflow::load_workflow_named(&repo, n),
+        Err(e) => Err(vec![format!("that is not a usable workflow name: {e}")]),
+    };
+    let (name, blocks, gates, errors, capacity) = match loaded {
         Ok(Some(wf)) => {
             let gates: Vec<String> = wf.gates.keys().cloned().collect();
             // #255: same derivation `create_group_ex` records at load time, so the
@@ -54785,7 +54944,7 @@ pub fn orch_workflow_preview_sync(repo: String, agent_cli: String) -> Value {
     // came from the gate (that conflation was rev-1's finding).
     let extra_tiers = capacity.map(|c| workflow::extra_tiers(&resolved, c.reviewers_needed));
     json!({
-        "path": workflow::workflow_path(&repo),
+        "path": rel,
         "present": present,
         "valid": errors.is_empty(),
         "name": name,
@@ -56808,7 +56967,7 @@ fn register_orchestrator_pane(
                     "[orrerix] this launch asked for {starters} initial worker(s), but this repo's \
                      {} declares no worker block — none were opened. Spawn the blocks it does \
                      declare instead (they are listed above).",
-                    workflow::workflow_path(&group2.repo)
+                    active_workflow_path(&group2.repo, &group2.guardrails)
                 ),
                 brand::AUDIT_ACTOR,
             );

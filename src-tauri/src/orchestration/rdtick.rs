@@ -503,7 +503,7 @@ impl OrchRegistry {
         if !g.guardrails.advanced_orchestrator {
             return off;
         }
-        let Ok(Some(wf)) = workflow::load_workflow(&g.repo) else { return off };
+        let Ok(Some(wf)) = super::load_active_workflow(&g.repo, &g.guardrails) else { return off };
         let d = wf.driver;
         (
             d.enabled,

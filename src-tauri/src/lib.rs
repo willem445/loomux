@@ -296,6 +296,7 @@ pub fn run() {
             orchestration::orch_group_view,
             orchestration::orch_strip_view,
             orchestration::orch_workflow_preview,
+            orchestration::orch_workflow_list,
             orchestration::orch_set_advanced_orchestrator,
             orchestration::orch_workflow_status,
             orchestration::orch_group_watches,

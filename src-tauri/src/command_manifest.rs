@@ -131,6 +131,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "orch_group_view",
     "orch_strip_view",
     "orch_workflow_preview",
+    "orch_workflow_list",
     "orch_set_advanced_orchestrator",
     "orch_workflow_status",
     "orch_group_watches",

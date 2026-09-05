@@ -353,7 +353,8 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
     /// File-extension literals that mark a `format!` template as building a file
     /// name. Matched inside the template only — see this test's doc.
     const EXTENSIONS: &[&str] = &[
-        ".json", ".jsonl", ".log", ".toml", ".yaml", ".md", ".txt", ".cmd", ".ps1", ".sh",
+        ".json", ".jsonl", ".log", ".toml", ".yaml", ".yml", ".md", ".txt", ".cmd", ".ps1",
+        ".sh",
     ];
 
     /// Every sanctioned identifier-into-file-name site: the line text, the
@@ -562,6 +563,24 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
             "block ids are validated by workflow::sanitize_id — a separate, weaker predicate, \
              deliberately not converted by #925",
             "let Some(id) = sanitize_id(&rb.id) else {",
+        ),
+        // #1689: a workflow NAME becomes `workflows/<name>.yml`, and
+        // `workflow_path_named` is the one place it does — `workflow_file_named`
+        // joins the repo root onto this function's result rather than
+        // re-spelling the name, so there is no second assembly point to keep in
+        // step. The binding is a `WorkflowName`, a newtype whose only
+        // constructor runs `PathSegment::parse`, so the argument is the same one
+        // every row above rests on, one type removed.
+        //
+        // The proof names the SIGNATURE, which fits on one line and carries the
+        // type — the wrapped-signature trap the `pi_session_file_in_dir` row
+        // records. Revert `name: &WorkflowName` to `name: &str` and this row
+        // strands, which is what makes it a checked claim rather than a promise.
+        (
+            "format!(\"{}/{name}.yml\", workflows_dir(repo))",
+            "workflow_path_named(repo, &WorkflowName) — the one assembly point for a named \
+             workflow's path",
+            "pub fn workflow_path_named(repo: &str, name: &WorkflowName) -> String {",
         ),
         // These two interpolate a locally-parsed `PathSegment` rather than the
         // raw parameter. The binding name is a hint, not the evidence — the
