@@ -47830,11 +47830,17 @@ impl OrchRegistry {
                 // widens nothing — the same decision as gemini's, opencode's
                 // and pi's arms.
                 //
-                // `containment` is likewise unread, and that is `cli_can_host`
-                // holding rather than an omission: codex tops out at
-                // `Containment::None`, so the only classes that reach here are
-                // the ones with nothing to deny.
-                debug_assert!(!containment.denies_edits());
+                // `containment` is deliberately unread, and it is NOT asserted
+                // either. codex tops out at `Containment::None`, so no contained
+                // class can reach a real codex spawn — but that is `cli_can_host`
+                // holding at parse and spawn time, not a property of this
+                // function. These builders are pure and are driven directly over
+                // EVERY tier by `string_and_argv_forms_agree_for_every_adapter`,
+                // so a `debug_assert!` here would panic a debug test build on a
+                // call that is entirely legitimate. Reading the parameter and
+                // emitting nothing is the honest shape: there is no flag codex
+                // could carry a denial on, whatever tier it is handed.
+                let _ = containment;
                 cmd
             }
             "pi" => {
@@ -48308,7 +48314,10 @@ impl OrchRegistry {
                     push(&mut a, "resume");
                     push(&mut a, s);
                 }
-                debug_assert!(!containment.denies_edits());
+                // Read and deliberately not asserted — see the string form's
+                // arm for why a `debug_assert!` here would panic a debug test
+                // build on a legitimate call.
+                let _ = containment;
             }
             "pi" => {
                 push(&mut a, "pi");
