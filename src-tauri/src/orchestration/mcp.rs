@@ -1821,7 +1821,7 @@ fn require_orchestrator(caller: &Caller) -> Result<(), String> {
 /// orchestrator-only when a lead also holds it learns something untrue about
 /// the system it is in.
 fn require_spawner(caller: &Caller) -> Result<(), String> {
-    if matches!(caller.role, Role::Orchestrator | Role::Lead) {
+    if matches!(caller.role, Role::Orchestrator) {
         Ok(())
     } else {
         Err("permission denied: opening and driving agent panes is for an orchestrator, or a \
