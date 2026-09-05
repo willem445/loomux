@@ -713,8 +713,14 @@ pub fn drive_ssh_add_with_transcript(
     // yields a `std::process::Child` whose `Drop` does no wait, and nothing else
     // in this process ever reaps it. A `Timeout` was cleaned up and a SUCCESS
     // was not, and success is the arm every working launch takes (#2594 item 1).
+    // [scratch #2594 R1] the pre-fix split: a run a transcript line decided
+    // only KILLS the child, and nothing ever waits for it.
     if end.status.is_none() {
-        end.status = reap_bounded(&mut child, &mut killer);
+        if end.terminal.is_some() {
+            let _ = killer.kill();
+        } else {
+            end.status = reap_bounded(&mut child, &mut killer);
+        }
     }
     let (outcome, seen) = verdict(end, passphrase);
     close_console_while_the_reader_drains(writer, master, rx);
