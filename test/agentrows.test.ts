@@ -17,9 +17,12 @@
 // reddens alone.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readdirSync, readFileSync } from "node:fs";
 import {
   deriveAgentState,
   groupRows,
+  agentRows,
+  isAgentPane,
   toAgentRow,
   matchesFilter,
   sortRows,
@@ -31,6 +34,9 @@ import {
   type TabRef,
 } from "../src/agentrows.ts";
 import { ACTIVITY_FLOOR_BYTES } from "../src/paneactivity.ts";
+import { AGENTS, LAUNCHABLE_AGENT_PROGRAMS } from "../src/agents.ts";
+import { agentMark } from "../src/agenticons.ts";
+import { sessionCliFromCommand } from "../src/panerestore.ts";
 
 const T0 = 1_000_000;
 
@@ -692,4 +698,188 @@ test("the needs-you badge is unchanged by grouping, in either order", () => {
       `grouping in ${order} order did not preserve the row set`,
     );
   }
+});
+
+// --- membership: which panes are agent panes at all (#2514) ------------------
+//
+// Red arm (mechanically): make `isAgentPane` return true unconditionally and
+// the three "is not an agent row" tests redden together; drop its catalog arm
+// and `the four launchable CLIs no session store covers` reddens alone; drop
+// its `harness` arm and the issue's own positive control reddens alone; make
+// `agentRows` skip the filter and the badge test reddens.
+
+/** A plain terminal the human opened and typed into: no launch line, no
+ *  orchestration identity, no session-store CLI — and painting above the floor,
+ *  which is exactly what made the ladder call it `working` (#2514). */
+function shell(patch: FactsPatch = {}): PaneFacts {
+  return facts({
+    key: "pane-shell",
+    name: "bash",
+    kind: "terminal",
+    harness: null,
+    orch: null,
+    sessionId: null,
+    mark: { command: null, argv: null, knownCli: null, remote: false },
+    ...patch,
+  });
+}
+
+test("a plain shell the human has typed into is not an agent row (#2514)", () => {
+  const pane = shell();
+  // The reported bug, stated as the two facts that make it: the ladder is asked
+  // and answers `working` — correctly, about a question it was never the right
+  // one to ask. Pinning the ladder's answer here is the POSITIVE CONTROL for
+  // the exclusion below: without it, "not a row" would pass just as well on a
+  // fixture the ladder had stopped reading at all.
+  assert.equal(pane.activity.lastHumanInputMs !== null, true, "the human has typed into it");
+  assert.ok(pane.activity.bytesInWindow >= ACTIVITY_FLOOR_BYTES, "and it is painting");
+  assert.equal(deriveAgentState(pane), "working", "the ladder still calls it working, and always did");
+  assert.equal(isAgentPane(pane), false, "…but it is not an agent pane, so nothing asks the ladder");
+  assert.deepEqual(agentRows([pane]), [], "and it never becomes a row");
+});
+
+test("the same facts with a harness ARE an agent row, still working (#2514)", () => {
+  // The issue's own positive control, and it changes exactly ONE field: if the
+  // exclusion above were coming from something else in the fixture — the kind,
+  // the null session id, the absent launch line — this would still be empty.
+  const pane = shell({ harness: "claude" });
+  assert.equal(isAgentPane(pane), true);
+  const rows = agentRows([pane]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].state, "working");
+});
+
+test("a content pane is not an agent row (#2514)", () => {
+  // Files, editor, git and workflow panes are `alive` BY DESIGN — they have no
+  // PTY at all — so every rung above `working` declines and the default rung
+  // caught them too. `kind` is not what excludes them: the three membership
+  // arms are, and a content pane satisfies none. That is why the loop varies
+  // the kind and asserts the same answer rather than pretending it is read.
+  for (const kind of ["files", "editor", "git", "workflow"]) {
+    assert.equal(isAgentPane(shell({ kind, name: kind })), false, `a ${kind} pane is not an agent`);
+  }
+});
+
+test("an orchestration pane with no harness is still an agent row (#2514)", () => {
+  // A manager arrives through the repo's workflow file and may carry no CLI
+  // loomux launched it with; the group is the evidence.
+  const pane = shell({ name: "mgr", orch: { group: "g", agentId: null, role: "manager" } });
+  assert.equal(pane.harness, null);
+  assert.equal(isAgentPane(pane), true);
+});
+
+test("an SSH pane whose profile declares the far-end CLI is an agent row (#2514)", () => {
+  // Production shape: `Pane.facts()` sets `harness` to `agentCli ??
+  // sshDefaultCli`, so a declared far-end CLI lands on BOTH this and
+  // `mark.knownCli` — two arms carry it, and writing the fixture with only one
+  // of them would be pinning a pane that cannot exist. The catalog arm is
+  // pinned ALONE on the local `codex` pane below, which `harness` cannot carry.
+  const pane = shell({
+    name: "prod",
+    harness: "claude",
+    mark: { command: "ssh prod", argv: null, knownCli: "claude", remote: true },
+  });
+  assert.equal(isAgentPane(pane), true);
+});
+
+test("an SSH pane that declares no far-end CLI is not an agent row (#2514)", () => {
+  // Deliberate, and the honest answer: nothing here says an agent is running.
+  // The launch line is the TRANSPORT — reading `ssh` as the pane's CLI is the
+  // confident-wrong-answer `agenticons.ts` exists to refuse — and the profile
+  // named nothing. RESIDUAL, stated in `doc/design/agents-tab.md`: a human who
+  // SSHes out and starts an agent BY HAND gets no row until the profile
+  // declares one. Declaring it is the fix; guessing is not.
+  const pane = shell({ name: "box", mark: { command: "ssh box", argv: null, knownCli: null, remote: true } });
+  assert.equal(isAgentPane(pane), false);
+});
+
+test("the four launchable CLIs no session store covers are still agent rows (#2514)", () => {
+  // THE ARM `harness` CANNOT CARRY, and the reason the predicate is not just
+  // `harness !== null || orch !== null`. `sessionCliFromCommand` is a closed
+  // four-name membership test — it is matched against `listSessions()` rows —
+  // while the launcher starts panes on eight CLIs. Resting membership on it
+  // would drop these four out of the tab AND out of the badge: an agent asking
+  // the human a question, invisible.
+  for (const program of ["codex", "gemini", "hermes", "ante"]) {
+    const pane = shell({
+      name: program,
+      mark: { command: `${program} --resume`, argv: null, knownCli: null, remote: false },
+    });
+    // The negative control that makes this test discriminate at all: these
+    // really are outside the session-store set, so `harness` is genuinely null
+    // in production and only the catalog arm can be answering.
+    assert.equal(sessionCliFromCommand(program), null, `${program} is outside the session-store set`);
+    assert.equal(pane.harness, null);
+    assert.equal(isAgentPane(pane), true, `${program} is a launchable agent CLI and must be a row`);
+  }
+});
+
+test("a custom-command pane naming an unrecognised program is not an agent row (#2514)", () => {
+  const pane = shell({ name: "build", mark: { command: "make -j8", argv: null, knownCli: null, remote: false } });
+  assert.equal(isAgentPane(pane), false);
+  // NEGATIVE CONTROL for the arm's SHAPE. `agentMarkFor` is total: it gives
+  // this pane a lettered badge, so a predicate reading "does the launch line
+  // resolve to any program at all" would have let it straight in. Membership is
+  // the launcher's catalog, which is the stricter question — and this assertion
+  // is what fails if someone ever relaxes it to the resolver's.
+  const view = agentMark(pane.mark);
+  assert.equal(view?.kind, "letter", "the resolver still badges it; membership is stricter than the badge");
+});
+
+test("the launchable set is the launcher's own catalog (#2514)", () => {
+  // Spelled out ONCE, here, on purpose: production derives it from `AGENTS`, so
+  // this is the place a ninth CLI becomes a visible decision about the Agents
+  // tab's membership rather than a silent widening.
+  assert.deepEqual(
+    [...LAUNCHABLE_AGENT_PROGRAMS].sort(),
+    ["ante", "claude", "codex", "copilot", "gemini", "hermes", "opencode", "pi"],
+  );
+  // And that it is DERIVED, not a copy that can drift: exactly the catalog
+  // minus the `custom` row, whose command names no program.
+  assert.equal(LAUNCHABLE_AGENT_PROGRAMS.size, AGENTS.length - 1);
+  assert.equal(LAUNCHABLE_AGENT_PROGRAMS.has(""), false);
+  for (const notAnAgent of ["bash", "pwsh", "cmd", "ssh", "make"]) {
+    assert.equal(LAUNCHABLE_AGENT_PROGRAMS.has(notAnAgent), false, `${notAnAgent} is not an agent CLI`);
+  }
+});
+
+test("the badge and the list are read off one filtered array (#2514)", () => {
+  // "One rule, not two": the count and the rendered list both come from
+  // `agentRows`, so a pane cannot be excluded from the list and still counted.
+  const panes = [
+    shell({ key: "p-shell" }),
+    shell({ key: "p-question", harness: "claude", attention: { reason: "gate", detail: null } }),
+  ];
+  const rows = agentRows(panes);
+  assert.deepEqual(rows.map((r) => r.key), ["p-question"]);
+  assert.equal(needsYouCount(rows), 1);
+  // The pre-fix reading, for contrast — and the control that the fixture really
+  // does hold a pane the old path counted: mapping without the rule gives two.
+  assert.equal(panes.map((f) => toAgentRow(f)).length, 2);
+});
+
+test("nothing in src/ projects an agent row outside the membership rule (#2514)", () => {
+  // DEFAULT-DENY. `agentRows` carries the rule; a caller reaching `toAgentRow`
+  // directly is a second place the filter can be forgotten, which is exactly
+  // the "one rule, not two" the issue asks for. Decided on the SYMBOL — the
+  // module's own API, which cannot be renamed away without renaming the export
+  // — not on any binding's name (CLAUDE.md's source-scanning-guard rule).
+  const all = readdirSync(new URL("../src/", import.meta.url)).filter((f) => f.endsWith(".ts"));
+  const hits = (files: string[]) =>
+    files.flatMap((f) =>
+      readFileSync(new URL(`../src/${f}`, import.meta.url), "utf8")
+        .split(/\r?\n/)
+        .filter((l) => l.includes("toAgentRow("))
+        .map((l) => `${f}: ${l.trim()}`),
+    );
+  assert.ok(all.length > 10, `only ${all.length} source files scanned — the walk is broken`);
+  assert.deepEqual(
+    hits(all.filter((f) => f !== "agentrows.ts")),
+    [],
+    "a module projects agent rows without the membership rule (#2514). Call agentRows() instead.",
+  );
+  // POSITIVE CONTROL, in the SAME shape as the scan above: a walk that matched
+  // nothing at all would report zero denials and pass. `agentrows.ts` really
+  // does carry the symbol — its declaration and `agentRows`' own call.
+  assert.equal(hits(["agentrows.ts"]).length, 2, "the scan cannot see toAgentRow where it is defined and used");
 });

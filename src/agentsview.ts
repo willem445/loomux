@@ -19,7 +19,7 @@
 import { getAgentOrder, setAgentOrder } from "./agentorder";
 import {
   needsYouCount,
-  toAgentRow,
+  agentRows,
   type AgentFilter,
   type AgentGroup,
   type AgentOrder,
@@ -223,7 +223,11 @@ export class AgentsView {
    *  disagreeing rule for the same number, which is the divergence
    *  `agentrows.ts` exists to prevent. */
   refresh(): void {
-    const rows = this.deps.facts().map((f) => toAgentRow(f));
+    // `agentRows` and not `facts().map(toAgentRow)`: the membership rule
+    // (#2514) rides on the projection, so the BADGE below and the rendered
+    // list below that cannot come to disagree about which panes are agents.
+    // A plain shell the human has typed into is not one of them.
+    const rows = agentRows(this.deps.facts());
     this.deps.onCountChanged(needsYouCount(rows));
     if (!this.open) return;
     this.renderChips(rows);

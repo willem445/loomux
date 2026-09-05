@@ -373,10 +373,36 @@ export interface AgentMarkInput {
  * argv-only command. A private copy would be a fourth derivation, and it would be the one
  * that quietly disagrees on Windows.
  */
-export function agentMark(input: AgentMarkInput, size = ICON_AGENT_PX): AgentMarkView | null {
+/**
+ * WHICH PROGRAM this pane's reading names, or `null` when none can be named —
+ * steps 1, 2 and 3 of the order above, without the rendering.
+ *
+ * Extracted (#2514) because a SECOND question is asked of the same reading:
+ * `agentrows.ts`'s `isAgentPane` tests the answer for membership of the
+ * launcher's catalog. Asking it here rather than re-deriving it there keeps the
+ * resolution order — knownCli beats the launch line, a remote pane's transport
+ * is never read as its agent — in ONE place, which is the same reason
+ * `programFromRestore` is used below instead of a private first-token parse.
+ *
+ * `null` therefore means two different things to its two callers and that is
+ * fine, because each disambiguates on `input.remote` itself: no launch line at
+ * all (draw nothing) versus the answer is on the far end (draw the neutral
+ * badge). Nothing is lost by merging them here — `agentMark` below reads
+ * `remote` in exactly the branch it always did.
+ */
+export function markProgram(input: AgentMarkInput): string | null {
   const known = input.knownCli?.trim();
-  if (known) return agentMarkFor(normalizeAgentProgram(known), size);
+  if (known) return normalizeAgentProgram(known);
+  if (input.remote) return null;
+  return programFromRestore(input.command ?? null, input.argv ?? null);
+}
+
+export function agentMark(input: AgentMarkInput, size = ICON_AGENT_PX): AgentMarkView | null {
+  const program = markProgram(input);
+  if (program) return agentMarkFor(program, size);
+  // No program AND remote is the one case that still draws: the far end has an
+  // agent loomux cannot name. No program and local is a pane with no launch
+  // line, which draws nothing.
   if (input.remote) return neutralView(REMOTE_UNKNOWN_LABEL, size);
-  const program = programFromRestore(input.command ?? null, input.argv ?? null);
-  return program ? agentMarkFor(program, size) : null;
+  return null;
 }

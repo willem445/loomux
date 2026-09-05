@@ -5,6 +5,9 @@
 // pane-setup screen (#194).
 
 import { mergeRecentDir } from "./recentdirs.ts";
+// The catalog's own first-token parse (#452's single derivation), reused here
+// rather than re-spelled — see `LAUNCHABLE_AGENT_PROGRAMS`.
+import { programFromRestore } from "./panerestore.ts";
 
 export interface AgentDef {
   id: string;
@@ -24,6 +27,25 @@ export const AGENTS: AgentDef[] = [
   { id: "ante", label: "Ante", command: "ante" },
   { id: "custom", label: "Custom…", command: "" },
 ];
+
+/** The program names loomux's own launcher can start an agent pane on.
+ *
+ *  DERIVED from `AGENTS` rather than spelled a second time, and through
+ *  `programFromRestore` rather than a private first-token parse, so a ninth
+ *  CLI is one edit to the catalog above and nothing here. The `custom` row
+ *  drops out on its own: its command is empty, which names no program.
+ *
+ *  **This set answers "is this pane an agent at all", and `agentrows.ts`'s
+ *  `isAgentPane` is its one caller (#2514).** It is deliberately NOT the
+ *  session-store set (`sessionCliFromCommand`, four names) and deliberately
+ *  NOT "does this resolve to any program at all": the first would drop a
+ *  `codex` pane out of the Agents tab, and the second would put a
+ *  hand-typed `make` pane into it. A custom-command pane naming a program
+ *  loomux does not recognise is not an agent as far as this window is
+ *  concerned — the honest answer, and the one the Agents tab renders. */
+export const LAUNCHABLE_AGENT_PROGRAMS: ReadonlySet<string> = new Set(
+  AGENTS.map((a) => programFromRestore(a.command, null)).filter((p): p is string => p !== null),
+);
 
 const KEY_DEFAULT = "loomux.defaultAgent";
 const KEY_CUSTOM = "loomux.customAgentCommand";
