@@ -984,6 +984,12 @@ totals, whether a round was cut from the right base -- is in
 `doc/design/mutation-ledger.md`. A parse that finds no totals is an error rather
 than an empty row, so the failure you get is loud rather than a blank cell.
 
+**Checking a body against a run that is still going gets you provisional figures,
+and the script says so on stderr rather than caching them.** Only a completed run's
+log is banked; an in-flight one is read fresh every time. So a `--check` run while
+CI is mid-flight is a look, not a receipt -- re-run it once the run completes, which
+is the same rule as everywhere else here.
+
 
 ### The frontend half runs its base red locally — build the isolated tree right
 

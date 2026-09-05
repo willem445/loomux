@@ -19,6 +19,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const require_ = createRequire(import.meta.url);
@@ -509,6 +510,145 @@ test('the rendered check report ends in a summary a worker can read the MISMATCH
 });
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// The generator against its OWN checker. Every fixture above drives one half or the other;
+// these drive the round trip, which is where both round-2 blocking findings lived (#2512).
+// ---------------------------------------------------------------------------
+
+const NODE_RUN = '99999999';
+const NODE_SPEC = {
+  target: 'node',
+  rows: [{ n: 1, behaviour: 'a frontend round', run: NODE_RUN, headSha: 'deadbeefdeadbeef', cutFrom: 'cafebabe' }],
+};
+const NODE_LOGS = { [NODE_RUN]: log('node-red') };
+const generatedNodeBody = (): string => String(ml.renderLedger(ml.buildLedger(NODE_SPEC, NODE_LOGS)));
+
+// A `node --test` name is PROSE with spaces. An identifier-shaped filter over the claimed
+// names is a fact about cargo, and under it every name in a frontend row was discarded,
+// `claimedNames` came back empty, and the checker reported 'the row names no reddened test'
+// against a row naming both of them correctly — the generator failing its own checker on a
+// body nobody had touched, with no edit that could clear it.
+test("the generator's own NODE output passes its own checker, with nothing edited in between", () => {
+  const gen = generatedNodeBody();
+  assert.match(gen, /a ledger row must carry the head its run measured/);
+  assert.ok(/`[^`]* [^`]*`/.test(gen), 'the round trip is only about anything if a claimed name contains a space');
+  const r = ml.checkBody(gen, NODE_LOGS, { target: 'node' }) as CheckResult;
+  assert.equal(r.counts.MISMATCH, 0, JSON.stringify(r.findings.filter((f) => f.severity === 'MISMATCH'), null, 1));
+  assert.equal(r.rows, 1);
+  assert.equal(r.findings.filter((f) => f.severity === 'OK' && /reddened name\(s\) match the log/.test(f.message)).length, 1);
+});
+
+// The same round trip for the SPLIT. `renderLedger` writes `(2/2, run 99999999 @ `deadbeef`)`,
+// and a group demanding the closing paren straight after `P/F` read no split at all — no OK,
+// no CHECK, no MISMATCH. A checked ledger and an unchecked one rendered identically.
+test("the generator's own bullet split is READ, not silently skipped", () => {
+  const gen = generatedNodeBody();
+  const bullets = ml.readBullets(gen) as any[];
+  assert.equal(bullets.length, 1);
+  assert.deepEqual([bullets[0].k, bullets[0].passed, bullets[0].failed], [2, 2, 2]);
+  assert.match(gen, /\*\*Round 1 — 2 tests\*\* \(2\/2, run 99999999 @ `deadbeef`\)/,
+    'the generator really does write a trailing clause inside the parenthetical, or this pin is about nothing');
+  const r = ml.checkBody(gen, NODE_LOGS, { target: 'node' }) as CheckResult;
+  assert.equal(r.findings.filter((f) => f.severity === 'OK' && /bullet split 2\/2 matches/.test(f.message)).length, 1,
+    'the split must produce a finding of its own; silence here is the defect');
+});
+
+test('a WRONG split in the generator’s own format is a MISMATCH, not silence', () => {
+  const wrong = generatedNodeBody().replace('(2/2, run', '(999/777, run');
+  assert.notEqual(wrong, generatedNodeBody(), 'the edit must have landed');
+  const r = ml.checkBody(wrong, NODE_LOGS, { target: 'node' }) as CheckResult;
+  const f = r.findings.filter((x) => x.severity === 'MISMATCH' && /the bullet says 999\/777/.test(x.message));
+  assert.equal(f.length, 1);
+  assert.match(f[0].message, /run 99999999 says 2\/2/);
+});
+
+test('a split whose parenthetical sits far out is still read', () => {
+  // The window before the paren is wide enough for a hand-written bullet that says something
+  // before its figures; the 20-char one it replaces lost the split silently.
+  const b = ml.readBullets('- **Round 13 — six tests** for the session-id compare, re-cut at head (588/6).') as any[];
+  assert.equal(b.length, 1);
+  assert.deepEqual([b[0].k, b[0].passed, b[0].failed], [6, 588, 6]);
+});
+
+test('a first parenthetical carrying no P/F leaves the split unclaimed rather than misread', () => {
+  // #2239’s green-round form. The split group must fail as a whole here: there is no split to
+  // check, and reaching past this parenthetical for a later one would invent a claim.
+  const b = ml.readBullets('- **Round 6 — one test** (run 33917588137 @ `3774789b`) against 592/2 elsewhere.') as any[];
+  assert.equal(b.length, 1);
+  assert.equal(b[0].k, 1);
+  assert.equal(b[0].passed, null);
+  assert.equal(b[0].failed, null);
+});
+
+// ---------------------------------------------------------------------------
+// A fenced example table is not the ledger
+// ---------------------------------------------------------------------------
+
+test('a ledger table quoted inside a fence is not what --check re-reads', () => {
+  const fenceOpen = '```';
+  const decoy = [
+    fenceOpen,
+    '| # | behaviour | scratch SHA | cut from | run | tests reddened | failure line |',
+    '|---|---|---|---|---|---|---|',
+    '| 1 | an ILLUSTRATION | `aaaaaaaa` | `bbbbbbbb` | 12345678 | `nothing_real` | `x` |',
+    fenceOpen,
+    '',
+    body('good'),
+  ].join(LF);
+  const t = ml.findLedgerTable(decoy);
+  assert.ok(t, 'the real ledger below the fence must still be found');
+  assert.equal(t.rows.length, 2, 'the real ledger has two rows; the decoy has one');
+  assert.equal(ml.findLedgerTable(decoy).rows[0].cells[4], '33928049423');
+  // The positive control: the decoy IS a well-formed ledger table, so a fence-blind reader
+  // finds it. Without this the assertion above passes for a reader that found nothing.
+  const unfenced = decoy.split(fenceOpen + LF).join('').split(LF + fenceOpen).join('');
+  assert.equal(ml.findLedgerTable(unfenced).rows[0].cells[4], '12345678');
+});
+
+// ---------------------------------------------------------------------------
+// Logs are supplied lazily, and an in-flight run is never cached
+// ---------------------------------------------------------------------------
+
+test('logs may be supplied as a READER, and each run is asked for once per pass', () => {
+  // Holding every log resident was ~229 MB on a 31-row ledger. Nothing needs it: one read
+  // per row. The call count is what makes that a property rather than an intention.
+  const asked: string[] = [];
+  const reader = (id: string) => { asked.push(id); return (CHECK_LOGS as any)[id]; };
+  const r = ml.checkBody(body('good'), reader, { runHeads: HEADS }) as CheckResult;
+  assert.equal(r.counts.MISMATCH, 0);
+  assert.equal(r.rows, 2);
+  assert.deepEqual(asked, [RUN_ROUND1, RUN_ROUND13]);
+
+  const asked2: string[] = [];
+  const reader2 = (id: string) => { asked2.push(id); return (NODE_LOGS as any)[id]; };
+  const ledger = ml.buildLedger(NODE_SPEC, reader2);
+  assert.equal(ledger.rows[0].failed, 2);
+  assert.deepEqual(asked2, [NODE_RUN]);
+});
+
+test('a COMPLETED run is cached; an in-flight one is read and NOT written', () => {
+  // 'A finished run’s log is immutable' is true; an in-flight run’s is not, and it is the one
+  // a worker hits — a draft body citing its own running CI. Cached, the partial output is
+  // banked permanently and every later check reads it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ml-cache-'));
+  try {
+    const text = 'a log body';
+    const done = ml.fetchLog('111', { cache: dir, readLog: () => text, statusOf: () => 'completed' });
+    assert.equal(done, text);
+    assert.ok(fs.existsSync(path.join(dir, '111.log')), 'a completed run must be cached, or the cache does nothing');
+
+    const live = ml.fetchLog('222', { cache: dir, readLog: () => text, statusOf: () => 'in_progress' });
+    assert.equal(live, text, 'the text is still returned — refusing to cache is not refusing to read');
+    assert.equal(fs.existsSync(path.join(dir, '222.log')), false);
+
+    // Fails safe: a status probe that cannot answer must not cache either.
+    const unknown = ml.fetchLog('333', { cache: dir, readLog: () => text, statusOf: () => null });
+    assert.equal(unknown, text);
+    assert.equal(fs.existsSync(path.join(dir, '333.log')), false);
+    assert.equal(ml.runIsComplete('444', { statusOf: () => 'completed' }), true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 // The CLI seam
 // ---------------------------------------------------------------------------
 

@@ -368,15 +368,28 @@ function short(sha) { return sha ? String(sha).slice(0, 8) : '(unknown)'; }
 // GENERATE
 // ---------------------------------------------------------------------------
 
-// `logs` maps a run id to that run's log TEXT. Nothing here fetches anything, which is what
-// lets the suite drive the whole generator over fixtures.
+// How a caller supplies logs. `logs` is either a plain object keyed by run id, or a FUNCTION
+// of the run id returning that run's text.
+//
+// The function form exists for size, not elegance. One CI log here measures 7,385,209 bytes
+// (run 33940325443), so an object holding all 31 of #2239's rounds keeps ~229 MB of text
+// resident at once — more as UTF-16 — for the whole call, on top of `execFileSync`'s 512 MB
+// `maxBuffer` per fetch. Each log is read exactly once per row, so nothing needs to be held:
+// the CLI passes a reader that pulls one log from the cache and lets it go (#2512 rev-final
+// premortem 2). The object form stays because the suite is offline and a fixture is small.
+function logOf(logs, id) {
+  return typeof logs === 'function' ? logs(String(id)) : logs[String(id)];
+}
+
+// Nothing below fetches anything, which is what lets the suite drive the whole generator and
+// the whole checker over fixtures.
 function buildLedger(spec, logs) {
   const sel = { target: spec.target, job: spec.job, what: spec.what };
   const notes = [];
 
   let base = null;
   if (spec.base && spec.base.run != null) {
-    const text = logs[String(spec.base.run)];
+    const text = logOf(logs, spec.base.run);
     if (text == null) throw new Error(`no log supplied for the base run ${spec.base.run}`);
     const suite = selectSuite(readSuites(text), sel);
     base = { run: String(spec.base.run), suite, headSha: spec.base.headSha || null };
@@ -385,7 +398,7 @@ function buildLedger(spec, logs) {
   const rows = [];
   for (const r of spec.rows || []) {
     const id = String(r.run);
-    const text = logs[id];
+    const text = logOf(logs, id);
     if (text == null) throw new Error(`no log supplied for run ${id} (round ${r.n})`);
     const all = readSuites(text);
     const suite = selectSuite(all, Object.assign({}, sel, { failingOnly: !sel.target }));
@@ -470,13 +483,31 @@ function renderLedger(ledger, opts) {
 
 // Split a markdown body into its tables. A table is a run of contiguous lines beginning
 // with `|`; the first is the header and the second the delimiter.
+//
+// FENCED CONTENT IS NOT A TABLE. A body legitimately QUOTES a ledger table — as an example,
+// as the generator's own output, as the thing a finding is about — and a run of `|`-leading
+// lines inside a ``` fence has the same shape as the real one. Read fence-blind, an
+// illustrative table quoted ABOVE the ledger is what `findLedgerTable` returns, `--check`
+// re-reads the example, the real ledger is never opened, and the summary still says
+// `1 ledger row(s) re-read`: a clean report about the wrong table, which is the silent shape
+// this whole script exists to refuse. This PR's own body quotes such a table (#2512 rev-final
+// N1).
 function readTables(body) {
   const lines = String(body).replace(/\r\n/g, '\n').split('\n');
   const tables = [];
   let cur = null;
+  let inFence = false;
+  let fence = '';
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-    if (/^\s*\|/.test(line)) {
+    const f = line.match(/^\s*(`{3,}|~{3,})/);
+    if (f) {
+      if (!inFence) { inFence = true; fence = f[1][0]; }
+      else if (f[1][0] === fence) { inFence = false; }
+      if (cur) { tables.push(cur); cur = null; }
+      continue;
+    }
+    if (!inFence && /^\s*\|/.test(line)) {
       if (!cur) cur = { start: i + 1, rows: [] };
       cur.rows.push({ n: i + 1, cells: splitRow(line) });
     } else if (cur) { tables.push(cur); cur = null; }
@@ -540,7 +571,20 @@ function backticked(cell) {
 // count is spelled as a WORD as often as a digit in real bodies (#2239 spells every one of
 // them), and a checker that reads only digits silently passes every worded one — the
 // vacuous shape CLAUDE.md's absence-control rule is about.
-const BULLET_RE = /\*\*Rounds?\s+([0-9]+(?:(?:\s*,\s*|\s+and\s+)[0-9]+)*)\s*[—–-]\s*([0-9]+|[A-Za-z]+)\s+(?:tests?|each)\s*[.,;:]?\s*\*\*(?:[^\n]{0,20}?\((\d+)\s*\/\s*(\d+)\))?/g;
+//
+// THE SPLIT GROUP MUST TOLERATE A TRAILING CLAUSE, and getting that wrong made this reader
+// blind to its OWN generator. `renderLedger` writes `(2/2, run 99999999 @ `deadbeef`)`; a
+// group ending `(\d+)\)` demands the paren immediately after the second number, so the split
+// was never read, `passed` stayed null, and NO finding was emitted — not an OK, not a CHECK.
+// A checked ledger and an unchecked one rendered identically, which is §2's rule turned on
+// the script itself (#2512 rev-final B2). The window before the paren excludes a paren of its
+// own, so the split is read out of the FIRST parenthetical after the bold and never out of a
+// later one. A first parenthetical that carries no `P/F` — the
+// green-round form `**Round 6 — a bad mutation** (run 33917588137 @ `3774789b`)` — makes the
+// optional group fail as a whole, which is right: that bullet claims no split. The 20-char
+// window it replaces also lost the split on a hand-written bullet whose parenthetical sat
+// further out (#2512 rev-std non-blocking 2).
+const BULLET_RE = /\*\*Rounds?\s+([0-9]+(?:(?:\s*,\s*|\s+and\s+)[0-9]+)*)\s*[—–-]\s*([0-9]+|[A-Za-z]+)\s+(?:tests?|each)\s*[.,;:]?\s*\*\*(?:[^\n(]{0,120}?\((\d+)\s*\/\s*(\d+)[^)\n]*\))?/g;
 
 function readBullets(body) {
   const lines = String(body).replace(/\r\n/g, '\n').split('\n');
@@ -589,7 +633,7 @@ function checkBody(body, logs, opts) {
     if (!idm) { add('CHECK', row.n, `no run id in the run column (${JSON.stringify(runCell.slice(0, 60))})`); continue; }
     const id = idm[1];
     const n = table.numCol >= 0 ? Number(String(cells[table.numCol]).replace(/[^0-9]/g, '')) : null;
-    const text = logs[id];
+    const text = logOf(logs, id);
     if (text == null) { add('CHECK', row.n, `run ${id}: no log available — not fetched, or the run's logs have expired`); continue; }
 
     let suite;
@@ -618,7 +662,18 @@ function checkBody(body, logs, opts) {
     // The reddened set, as a SET: order is the author's, membership is the log's. Compared
     // on the LAST `::` segment, because a body spells a test as declared while the harness
     // prints it module-qualified — the same rule #2239's own body states for a test name.
-    const claimedNames = backticked(cells[table.redCol]).filter((s) => /^[A-Za-z_][A-Za-z0-9_:]*$/.test(s));
+    //
+    // EVERY BACKTICKED TOKEN IN THIS CELL IS A CLAIMED NAME, with no shape filter over it. An
+    // earlier draft kept only identifier-shaped tokens, which is a fact about CARGO names: a
+    // `node --test` name is prose with spaces (`a ledger row must carry the head its run
+    // measured`), so every claimed name in a frontend row was filtered away, `claimedNames`
+    // came back empty, and the branch below fired MISMATCH — "the row names no reddened test"
+    // — against a row naming both of them correctly. The generator's own unedited output
+    // failed its own checker, on a body nothing had touched, with no edit available that
+    // would clear it (#2512 rev-final B1). The cell's whole purpose is to list names, so what
+    // is in it IS the claim; a token that matches nothing in the log is reported as a
+    // disagreement, which is the honest answer and the one a reader can act on.
+    const claimedNames = backticked(cells[table.redCol]);
     const actualNames = suite.failures.map((f) => f.name);
     const actualShort = new Set(actualNames.map(lastSegment));
     const claimedShort = new Set(claimedNames.map(lastSegment));
@@ -691,9 +746,30 @@ function shq(cmd, args, o) {
   catch (err) { return { ok: false, out: String((err && err.stdout) || ''), err: String((err && err.stderr) || (err && err.message) || '') }; }
 }
 
-// A run's log is a multi-megabyte zip download, and a 34-row ledger re-reads the same runs
-// on every draft. The cache is keyed by run id alone: a finished run's log is immutable, so
-// there is nothing to invalidate.
+// A run's log is a multi-megabyte zip download, and a 31-row ledger re-reads the same runs
+// on every draft, so a finished run's log is cached by run id.
+//
+// ONLY A COMPLETED RUN IS CACHED, and the distinction is not pedantry. "A finished run's log
+// is immutable" is true; an IN-FLIGHT run's log is not, and it is exactly the one a worker
+// hits — a draft body citing its own CI run while that run is still going. Cache that and
+// the partial output is banked permanently: every later `--check` on the worktree reads
+// half-finished text and can report a plausible `0 MISMATCH` off a suite that had not
+// finished running (#2512 rev-std non-blocking 3). So the status is asked for first, and an
+// in-flight run is fetched fresh and NOT written. The status probe fails safe: if `gh` will
+// not answer, the log is used but not cached.
+// The two `gh` calls are injectable (`o.statusOf`, `o.readLog`) so the caching RULE above is
+// a testable behaviour rather than a paragraph: the suite drives both branches with fakes and
+// asserts what lands on disk, without a network or a `gh` on PATH.
+function runIsComplete(id, o) {
+  const opts = o || {};
+  if (opts.statusOf) return opts.statusOf(String(id)) === 'completed';
+  const args = ['run', 'view', String(id), '--json', 'status'];
+  if (opts.repo) args.push('--repo', opts.repo);
+  const r = shq('gh', args);
+  if (!r.ok) return false;
+  try { return JSON.parse(r.out).status === 'completed'; } catch (e) { return false; }
+}
+
 function fetchLog(id, o) {
   const opts = o || {};
   const dir = opts.cache || path.join('.scratch', 'mutation-ledger-logs');
@@ -701,12 +777,16 @@ function fetchLog(id, o) {
   if (fs.existsSync(file)) return fs.readFileSync(file, 'utf8');
   const args = ['run', 'view', String(id), '--log'];
   if (opts.repo) args.push('--repo', opts.repo);
-  const r = shq('gh', args);
+  const r = opts.readLog ? { ok: true, out: opts.readLog(String(id)) } : shq('gh', args);
   // A FAILED run exits non-zero from `gh run view --log` while still printing the whole
   // log, so a non-zero exit with output is the normal case here, not an error.
   if (!r.ok && !r.out) throw new Error(`could not read the log of run ${id}: ${String(r.err).split('\n')[0]}`);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(file, r.out);
+  if (runIsComplete(id, opts)) {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, r.out);
+  } else {
+    process.stderr.write(`mutation-ledger: run ${id} has not completed — its log is read but NOT cached, and every figure off it is provisional\n`);
+  }
   return r.out;
 }
 
@@ -765,20 +845,33 @@ empty row. Exits 0 always — a report, not a gate. MISMATCH must be zero before
 Seam: \`pr-body-check\` re-measures a body against HEAD and never opens a log; this opens a
 log and never looks at head. Run both.`;
 
+// A READER, not a map. `ids` is walked once up front so every log is on disk (and every
+// fetch failure is reported) before any figure is read, and the function it returns then
+// pulls one log at a time and lets it go. Holding all of them was ~229 MB of text on a
+// 31-row ledger — see `logOf` — and nothing needs it: each is read exactly once per row.
 function loadLogs(ids, o) {
-  const logs = {};
-  for (const id of ids) {
-    const key = String(id);
-    if (logs[key] !== undefined) continue;
+  const dir = o.logDir || o.cache || path.join('.scratch', 'mutation-ledger-logs');
+  const missing = new Set();
+  // Only what could not be put on disk is held in memory: an in-flight run, which `fetchLog`
+  // deliberately refuses to cache. That is one log in practice, not thirty-one.
+  const resident = new Map();
+  for (const id of new Set(ids.map(String))) {
     if (o.logDir) {
-      const f = path.join(o.logDir, `${key}.log`);
-      if (fs.existsSync(f)) logs[key] = fs.readFileSync(f, 'utf8');
+      if (!fs.existsSync(path.join(dir, `${id}.log`))) missing.add(id);
       continue;
     }
-    try { logs[key] = fetchLog(key, o); }
-    catch (err) { process.stderr.write(`mutation-ledger: ${err.message}\n`); }
+    try {
+      const text = fetchLog(id, o);
+      if (!fs.existsSync(path.join(dir, `${id}.log`))) resident.set(id, text);
+    } catch (err) { missing.add(id); process.stderr.write(`mutation-ledger: ${err.message}\n`); }
   }
-  return logs;
+  return (id) => {
+    const key = String(id);
+    if (missing.has(key)) return undefined;
+    if (resident.has(key)) return resident.get(key);
+    const f = path.join(dir, `${key}.log`);
+    return fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : undefined;
+  };
 }
 
 function main(argv) {
@@ -822,8 +915,8 @@ function main(argv) {
 
 module.exports = {
   stripAnsi, parseRunLog, targetStem, readCargoSuites, readNodeSuites, readSuites, selectSuite,
-  suiteLabel, abridge, buildLedger, renderLedger, readTables, splitRow, findLedgerTable, readBullets,
-  checkBody, renderCheck, parseArgs, fetchLog, loadLogs, main, USAGE, ABRIDGE, NUMBER_WORDS,
+  suiteLabel, abridge, logOf, buildLedger, renderLedger, readTables, splitRow, findLedgerTable, readBullets,
+  checkBody, renderCheck, parseArgs, fetchLog, runIsComplete, loadLogs, main, USAGE, ABRIDGE, NUMBER_WORDS,
 };
 
 if (require.main === module) {

@@ -125,7 +125,36 @@ same runs, because a bullet is a second statement of a figure the row already ca
 two drift apart independently — #2239's own body records a round whose paragraph said *five*
 where its row, its count line and the run's log all said six.
 
-The two are complements, not alternatives. Run both before `report(done)`.
+### 4.1 The three reading rules, and why each is written against the GENERATOR
+
+Both halves of this script must agree, and the only thing that proves they do is running
+one into the other. Each rule below was got wrong in a way no fixture for either half
+alone could show (#2512 round 2).
+
+**A claimed name is whatever is backticked in the reddened cell, with no shape filter.** An
+identifier-shaped filter is a fact about *cargo* names. A `node --test` name is prose with
+spaces, so under such a filter every claimed name in a frontend row was discarded, the
+claim set came back empty, and the checker reported "the row names no reddened test"
+against a row naming them all correctly. That is the generator failing its own checker on a
+body nobody had touched, with no edit available that would clear it. The cell exists to
+list names; what is in it IS the claim, and a token matching nothing in the log is reported
+as a disagreement rather than filtered out of the question.
+
+**The split is read out of the FIRST parenthetical after the bold, and it may carry a
+trailing clause.** `renderLedger` writes `(2/2, run 33928069681 @ `f9afc965`)`; a pattern
+demanding the closing paren straight after `P/F` read no split at all, and emitted nothing
+— not an OK, not a CHECK, not a MISMATCH. A checked ledger and an unchecked one
+rendered identically, which is §2 turned on the script itself. The window before the paren
+cannot cross a paren, so a later parenthetical is never mistaken for the split; a first one
+that carries no `P/F` (the green-round form `(run 33917588137 @ `3774789b`)`) means the
+bullet claims no split, which is a different thing from claiming a wrong one.
+
+**A `|`-run inside a ``` fence is not a table.** A body legitimately QUOTES a ledger table,
+and this note and this feature’s own PR both do. Read fence-blind, an illustrative table
+quoted above the real one is what `--check` re-reads, the real ledger is never opened, and
+the summary still reports a row count: a clean report about the wrong table.
+
+The two scripts are complements, not alternatives. Run both before `report(done)`.
 
 Severities match `pr-body-check`'s so a worker reads one vocabulary: **MISMATCH** (a figure
 disagrees with the log; must be zero), **CHECK** (narrowed to a judgment the script cannot
@@ -176,14 +205,34 @@ output is a CHECK or an error rather than a confident row.
 
 ## 6. Input, output, and where the state lives
 
-Input is a rows file — the base (banked green) run, and one row per round naming its run id
-and the behaviour it set aside. Output is the markdown table plus the bullets, on stdout, for
+Input is a rows file — the base (banked green) run, and one row per round naming its run
+id and the behaviour it set aside. **A row names a run id, not the `PR number@sha` form
+#2507 also offered.** That is a deliberate narrowing rather than an omission: the head SHA
+is then derived from the run’s own metadata instead of typed, which is the whole point of
+the tool — a hand-supplied SHA is one more figure that goes stale. A worker who has a PR
+rather than a run id gets the run from `gh run list --branch <b> --json headSha,databaseId`
+(#2512 rev-std non-blocking 1). Output is the markdown table plus the bullets, on stdout, for
 a worker to paste into the body's agent layer. Nothing is written to the repo.
 
 Fetched logs are cached under `.scratch/mutation-ledger-logs/` (gitignored, worktree-local per
-the #625 rule) keyed by run id alone: a finished run's log is immutable, so there is nothing
-to invalidate, and a 30-row ledger re-generated across four review rounds downloads each log
-once instead of 120 times.
+the #625 rule) keyed by run id, so a 31-row ledger re-generated across four review rounds
+downloads each log once instead of 124 times.
+
+**Only a COMPLETED run is cached.** "A finished run’s log is immutable" is true, and an
+in-flight run’s log is not — and the in-flight one is exactly what a worker hits, because
+the natural first use is checking a draft body against its own CI run while that run is
+still going. Cached, that partial output is banked permanently and every later `--check` on
+the worktree reads half-finished text, which can report a plausible `0 MISMATCH` off a suite
+that never finished. So the run’s status is asked for first; an in-flight run is read, used,
+warned about on stderr, and not written. The probe fails safe: a status it cannot get is
+treated as not-complete (#2512 rev-std non-blocking 3).
+
+**Logs reach the pure core through a reader, not a map.** One CI log for this repo measures
+7,385,209 bytes, so an object holding all 31 of #2239’s rounds keeps ~229 MB of text resident
+for the whole call — more as UTF-16 — on top of `execFileSync`’s 512 MB `maxBuffer` per fetch.
+Each log is read exactly once per row, so nothing needs holding: the CLI passes a function of
+the run id that pulls one log from the cache and lets it go. The object form is still
+accepted, and is what the offline suite uses (#2512 rev-final premortem 2).
 
 The pure core takes log **text**, never a run id, so `test/mutationledger.test.ts` drives the
 whole generator and the whole checker over fixtures and never runs `gh`.
