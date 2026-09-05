@@ -133,6 +133,7 @@
 //! nudge never churns the semantic diff.
 
 use crate::model::{cli_can_host, default_model, Role, SUPPORTED_CLIS};
+use crate::pathseg::{PathSegment, SegmentError};
 use crate::notify::{
     clamp_expires_minutes, NOTIFY_EXPIRES_DEFAULT_MIN, NOTIFY_EXPIRES_MAX, NOTIFY_EXPIRES_MIN,
 };
@@ -164,6 +165,279 @@ pub fn workflow_path(repo: &str) -> &'static str {
 /// The absolute workflow file for `repo`, resolved through [`workflow_path`].
 pub fn workflow_file(repo: &str) -> std::path::PathBuf {
     Path::new(repo).join(workflow_path(repo))
+}
+
+/// The directory a repo's NAMED workflows live in (#1689).
+///
+/// `.orrerix/workflow.yml` stays exactly what it was — the workflow named
+/// [`DEFAULT_WORKFLOW_NAME`] — and this directory is purely additive: a repo
+/// that has never created it behaves byte-for-byte as it did before named
+/// workflows existed, because nothing here is ever opened.
+pub const WORKFLOWS_DIR: &str = ".orrerix/workflows";
+
+/// The pre-#1153 spelling of [`WORKFLOWS_DIR`], discovered on the same terms
+/// `.loomux/workflow.yml` is: when the preferred directory is absent, and never
+/// renamed on the repo's behalf. See [`crate::brand`].
+pub const LEGACY_WORKFLOWS_DIR: &str = ".loomux/workflows";
+
+/// The name of the workflow a group runs when nothing says otherwise — and the
+/// name `.orrerix/workflow.yml` is listed under.
+///
+/// A `group.json` written before #1689 has no `workflow` key at all, so this is
+/// what it reads as: the one file that has always been there.
+pub const DEFAULT_WORKFLOW_NAME: &str = "default";
+
+/// Which of the two spellings of the workflows DIRECTORY this repo uses.
+pub fn workflows_dir(repo: &str) -> &'static str {
+    crate::brand::resolve_repo_dir(repo, WORKFLOWS_DIR, LEGACY_WORKFLOWS_DIR)
+}
+
+/// A workflow's name — the fifth identifier family through
+/// [`check_segment`](crate::pathseg::check_segment) (#925's list, extended by
+/// #1689).
+///
+/// It is a name that becomes `<name>.yml` under [`workflows_dir`], so it is a
+/// path component and is validated as one: refused, never rewritten. A newtype
+/// rather than a bare [`PathSegment`] so a workflow name and a session id cannot
+/// be handed to each other's functions, exactly as
+/// [`GroupId`](crate::groupid::GroupId) is a distinct type over the same checks —
+/// and so [`workflow_file_named`] can demand the type at its signature, which is
+/// what actually holds the property (a textual scan cannot see types; see
+/// `src-tauri/tests/pathseg.rs`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WorkflowName(PathSegment);
+
+impl WorkflowName {
+    /// The one gate. Every `WorkflowName` in the process came through here, and it
+    /// delegates to `PathSegment` rather than restating the rules — the drift #925
+    /// closed is not worth reopening for a fifth family.
+    pub fn parse(s: &str) -> Result<Self, SegmentError> {
+        PathSegment::parse(s).map(WorkflowName)
+    }
+
+    /// [`DEFAULT_WORKFLOW_NAME`] as a validated name. Infallible by construction —
+    /// `"default"` is in the alphabet — and written as an `expect` rather than an
+    /// `unwrap` so a future edit to the constant that broke it says why.
+    pub fn default_name() -> Self {
+        WorkflowName::parse(DEFAULT_WORKFLOW_NAME)
+            .expect("DEFAULT_WORKFLOW_NAME must be a valid path segment")
+    }
+
+    /// The validated name.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Whether this names the workflow `.orrerix/workflow.yml` is listed under.
+    pub fn is_default(&self) -> bool {
+        self.0.as_str() == DEFAULT_WORKFLOW_NAME
+    }
+}
+
+impl std::fmt::Display for WorkflowName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl Default for WorkflowName {
+    fn default() -> Self {
+        WorkflowName::default_name()
+    }
+}
+
+/// Transparent on the wire, like [`PathSegment`]: `group.json` carries a bare
+/// string, so no persisted file changes shape.
+impl serde::Serialize for WorkflowName {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(self.0.as_str())
+    }
+}
+
+/// Validating on the way in, for the same reason `PathSegment` does: a
+/// hand-edited state file is a construction site like any other.
+impl<'de> serde::Deserialize<'de> for WorkflowName {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        WorkflowName::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The absolute file for one NAMED workflow.
+///
+/// `default` resolves to [`workflow_file`] whenever that file exists, and to
+/// `workflows/default.yml` only when it does not — which is what makes a repo
+/// that has only ever had `.orrerix/workflow.yml` read byte-for-byte as it did
+/// before #1689. When BOTH exist the plain file wins and [`list_workflows`]
+/// reports the ambiguity; a launch is never blocked by it.
+pub fn workflow_file_named(repo: &str, name: &WorkflowName) -> std::path::PathBuf {
+    Path::new(repo).join(workflow_path_named(repo, name))
+}
+
+/// The repo-relative path one named workflow resolves to — the string every
+/// message, audit line and preview must name, so "this group runs `…`" points
+/// at the file that was really read. [`workflow_path`]'s named sibling.
+pub fn workflow_path_named(repo: &str, name: &WorkflowName) -> String {
+    if !name.is_default() {
+        return workflows_dir_file(repo, name);
+    }
+    // `default` IS `.orrerix/workflow.yml` — the file that has always been
+    // there, and the file to CREATE when a repo has none. `workflows/default.yml`
+    // is tolerated when somebody made one and there is no plain file, but it is
+    // never the answer for a repo that declares NEITHER: every refusal and
+    // every "add the file" message names this path, and pointing a human at
+    // `workflows/default.yml` would send them somewhere they have no reason to
+    // go. Three arms, one `pick_repo_path`-shaped rule: prefer the plain file,
+    // fall back to the directory only when it really holds one, else name the
+    // canonical home.
+    let plain = workflow_path(repo);
+    if Path::new(repo).join(plain).is_file() {
+        return plain.to_string();
+    }
+    let under_dir = workflows_dir_file(repo, name);
+    if Path::new(repo).join(&under_dir).is_file() {
+        return under_dir;
+    }
+    plain.to_string()
+}
+
+/// One name's path UNDER [`workflows_dir`], asked without the `default` special
+/// case — which is what [`list_workflows`] needs for a row it read out of that
+/// directory. `workflow_path_named` answers "the file this name RESOLVES to",
+/// and for `default` beside a plain `workflow.yml` that is a different file;
+/// a listing row that borrowed that answer would name the file that SHADOWED it
+/// rather than itself (found by CI, not by reading).
+///
+/// **The one place a workflow name becomes a file name**, which is why it takes
+/// `&WorkflowName` rather than `&str`: the signature is what holds the
+/// property, and `src-tauri/tests/pathseg.rs` allowlists this line on the
+/// strength of it. `workflow_file_named` joins the repo root onto
+/// `workflow_path_named`'s result, so there is no second assembly point.
+fn workflows_dir_file(repo: &str, name: &WorkflowName) -> String {
+    format!("{}/{name}.yml", workflows_dir(repo))
+}
+
+/// [`load_workflow`] for a NAMED workflow. Identical contract: `Ok(None)` for
+/// "no such file", `Err` for "the file is there and will not parse".
+pub fn load_workflow_named(
+    repo: &str,
+    name: &WorkflowName,
+) -> Result<Option<Workflow>, Vec<String>> {
+    let path = workflow_file_named(repo, name);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| vec![format!("{} is unreadable: {e}", path.display())])?;
+    parse_workflow(&text).map(Some)
+}
+
+/// One row of [`list_workflows`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowEntry {
+    /// The name a group pins in `group.json` and a picker offers.
+    pub name: WorkflowName,
+    /// The repo-relative path this name resolves to, so every display site can
+    /// say which file it really read.
+    pub path: String,
+    /// The file's own `name:` field — human prose, empty when the file will not
+    /// parse.
+    pub display_name: String,
+    /// Why this file will not parse, if it will not. **A broken file is carried
+    /// as an entry rather than dropped**: a workflow that vanishes from the
+    /// picker the moment it gets a syntax error is a workflow the human cannot
+    /// find their way back to.
+    pub errors: Vec<String>,
+}
+
+/// Everything [`list_workflows`] found, plus what it could not make sense of.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkflowListing {
+    /// One row per name, sorted by name.
+    pub workflows: Vec<WorkflowEntry>,
+    /// Listing-level problems — an ambiguous `default`, a file whose stem is not a
+    /// usable name. **Not `errors` on an entry**, because these are not about a
+    /// file failing to parse; and not silence, because a file dropped without a
+    /// word is indistinguishable from a directory that never had it. Advisory:
+    /// nothing here blocks a launch or an apply.
+    pub findings: Vec<String>,
+}
+
+/// Every workflow this repo declares (#1689).
+///
+/// `.orrerix/workflow.yml` is listed as [`DEFAULT_WORKFLOW_NAME`]; every
+/// `<name>.yml` under [`workflows_dir`] is listed under its own stem. Sorted by
+/// name, because `read_dir` order is a filesystem accident (and on Windows not
+/// even a stable one), and a picker that reorders itself between reads is a
+/// picker nobody can point at.
+pub fn list_workflows(repo: &str) -> WorkflowListing {
+    let mut listing = WorkflowListing::default();
+    // Keyed by name and iterated in key order at the end: the sort is the map's,
+    // not a separate step that could be forgotten.
+    let mut seen: BTreeMap<String, WorkflowEntry> = BTreeMap::new();
+
+    let dir_rel = workflows_dir(repo);
+    let dir = Path::new(repo).join(dir_rel);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("yml") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let name = match WorkflowName::parse(stem) {
+                Ok(n) => n,
+                Err(e) => {
+                    // The file name as `read_dir` spelled it — a diagnostic, never
+                    // a path: the whole reason this row exists is that `stem` did
+                    // NOT parse, so nothing here may be joined onto anything.
+                    let file = path.file_name().and_then(|s| s.to_str()).unwrap_or(stem);
+                    listing
+                        .findings
+                        .push(format!("{dir_rel}/{file} is not offered: its {e}"));
+                    continue;
+                }
+            };
+            // The directory's own answer, never `workflow_path_named`'s — see
+            // `workflows_dir_file`.
+            let rel = workflows_dir_file(repo, &name);
+            seen.insert(name.as_str().to_string(), read_entry(&path, name, rel));
+        }
+    }
+
+    // The plain file, listed under `default` — and it WINS, so it is inserted
+    // last. When it displaces a `workflows/default.yml`, say which file the name
+    // now means rather than letting the human guess from a picker that shows one
+    // row for two files.
+    let plain_rel = workflow_path(repo);
+    let plain = Path::new(repo).join(plain_rel);
+    if plain.is_file() {
+        if let Some(shadowed) = seen.remove(DEFAULT_WORKFLOW_NAME) {
+            listing.findings.push(format!(
+                "both {plain_rel} and {shadowed} declare the workflow named \
+                 '{DEFAULT_WORKFLOW_NAME}' — {plain_rel} is the one that is read",
+                shadowed = shadowed.path
+            ));
+        }
+        seen.insert(
+            DEFAULT_WORKFLOW_NAME.to_string(),
+            read_entry(&plain, WorkflowName::default_name(), plain_rel.to_string()),
+        );
+    }
+
+    listing.workflows = seen.into_values().collect();
+    listing
+}
+
+/// One [`WorkflowEntry`] off an absolute path already known to be a file.
+fn read_entry(path: &Path, name: WorkflowName, rel: String) -> WorkflowEntry {
+    let parsed = std::fs::read_to_string(path)
+        .map_err(|e| vec![format!("{} is unreadable: {e}", path.display())])
+        .and_then(|text| parse_workflow(&text));
+    match parsed {
+        Ok(wf) => WorkflowEntry { name, path: rel, display_name: wf.name, errors: Vec::new() },
+        Err(errors) => WorkflowEntry { name, path: rel, display_name: String::new(), errors },
+    }
 }
 
 /// Schema version this build understands. Recorded in the file so a future
@@ -3238,13 +3512,7 @@ pub fn roster_is_custom(blocks: &[Block]) -> bool {
 ///   skips it**, falling back to the default roster. A workflow file must never
 ///   be able to block a spawn.
 pub fn load_workflow(repo: &str) -> Result<Option<Workflow>, Vec<String>> {
-    let path = workflow_file(repo);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| vec![format!("{} is unreadable: {e}", path.display())])?;
-    parse_workflow(&text).map(Some)
+    load_workflow_named(repo, &WorkflowName::default_name())
 }
 
 /// The model a block runs, resolving the empty ("inherit") case: the block's
@@ -4641,6 +4909,336 @@ mod tests {
     // lib need the comctl32-v6 manifest, which only integration targets get)
     // does not apply. The three refusals are the whole of what R1 ships, so
     // they are tested against the parser directly.
+
+    // ── named workflows: discovery + naming (#1689) ──────────────────────
+    //
+    // Unit tests, for the reason the `remote:` block above states: discovery
+    // and naming are pure functions over a directory, and nothing here links
+    // the Tauri lib.
+
+    /// A throwaway repo root under the OS temp dir.
+    ///
+    /// No `tempfile`: CLAUDE.md constraint 2 bans getrandom-based crates from
+    /// anything linked into the shipped Windows binary, and this crate is. The
+    /// name is minted from the caller's label plus a process-local counter, so
+    /// two tests in one binary — and two binaries at once — cannot collide.
+    fn temp_repo(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("loomux-wfdisco-{}-{label}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp repo");
+        dir
+    }
+
+    /// A minimal file that parses, carrying `name:` so the display name is
+    /// distinguishable from the file name.
+    fn wf_doc(display: &str) -> String {
+        format!("version: 1\nname: {display}\nblocks:\n  - id: w\n    kind: worker\n")
+    }
+
+    fn write_at(root: &std::path::Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+    }
+
+    fn names(listing: &WorkflowListing) -> Vec<&str> {
+        listing.workflows.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// The naming rule, one row per shape — and every row is a REFUSAL, never a
+    /// repair. `sanitize_id`, the predicate a workflow BLOCK id goes through,
+    /// rewrites `../x` to `x`; a workflow NAME must not, because two strings
+    /// naming one file is how a picker and a path join end up disagreeing about
+    /// which thing they are talking about.
+    #[test]
+    fn a_workflow_name_is_refused_never_rewritten() {
+        let cases: &[(&str, SegmentError)] = &[
+            ("../x", SegmentError::IllegalChar('.')),
+            ("..", SegmentError::IllegalChar('.')),
+            ("a/b", SegmentError::IllegalChar('/')),
+            ("a\\b", SegmentError::IllegalChar('\\')),
+            ("my.workflow", SegmentError::IllegalChar('.')),
+            ("C:", SegmentError::IllegalChar(':')),
+            ("", SegmentError::Empty),
+            // Path-safe, but an OPTION to any command line the name reaches.
+            ("-x", SegmentError::LeadingDash),
+            // Opens a device on Windows rather than naming a file.
+            ("CON", SegmentError::ReservedDeviceName),
+            ("nul", SegmentError::ReservedDeviceName),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                WorkflowName::parse(raw),
+                Err(expected.clone()),
+                "WorkflowName::parse({raw:?}) must be REFUSED with {expected:?} — never \
+                 normalized into a neighbouring valid name"
+            );
+        }
+        // The acceptance half: refusing a name a human would really use is an
+        // outage, not hardening.
+        for good in ["default", "review-heavy", "solo_fast", "a", "wf2"] {
+            assert!(WorkflowName::parse(good).is_ok(), "{good:?} must be accepted");
+        }
+    }
+
+    /// A repo that declares NOTHING still resolves `default` to
+    /// `.orrerix/workflow.yml`, never to the `workflows/` spelling.
+    ///
+    /// Not cosmetic: every "this repo declares no workflow" message names this
+    /// path, and the live workflow-mode toggle's refusal says *add the file*.
+    /// Naming `.orrerix/workflows/default.yml` there sends a human to a
+    /// directory they have no reason to create. Caught by
+    /// `advanced_orchestrator_toggle_on_refuses_when_the_repo_declares_no_workflow_file`
+    /// (`src-tauri/tests/orchestration.rs`), which is the surface that says so.
+    #[test]
+    fn a_repo_declaring_nothing_still_names_the_plain_file_as_default() {
+        let root = temp_repo("declares-nothing");
+        let repo = root.to_str().unwrap();
+        let default = WorkflowName::default_name();
+
+        assert_eq!(workflow_path_named(repo, &default), ".orrerix/workflow.yml");
+        assert!(!workflow_file_named(repo, &default).is_file(), "and it is not there");
+        assert_eq!(load_workflow_named(repo, &default), Ok(None), "absence, not an error");
+        assert!(list_workflows(repo).workflows.is_empty());
+
+        // The `workflows/` spelling becomes the answer only once a file really
+        // sits there — the middle arm, which the two assertions above and below
+        // it would both pass without.
+        write_at(&root, ".orrerix/workflows/default.yml", &wf_doc("Only under the dir"));
+        assert_eq!(workflow_path_named(repo, &default), ".orrerix/workflows/default.yml");
+        assert_eq!(
+            load_workflow_named(repo, &default).unwrap().unwrap().name,
+            "Only under the dir"
+        );
+
+        // …and the plain file, once it exists, takes the name back.
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("The plain one"));
+        assert_eq!(workflow_path_named(repo, &default), ".orrerix/workflow.yml");
+
+        // A NON-default name is unconditional: it names its file whether or not
+        // one is there, because there is no other place it could live.
+        let nope = WorkflowName::parse("nope").unwrap();
+        assert_eq!(workflow_path_named(repo, &nope), ".orrerix/workflows/nope.yml");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The listing: named files under `workflows/`, sorted, plus the plain file
+    /// under `default`.
+    #[test]
+    fn list_workflows_lists_the_named_files_and_the_plain_one_as_default() {
+        let root = temp_repo("listing");
+        // Written b-then-a so a listing that merely echoed `read_dir` order
+        // could come back wrong on some filesystem — the sort is the claim.
+        write_at(&root, ".orrerix/workflows/b.yml", &wf_doc("Bee"));
+        write_at(&root, ".orrerix/workflows/a.yml", &wf_doc("Ay"));
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("Plain"));
+        let repo = root.to_str().unwrap();
+
+        let listing = list_workflows(repo);
+        assert_eq!(names(&listing), vec!["a", "b", "default"]);
+        assert_eq!(listing.findings, Vec::<String>::new());
+        assert_eq!(listing.workflows[0].path, ".orrerix/workflows/a.yml");
+        assert_eq!(listing.workflows[0].display_name, "Ay");
+        // `default` names the PLAIN file, not `workflows/default.yml`.
+        assert_eq!(listing.workflows[2].path, ".orrerix/workflow.yml");
+        assert_eq!(listing.workflows[2].display_name, "Plain");
+        // Non-`.yml` neighbours are not workflows.
+        write_at(&root, ".orrerix/workflows/a.layout.json", "{}");
+        write_at(&root, ".orrerix/workflows/c.yaml", &wf_doc("See"));
+        assert_eq!(
+            names(&list_workflows(repo)),
+            vec!["a", "b", "default"],
+            "only `<name>.yml` is a workflow — a layout sidecar and a `.yaml` \
+             spelling are not"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A repo that has only ever had `.orrerix/workflow.yml` is what it always
+    /// was: one workflow, named `default`, and nothing under `workflows/` is
+    /// ever opened, because there is no such directory.
+    #[test]
+    fn a_repo_with_only_the_plain_file_is_exactly_what_it_was() {
+        let root = temp_repo("plain-only");
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("Plain"));
+        let repo = root.to_str().unwrap();
+        let default = WorkflowName::default_name();
+
+        let listing = list_workflows(repo);
+        assert_eq!(names(&listing), vec!["default"]);
+        assert_eq!(listing.findings, Vec::<String>::new());
+        assert_eq!(workflow_path_named(repo, &default), ".orrerix/workflow.yml");
+        assert_eq!(workflow_file_named(repo, &default), workflow_file(repo));
+        // `load_workflow` IS `load_workflow_named` at `default` — the two must
+        // not be able to disagree, which is why one calls the other.
+        assert_eq!(
+            load_workflow(repo).unwrap().unwrap().name,
+            load_workflow_named(repo, &default).unwrap().unwrap().name
+        );
+        // A name this repo does not declare is absence, not an error.
+        let b = WorkflowName::parse("b").unwrap();
+        assert_eq!(load_workflow_named(repo, &b), Ok(None));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The legacy directory, discovered on exactly the terms
+    /// `.loomux/workflow.yml` is — only when the preferred one is absent, and
+    /// never renamed on the repo's behalf.
+    #[test]
+    fn the_legacy_workflows_directory_is_discovered_when_the_preferred_one_is_absent() {
+        let root = temp_repo("legacy");
+        write_at(&root, ".loomux/workflows/a.yml", &wf_doc("Legacy Ay"));
+        let repo = root.to_str().unwrap();
+        let a = WorkflowName::parse("a").unwrap();
+
+        assert_eq!(workflows_dir(repo), LEGACY_WORKFLOWS_DIR);
+        let listing = list_workflows(repo);
+        assert_eq!(names(&listing), vec!["a"]);
+        assert_eq!(listing.workflows[0].path, ".loomux/workflows/a.yml");
+        assert_eq!(load_workflow_named(repo, &a).unwrap().unwrap().name, "Legacy Ay");
+
+        // The preferred spelling, once it exists, is the one that is read — and
+        // the legacy directory is left on disk untouched.
+        write_at(&root, ".orrerix/workflows/a.yml", &wf_doc("Preferred Ay"));
+        assert_eq!(workflows_dir(repo), WORKFLOWS_DIR);
+        assert_eq!(list_workflows(repo).workflows[0].path, ".orrerix/workflows/a.yml");
+        assert_eq!(load_workflow_named(repo, &a).unwrap().unwrap().name, "Preferred Ay");
+        assert!(root.join(".loomux/workflows/a.yml").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file that will not parse stays IN the listing, carrying its errors. A
+    /// workflow that vanishes from the picker the moment it gets a syntax error
+    /// is one the human cannot navigate back to in order to fix it.
+    #[test]
+    fn a_broken_workflow_is_carried_as_an_entry_with_its_errors_not_dropped() {
+        let root = temp_repo("broken");
+        write_at(&root, ".orrerix/workflows/a.yml", &wf_doc("Ay"));
+        write_at(&root, ".orrerix/workflows/b.yml", "version: 1\nblocks: [[[\n");
+        let repo = root.to_str().unwrap();
+
+        let listing = list_workflows(repo);
+        assert_eq!(names(&listing), vec!["a", "b"], "the broken file is still offered");
+        // Positive control on the two absence-shaped assertions below: this
+        // listing really did open two files, rather than reporting an empty
+        // directory — which would satisfy `errors.is_empty()` just as well.
+        assert_eq!(listing.workflows.len(), 2);
+        let b = &listing.workflows[1];
+        assert!(!b.errors.is_empty(), "b.yml must carry why it will not parse");
+        assert_eq!(b.display_name, "", "a file that will not parse has no display name");
+        assert!(listing.workflows[0].errors.is_empty(), "a's entry is unaffected by b");
+        // And it is an entry, not a listing-level finding: the file is there and
+        // addressable, it just will not parse.
+        assert_eq!(listing.findings, Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Both `workflow.yml` and `workflows/default.yml`: one name, two files.
+    /// The plain file wins, the listing SAYS so, and nothing is blocked.
+    #[test]
+    fn a_default_declared_twice_is_a_finding_and_the_plain_file_wins() {
+        let root = temp_repo("ambiguous");
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("The plain one"));
+        write_at(&root, ".orrerix/workflows/default.yml", &wf_doc("The named one"));
+        let repo = root.to_str().unwrap();
+        let default = WorkflowName::default_name();
+
+        let listing = list_workflows(repo);
+        assert_eq!(names(&listing), vec!["default"], "one NAME, however many files");
+        assert_eq!(listing.workflows[0].path, ".orrerix/workflow.yml");
+        assert_eq!(listing.workflows[0].display_name, "The plain one");
+        assert_eq!(listing.findings.len(), 1, "the ambiguity is reported exactly once");
+        assert!(
+            listing.findings[0].contains(".orrerix/workflows/default.yml")
+                && listing.findings[0].contains(".orrerix/workflow.yml"),
+            "the finding must name BOTH files, or it cannot be acted on: {:?}",
+            listing.findings[0]
+        );
+        // Advisory, not blocking: the load still succeeds, from the winner.
+        assert_eq!(
+            load_workflow_named(repo, &default).unwrap().unwrap().name,
+            "The plain one"
+        );
+        // The other half of the rule: with the plain file gone, the same name
+        // resolves to the file under `workflows/` and the finding goes away.
+        std::fs::remove_file(root.join(".orrerix/workflow.yml")).unwrap();
+        let listing = list_workflows(repo);
+        assert_eq!(listing.findings, Vec::<String>::new());
+        assert_eq!(listing.workflows[0].path, ".orrerix/workflows/default.yml");
+        assert_eq!(
+            load_workflow_named(repo, &default).unwrap().unwrap().name,
+            "The named one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file whose stem is not a usable name is REPORTED, not silently
+    /// swallowed — an absent row and a directory that never had the file look
+    /// identical to whoever is wondering where their workflow went.
+    #[test]
+    fn a_file_whose_stem_is_not_a_usable_name_is_reported_rather_than_dropped() {
+        let root = temp_repo("unnamable");
+        write_at(&root, ".orrerix/workflows/a.yml", &wf_doc("Ay"));
+        write_at(&root, ".orrerix/workflows/my.workflow.yml", &wf_doc("Dotted"));
+        write_at(&root, ".orrerix/workflows/CON.yml", &wf_doc("Device"));
+        let repo = root.to_str().unwrap();
+
+        let listing = list_workflows(repo);
+        assert_eq!(names(&listing), vec!["a"], "neither unusable stem is offered");
+        assert_eq!(listing.findings.len(), 2, "and BOTH are accounted for");
+        assert!(
+            listing.findings.iter().any(|m| m.contains("my.workflow.yml")),
+            "findings: {:?}",
+            listing.findings
+        );
+        assert!(
+            listing.findings.iter().any(|m| m.contains("CON.yml")),
+            "findings: {:?}",
+            listing.findings
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every listing finding is ONE PARAGRAPH, pinned as a SHAPE beside the
+    /// content the tests above pin.
+    ///
+    /// CLAUDE.md's rule, and it earned its place here rather than being
+    /// precautionary: the ambiguity finding shipped with a `\` line
+    /// continuation that had not survived authoring, so it carried an
+    /// eighteen-space run mid-sentence with no newline at all. The
+    /// `contains(…)` assertions above did not see it — no asserted substring
+    /// straddled the break — and it reached CI only because a *different*
+    /// assertion in the same test happened to print the whole string.
+    ///
+    /// Both shapes, because they are different failures: a `\n` plus
+    /// indentation ships the source's leading spaces; a continuation that
+    /// collapsed leaves the same run of spaces with no `\n`.
+    #[test]
+    fn every_listing_finding_is_one_paragraph() {
+        let root = temp_repo("one-paragraph");
+        // Every finding this function can produce, in one listing.
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("Plain"));
+        write_at(&root, ".orrerix/workflows/default.yml", &wf_doc("Shadowed"));
+        write_at(&root, ".orrerix/workflows/my.workflow.yml", &wf_doc("Dotted"));
+        let listing = list_workflows(root.to_str().unwrap());
+
+        // Positive control: an empty findings list satisfies every assertion in
+        // the loop below just as well.
+        assert_eq!(listing.findings.len(), 2, "{:?}", listing.findings);
+        for m in &listing.findings {
+            assert!(!m.contains('\n'), "a finding must not carry a newline: {m:?}");
+            assert!(
+                !m.contains("          "),
+                "a finding must not carry a ten-space run — a `\\` continuation that \
+                 collapsed leaves one with no newline to notice: {m:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// One block, with whatever keys the case under test needs.
     fn remote_doc(keys: &[(&str, &str)]) -> String {

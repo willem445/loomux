@@ -18,6 +18,7 @@ permissions = [
     "allow-orch-group-view",
     "allow-orch-strip-view",
     "allow-orch-workflow-preview",
+    "allow-orch-workflow-list",
     "allow-orch-workflow-status",
     "allow-orch-group-watches",
     "allow-orch-lock-state",

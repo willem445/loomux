@@ -215,6 +215,27 @@ pub fn resolve_repo_file(
     }
 }
 
+/// [`pick_repo_path`] for a `preferred`/`legacy` pair of repo-relative
+/// *directory* paths — the same one rule, asked of directories.
+///
+/// Separate from [`resolve_repo_file`] only because the existence test differs
+/// (`is_dir` vs `is_file`): a `.orrerix/workflows` FILE must not shadow a
+/// `.loomux/workflows` directory, and a `resolve_repo_file` reused here would
+/// say it did. The decision itself is still `pick_repo_path`'s, so the two
+/// spellings cannot come to different conclusions about which era a repo is in
+/// (#1689).
+pub fn resolve_repo_dir(
+    repo: &str,
+    preferred: &'static str,
+    legacy: &'static str,
+) -> &'static str {
+    let root = Path::new(repo);
+    match pick_repo_path(root.join(preferred).is_dir(), root.join(legacy).is_dir()) {
+        RepoPick::Preferred => preferred,
+        RepoPick::Legacy => legacy,
+    }
+}
+
 // ---------- protocol identities (#1153 phase 3) ----------
 //
 // These are the spellings AGENTS see and match on: the marker every notice
