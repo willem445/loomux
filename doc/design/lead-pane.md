@@ -159,12 +159,20 @@ not any check — is what makes three refusals structural:
 3. A `resume_session` carrying a recorded `role: "lead"` and no block id is
    refused rather than re-roled, by the same #544 "never guess a capability
    class" path every unrecognized role takes: the `block.trim().is_empty()`
-   branch runs `kind_from_str` on the recorded role and errors on `None`. A
-   recorded row that *does* carry a block id takes the other branch and is
-   refused a step later instead, by the lead caller's own effective-class check
-   (`declared.or(kind)` is then `None`). Both routes refuse; only the first is
-   the vocabulary's doing, and which is which is worth spelling out — a review
-   round turned on exactly that distinction (rev-final R1).
+   branch runs `kind_from_str` on the recorded role and errors on `None`.
+
+   A recorded row that *does* carry a block id takes the other branch, and
+   **that branch is not a second structural refusal — do not read it as one.**
+   `kind` is `None` by construction on a bare resume, so the lead caller's
+   effective-class check reads the recorded *block*: `Some(Role::Lead)` for the
+   lead's own block, refused as `resolves to kind "lead"`; `Some(Role::Worker)`
+   for a worker block, which is **permitted**; and `None` only when the recorded
+   block id no longer resolves at all. What carries the property there is the
+   missing `lead` arm itself — no block can have kind `Lead` while
+   `kind_from_str` cannot name one, so no resume of any shape yields a lead
+   pane. An earlier draft of this item said "both routes refuse", which is false
+   of the corrupt-data subcase and points a reader at the wrong invariant
+   (rev-final N1 / rev-std round 2).
 
 `Role::Solo` is absent from that vocabulary for the identical reason and is the
 precedent.

@@ -2024,12 +2024,22 @@ pub fn kind_from_str(s: &str) -> Option<Role> {
         //    id is refused rather than re-roled, by the same #544 "never guess a
         //    capability class" path every unrecognized role takes — the
         //    `owner_rec.block.trim().is_empty()` branch runs this function on
-        //    the recorded role and errors on `None`. (A recorded row that DOES
-        //    carry a block id takes the other branch and is refused a step
-        //    later, by the lead caller's own effective-class check, whose
-        //    `declared.or(kind)` is then `None`. Both routes refuse; only the
-        //    first is this function's doing, and naming which is which is the
-        //    point of spelling it out — rev-final R1 on #2519.)
+        //    the recorded role and errors on `None`.
+        //
+        //    **A recorded row that DOES carry a block id takes the other
+        //    branch, and that branch is NOT a second structural refusal — do
+        //    not read it as one.** `kind` is `None` by construction on a bare
+        //    resume, so the lead caller's effective-class check reads the
+        //    recorded BLOCK: `Some(Role::Lead)` for the lead's own block, which
+        //    is refused as `resolves to kind "lead"`; `Some(Role::Worker)` for
+        //    a worker block, which is PERMITTED; and `None` only when the
+        //    recorded block id no longer resolves at all. What carries the
+        //    property on that branch is THIS FUNCTION'S MISSING `lead` ARM — no
+        //    block can have kind `Lead` while `kind_from_str` cannot name one,
+        //    so no resume of any shape yields a lead pane. (The first version
+        //    of this comment said "both routes refuse", which is false of the
+        //    corrupt-data subcase and, worse, pointed a reader at the wrong
+        //    invariant — rev-final N1 / rev-std round 2 on #2519.)
         //
         // Adding an arm here would silently undo all three at once. `Role::Solo`
         // is absent for the identical reason and is the precedent.
