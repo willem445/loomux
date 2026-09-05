@@ -3869,6 +3869,11 @@ pub fn releasable(
     facts: &DriveFacts,
     step: &DriveStep,
 ) -> Vec<ReleaseCandidate> {
+    // [scratch] #2501 round 2: the pure RULE is neutered  the driver is finished
+    // with nothing, ever, which is the pre-#2501 behaviour.
+    if true {
+        return Vec::new();
+    }
     // Condition 1. A step that parks or ends the drive releases nothing.
     if let DriveStep::Advance { to, .. } = step {
         if to.is_parked() || to.is_terminal() {
