@@ -295,6 +295,39 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
 /// same "agent has no terminal yet" error an unpaused one would get. The text
 /// is still recorded in full; it lands under the ordinary `prompt` action now,
 
+/// One codex rollout under `<root>/<yyyy>/<mm>/<dd>/`, in the shape
+/// `RolloutFileName::render` emits and with the `session_meta` first line
+/// `RolloutRecorder::new` writes (#2515 C1).
+///
+/// The timestamp is a literal 19 characters because that is what the vendor's
+/// own parser requires — it reads the id from offset 20 after checking for a
+/// `-` at 19 — and `thread` is deliberately allowed to be a readable label
+/// rather than a UUID: this repo's rule is looser than the vendor's about the
+/// timestamp on purpose (`codex_rollout_thread_id`'s doc), and a fixture whose
+/// ids read as words makes a contest assertion legible.
+///
+/// **No codex is ever run** (constraint 3): the format is read blob-by-blob out
+/// of `openai/codex` at tag `rust-v0.153.4` and quoted in `doc/design/codex.md`.
+fn write_codex_rollout(root: &Path, date: (&str, &str, &str), thread: &str, cwd: &str) -> PathBuf {
+    let dir = root.join(date.0).join(date.1).join(date.2);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("rollout-2026-09-05T10-00-00-{thread}.jsonl"));
+    // `cwd` is interpolated into JSON, so a Windows path would need its
+    // backslashes escaped. Every caller here passes a forward-slash path, and
+    // that is not laziness: `norm_path` folds both separators, so the fixtures
+    // exercise the comparison rather than the escaping — which is
+    // `codex_profile_toml`'s job and is pinned in `tests/codexharness.rs`.
+    assert!(!cwd.contains('\\'), "fixture cwds use forward slashes: {cwd}");
+    let body = format!(
+        "{{\"timestamp\":\"2026-09-05T10:00:00.000Z\",\"type\":\"session_meta\",\
+         \"payload\":{{\"session_id\":\"{thread}\",\"id\":\"{thread}\",\
+         \"timestamp\":\"2026-09-05T10:00:00.000Z\",\"cwd\":\"{cwd}\",\
+         \"originator\":\"codex_cli_rs\",\"cli_version\":\"0.153.4\"}}}}\n"
+    );
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
 /// #904: the one constructor, in tests as in production — these suites drive
 /// the refusal paths with ids that are deliberately not live groups.
 fn parse_gid(s: &str) -> GroupId {
@@ -61221,6 +61254,302 @@ fn pi_launch_flags_per_posture() {
     assert!(
         !attended.contains("--thinking"),
         "no knob set means no flag, never a blank one: {attended}"
+    );
+}
+
+/// The codex launch line, per posture (#2515 C1) — the twin of
+/// `pi_launch_flags_per_posture` above, and it makes the OPPOSITE claim about
+/// the same equality.
+///
+/// On pi the two postures are byte-identical because pi has no posture at all.
+/// On codex they are byte-identical because the posture is real and rides the
+/// PROFILE — so the equality here is only honest beside
+/// `the_codex_approval_policy_flips_with_the_panes_posture` in
+/// `tests/codexharness.rs`, which asserts the two profiles differ. Either
+/// assertion alone would be satisfied by a codex adapter that delivered no
+/// posture anywhere.
+#[test]
+fn codex_launch_flags_per_posture() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/orrerix-w-3.config.toml");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo/worktree");
+    let cmd = |model: &str, auto: bool, session: Option<&str>, resume: bool| {
+        reg.build_agent_command(
+            "codex",
+            model,
+            auto,
+            cfg,
+            None,
+            gdir,
+            wd,
+            session,
+            resume,
+            Containment::None,
+            &PersonaInject::default(),
+        )
+    };
+
+    let attended = cmd("", false, None, false);
+    assert!(
+        attended.starts_with("codex "),
+        "the program must be codex, not the claude fallback — a missing arm here launches the \
+         wrong CLI entirely: {attended}"
+    );
+
+    // Where. `-C` on every line, because codex's working root is otherwise the
+    // process's cwd rather than the pane's.
+    assert!(attended.contains(" -C \"C:/repo/worktree\""), "{attended}");
+
+    // Everything loomux configured, by NAME — `-p` takes a profile name and
+    // resolves it against CODEX_HOME itself, so a line carrying the PATH would
+    // send codex looking for `CODEX_HOME/C:/x/orrerix-w-3.config.toml`.
+    assert!(
+        attended.contains(" -p orrerix-w-3") && !attended.contains(".config.toml"),
+        "the line must name the profile, never its path: {attended}"
+    );
+
+    // **Attended == unattended**, and the reason is the opposite of pi's: the
+    // approval policy is a profile key. A later edit reaching for
+    // `-a/--ask-for-approval` here would give a pane a posture its own profile
+    // disagrees with.
+    let unattended = cmd("", true, None, false);
+    assert_eq!(
+        attended, unattended,
+        "codex's posture rides the profile, so the two postures must produce ONE command line — \
+         see the_codex_approval_policy_flips_with_the_panes_posture for the half that must DIFFER"
+    );
+
+    // The flags loomux must never emit on codex, each for its own reason:
+    // `--full-auto` does not exist at the pin (its only occurrence in the
+    // vendor is a test, and the docs call it a deprecated alias); the bypass
+    // flag turns the sandbox off entirely; `-s`/`-a` would contradict the
+    // profile.
+    for forbidden in ["--full-auto", "--yolo", "--dangerously-bypass", " -s ", " -a "] {
+        assert!(
+            !attended.contains(forbidden),
+            "loomux never emits {forbidden:?} on a codex line: {attended}"
+        );
+    }
+
+    // Session identity: a SUBCOMMAND, not a flag, and only on a resume. codex
+    // has no opens-or-creates flag — `resume_session_id` is `#[clap(skip)]` —
+    // so a fresh spawn names nothing and learns its id from the store.
+    let sid = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+    let fresh = cmd("", false, Some(sid), false);
+    let resumed = cmd("", false, Some(sid), true);
+    assert!(
+        !fresh.contains(sid),
+        "a FRESH codex spawn must not name a session at all — there is no flag that would \
+         create one, so an id here would be a `resume` of a thread that does not exist: {fresh}"
+    );
+    assert_eq!(
+        fresh, attended,
+        "a fresh spawn with an id in hand must produce the same line as one without: {fresh}"
+    );
+    assert!(resumed.ends_with(&format!(" resume {sid}")), "{resumed}");
+    // The ORDER is the property, not just the presence: codex's usage is
+    // `codex [OPTIONS] <COMMAND> [ARGS]` and the subcommand inherits the root
+    // options, so a `-C` after `resume` would be an argument to `resume`.
+    let c_at = resumed.find(" -C ").expect("-C must be present");
+    let resume_at = resumed.find(" resume ").expect("resume must be present");
+    assert!(
+        c_at < resume_at,
+        "root options must precede the subcommand — `-C` after `resume` is not a root option \
+         at all: {resumed}"
+    );
+    // `-C` survives the resume, and that is what keeps the resume-cwd PROMPT
+    // from ever appearing on a pane loomux is about to type into.
+    assert!(resumed.contains(" -C \"C:/repo/worktree\""), "{resumed}");
+
+    // An empty model omits the flag — `default_model("codex", _)` is empty so
+    // the human's own config.toml `model` wins.
+    assert!(
+        !attended.contains(" -m "),
+        "an empty model must omit the flag, not emit a blank one: {attended}"
+    );
+    let modelled = cmd("gpt-5.5-codex", false, None, false);
+    assert!(modelled.contains(" -m gpt-5.5-codex"), "{modelled}");
+
+    // #687: the effort knob is a profile key on codex, so it must reach the
+    // line NOWHERE — the inverse of pi's assertion two tests up, and the half
+    // that would silently double-deliver if someone added a flag here.
+    let knobs = workflow::ModelKnobs { effort: "xhigh", context: "" };
+    let effortful = reg.build_agent_command_ex(
+        "codex",
+        "",
+        knobs,
+        false,
+        cfg,
+        None,
+        gdir,
+        wd,
+        None,
+        false,
+        Containment::None,
+        &PersonaInject::default(),
+        Role::Worker,
+        None,
+    );
+    assert_eq!(
+        effortful, attended,
+        "codex has no effort FLAG — the knob is `model_reasoning_effort` in the profile, so a \
+         block that sets one must not change the command line at all: {effortful}"
+    );
+    assert!(!effortful.contains("xhigh"), "{effortful}");
+}
+
+/// The two builders must agree (#2515 C1). A string command and an argv vector
+/// that disagree is the failure `command_line_length_guard` cannot catch: the
+/// pane is spawned from one and measured from the other.
+#[test]
+fn the_codex_argv_builder_agrees_with_the_command_builder() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/orrerix-w-3.config.toml");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo/worktree");
+    let sid = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+    let knobs = workflow::ModelKnobs { effort: "high", context: "" };
+
+    for (session, resume, model) in
+        [(None, false, ""), (Some(sid), true, ""), (Some(sid), true, "gpt-5.5-codex")]
+    {
+        let argv = reg.build_agent_argv_ex(
+            "codex", model, knobs, true, cfg, None, gdir, wd, session, resume,
+            Containment::None, &PersonaInject::default(), Role::Worker, None,
+        );
+        let cmd = reg.build_agent_command_ex(
+            "codex", model, knobs, true, cfg, None, gdir, wd, session, resume,
+            Containment::None, &PersonaInject::default(), Role::Worker, None,
+        );
+        // The argv form carries no quotes (there is no shell), so the
+        // comparison is on the TOKENS the string form quotes.
+        assert_eq!(argv[0], "codex", "{argv:?}");
+        for tok in ["-C", "C:/repo/worktree", "-p", "orrerix-w-3"] {
+            assert!(argv.iter().any(|a| a == tok), "argv is missing {tok:?}: {argv:?}");
+            assert!(cmd.contains(tok), "the string form is missing {tok:?}: {cmd}");
+        }
+        if resume {
+            let at = argv.iter().position(|a| a == "resume").expect("resume token");
+            assert_eq!(argv.get(at + 1).map(String::as_str), Some(sid), "{argv:?}");
+            assert_eq!(at, argv.len() - 2, "the subcommand and its id come LAST: {argv:?}");
+        } else {
+            assert!(!argv.iter().any(|a| a == "resume"), "{argv:?}");
+        }
+        assert_eq!(
+            argv.iter().any(|a| a == "-m"),
+            !model.is_empty(),
+            "the model flag must appear exactly when a model is set: {argv:?}"
+        );
+        assert!(!argv.iter().any(|a| a == "xhigh" || a == "high"), "{argv:?}");
+    }
+}
+
+/// The store watcher (#2515 C1, T1.6): a codex pane finds its own session by
+/// the directory it runs in, refuses a contest, and never takes a session
+/// another pane in the group has already claimed.
+///
+/// Every property here is one a wrong watcher gets wrong in its own direction,
+/// and the CONTEST one is the reason this is not `Option<String>`: several
+/// panes in a group routinely share a directory, so "two matched" is a
+/// recurring answer rather than an edge case, and resolving it by taking the
+/// newest would hand a pane somebody else's conversation.
+#[test]
+fn a_codex_pane_finds_its_session_by_cwd_after_the_baseline_and_refuses_a_contest() {
+    use loomux_lib::sessions::{codex_session_ids, newest_new_codex_session, CodexIdentified};
+    use std::collections::HashSet;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("sessions");
+    let mine = "C:/repo/worktree-a";
+    let theirs = "C:/repo/worktree-b";
+
+    // Two rollouts that existed BEFORE the spawn, in two different date dirs —
+    // a pane booting across local midnight lands in tomorrow's, so the walk
+    // must not be scoped to one day.
+    write_codex_rollout(&root, ("2026", "09", "04"), "old-a", mine);
+    write_codex_rollout(&root, ("2026", "09", "05"), "old-b", mine);
+    let baseline = codex_session_ids(&root);
+    assert_eq!(baseline.len(), 2, "the baseline must see BOTH date dirs: {baseline:?}");
+
+    let none = HashSet::new();
+    // Nothing new yet: the ordinary answer for a booting pane, and the one
+    // that must not be `Found` — the two files above are in this very
+    // directory, so a watcher that ignored the baseline would bind one.
+    assert_eq!(newest_new_codex_session(&root, &baseline, mine, &none), CodexIdentified::None);
+
+    // A new rollout in ANOTHER directory is not this pane's, however new it is.
+    write_codex_rollout(&root, ("2026", "09", "05"), "new-elsewhere", theirs);
+    assert_eq!(
+        newest_new_codex_session(&root, &baseline, mine, &none),
+        CodexIdentified::None,
+        "a cwd mismatch must never fall back to `the newest fresh session` — that is copilot's \
+         rule, and it is wrong here because codex writes cwd in the FIRST line"
+    );
+
+    // The happy path.
+    write_codex_rollout(&root, ("2026", "09", "05"), "new-mine", mine);
+    assert_eq!(
+        newest_new_codex_session(&root, &baseline, mine, &none),
+        CodexIdentified::One("new-mine".into())
+    );
+
+    // A second pane in the SAME directory: refused, never guessed.
+    write_codex_rollout(&root, ("2026", "09", "05"), "new-sibling", mine);
+    assert_eq!(
+        newest_new_codex_session(&root, &baseline, mine, &none),
+        CodexIdentified::Contested(2)
+    );
+
+    // …unless the sibling's id is already claimed by another pane, which is
+    // exactly what resolves the ordinary two-panes-one-worktree case.
+    let claimed: HashSet<String> = ["new-sibling".to_string()].into_iter().collect();
+    assert_eq!(
+        newest_new_codex_session(&root, &baseline, mine, &claimed),
+        CodexIdentified::One("new-mine".into())
+    );
+
+    // A pane with no recorded directory matches NOTHING rather than everything
+    // — the fail-closed direction, and the one an `is_empty()` slip inverts.
+    assert_eq!(newest_new_codex_session(&root, &baseline, "", &none), CodexIdentified::None);
+}
+
+/// A torn header is `Waiting`, not a wrong binding — the mid-write case a poll
+/// every two seconds will hit sooner or later.
+///
+/// Separate from the test above because it is about a file that exists and
+/// cannot be read, which is a different question from a file that names a
+/// different directory. A watcher that treated an unreadable header as "close
+/// enough" would bind whatever appeared next.
+#[test]
+fn a_torn_codex_header_leaves_the_watcher_waiting_rather_than_binding() {
+    use loomux_lib::sessions::{newest_new_codex_session, CodexIdentified};
+    use std::collections::HashSet;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("sessions");
+    let dir = root.join("2026").join("09").join("05");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Half a header line — what a reader sees between codex's write and its
+    // flush.
+    std::fs::write(
+        dir.join("rollout-2026-09-05T10-00-00-torn.jsonl"),
+        "{\"timestamp\":\"2026-09-05T10:00:00.000Z\",\"type\":\"session_me",
+    )
+    .unwrap();
+    let empty = HashSet::new();
+    assert_eq!(
+        newest_new_codex_session(&root, &empty, "C:/repo/worktree-a", &empty),
+        CodexIdentified::None,
+        "an unreadable header must not match — the next poll reads it whole"
+    );
+    // The control: the same file, written whole, DOES match. Without this the
+    // assertion above passes just as well against a walker that finds nothing
+    // at all.
+    write_codex_rollout(&root, ("2026", "09", "05"), "whole", "C:/repo/worktree-a");
+    assert_eq!(
+        newest_new_codex_session(&root, &empty, "C:/repo/worktree-a", &empty),
+        CodexIdentified::One("whole".into())
     );
 }
 
