@@ -78,7 +78,7 @@ use std::time::{Duration, Instant};
 /// review B1 it then waited for that child unbounded. “Enforced” has to survive
 /// the last statement, not just the loop — so the reap is bounded too, and its
 /// budget is part of this sum rather than a step outside it.
-pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(27);
+pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(30);
 
 /// One deadline shared by **everything before the conversation** — the first
 /// probe, the start attempt, and the re-probe together.
