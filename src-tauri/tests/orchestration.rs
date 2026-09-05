@@ -50836,15 +50836,25 @@ fn every_cli_row_explains_both_knobs() {
     // loomux's five levels (#2126), so two CLIs can set effort, while claude is
     // still alone on context because the [1m] suffix has no analogue anywhere
     // else.
-    for cli in ["claude", "pi"] {
+    //
+    // codex joins them with #2515 C1, and it is the one whose seam is NOT a
+    // flag: `model_reasoning_effort` is a key in the profile file loomux
+    // generates and selects with `-p`. The set is still all five, because
+    // `ReasoningEffort::from_str` at the pinned tag maps `"max" => Max`
+    // alongside `none`/`minimal`/`ultra`/`persistent` and a `Custom(String)`
+    // catch-all — a strict superset of loomux's vocabulary. #2515's slice plan
+    // claimed the opposite ("loomux's `max` is not deliverable"); the
+    // correction is recorded on the issue, and this is where it is pinned, so
+    // narrowing the row back has to argue with a test rather than with prose.
+    for cli in ["claude", "pi", "codex"] {
         assert_eq!(
             cli_caps(cli).unwrap().effort_levels,
             EFFORT_LEVELS,
-            "{cli} has a session-scoped flag for every level loomux can ask for"
+            "{cli} can be given every level loomux can ask for"
         );
     }
     assert_eq!(cli_caps("claude").unwrap().context_variants, CONTEXT_VARIANTS);
-    for cli in ["copilot", "gemini", "opencode", "pi"] {
+    for cli in ["copilot", "gemini", "opencode", "pi", "codex"] {
         assert!(
             cli_caps(cli).unwrap().context_variants.is_empty(),
             "{cli}'s context window is model-determined, not loomux-settable"
