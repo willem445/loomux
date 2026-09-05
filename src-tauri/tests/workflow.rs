@@ -10469,7 +10469,7 @@ fn a_group_pinned_to_a_named_workflow_persists_that_name_and_resumes_on_it() {
 
     // …and the name is in `group.json`, beside the roster it produced.
     let persisted: Value = serde_json::from_str(
-        &fs::read_to_string(dir.path().join("groups").join(g.id.as_str()).join("group.json"))
+        &fs::read_to_string(dir.path().join(g.id.as_str()).join("group.json"))
             .unwrap(),
     )
     .unwrap();
@@ -10489,7 +10489,7 @@ fn a_group_json_written_before_named_workflows_reads_as_default() {
     let repo = Repo::new().workflow(DECOY_WORKFLOW);
     let (reg, dir) = test_registry();
     let g = reg.create_group(&repo.path(), rails()).unwrap();
-    let path = dir.path().join("groups").join(g.id.as_str()).join("group.json");
+    let path = dir.path().join(g.id.as_str()).join("group.json");
 
     // Strip the key entirely, exactly as a group.json written before #1689 is.
     let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -10633,7 +10633,7 @@ fn the_workflow_path_a_delegate_is_told_about_is_the_groups_own_file() {
     // workflow section) and `block.md` (a delegate's). Neither is one of the
     // four `pre222`-pinned role templates, which is why this text may move at
     // all — see `tests/fixtures/pre222/README.md`.
-    let group_dir = dir.path().join("groups").join(g.id.as_str());
+    let group_dir = dir.path().join(g.id.as_str());
     let mut named = 0usize;
     let mut scanned = 0usize;
     for entry in fs::read_dir(&group_dir).unwrap().flatten() {
@@ -10659,9 +10659,15 @@ fn the_workflow_path_a_delegate_is_told_about_is_the_groups_own_file() {
     assert!(named > 0, "and at least one names b's file");
 }
 
-/// The residual, pinned rather than promised: exactly two call sites in
-/// `src-tauri/src` still name the repo's `default` workflow without asking
-/// which one a GROUP runs, and neither is group-scoped.
+/// The residual, pinned rather than promised: exactly ONE call site in
+/// `src-tauri/src` still reads the repo's `default` workflow without asking
+/// which one a GROUP runs, and it is repo-scoped rather than group-scoped.
+///
+/// The plan predicted two. `orch_workflow_preview_sync` was the second, and it
+/// stopped being one when it gained its optional `name` — its no-name arm now
+/// goes through `load_workflow_named` at `default` like everything else. This
+/// scan is what noticed: the stale-row assertion below refused to carry a row
+/// that matched nothing, rather than letting the count go quietly wrong.
 ///
 /// A textual scan, with the limits that implies — it reads call TEXT, so a
 /// caller that bound the function to a local first would be invisible. What it
@@ -10679,12 +10685,6 @@ fn only_the_argued_residuals_still_read_the_default_workflow_directly() {
             "hold_label takes a REPO, not a group: the gh shim's label allow-list is resolved \
              before any group is in hand, and a group's own intake profile is pinned in \
              `guardrails.intake` at launch anyway",
-        ),
-        (
-            "mod.rs",
-            "workflow::load_workflow(&repo)",
-            "orch_workflow_preview_sync's `default` arm — the launcher's own default, and the \
-             one call whose whole question is what this repo declares by default",
         ),
     ];
 

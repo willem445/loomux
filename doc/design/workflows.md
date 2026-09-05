@@ -2675,7 +2675,7 @@ messages, and the `{{WORKFLOW_PATH}}` variable rendered into `workflow.md` and
 what makes it legitimate for their text to move for a named workflow; the four
 role templates are pinned and were not touched.
 
-**Two residuals stay on the `default` file, both argued and both pinned** by
+**One residual stays on the `default` file, argued and pinned** by
 `only_the_argued_residuals_still_read_the_default_workflow_directly`
 (`src-tauri/tests/workflow.rs`), which is default-deny over `src-tauri/src` and
 fails when a row goes stale:
@@ -2684,8 +2684,12 @@ fails when a row goes stale:
   a REPO, before any group is in hand. A group's own intake profile is pinned in
   `guardrails.intake` at launch anyway, so this is not a group-scoped question
   wearing a repo-scoped signature.
-- `orch_workflow_preview_sync` with no `name` — the launcher's default, and the
-  one call whose whole question is "what does this repo declare by default".
+
+The plan predicted two, and `orch_workflow_preview_sync` with no `name` was the
+second. It stopped being one in this same slice: gaining the optional `name`
+routed its no-name arm through `load_workflow_named` at `default`, like
+everything else. The scan is what said so — its stale-row assertion refused to
+carry a row matching nothing, rather than letting the count go quietly wrong.
 
 It is a textual scan, with the limits that implies: a caller that bound the
 function to a local first would be invisible to it. What it is defence in depth
