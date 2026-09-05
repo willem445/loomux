@@ -62620,15 +62620,27 @@ fn codex_approval_overlays_read_as_waiting_for_input() {
     );
 }
 
-/// A codex profile is removed with its agent, and an orphan is swept — but only
-/// when the live-agent set is actually known (#2515 C1, T1.9).
+/// A codex profile is removed with its agent, and an orphan is swept — with the
+/// candidate's id sitting in a roster that PARSES (#2515 C1, T1.9; review round
+/// 3, R2).
 ///
-/// This is the file loomux writes into someone else's home directory, so the
+/// This is the file orrerix writes into someone else's home directory, so the
 /// two failure directions are asymmetric and both are pinned. Leaving files
 /// behind is #502 by another route (1,111 stray files in a real
-/// `~/.claude/agents`). Deleting one that is still in use is worse: the pane it
-/// belongs to loses its trust, its MCP server and its contract on the next
-/// respawn, with nothing to say why.
+/// `~/.claude/agents`). Deleting one still in use is worse: the pane loses its
+/// trust, its MCP server and its contract on the next respawn, with nothing to
+/// say why.
+///
+/// **The fixture that was missing, and why its absence hid a defect.** The
+/// earlier version reclaimed its orphan only from a state root with no groups at
+/// all — its own comment said "Nothing is live yet — this registry has no groups"
+/// — so no swept candidate's id ever sat in a readable roster. That is the state
+/// of every real installation after its first spawn, and it is exactly where the
+/// first implementation failed: it keyed on the durable roster, which is never
+/// pruned, so every profile orrerix had ever written was skipped and the sweep
+/// reclaimed nothing in production. The witness sat outside the class it was
+/// meant to witness (CLAUDE.md #1225). `w-90` below is that witness: a readable,
+/// parsing roster row for an agent this process does not hold.
 #[test]
 fn a_codex_profile_is_removed_with_its_agent_and_orphans_are_swept() {
     let (reg, dir) = test_registry();
@@ -62636,116 +62648,127 @@ fn a_codex_profile_is_removed_with_its_agent_and_orphans_are_swept() {
     std::fs::create_dir_all(&home).unwrap();
     reg.set_codex_home_override(home.clone());
 
-    let live = home.join("orrerix-w-1.config.toml");
-    let orphan = home.join("orrerix-w-99.config.toml");
-    // Not loomux's: the sweep must leave both alone. The first is the human's
-    // own codex profile; the second carries loomux's prefix but not its
-    // suffix, which is the pairing `write_codex_profile` actually writes.
+    // A LIVE agent — the pane whose profile must survive a sweep.
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let live_agent = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let live_profile = home.join(format!("orrerix-{}.config.toml", live_agent.id));
+
+    // The orphan, and the fixture that was missing: its id is in a roster that
+    // READS and PARSES, which is what every installation looks like after its
+    // first spawn. `spawn_agent` above has already written a real `agents.json`
+    // for this group; this appends a second row for an agent the process does
+    // not hold, exactly as a crash would leave behind.
+    let roster = reg.state_root().join(g.id.as_str()).join("agents.json");
+    let mut rows: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&roster).unwrap()).unwrap();
+    let crashed = rows[0].clone();
+    let mut crashed = crashed;
+    crashed["id"] = json!("w-90");
+    // `running` on purpose: a `kill -9` leaves the last-written status exactly
+    // here, so a `status != "dead"` filter would not have saved this case
+    // either.
+    crashed["status"] = json!("running");
+    rows.push(crashed);
+    std::fs::write(&roster, serde_json::to_string_pretty(&rows).unwrap()).unwrap();
+    assert!(
+        serde_json::from_str::<Vec<serde_json::Value>>(&std::fs::read_to_string(&roster).unwrap())
+            .is_ok(),
+        "the fixture is only about the defect if this roster PARSES"
+    );
+    let orphan = home.join("orrerix-w-90.config.toml");
+
+    // Not orrerix's: the sweep must leave both alone. The first is a human's own
+    // codex profile; the second carries orrerix's prefix but not the suffix
+    // `write_codex_profile` actually writes.
     let human = home.join("work.config.toml");
     let notes = home.join("orrerix-notes.md");
-    for p in [&live, &orphan, &human, &notes] {
+    for p in [&live_profile, &orphan, &human, &notes] {
         std::fs::write(p, "# fixture\n").unwrap();
     }
 
-    // Nothing is live yet — this registry has no groups at all — so a sweep
-    // here would reclaim BOTH loomux files. That is the correct answer for a
-    // root with no rosters, and it is asserted so the test below is known to
-    // be exercising the roster rather than an accident of ordering.
     let swept = reg.sweep_orphaned_agent_files();
     let reclaimed = swept["reclaimed"].as_array().unwrap();
     let named = |p: &std::path::Path| {
         reclaimed.iter().any(|r| r.as_str().unwrap_or_default() == p.to_string_lossy())
     };
-    assert!(named(&live) && named(&orphan), "both loomux profiles are orphans here: {swept}");
+
+    assert!(
+        named(&orphan) && !orphan.exists(),
+        "an agent this process does not hold is an orphan even though its roster row reads and \
+         parses — that row is never pruned, so it can never be the oracle: {swept}"
+    );
+    assert!(
+        !named(&live_profile) && live_profile.exists(),
+        "a LIVE pane's profile must survive: deleting it strips a running agent of its trust, \
+         its MCP server and its contract on the next respawn: {swept}"
+    );
     assert!(
         human.exists() && notes.exists(),
-        "a file that is not `<brand>-<agent>.config.toml` is not loomux's to delete: \
+        "a file that is not `<brand>-<agent>.config.toml` is not orrerix's to delete: \
          work.config.toml={} orrerix-notes.md={}",
         human.exists(),
         notes.exists()
     );
 
-    // **Through `mark_dead`, which is the wiring that can actually go missing.**
-    // An earlier version of this test called `remove_codex_profile` directly and
-    // stayed green when the call site was deleted from `mark_dead` — it pinned
-    // the function and not the fact that anything invokes it. Caught by round 15
-    // of this slice's red-before-green wave, which is what that wave is for.
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let a = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
-    let its_profile = home.join(format!("orrerix-{}.config.toml", a.id));
-    std::fs::write(&its_profile, "# fixture\n").unwrap();
-    reg.mark_dead(&a.id, Some(0)).expect("precondition: the agent really was alive");
+    // Per-agent removal through `mark_dead`, which is the wiring that can
+    // actually go missing — an earlier version called `remove_codex_profile`
+    // directly and stayed green when the call site was deleted (wave round 15).
+    reg.mark_dead(&live_agent.id, Some(0)).expect("precondition: the agent really was alive");
     assert!(
-        !its_profile.exists(),
+        !live_profile.exists(),
         "the profile must go with its agent — `mark_dead` is the one path every exit funnels \
          through (kill, idle-reap, crash, pane close)"
     );
 
-    // The function itself, and its idempotence: `mark_dead` calls it for EVERY
-    // agent whatever CLI it ran, so a second removal, a non-codex agent and an
-    // id that never had a profile must all be no-ops rather than errors.
-    std::fs::write(&live, "# fixture\n").unwrap();
-    reg.remove_codex_profile("w-1");
-    assert!(!live.exists(), "the profile must go with its agent");
-    reg.remove_codex_profile("w-1");
+    // Idempotent: a second removal, and an id that never had a profile, are
+    // no-ops rather than errors — `mark_dead` calls this for EVERY agent,
+    // whatever CLI it ran.
+    reg.remove_codex_profile(&live_agent.id);
     reg.remove_codex_profile("orch-1");
 }
 
-/// The refusal half of the sweep (#2515 C1): a roster that cannot be READ makes
-/// the live-agent set incomplete, and an incomplete set deletes NOTHING.
+/// A `CODEX_HOME` that cannot be listed deletes NOTHING (#2515 C1; review round
+/// 3, B1's surviving half).
 ///
-/// This is #464 B1's rule one level down, and it is the direction that must
-/// never be got wrong. That review found the sweep reading "I cannot enumerate
-/// the groups" as "no groups are live" and deleting every generated file; the
-/// same mistake is available here one scope smaller, where a single unparseable
-/// `agents.json` would make every one of THAT group's panes look orphaned — and
-/// the panes are running, so the next respawn strips them of trust, MCP and
-/// contract during exactly the post-crash relaunch this sweep exists for.
+/// This is the one refusal left after the oracle moved off the durable roster,
+/// and it is the half that was always right: "I could not look" is not "there
+/// was nothing there" — #464 B1's rule, at the level where it actually applies.
 ///
-/// The two absences are deliberately different and both are asserted: a group
-/// with NO `agents.json` is a group that has never spawned an agent, which is
-/// real, common, and genuinely contributes no ids — so it must NOT poison the
-/// sweep the way an unreadable one does.
+/// The unreadable directory is fixtured as a FILE where the directory should be,
+/// which is portable; a permissions fixture is not, on Windows or in CI.
 #[test]
-fn an_unreadable_roster_stops_the_codex_sweep_rather_than_orphaning_a_live_pane() {
+fn a_codex_home_that_cannot_be_listed_reclaims_nothing() {
     let (reg, dir) = test_registry();
+
+    // A real home first, so the control below is about the LISTING failing
+    // rather than about the sweep never having anything to do.
     let home = dir.path().join("fake-codex-home");
     std::fs::create_dir_all(&home).unwrap();
     reg.set_codex_home_override(home.clone());
-    let profile = home.join("orrerix-w-7.config.toml");
-
-    // A group that has never spawned an agent: no roster file at all. This
-    // must leave the sweep able to act — it is not ignorance, it is an empty
-    // answer.
-    let empty_group = reg.state_root().join("group-never-spawned");
-    std::fs::create_dir_all(&empty_group).unwrap();
-    std::fs::write(&profile, "# fixture\n").unwrap();
+    let orphan = home.join("orrerix-w-90.config.toml");
+    std::fs::write(&orphan, "# fixture\n").unwrap();
     let swept = reg.sweep_orphaned_agent_files();
     assert!(
-        !profile.exists(),
-        "a group with no roster contributes no ids and must not stop the sweep: {swept}"
+        !orphan.exists(),
+        "control: with a listable home this profile IS reclaimed, so the assertion below is \
+         about the unreadable case rather than about a sweep that never acts: {swept}"
     );
 
-    // Now a roster that EXISTS and cannot be parsed. Its agents are real and
-    // this cannot see them, so nothing may be deleted.
-    std::fs::write(&profile, "# fixture\n").unwrap();
-    let broken = reg.state_root().join("group-broken-roster");
-    std::fs::create_dir_all(&broken).unwrap();
-    std::fs::write(broken.join("agents.json"), "{ this is not json").unwrap();
+    // Now a home that is not a directory at all: `read_dir` fails.
+    let not_a_dir = dir.path().join("codex-home-is-a-file");
+    std::fs::write(&not_a_dir, "not a directory\n").unwrap();
+    reg.set_codex_home_override(not_a_dir.clone());
     let swept = reg.sweep_orphaned_agent_files();
     assert!(
-        profile.exists(),
-        "an unreadable roster means the live-agent set is UNKNOWN — deleting on a guess is how \
-         a running pane loses its trust and its tools: {swept}"
+        swept["errors"].as_array().map(|e| e.iter().all(|x| x["path"] != json!(""))).unwrap_or(true),
+        "{swept}"
     );
-    // …and it says so, rather than reporting a clean sweep. An error-free
-    // report of zero reclamations is indistinguishable from a healthy one.
-    let errors = swept["errors"].as_array().unwrap();
     assert!(
-        errors.iter().any(|e| e["error"].as_str().unwrap_or_default().contains("roster")),
-        "the skip must be reported: {swept}"
+        not_a_dir.exists(),
+        "the sweep must not touch a CODEX_HOME it could not list: {swept}"
     );
 }
+
 /// The launcher's autopilot toggle and the group spawn must MEAN THE SAME
 /// THING on pi (#101), and on pi that meaning is "nothing".
 ///

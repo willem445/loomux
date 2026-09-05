@@ -29450,8 +29450,11 @@ impl OrchRegistry {
     /// three things travel with it: the name is loomux-branded so a sweep can
     /// recognise it, the file is removed with the agent that owns it
     /// ([`Self::remove_codex_profile`]), and anything the removal misses is
-    /// reclaimed at startup ([`Self::sweep_orphaned_agent_files`]). A file in a
-    /// vendor's user directory that nothing cleans up is #502 by another route.
+    /// reclaimed at startup ([`Self::sweep_orphaned_agent_files`], which keys on
+    /// the LIVE AGENT MAP — see the comment in its codex arm for why the durable
+    /// roster is the wrong oracle and made that claim false once already). A file
+    /// in a vendor's user directory that nothing cleans up is #502 by another
+    /// route.
     ///
     /// `Err` rather than best-effort, and for the same reason
     /// `write_gemini_policy` is: this file is not a convenience the pane can do
@@ -29692,9 +29695,42 @@ impl OrchRegistry {
         // "I could not find out" as "nothing is live" is exactly backwards and
         // would strip a running pane of its trust, its MCP server and its
         // contract on the next respawn.
-        let (live_agents, roster_complete) = self.live_agent_ids();
-        if roster_complete {
+        // **The oracle is the LIVE AGENT MAP, not the durable roster**
+        // (review round 3, B1). The first version unioned every
+        // `AgentRecord::id` in every group's `agents.json`, which made this
+        // arm dead code: `persist_agent_record` is an upsert and never
+        // removes a row, `end_group` does not delete the group directory, and
+        // an agent id is never re-minted (#524) — so that union is "every
+        // agent id ever spawned in this root", and the skip below matched
+        // every profile orrerix had ever written. The backstop three surfaces
+        // promised did not exist.
+        //
+        // `self.agents` is the only thing that knows which panes are actually
+        // running, and at this function's one production call site
+        // (`lib.rs`, the setup block, before the reapers start and before any
+        // spawn) it is EMPTY — which is exactly right: a profile is read by
+        // codex at launch and is useless afterwards, so every one present at
+        // startup is stale by construction. Keying on the live map also keeps
+        // this correct if the sweep is ever called later, where the roster
+        // could not have been.
+        //
+        // The claude/copilot loops above key on GROUPS because their file
+        // names carry a group and "no such group in this root" is a real
+        // orphan signal. A codex profile carries an AGENT, and the roster it
+        // would have to be checked against is never pruned — which is why the
+        // same shape does not transfer.
+        // Named for what it IS: every agent this PROCESS holds, live or
+        // recently dead (`mark_dead` sets the status and leaves the entry in the
+        // map). That is deliberately conservative within a running process — a
+        // dead agent's profile is already removed by `mark_dead` itself — and at
+        // the startup call site the map is empty, which is the case that matters.
+        let agents_this_process_holds: HashSet<String> =
+            self.agents.lock_safe().values().map(|a| a.id.clone()).collect();
+        {
             if let Some(home) = self.codex_home_dir() {
+                // The one refusal that survives, and it is the half that was
+                // right: if this directory cannot be listed, delete nothing.
+                // "I could not look" is not "there was nothing there".
                 if let Ok(entries) = fs::read_dir(&home) {
                     let prefix = format!("{}-", brand::NAME);
                     for entry in entries.flatten() {
@@ -29710,7 +29746,7 @@ impl OrchRegistry {
                         // this directory is not loomux's to delete.
                         let Some(stem) = name.strip_suffix(CODEX_PROFILE_FILE_EXT) else { continue };
                         let Some(agent) = stem.strip_prefix(&prefix) else { continue };
-                        if live_agents.contains(agent) {
+                        if agents_this_process_holds.contains(agent) {
                             continue;
                         }
                         match fs::remove_file(&path) {
@@ -29728,53 +29764,8 @@ impl OrchRegistry {
                     }
                 }
             }
-        } else {
-            let msg = "codex profile sweep skipped: at least one group's roster could not be \
-                       read, so which agents are live is unknown — refusing to guess";
-            crate::obs::breadcrumb("fixture-sweep", msg);
-            errors.push(json!({ "path": "agents.json", "error": msg }));
         }
         json!({ "reclaimed": reclaimed, "errors": errors })
-    }
-
-    /// Every agent id any group's durable roster records, and whether that
-    /// answer is COMPLETE (#2515 C1).
-    ///
-    /// The second half is the whole point, and it is #464 B1's rule one level
-    /// down. `sweep_orphaned_agent_files` already refuses to sweep when it
-    /// cannot enumerate GROUPS; a group whose `agents.json` is individually
-    /// unreadable is the same ignorance in a smaller scope, and treating it as
-    /// "that group has no agents" would make every one of its panes' profiles
-    /// look orphaned. So a single unreadable roster turns the whole answer
-    /// incomplete and the caller deletes nothing.
-    ///
-    /// A group directory with no `agents.json` at ALL is not that case: it is a
-    /// group that has never spawned an agent, which is a real and common state
-    /// (a freshly created group), and it genuinely contributes no ids.
-    /// `NotFound` is therefore complete and everything else is not — the same
-    /// distinction `capture_session_baseline` draws between a missing store and
-    /// an unreadable one.
-    fn live_agent_ids(&self) -> (HashSet<String>, bool) {
-        let mut ids = HashSet::new();
-        let Ok(entries) = fs::read_dir(&self.root) else {
-            return (ids, false);
-        };
-        let mut complete = true;
-        for e in entries.flatten().filter(|e| e.path().is_dir()) {
-            let path = e.path().join("agents.json");
-            match fs::read_to_string(&path) {
-                Ok(text) => match serde_json::from_str::<Vec<AgentRecord>>(&text) {
-                    Ok(list) => ids.extend(list.into_iter().map(|r| r.id)),
-                    // A roster that is present and unparseable is the
-                    // dangerous one: its agents exist and this cannot see
-                    // them.
-                    Err(_) => complete = false,
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => complete = false,
-            }
-        }
-        (ids, complete)
     }
 
     /// Record the `Arc` the registry is stored behind so `&self` methods can

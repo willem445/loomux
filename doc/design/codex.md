@@ -604,14 +604,41 @@ things travel with it: the loomux-branded name, removal with the agent that owns
 it (`mark_dead`), and a startup sweep for anything the removal missed. A file in
 someone else's home that nothing cleans up is #502 by another route.
 
-The sweep applies #464's rule one level down. That sweep already refuses to
-delete anything when it cannot enumerate GROUPS; a group whose `agents.json` is
-individually unreadable is the same ignorance in a smaller scope, and reading it
-as "that group has no agents" would make every one of its panes' profiles look
-orphaned. So a single unreadable roster makes the live-agent set *incomplete*
-and the sweep deletes nothing. A group directory with **no** `agents.json` is
-not that case — that is a group that has never spawned an agent, which is real
-and common, and it genuinely contributes no ids.
+**What the sweep asks, and the wrong oracle it asked first.** The first version
+keyed on the durable roster: it unioned every `AgentRecord::id` in every group's
+`agents.json` and skipped any profile whose agent appeared there. That made the
+arm dead code, and review round 3 caught it. Three facts conspire —
+`persist_agent_record` is an upsert and never removes a row, `end_group` does not
+delete the group directory, and an agent id is never re-minted (#524) — so the
+union is *every agent id ever spawned in this root*, and the skip matched every
+profile orrerix had ever written. The backstop this section promised did not
+exist.
+
+The oracle is now the **live agent map** (`self.agents`), which is the only thing
+that knows which panes are actually running. At the sweep's one production call
+site — `lib.rs`'s setup block, before the reapers start and before any spawn —
+that map is EMPTY, and that is exactly right: codex reads a profile at launch and
+never again, so every profile present at startup is stale by construction.
+Keying on the live map also stays correct if the sweep is ever called later,
+which the roster could not have done.
+
+The claude/copilot loops beside it key on GROUPS, and that shape deliberately
+does **not** transfer: their file names carry a group, and "no such group in this
+root" is a real orphan signal (it is how #502's test-registry files were found).
+A codex profile carries an AGENT, and the roster it would have to be checked
+against is never pruned.
+
+One refusal survives, and it is the half that was always right: if `CODEX_HOME`
+cannot be listed, the sweep deletes nothing. "I could not look" is not "there was
+nothing there".
+
+**Residual, because the oracle is per-process.** Two orrerix instances sharing one
+`CODEX_HOME` would each see the other's panes as not-live, so a startup sweep in
+one could reclaim a profile a pane in the other is still using — that pane keeps
+running (codex has already read the file) but loses its profile on respawn. The
+same exposure exists for the generated agent files in `~/.claude/agents` and
+`~/.copilot/agents`, which the neighbouring loops delete on the same per-root
+reasoning, so this is the established trade rather than a new one.
 
 ## Containment: why the ceiling is `None`
 
