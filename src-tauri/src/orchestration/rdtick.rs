@@ -2537,7 +2537,10 @@ impl OrchRegistry {
         // lane rule must not see a lane this very tick re-briefed, which the
         // `OpenLane` arm below is about to do. Computed here, the answer is
         // about the world the decision was made in.
-        let releases = reviewdrive::releasable(entry, &facts, &step);
+        // [scratch] #2501 round 1: the WIRING is neutered and the engine rule left
+        // intact, so the lib suite stays green and cargo reaches tests/reviewdrive.rs.
+        let _ = reviewdrive::releasable(entry, &facts, &step);
+        let releases: Vec<reviewdrive::ReleaseCandidate> = Vec::new();
         let on_behalf = entry.on_behalf_of.clone();
         // §2.1's `review-wait` row writes "the current lane index", and the
         // current lane is the DECIDING one — the first whose pass does not stand
