@@ -224,6 +224,25 @@ fn every_sync_orchestration_command_is_frame_mandatory_or_cannot_lock() {
         files.len()
     );
 
+    // PER-ROOT CONTROL, and it is the half the combined floor structurally
+    // cannot give. `gh.rs` contributes ZERO sync commands, so nothing about
+    // `total` moves if that root stops being read at all — deleted from the
+    // list, renamed on disk, or read and yielding nothing because the
+    // attribute spelling changed. Each is indistinguishable from the healthy
+    // state by every assertion above. So assert each root really was opened
+    // and really does carry commands of the shape this scan parses; the
+    // *sync* count staying 0 for `gh.rs` is then a fact about gh.rs rather
+    // than about the instrument.
+    for (rel, src) in &files {
+        let commands = src.matches("#[tauri::command]").count();
+        assert!(
+            commands > 0,
+            "{rel} was read but yielded no `#[tauri::command]` at all — the root is stale or \
+             the attribute spelling moved, and a root that yields nothing is byte-identical \
+             to a clean one"
+        );
+    }
+
     assert!(bare.is_empty(), "{}", bare.join("\n"));
 }
 
