@@ -796,6 +796,31 @@ pub const PLANNER_TPL: &str = include_str!("templates/planner.md");
 /// against.
 #[doc(hidden)]
 pub const MANAGER_TPL: &str = include_str!("templates/manager.md");
+/// The lead pane's role contract (#2519).
+///
+/// Like [`MANAGER_TPL`] it is outside `write_instruction_files`'s
+/// class-fallback loop — no built-in roster has a lead, and a `lead.md`
+/// appearing in every group dir would be a default-path change for a feature
+/// nobody turned on. It is written by the block loop, for the roster the
+/// launcher's toggle mints.
+///
+/// **Unlike `manager.md` it is NOT golden-pinned in this slice**, and that is a
+/// decision rather than an oversight. The pin (`tests/fixtures/pre222/` + the
+/// `LIVE` pairing in `tests/workflow.rs`) exists to make an accidental edit to
+/// bytes a shipped pane already reads fail loudly; nothing delivers this file
+/// yet — slice A ships the CLASS, and the launch path that pastes a kickoff is
+/// slice B — so there is no shipped reading to regress. `block.md` and
+/// `workflow.md` are unpinned on the same terms. It joins the pin in the slice
+/// that delivers it, when its per-CLI content is settled, rather than being
+/// blessed once here and re-blessed there — a fixture re-blessed per slice is
+/// one chance per slice to bless a mistake.
+///
+/// It carries `{{GROUP_ID}}` and `{{REPO}}` and no other placeholder: a lead
+/// may never carry a repo persona (`workflow::persona_allowed` is false for
+/// every `Role::is_fixture` class), it holds no locks, and there is no workflow
+/// file in a lead group for a `{{WORKFLOW}}` fragment to describe.
+#[doc(hidden)]
+pub const LEAD_TPL: &str = include_str!("templates/lead.md");
 /// Workflow-aware fragments (#222), substituted into the role templates above as
 /// `{{WORKFLOW}}` (orchestrator) and `{{BLOCK_NOTE}}` (worker/reviewer/planner).
 ///
@@ -840,19 +865,13 @@ pub(crate) fn role_template(role: Role) -> &'static str {
         // (the only caller of a role's template machinery) is never
         // invoked for `Role::Solo`.
         Role::Solo => unreachable!("solo panes have no role template"),
-        // #2519 slice A: the CLASS lands here, its template lands with the
-        // launch path that delivers it (slice B). Nothing in this slice mints a
-        // `Role::Lead` agent — `workflow::kind_from_str` has no `lead` arm, so
-        // neither a workflow file nor `spawn_agent` can produce one, and the
-        // `orch_lead_prepare` command that will does not exist yet — so this is
-        // unreachable today in the same sense `Role::Solo` is. It is a panic
-        // rather than a placeholder string deliberately: it is what makes a
-        // premature mint fail loudly at the ONE site that would otherwise write
-        // an empty `lead.md` into a group dir and hand a human's pane a kickoff
-        // with no instructions in it.
-        Role::Lead => unreachable!(
-            "the lead's role template lands with the launch path that delivers it (#2519 slice B)"
-        ),
+        // #2519. A real template, not an `unreachable!`, and the reason is that
+        // this arm IS reachable from a public path: `write_instruction_files`'s
+        // block loop renders every block in a roster, so it runs the moment a
+        // lead block exists — which is before any lead pane is opened, and in a
+        // function whose failure mode would be a process abort rather than an
+        // error. See [`LEAD_TPL`] for why it is not golden-pinned in this slice.
+        Role::Lead => LEAD_TPL,
     }
 }
 

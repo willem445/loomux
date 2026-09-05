@@ -1120,11 +1120,21 @@ pub fn default_model(cli: &str, role: Role) -> &'static str {
         // A solo pane's model is whatever the human picked in the launcher —
         // loomux never spawns or models it. Never reached.
         Role::Solo => unreachable!("solo panes are never spawned through the model-resolution path"),
-        // #2519: same as a solo pane, for the same reason. A lead's CLI and
-        // model are what the HUMAN picked in the launcher for their own pane;
-        // orrerix never resolves either. (Its CHILDREN are ordinary workers and
-        // resolve `Role::Worker` here, as they always did.)
-        Role::Lead => unreachable!("a lead pane's model is the human's launcher choice, never resolved here"),
+        // #2519: EMPTY, on the opencode/pi argument above and NOT the solo
+        // pane's `unreachable!`. A lead's model is what the human picked in
+        // their own launcher, so loomux has no default to offer — but this arm
+        // IS reached, which is what rules the panic out: `Guardrails::clamped`
+        // normalizes every block's effective model, so it runs the moment a
+        // lead block exists in a roster, before any pane is opened. An
+        // `unreachable!` there would be a public normalization path that
+        // aborts the process on a class the same crate defines.
+        //
+        // Empty means "no `--model` flag and no model suffix", i.e. the CLI's
+        // own default — which for a pane the human configured is the only
+        // answer that is not an override of a choice they already made. (Its
+        // CHILDREN are ordinary workers and resolve `Role::Worker` here, as
+        // they always did.)
+        Role::Lead => "",
     }
 }
 
@@ -1164,11 +1174,12 @@ pub fn sanitize_model_opt(m: &str) -> String {
 /// and reading the group dir) and its bytes by the same live-vs-golden pairing
 /// the other four get in `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares`.
 ///
-/// [`Role::Lead`] (#2519) is outside that pin for the same reason and is
+/// [`Role::Lead`] (#2519) is outside that pin for the manager's reason and is
 /// unpinned for a second one on top of it: no default group has a lead either,
-/// and the file's BYTES do not exist yet — the template lands with the launch
-/// path that delivers it (#2519 slice B), which is where its own name and bytes
-/// pins land with it.
+/// and nothing DELIVERS `lead.md` yet — slice A ships the class, the launch
+/// path that pastes a kickoff is slice B — so there is no shipped reading for a
+/// golden to protect. `orchestration::LEAD_TPL`'s doc carries the argument and
+/// names the slice its name and bytes get pinned in.
 pub fn role_instructions_file(role: Role) -> &'static str {
     match role {
         Role::Orchestrator => "orchestrator.md",
@@ -1177,14 +1188,9 @@ pub fn role_instructions_file(role: Role) -> &'static str {
         Role::Planner => "planner.md",
         Role::Manager => "manager.md",
         Role::Solo => unreachable!("solo panes have no instructions file"),
-        // #2519. A NAME, not a panic, even though slice A ships no path that
-        // mints a lead agent: this function loads nothing and its non-spawn
-        // callers are re-grounding notices that format the name of an existing
-        // agent's file (`OrchRegistry::regrounding_notice` and friends), so a
-        // panic here would be a live pane crashing to report a name. The BYTES
-        // are the other half and they land with the launch path that delivers
-        // them (#2519 slice B) — `orchestration::role_template` still refuses a
-        // lead, which is where a premature mint fails loudly.
+        // #2519. Its bytes are `orchestration::LEAD_TPL`; this is the name they
+        // are written under in the group dir, and — like every other arm here —
+        // the name a kickoff or re-grounding notice tells the pane to read.
         Role::Lead => "lead.md",
     }
 }
