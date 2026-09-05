@@ -1058,6 +1058,47 @@ because it is the half that would have resolved #525 with no re-review at all:
 *"this FAIL was recorded against body-digest X, current is Y"* is a race the
 orchestrator can settle by reading the current body.
 
+**3a. One delegation, for the review driver's body-verification round (#2168
+E2).** The rule above, applied to a gate with several reviewers, says every one
+of them must re-read the body after any edit. Measured on ten driven and
+hand-routed PRs, that is where a large share of the review rounds went: five
+other-lane re-records at one head on #1764, three on #1751, each of them a
+reviewer re-reading a diff it had already passed so that a digest would match.
+
+So where the review driver has re-briefed one lane **because** every required
+lane had already passed the code at this head and only the body moved, that
+lane's `pass` is recorded as a body **verification** and the clause accepts the
+passes it supersedes:
+
+| the reviewer's live pass | `body-unchanged` |
+| --- | --- |
+| carries the current digest | allowed, as always |
+| carries an earlier digest, and no required reviewer verified the current body | **refused**, as always |
+| carries an earlier digest, and a required reviewer's live pass verified the current body | allowed (#2168 E2) |
+| carries no digest at all | **refused** under either — unknown is never "unbound, therefore fine" |
+
+What the clause promises is therefore weaker, and it is worth writing the weaker
+sentence out: *the body that would be committed was read and passed by a required
+reviewer, and every other pass is bound to the same head, so the code those
+reviewers approved has not moved since they approved it.* It no longer promises
+that all of them read this body.
+
+**Three things bound that, and none of them is a convention.** The mark is
+written by the `review_verdict` tool from the driver's own lane record — rule 2
+above, one level up: a reviewer never passes it and cannot type it, because it
+rides line 5 of the verdict file, which is the tool's, while everything a
+reviewer writes starts on line 6. It is spent the moment the body moves again,
+since nothing then carries the current digest. And it never reaches across a
+head: a pass bound to an earlier commit is stale to the *reviewer* half, which
+runs first and is untouched.
+
+A repo that runs no review driver therefore sees this clause exactly as it was —
+nothing hand-recorded ever carries the mark. The two wider shapes proposed
+instead were both refused: excluding an "evidence" region of the body from the
+digest (which would let precisely the class this is about through unreviewed),
+and accepting any newer pass that happens to carry the current digest (which
+would weaken the clause for every repo, driver or no driver).
+
 **4. Enforcement is opt-in — `also: [body-unchanged]`.** The check only matters
 where the body *becomes* the record. On a repo that merge-commits, the PR body is
 discussion, and this would be noise. "Squash makes the body permanent" is a fact
@@ -1096,9 +1137,31 @@ The issue also names a planner's **issue body** as a candidate. That one is not 
 smaller version of this: it is part of no commit, and no gate reads it, so it needs
 its own argument for what a digest would be *for* before it gets one.
 
+The verdict file carries the digest on **line 5**, and since #2168 E2 that line
+is `<digest> verified-body` when the verdict is a body verification. Both halves
+read it the same way: split a trailing `verified-body` off the line, then run
+`sanitize_digest` over **what remains** — the whole field, not its first
+whitespace-separated word. Rust does that in `parse_verdict_file`; the shim
+reproduces it in `loomux_verdict_line5`, which every one of its line-5 readers
+goes through. **Do not implement a new reader from the first-field shortcut**: it
+accepts prose beginning with a hex word, which is looser than Rust on the half
+that refuses merges, and this slice shipped and retracted that twice (#2308
+rounds 4 and 5).
+
+The shim's `body-unchanged` loop then makes two passes over the reviewer list —
+one asking whether any of them verified the body as it stands, one deciding each
+stale pass against that answer — because the question is a property of the
+reviewer set and not of one member. The two halves are cross-checked by an
+executed test that runs **both** of them over one set of verdict files
+(`the_shim_and_the_gate_agree_about_which_passes_a_verification_covers`), rather
+than by agreement in prose; the end-to-end
+`the_shim_takes_a_body_verification_pass_for_the_lanes_it_supersedes` exercises
+the shim alone and cannot see a divergence.
+
 Fail-closed, like the head binding: a verdict with **no** digest (recorded by a
 build older than this one, or with the body unreadable at record time) can never
-show the body unchanged, so `body-unchanged` refuses on it. The hasher itself is
+show the body unchanged, so `body-unchanged` refuses on it — under the
+delegation too. The hasher itself is
 resolved at the point of use (`sha256sum`, else `shasum -a 256`, else
 `openssl dgst -r`) rather than added to the shim's proven-dependency preamble —
 that preamble is asserted before *every* gated command on every host and is shared

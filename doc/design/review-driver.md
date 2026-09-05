@@ -75,9 +75,9 @@ resumes it; `cancel_review_drive` cancels it), and only `satisfied` and
 | State | Reads | Writes | Leaves for |
 | --- | --- | --- | --- |
 | `ci-wait` | PR head and mergeability (`mqdriver::resolve_pr_detailed`, whose raw output `notify::pr_mergeability_result` classifies — this is how CONFLICTING is learned); checks (`mqdriver::pr_ci_green_detailed` over `notify::pr_checks_result`, which already reads "no checks reported" as pending); **on a head that arrived by arc 7, the worker's intercepted `report` as well** (#2168 E1 — green says the checks settled, not that the round is over) | `head`; `ci_attempts` on a red; `rebase_attempts` on a conflict; `fix_pushed_ms` (§5.2, written by every arc and re-stamped by a further push); `rd-ci-green`, `rd-ci-red` or `rd-conflicting` | `review-wait` on green — **on an arc-7 head, only once the worker has also reported done** (#2168 E1); `fix-wait` on red or conflicting; `held(ci-limit)`, `held(rebase-limit)`, `held(worker-blocked)`, `held(worker-unresumable)`, `held(fix-stalled)` (all three #2168 E1, on an arc-7 head only), `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
-| `review-wait` (lane *k*) | the required lane list at **this** head (`workflow::route_reviewers` over `pr_changed_files`, then `RoutingDecision::gate`); the lane's verdict file via `verdict_map` (`workflow::parse_verdict_file`: line 1 the verdict, line 2 the head it binds to, line 5 the body digest); the live head and body digest; **whether the pane it recorded for that lane is still alive** (#2163 — the lane-side twin of `fix-wait`'s own exit read, and for the same reason: a dead pane can never produce the verdict this state is waiting for, and `lane-stalled` is an hour away anchored at the brief rather than at the death) | the lane's spawned or resumed session id; the current lane index; `review_rounds` on a `fail`; `cap_starved_since_ms` on a lane spawn the cap refuses (#2109); `rd-lane-spawned`, `rd-lane-resume-failed`, `rd-lane-duplicate-refused`, `rd-lane-reopened`, `rd-verdict` | `gate-check` once the last required lane has passed; `fix-wait` on a `fail`; `ci-wait` when the head moves under a lane; `held(escalate)`, `held(review-limit)`, `held(lane-stalled)`, `held(cap-full)` (#2109 — the cap has refused this lane for `CAP_HOLD_MS`), `held(routing-unaccountable)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
+| `review-wait` (lane *k*) | the required lane list at **this** head (`workflow::route_reviewers` over `pr_changed_files`, then `RoutingDecision::gate`); the lane's verdict file via `verdict_map` (`workflow::parse_verdict_file`: line 1 the verdict, line 2 the head it binds to, line 5 the body digest and, since #2168 E2, the `verified-body` mark beside it); the live head and body digest; **whether the pane it recorded for that lane is still alive** (#2163 — the lane-side twin of `fix-wait`'s own exit read, and for the same reason: a dead pane can never produce the verdict this state is waiting for, and `lane-stalled` is an hour away anchored at the brief rather than at the death) | the lane's spawned or resumed session id; the current lane index; **`briefed_verify` when the brief is a body-verification delta** (#2168 E2); `review_rounds` on a `fail`; `cap_starved_since_ms` on a lane spawn the cap refuses (#2109); `rd-lane-spawned`, `rd-lane-resume-failed`, `rd-lane-duplicate-refused`, `rd-lane-reopened`, `rd-verdict` | `gate-check` once the last required lane has passed — **or, after a body-only move, once ONE lane's body-verification pass settles the rest** (#2168 E2); `fix-wait` on a `fail`; `ci-wait` when the head moves under a lane; `held(escalate)`, `held(review-limit)`, `held(lane-stalled)`, `held(cap-full)` (#2109 — the cap has refused this lane for `CAP_HOLD_MS`), `held(routing-unaccountable)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
 | `fix-wait` | the worker's intercepted `report`; the live head; **whether the pane it resumed is still alive** (#1961 — a resumed pane that exits before reporting is a hand-back that failed, not a wait, and waiting it out costs a whole `fix_timeout_minutes` on a dead process) | `rd-handback`; `rd-kickback` and `fix_kickback_ms` when it answers a worker's `report(progress)` (#1959) | `ci-wait` when the head moves; `review-wait` on a `report(done)` with the head unchanged (a body-only fix); `held(worker-blocked)`, `held(worker-unresumable)`, `held(cap-refused)` (the hand-back's spawn refused by the live-delegate cap, #1960), `held(fix-stalled)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
-| `gate-check` | the same parsers the shim and the queue read — `route_reviewers`, then `RoutingDecision::gate`, then `workflow::evaluate_merge_gate(gate, verdicts, Some(head))` — plus `body_drift` for `also: [body-unchanged]` | nothing | `satisfied`; `ci-wait` when the gate is not satisfied for any reason; `held(routing-unaccountable)`, `held(gate-unreadable)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
+| `gate-check` | the same parsers the shim and the queue read — `route_reviewers`, then `RoutingDecision::gate`, then `mergeq::recheck_gate`, which is `workflow::evaluate_merge_gate(gate, verdicts, Some(head))` plus the `also:` clauses including `body-unchanged` (§4 — one gate decision, so the delegation of #2168 E2 is decided here and in the shim by the same rule) | nothing | `satisfied`; `ci-wait` when the gate is not satisfied for any reason; `held(routing-unaccountable)`, `held(gate-unreadable)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
 | `held{reason}` (parked) | nothing; the tick does not advance it | one `deliver_to_orchestrator` notice and one `rd-held` line, on entry only | `ci-wait` on `drive_review`; `cancelled` on `cancel_review_drive` |
 | `satisfied`, `cancelled` (terminal) | — | one notice, one `rd-satisfied` / `rd-cancelled` line, one `TaskNote` | nothing |
 
@@ -904,9 +904,51 @@ with two readers — the `gh` shim and `mergeq::GateRecheck` — and the driver 
 third **reader**, never a third implementation. Merge-queue §6 is explicit that
 a third implementation of the gate decision is a defect rather than an
 optimization, so the driver calls `route_reviewers`, then
-`RoutingDecision::gate`, then `evaluate_merge_gate`, plus `body_drift` for
-`also: [body-unchanged]`, and adds no decision of its own. If the driver's needs
-ever diverge from those parsers, the parsers move.
+`RoutingDecision::gate`, then `recheck_gate`, and adds no decision of its own.
+If the driver's needs ever diverge from those parsers, the parsers move.
+
+**#2168 E2 is that rule tested from the other side, and it is where the gate
+moved for the driver rather than the driver deciding for itself.** A body-only
+edit after every required lane has passed used to re-brief every lane so that
+their digests would match again — the cascade measured on #1764 (five other-lane
+re-records at one head) and #1751 (three). The saving needs `body-unchanged` to
+accept the passes it supersedes, so the rule had to change **in the gate**: a
+live pass at an earlier body is accepted when a required reviewer's live pass is
+a **body verification** carrying the current digest
+(`mergeq::body_verified_by_required`, over `ReviewVerdict::verified_body`). The
+driver reads that same predicate through `first_stale_lane` — a driver that
+answered it differently would advance to `gate-check` and be refused there on
+every tick until `state-stalled`, which is exactly the failure this section
+exists to prevent.
+
+**What the clause now promises, stated as the weaker thing it is.** Before: every
+required reviewer read the body that would be committed. Now: a required reviewer
+read it, and every other pass is bound to the same head, so the code they
+approved has not moved since they approved it. The two shapes #1875 proposed
+instead are both wider — a digest carve-out excluding an evidence region lets
+exactly the class #2168 is about through unreviewed, and "any newer pass carries
+the current digest" would weaken the clause for every repo, including one that
+runs no driver. This one is carried by a field only `review_verdict` writes, and
+only from the drive's own lane record for the exact revision it briefed: a
+reviewer cannot set it, and an undriven repo never sees it.
+
+**What that agreement covers, and one place the two sides still differ.** The
+shared rule is the VERIFICATION question — "has a required reviewer verified the
+body as it stands" — and
+`the_driver_and_the_gate_answer_the_verification_question_identically` runs both
+readers over every crossing of it. It is **not** a claim that the driver and the
+gate agree about every pass in every state, and they do not: `lane_pass_is_current`
+reads an *unknown* digest as not-drift (#791's asymmetry — one transient `gh`
+failure to read a PR body must not re-brief every open lane in the group), while
+the gate refuses an empty digest outright (#565's — unknown may never discharge a
+merge condition). Both are right about their own question, so on a gate declaring
+`body-unchanged` a pass recorded during a body-read outage settles in
+`review-wait` and is refused at `gate-check`, and the drive cycles
+`gate-check -> ci-wait -> review-wait` on unchanged facts until
+`held(drive-stalled)` — the same exit §8's `also: [base-green]` row parks on.
+That divergence predates #2168 E2 and is not closed by it: closing it means
+deciding which of the two asymmetries yields, which is a change to the gate's
+contract rather than to the driver, and it wants its own slice.
 
 The distinction is not cosmetic. An `edges:` graph would be the runtime deciding
 *which agent runs next in a workflow* — the 500-line-YAML sprawl that section
@@ -926,6 +968,12 @@ the same list and not merely the same set. Lane *k+1* spawns only after lane
 *k*'s `pass` bound to the current head and body digest, which is how the
 sequenced-lane rule ("the standard lane to a `pass` on a final body, then the
 final lane once") is expressed with no block name anywhere in the code.
+
+That order is also what picks the **verification lane** of #2168 E2: after a
+body-only move the first entry of the same list is the one re-briefed. It is
+called the first rather than the cheapest deliberately — a repo expresses which
+lane it wants asked first by writing it first, and a product that ranked lanes by
+cost would be baking one repo's roster into a generic tool (constraint 8).
 
 **Routing is re-evaluated at every reviewed head**, because a push can change
 which reviewers are required: a round that starts touching `src/**` pulls in
@@ -1035,8 +1083,8 @@ Four are new, and each closes a case that would otherwise have no answer:
   agent map, the roster — #2109's lesson one boundary over, since a copilot or
   opencode lane's session is never on the record at all), its pane moved to
   `prior_agents` so §7 still owns it but nothing treats it as current, and every
-  claim about a revision — `briefed_head`, `briefed_digest`, `last_verdict`,
-  `at_head`, `spawned_ms` — cleared, so the first tick briefs each lane rather
+  claim about a revision — `briefed_head`, `briefed_digest`, `briefed_verify`,
+  `last_verdict`, `at_head`, `spawned_ms` — cleared, so the first tick briefs each lane rather
   than waiting on it. That last part is about the RECORD and not about what the
   brief says: the verdict FILE outlives the drive that produced it and is
   re-read through the gate's own parser every tick, so `record_verdict_seen`
@@ -1134,7 +1182,7 @@ group id becomes a path) beside `state.json`, `tasks.json` and
                    "prior_agents": ["rev-2"],
                    "last_verdict": "pass", "at_head": "<sha>",
                    "briefed_head": "<sha>", "briefed_digest": "<digest>",
-                   "spawned_ms": 0 } ],
+                   "spawned_ms": 0, "briefed_verify": false } ],
       "lane_index": 0,
       "counters": { "review_rounds": 1, "ci_attempts": 0, "rebase_attempts": 0 },
       "started_ms": 0,
@@ -1226,6 +1274,32 @@ list since:
   *unreadable* digest on either side is "cannot tell" and does not mismatch,
   the asymmetry `ReviewVerdict::body_changed` already encodes: otherwise one
   transient failure to read a PR body re-briefs every open lane in the group.
+- **`briefed_verify`** (per lane, #2168 E2) — whether the brief now out on this
+  lane is a **body-verification delta**: every required lane had already passed
+  the code at this head, only the PR body moved, and this lane was asked for the
+  body as it stands. Per-revision, so it is read only together with the pair
+  above and cleared beside them on a re-drive.
+  **It is a capability grant, and that is why it is compared strictly.**
+  `review_verdict` consults it to decide whether the verdict it is about to
+  write carries `verified_body`, which is what lets `body-unchanged` stop asking
+  the lanes this one supersedes. So the comparison is exact equality on a
+  non-empty `briefed_head` AND `briefed_digest`, not `lane_open_for`'s
+  unknown-tolerant rule: that tolerance is right for "is this lane still open"
+  and wrong for "may this verdict discharge a gate condition", and a brief whose
+  revision cannot be pinned grants nothing. Only a **live** entry grants, for the
+  same reason §7 says only a live drive owns a pane: a held or terminal entry's
+  old brief is not a standing instruction.
+  **The grant and the sentence announcing it are one decision** (#2308 review 3).
+  The verification paragraph is rendered from the `verify` the step carried and
+  from nothing else, above the template selection, and interpolated into
+  whichever template the lane's history picks — because `rd_open_lane` renders
+  the brief BEFORE `open_lane` writes this field, so the record can never be
+  what decides what the brief says about it. Gating the paragraph on the lane
+  record instead left the ordinary path silent: a PR reviewed undriven and then
+  handed to `drive_review` after a body edit has no `at_head` on any lane, so it
+  rendered the first-round template and was granted anyway. What the sentence
+  asserts is a fact about the VERDICTS — every required lane passed this head —
+  and a lane record's `at_head` is what this drive last observed, which can lag.
 - **`fix_handback_ms`** (per entry) — when the drive last entered `fix-wait`.
   The `fix-stalled` anchor **in `fix-wait`**. **Named for the one thing it
   anchors, not for the state change that writes it**, and it stays that way now
@@ -2003,6 +2077,7 @@ orchestrator recovers its drives) and the audit log.
 | A lane's recorded session is empty because its CLI mints one late | The pane is asked instead (#2109). `spawn_agent_bound` returns a session id only for `cli == "claude"`, which pre-assigns a uuid; copilot and opencode mint theirs after boot and the watcher binds the discovered id to the PANE and the roster row, never to the lane record — so reading the record alone answered "no session" for every non-claude reviewer and every round opened a fresh conversation. `rd_lane_session` falls back to the live agent map and then the roster, in that order; the roster is what survives a pane that has since exited, which is exactly the lane a resume is FOR. Where neither knows one, the lane spawns fresh, as it always did. |
 | The worker pushes while a lane is mid-review | The head moves, so the drive re-enters `ci-wait` (§2.1 arc 6); the verdict that lands binds to the old head, so it decides nothing here — `fail`, `pass` and `escalate` alike read as absent and the lane is re-briefed after CI (§2.1's carried-over properties, as #1871 B1 rewrote them). One wasted review, bounded by the round counter; the re-brief itself spends no round, because a round counts findings delivered and this delivers none. This race is not designed away — it is the race the verdict binding already exists to handle. |
 | The PR body changes under a recorded `pass` | The `(head, digest)` key is re-read every tick, so a moved digest with an unchanged head re-enters `review-wait` at the first stale lane with a body-only delta brief. While a drive is live, body fixes go through the worker or the drive is cancelled first (§3.1 item 3). |
+| The PR body changes after **every** required lane has passed | **ONE lane is re-briefed, not all of them** (#2168 E2). The lane is the first in the gate's own `reviewers:` order — a repo says which lane it wants asked first by writing it first, and orrerix forms no opinion about what a lane costs (constraint 8) — and the brief is a **body-verification delta**: read the body as it stands, not the diff, and check what it asserts against the tree at this head. Its `pass` is recorded with `verified_body` (§5.2), and `body-unchanged` then accepts the passes it supersedes: they are bound to the same head, so the code they approved has not moved, and a required reviewer has read the body that would be committed. What the clause no longer asserts is that *every* reviewer read this body — see §4 for that trade, made against the measured cascade (five other-lane re-records at one head on #1764, three on #1751). **Precedence:** the delegation is asked strictly after the reviewer half, which is unchanged, so a `fail` still beats it, a lane that has recorded nothing still keeps the gate shut, and a pass bound to an older head is still stale. **Fail direction:** a body that moves again spends the verification (nothing carries the new digest, so every stale pass is reported again); an unreadable body is `BodyUnknown` as before; a superseded pass carrying no digest of its own is still refused. **What bounds the grant** is that only `review_verdict` writes the mark, and only from the drive's own lane record for the exact `(head, digest)` it briefed — so a reviewer cannot mark its own pass, and a repo with no driver sees `body-unchanged` exactly as it was. |
 | The worker fills the PR body's CI receipts after the checks settle | **The lane is not briefed until it has**, on any revision this drive handed back (#2168 E1, closing #1875's class). The receipts can only be written once the matrix is readable, so a lane briefed the instant CI went green was briefed at a digest about to move, and the `pass` it recorded was stale before it was written — measured on every code PR of that session, and instrumented on #1870: `pass` at digest `bbff76b8`, 0 findings, the CI section filled, `BODY CHANGED SINCE PASS`, gate blocked, re-record, head never moved. Arc 2 now requires `WorkerSignal::Done` on a head that arrived by arc 7 (§2.1), bounded from the push by `fix_timeout_minutes` into `held(fix-stalled)`. **What it degrades to when the worker never reports** is that hold, which names the worker's own pane — not silence, and not a brief. **What it does NOT cover** is a revision this drive never handed back: arc 6's push mid-review and the drive's own first pass both brief on green alone, for §2.1's reason (before a hand-back §7's interception is not keyed on the worker's pane, so no tick can see the report, and none was asked for), and each costs at most the one re-record round it always did. **The residual inside the covered case**: #1961's worker-pane exit read is asked only in `fix-wait`, so a pane that dies while the drive waits here is not seen as `worker-unresumable` on the next tick — that drive waits out `fix_timeout_minutes` and parks `fix-stalled`, bounded and named, but the slower notice. **A second residual, the same shape**: a worker that pushes AND reports inside one thirty-second tick window has both facts read on one tick, arc 7 outranks the report (§2.1) and the arc clears the signal, so this state waits for a report already spent and parks `fix-stalled` too. Not closed, because a `WorkerSignal` is a word and not a timestamp — the same `Done` beside a moved head is equally consistent with *reported, then pushed*, whose report is about the pre-push tree, and honouring it would brief a lane over exactly the unfinished revision #1875 is about. Failing toward a bounded hold rather than toward that defect is this slice’s direction throughout, and the ordering is uncommon by construction: the worker persona forbids `report(done)` before the matrix is re-read, and the matrix runs twenty to thirty minutes. **That residual clears on the first tick after `drive_review`** — what §2.2 requires of a wait hold — because arc 11 assigns `fix_pushed_ms` null, so the next green takes arc 2 with nothing further asked of the worker. **Two things a review round found were NOT residuals and are fixed here**: a further push inside one `ci-wait` stay re-anchors the wait (`note_fix_push`, §5.2) rather than leaving it running from the first one; and a worker's `report(progress)` in this state is answered in its own pane exactly as in `fix-wait`, because `kickback_owed` asks whether a hand-back is OUTSTANDING and E1 makes that two states — scoped to `fix-wait` it would have consumed the report, told the worker it reached the orchestrator, typed nothing back, and then held saying the driver had heard nothing from a worker that spoke. |
 | `gh` is missing, or a child is killed at the command timeout | `ResolveFailure::is_runner` — the seam itself failed: back off, no transition, no notice, bounded by whichever state the drive is in (§2.2 `held(state-stalled)`) and, past that, by `drive_timeout_minutes` → `held(drive-stalled)`. |
 | `gh` answers non-zero — rate-limited, unauthenticated, or the PR is genuinely gone | **Also back off; this is the row the obvious dichotomy gets wrong.** A rate-limited `gh` returns *promptly* with a non-zero exit, so it is not `Runner`: `resolve_pr_detailed` maps `!out.ok()` to `ResolveFailure::Refused(TargetRefusal::BaseUnverifiable)`, and nothing in `mqdriver.rs` mentions rate limiting at all. `BaseUnverifiable`'s own doc is "a lookup failed, or came back empty" — an **unknown**, not a fact about the PR — and `into_refusal` maps a `Runner` failure to the same code precisely because "unknown is never treated as safe". So a `Refused` answer is never grounds to terminate a drive; only §2.4's positive establishment is. |

@@ -557,6 +557,49 @@ impl OrchRegistry {
             .find_map(|e| e.driven_role(agent_id).map(|r| (e.pr, r)))
     }
 
+    /// **Was this lane's outstanding brief a body-verification delta at exactly
+    /// this revision?** (#2168 E2.) `review_verdict` asks before it writes, and
+    /// the answer becomes
+    /// [`workflow::ReviewVerdict::verified_body`](crate::orchestration::workflow::ReviewVerdict::verified_body).
+    ///
+    /// **A capability grant, so every comparison here is exact and every
+    /// unknown is a no.** `lane_open_for`'s digest rule is deliberately
+    /// unknown-TOLERANT — one transient `gh` failure to read a PR body must not
+    /// re-brief every open lane — and that tolerance is right for "is this lane
+    /// still open" and wrong for "may this verdict discharge the gate's
+    /// `body-unchanged` clause for the lanes it supersedes". So the brief's
+    /// recorded head and digest must be non-empty and must equal the ones the
+    /// verdict is being bound to; anything else grants nothing, and the verdict
+    /// is written exactly as it would have been before this existed.
+    ///
+    /// Only a LIVE drive grants: a held or terminal entry is not driving this
+    /// lane, and its old brief is not a standing instruction. Same read as
+    /// [`rd_owner`](Self::rd_owner), and the same reason.
+    pub fn rd_lane_briefed_verify(
+        &self,
+        group: &GroupId,
+        pr: u64,
+        block: &str,
+        head: &str,
+        body_digest: &str,
+    ) -> bool {
+        if head.is_empty() || body_digest.is_empty() {
+            return false;
+        }
+        let dir = self.group_dir(group);
+        let _state_guard = self.rd_state_lock.lock_safe();
+        let Ok(state) = reviewdrive::load_state(&dir) else { return false };
+        state
+            .entry(pr)
+            .filter(|e| e.state().is_live())
+            .and_then(|e| e.lane(block))
+            .is_some_and(|rec| {
+                rec.briefed_verify
+                    && rec.briefed_head == head
+                    && rec.briefed_digest == body_digest
+            })
+    }
+
     /// Record that a driven delegate's event was **consumed** by the driver
     /// rather than delivered to the orchestrator (§7).
     ///
@@ -1173,11 +1216,12 @@ impl OrchRegistry {
         brief: &RdBrief,
         limits: &reviewdrive::DriveLimits,
         now: u64,
+        verify: bool,
     ) -> Result<RdLaneOpen, String> {
         if block.is_empty() {
             return Err("no lane at that index".into());
         }
-        let text = self.rd_lane_brief(entry, block, brief, limits);
+        let text = self.rd_lane_brief(entry, block, brief, limits, verify);
         // **The lane's session is the pane's session, and the record is only
         // one of the two places it is written** (#2109).
         //
@@ -1369,7 +1413,15 @@ impl OrchRegistry {
                 (sp.id, sp.session_id.unwrap_or_default(), false)
             }
         };
-        entry.open_lane(block, &session_id, &agent, &brief.head, brief.body_digest_opt(), anchor);
+        entry.open_lane(
+            block,
+            &session_id,
+            &agent,
+            &brief.head,
+            brief.body_digest_opt(),
+            anchor,
+            verify,
+        );
         Ok(RdLaneOpen { agent, session: session_id, resumed })
     }
 
@@ -1833,6 +1885,7 @@ impl OrchRegistry {
         block: &str,
         brief: &RdBrief,
         limits: &reviewdrive::DriveLimits,
+        verify: bool,
     ) -> String {
         let round = entry.counters.review_rounds.saturating_add(1).to_string();
         let max = limits.max_review_rounds.to_string();
@@ -1866,6 +1919,56 @@ impl OrchRegistry {
             // only thing true of both.
             reviewdrive::CiObservation::Pending | reviewdrive::CiObservation::Unknown => "This PR's checks are not green at that head (orrerix could not read a settled result).",
         };
+        // **#2168 E2's paragraph is decided by `verify` and by nothing else**
+        // (#2308 review round 3, W1). It used to live inside the delta arm
+        // below, under a further `rec.at_head == brief.head` — so a lane with
+        // NO record, or one that had been briefed and not yet answered, was
+        // stamped `briefed_verify` by `open_lane` and handed the ordinary
+        // first-round brief. That path is not exotic: it is the
+        // undriven-to-driven transition, which is a PR reviewed by hand and
+        // then handed to `drive_review` after a body edit — the exact
+        // situation #2168 is about. `rd_open_lane` renders this BEFORE
+        // `open_lane` writes the record, so the record can never be the thing
+        // that decides what the brief says about the grant the record is
+        // about.
+        //
+        // Rendered once, here, and interpolated into whichever template the
+        // lane's history selects: the grant and the sentence announcing it are
+        // then one decision by construction rather than two that agree today.
+        // `a_verification_brief_announces_itself_on_every_path_that_grants_it`
+        // walks {record, no record} x {verify, not} and asserts the marker is
+        // present exactly when the grant is.
+        //
+        // **What it asserts is a fact about the VERDICTS, not about the drive's
+        // bookkeeping.** `decide_review_wait` sets `verify` only when every
+        // required lane has a `pass` bound to this head, which is read from the
+        // verdict files; a lane record's `at_head` is what this drive last
+        // observed and can lag. Gating the sentence on the latter made the
+        // announcement depend on something the claim does not rest on.
+        let verification = if verify {
+            // Stated as fact because it IS that precondition. The reviewer is
+            // told what its pass will be taken to MEAN, because the gate
+            // accepts the other lanes' passes on the strength of it — a grant
+            // said out loud in the brief rather than only in a design note.
+            //
+            // **What it asks for is deliberately repo-neutral.** orrerix has no
+            // idea what checking a body's receipts costs here, or what tool
+            // does it; it points the reviewer at the contributor docs, which is
+            // where a repo says (constraint 8).
+            " What moved: the head has not moved and the PR body has, and every \
+             required lane has already passed the code at this head. This is a \
+             VERIFICATION-ONLY round: read the body as it stands, not the diff. \
+             Check what it asserts against the tree at this head — figures, run \
+             ids, SHAs, quoted passages — plus whatever this repo's contributor \
+             docs tell a reviewer to run over a PR body. Your pass records that \
+             the body as it stands is sound, and the merge gate accepts the other \
+             lanes' passes on the strength of it instead of re-briefing them, so \
+             a body defect you wave through is one nobody else will look at. A \
+             finding about the code is still in scope if you see one; you are not \
+             being asked to go looking for one."
+        } else {
+            ""
+        };
         match entry.lane(block).filter(|l| !l.at_head.is_empty()) {
             // A lane that has answered before gets the delta — the line an
             // orchestrator typed by hand nine times on one PR.
@@ -1883,7 +1986,13 @@ impl OrchRegistry {
                 } else {
                     "changed"
                 };
-                let moved = if rec.at_head == brief.head {
+                let moved = if verify {
+                    // The grant outranks the record: see the block above the
+                    // `match`. `verification` opens with a space so it reads as
+                    // an appended clause in the other arm; this slot wants it
+                    // without one.
+                    verification.trim_start().to_string()
+                } else if rec.at_head == brief.head {
                     // **What this half says changed at #2168 E1.** Until then
                     // the commonest cause of a body-only re-brief was the
                     // worker pasting its CI receipts after the checks settled —
@@ -1902,11 +2011,12 @@ impl OrchRegistry {
                     // over a head it never handed back, where the receipts race
                     // is unchanged. A flat sentence would be the wider claim,
                     // and this brief lands in a reviewer's pane as fact.
-                    "What moved: the head has not moved and the PR body has. Re-read the body, \
-                     not the diff — the body is what a squash merge commits, so text that moved \
-                     there is text nobody has passed. After a hand-back the driver waits for the \
-                     worker's report(done) before opening this lane, so a body move you see \
-                     following one is a deliberate edit rather than CI receipts landing late."
+                    "What moved: the head has not moved and the PR body has. Re-read the \
+                     body, not the diff — the body is what a squash merge commits, so text \
+                     that moved there is text nobody has passed. After a hand-back the \
+                     driver waits for the worker's report(done) before opening this lane, \
+                     so a body move you see following one is a deliberate edit rather than \
+                     CI receipts landing late."
                         .to_string()
                 } else {
                     // **What this brief does NOT claim.** orrerix does not
@@ -1970,6 +2080,11 @@ impl OrchRegistry {
                         ("ROUND", &round),
                         ("MAX_ROUNDS", &max),
                         ("PRIOR_LANES", &prior),
+                        // #2308 W1: the arm that used to grant in silence. A
+                        // lane with no record — the undriven-to-driven
+                        // transition — is briefed HERE, and before this it was
+                        // stamped `briefed_verify` without ever being told.
+                        ("VERIFICATION", verification),
                     ],
                 )
             }
@@ -2446,7 +2561,7 @@ impl OrchRegistry {
                     }
                 }
             }
-            reviewdrive::DriveStep::OpenLane { index } => {
+            reviewdrive::DriveStep::OpenLane { index, verify } => {
                 // `decide` only ever names an index into the list it was handed,
                 // so `None` is unreachable — and it is handled by falling
                 // THROUGH rather than returning, because an early return here
@@ -2459,7 +2574,7 @@ impl OrchRegistry {
                 // asks about — and turned into a row only on the `Ok` arm,
                 // because a re-open the cap refused has re-opened nothing.
                 let replaced = entry.lane(&block).and_then(|rec| self.rd_dead_lane_pane(rec));
-                match self.rd_open_lane(group, entry, &block, &brief, limits, now) {
+                match self.rd_open_lane(group, entry, &block, &brief, limits, now, *verify) {
                     Ok(RdLaneOpen { agent, session, resumed }) => {
                         entry.lane_index = *index;
                         if let Some((pane, killed_by)) = replaced {

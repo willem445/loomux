@@ -263,6 +263,7 @@ fn verdict_map(head: &str, body: &str) -> BTreeMap<BlockId, ReviewVerdict> {
             verdict: Verdict::Pass,
             head: head.into(),
             body_digest: body_digest(body),
+            verified_body: false,
             summary: String::new(),
             ts_ms: 0,
         },

@@ -1390,6 +1390,64 @@ loomux_sha256() { # stdin → 64 hex chars, or empty
   case "$_h" in *[!0-9a-f]*) _h='' ;; esac
   printf '%s' "$_h"
 }
+# Read a verdict file's LINE 5 the way `workflow::parse_verdict_file` does, and
+# apply `workflow::sanitize_digest` to what that yields. Sets `v_digest` (the
+# lowercased 64-hex digest, or empty when the line does not carry one) and
+# `v_mark` (1 when the #2168 E2 `verified-body` mark is present).
+#
+# **One helper because the alternative is three approximations** (#2308 review 5).
+# Every earlier cut tested `${line%% *}` — the first whitespace FIELD — while
+# Rust runs `sanitize_digest` over the WHOLE line minus a trailing mark. The two
+# disagree on both sides at once, and each direction was reached by a real
+# fixture: line 5 reading `<64-hex> is the body digest this pass read` is a
+# first field of 64 hex, so the shim ACCEPTED a pass the Rust half refuses (loose,
+# on the half that refuses merges); and an UPPERCASE 64-hex digest is refused by a
+# `[!0-9a-f]` class while `sanitize_digest` accepts any case and lowercases
+# (strict, so a drive cycles to `drive-stalled` instead of merging). Neither is
+# reproduction. `the_shim_and_the_gate_agree_about_which_passes_a_verification_covers`
+# runs both halves over the same files, including those two.
+loomux_verdict_line5() { # $1=verdict file → sets v_digest, v_mark
+  v_raw=$(head -n5 "$1" 2>/dev/null | tail -n1)
+  v_sp=' '
+  v_tb=$(printf '\t')
+  v_cr=$(printf '\r')
+  # `str::lines()` strips ONE TRAILING `\r` per line and keeps every interior
+  # one, so this does too (#2308 round 5, rev-std NB). `tr -d` deleted them all,
+  # which could turn a digest with a CR through it into 64 hex for the shim while
+  # Rust still read it as unreadable — loose, on the half that refuses merges,
+  # the same class as the two findings above. It is also no longer a normalizer:
+  # a parameter expansion cannot fail the way a missing coreutil can, so #509's
+  # empty-output hazard does not arise and there is nothing here to guard.
+  v_l=${v_raw%"$v_cr"}
+  v_mark=0
+  # `trim_end` before the mark split, exactly as `parse_verdict_file` orders it.
+  while :; do
+    case "$v_l" in *"$v_sp"|*"$v_tb") v_l=${v_l%?} ;; *) break ;; esac
+  done
+  case "$v_l" in
+    *" verified-body") v_l=${v_l% verified-body}; v_mark=1 ;;
+  esac
+  # …then `sanitize_digest`, which trims BOTH ends and demands exactly 64 hex.
+  # Interior whitespace is deliberately NOT stripped: removing it could turn a
+  # 65-character line into 64 hex and accept what Rust refuses, which is the very
+  # direction this helper exists to close.
+  while :; do
+    case "$v_l" in
+      "$v_sp"*|"$v_tb"*) v_l=${v_l#?} ;;
+      *"$v_sp"|*"$v_tb") v_l=${v_l%?} ;;
+      *) break ;;
+    esac
+  done
+  v_digest=''
+  case "$v_l" in
+    *[!0-9a-fA-F]*) v_l='' ;;
+    *) [ ${#v_l} -eq 64 ] || v_l='' ;;
+  esac
+  if [ -n "$v_l" ]; then
+    v_digest=$(printf '%s' "$v_l" | tr 'A-F' 'a-f')
+    loomux_norm_guard "$v_l" "$v_digest" "a verdict file's body digest"
+  fi
+}
 # #256: CLAIM a one-time grant without spending it yet — the MERGE gate's grant
 # (`merge_grants/pr-<N>`) is the only one-time grant left, and it must be
 # consumed only when the real `gh` call it authorizes actually SUCCEEDS (live
@@ -2220,6 +2278,30 @@ if [ -f "$ORX_GD/merge_gate" ]; then
         loomux_norm_guard "$b_raw" "$b_norm" "the PR body"
         b_now=$(printf '%s\n' "$b_norm" | loomux_sha256)
         [ -n "$b_now" ] || loomux_block_wf "no-sha256" "the gate requires body-unchanged but this host has no usable sha256 tool (sha256sum, shasum or openssl), so orrerix cannot compare the PR body against the one the reviewers passed — a condition it cannot check refuses the merge"
+        # #2168 E2, PASS 1: has one of the gate's OWN reviewers recorded a
+        # body-VERIFICATION pass covering the body as it stands? That is line 5
+        # reading `<digest> verified-body`, on a live pass — a marker only the
+        # `review_verdict` tool writes, and only for a lane the review driver
+        # briefed BECAUSE every required lane had already passed the code at
+        # this head and only the body had moved. A reviewer cannot type it: line
+        # 5 is the tool's, and everything a reviewer writes lands on line 6 and
+        # below.
+        #
+        # Two passes rather than one, because the answer is a property of the
+        # whole reviewer SET and pass 2 asks it of each member: deciding it
+        # inside one loop would make it depend on the order `$g_revs` happens to
+        # be in.
+        b_verified=0
+        for b_r in $g_revs; do
+          b_vf="$ORX_GD/verdicts/pr-$num/$b_r"
+          [ -f "$b_vf" ] || continue
+          [ "$(head -n1 "$b_vf" 2>/dev/null)" = "pass" ] || continue
+          [ "$(head -n2 "$b_vf" 2>/dev/null | tail -n1)" = "$cur_head" ] || continue
+          loomux_verdict_line5 "$b_vf"
+          if [ "$v_mark" = "1" ] && [ -n "$v_digest" ] && [ "$v_digest" = "$b_now" ]; then
+            b_verified=1
+          fi
+        done
         b_bad=""
         for b_r in $g_revs; do
           b_vf="$ORX_GD/verdicts/pr-$num/$b_r"
@@ -2230,10 +2312,33 @@ if [ -f "$ORX_GD/merge_gate" ]; then
           # and re-recording is the same action whether or not it was load-bearing.)
           [ "$(head -n1 "$b_vf" 2>/dev/null)" = "pass" ] || continue
           [ "$(head -n2 "$b_vf" 2>/dev/null | tail -n1)" = "$cur_head" ] || continue
-          # Line 5 is the body digest it reviewed. Absent (a verdict recorded before
-          # #565, or one whose body gh could not read) reads as EMPTY, which equals
-          # no digest and so refuses — unknown is never "unbound, therefore fine".
-          [ "$(head -n5 "$b_vf" 2>/dev/null | tail -n1)" = "$b_now" ] || b_bad="$b_bad $b_r"
+          # Line 5 is the body digest it reviewed, read through the one helper
+          # that reproduces `parse_verdict_file` + `sanitize_digest`. Absent (a
+          # verdict recorded before #565, or one whose body gh could not read)
+          # reads as EMPTY, which equals no digest and so refuses — unknown is
+          # never "unbound, therefore fine".
+          loomux_verdict_line5 "$b_vf"
+          b_vd=$v_digest
+          if [ -n "$b_vd" ] && [ "$b_vd" = "$b_now" ]; then
+            continue
+          fi
+          # The delegation. This pass is at an EARLIER body, and it is accepted
+          # only because a required reviewer verified the body as it stands while
+          # this pass stayed bound to the head that would merge — so the code it
+          # approved has not moved.
+          #
+          # **A pass with no READABLE digest is refused** (#2308 reviews 4 and 5).
+          # A verdict file written before #565 has SUMMARY PROSE on line 5, and
+          # two successive approximations of `sanitize_digest` let one through:
+          # first "non-empty", then "the first field is 64 lowercase hex" — which
+          # a prose line beginning with a digest satisfies. `v_digest` is the
+          # helper's answer over the whole field, so the two halves now decide
+          # this from one rule. Agreement is executed, not asserted:
+          # `the_shim_and_the_gate_agree_about_which_passes_a_verification_covers`.
+          if [ "$b_verified" = "1" ] && [ -n "$b_vd" ]; then
+            continue
+          fi
+          b_bad="$b_bad $b_r"
         done
         [ -z "$b_bad" ] || loomux_block_wf "body-changed" "the PR body is not the one reviewer(s)$b_bad passed — and this repo squash-merges, so that body becomes the permanent commit message. Whoever edited it, the fix is the same: those reviewers re-read the body as it stands and re-record" ;;
       # #1174 STOP THE LINE. `ci-green` asks about THIS PR; `base-green` asks about
@@ -44252,6 +44357,18 @@ impl OrchRegistry {
                 String::new()
             }
         };
+        // #2168 E2: was the brief this verdict answers a body-verification
+        // delta? Asked of the DRIVE's own lane record, never of anything the
+        // reviewer typed — the same discipline as `body_digest` above, and for
+        // a stronger reason: this one lets the gate accept the passes this
+        // verdict supersedes, so a reviewer that could set it could open the
+        // `body-unchanged` clause for lanes that never read this body.
+        //
+        // Read after `head` and `body_digest` because it is checked AGAINST
+        // them: the grant is scoped to the exact revision the brief named, and
+        // a verdict orrerix could not bind to a head or a body never carries it.
+        let verified_body =
+            self.rd_lane_briefed_verify(group, num, &block, &head, &body_digest);
         let rec = workflow::ReviewVerdict {
             pr: num,
             block,
@@ -44259,6 +44376,7 @@ impl OrchRegistry {
             verdict,
             head,
             body_digest,
+            verified_body,
             summary,
             ts_ms: now_ms(),
         };
@@ -44275,6 +44393,12 @@ impl OrchRegistry {
             "verdict": rec.verdict.as_str(),
             "head": rec.head,
             "body_digest": rec.body_digest,
+            // #2168 E2: a verdict that discharges `body-unchanged` for the
+            // lanes it supersedes says so on the audit trail, because §5.4's
+            // rule is that an audit action names what actually happened — and
+            // "this pass was taken to cover two other reviewers' bodies" is the
+            // part a reader would otherwise have to infer from a file format.
+            "verified_body": rec.verified_body,
             "summary": rec.summary.chars().take(500).collect::<String>(),
             "warnings": warnings.clone(),
         }));
@@ -44451,8 +44575,43 @@ impl OrchRegistry {
         // enforced on neither here — enforcement is the opt-in `also: body-unchanged`
         // condition, checked at merge time in the shim, exactly like `ci-green`.
         let (drift_passed, drift_blocking) = self.body_drift(group, pr, body_digest);
+        // #2168 E2: a required reviewer may have recorded a body-VERIFICATION
+        // pass covering the body as it stands, in which case the drifted passes
+        // above are ones `body-unchanged` accepts and "have them re-read and
+        // re-record" would be a false instruction — the whole point of the
+        // delegation is that they are not asked again. Read through the gate's
+        // own definition rather than re-derived, and over the ROUTED reviewer
+        // list, because a block the gate does not name discharges nothing.
+        //
+        // **Three cheap conditions before the read, each for its own reason.**
+        // No drifted pass: there is nothing to say a different sentence about.
+        // No declared `body-unchanged`: on such a repo the clause accepts
+        // nothing because it is never checked, so the sentence would be a claim
+        // about a condition this gate does not have — the drift is still
+        // REPORTED there, exactly as it always was. And the read itself walks
+        // the verdict directory a second time, after `body_drift` has already
+        // walked it, which is the cost #791 spent a slice removing from this
+        // very function.
+        let verified = !drift_passed.is_empty()
+            && gate.also.iter().any(|c| c == "body-unchanged")
+            && head.as_ref().ok().is_some_and(|h| {
+                mergeq::body_verified_by_required(
+                    &gate,
+                    &self.verdict_map(group, pr),
+                    h,
+                    body_digest,
+                )
+            });
         let mut body_note = String::new();
-        if !drift_passed.is_empty() {
+        if verified {
+            body_note.push_str(&format!(
+                " BODY CHANGED SINCE PASS, and VERIFIED SINCE: {} passed an earlier PR body, and \
+                 a required reviewer has since read the body as it stands and passed it. This \
+                 gate's `body-unchanged` condition accepts that, so those reviewers are NOT \
+                 owed a re-read — the code they passed has not moved.",
+                drift_passed.join(", ")
+            ));
+        } else if !drift_passed.is_empty() {
             body_note.push_str(&format!(
                 " BODY CHANGED SINCE PASS: {} passed a DIFFERENT PR body than the one on the PR \
                  now — and the body is what a squash merge records as the commit message. Have \
