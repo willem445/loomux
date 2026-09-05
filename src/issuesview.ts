@@ -38,6 +38,7 @@ import {
   type ViewMode,
 } from "./issuesmodel";
 import { RefreshGate } from "./refreshgate";
+import { scopeChanged, shouldReresolve, resolvedHold } from "./labelvocab.ts";
 
 // gh.rs surfaces its bare "gh-not-found" sentinel from every command, not just
 // auth status (a gh removed mid-session) — map it to the install hint wherever
@@ -136,11 +137,25 @@ export class IssuesView {
 
   private repoRoot: string | null = null;
   /** The veto spelling (#778) for this pane's repo AND group, resolved by the
-   *  backend. Starts at the built-in and is replaced when the repo resolves —
-   *  never guessed from a label the list happened to contain. Re-resolved on
-   *  every repo change; the group half needs no re-resolution because a pane's
-   *  group is fixed for the life of the pane (#2663). */
+   *  backend — never guessed from a label the list happened to contain.
+   *
+   *  **Not cached per repo.** An earlier version of this comment said the group
+   *  half needed no re-resolution "because a pane's group is fixed for the life"
+   *  of the pane; the code says otherwise twice over. A pane GAINS a group
+   *  mid-life on #407's in-place promotion (`applyOrchIdentity` runs from
+   *  `respawnFresh`), and this view survives that — it is disposed only with
+   *  the pane. And a fixed group's own vocabulary moves under an open view when
+   *  `apply_workflow` rewrites its `guardrails.intake` (#1689 B). `labelvocab.ts`
+   *  owns when to re-ask and what a failed ask leaves behind; see there for why
+   *  a group re-resolves every refresh while a plain pane still does not. */
   private holdLabel: string = DEFAULT_HOLD;
+  /** What `holdLabel` was last resolved FOR — the pair `labelvocab` compares.
+   *  `repo` trails `repoRoot` by design: it moves only once a resolve for that
+   *  repo has actually been attempted. */
+  private vocabScope: { repo: string | null; group: string | null } = {
+    repo: null,
+    group: null,
+  };
   private issues: GhIssue[] = [];
   private prs: GhPr[] = [];
   /** Which list is showing — issues or pull requests. */
@@ -353,19 +368,31 @@ export class IssuesView {
         this.repoRoot = root;
         this.issues = [];
         this.prs = [];
-        // ...and re-resolve the veto spelling, which is this repo's config, not
-        // the last one's. Resolved BEFORE the gh auth gate below, deliberately:
-        // it reads a file rather than calling `gh`, so a repo with no gh auth
-        // still renders the right button — and a failure here falls back to the
-        // built-in rather than blanking the view, which is what the backend's
-        // allow-list would accept for a repo whose file it also could not read.
+      }
+
+      // Re-resolve the veto spelling when `labelvocab` says the cached one could
+      // be about something else — a different repo, a group this pane did not
+      // have before (#407 promotion), or the same group after an
+      // `apply_workflow` moved its vocabulary out from under an open view.
+      // Resolved BEFORE the gh auth gate below, deliberately: it reads a file or
+      // a registry entry rather than calling `gh`, so a repo with no gh auth
+      // still renders the right button — and a failure here never blanks the
+      // view.
+      const nextScope = { repo: root, group: this.host.getGroupId() };
+      if (shouldReresolve(this.vocabScope, nextScope)) {
+        // A scope change discards the previous answer; within one scope it is
+        // what a blipped call falls back to, rather than silently retracting a
+        // rename. `labelvocab.resolvedHold` owns that rule.
+        const previous = scopeChanged(this.vocabScope, nextScope) ? null : this.holdLabel;
+        let fetched: string | null = null;
         try {
-          this.holdLabel =
-            (await ghLabelVocabulary(root, this.host.getGroupId())).hold || DEFAULT_HOLD;
+          fetched = (await ghLabelVocabulary(root, nextScope.group)).hold;
         } catch {
-          this.holdLabel = DEFAULT_HOLD;
+          fetched = null;
         }
         if (this.disposed) return;
+        this.holdLabel = resolvedHold(fetched, previous, DEFAULT_HOLD);
+        this.vocabScope = nextScope;
       }
 
       // gh presence/auth gates everything — one cheap check up front so a

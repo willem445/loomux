@@ -685,10 +685,26 @@ fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
 #[test]
 fn every_group_taking_command_parses_its_id_at_the_boundary() {
     /// Every file holding `#[tauri::command]`s, with the floor of group-taking
-    /// ones each must still yield. `mod.rs`'s ~49 floors at 45; `gh.rs`'s two
-    /// floor at 1, which is what fails if its `group` parameter is renamed away
-    /// or the file stops being scanned at all.
-    const FILES: &[(&str, usize)] = &[("src/orchestration/mod.rs", 45), ("src/gh.rs", 1)];
+    /// ones each must still yield.
+    ///
+    /// **`gh.rs`'s floor IS its population**, and the two numbers are different
+    /// kinds of thing on purpose (rev-final round 1, finding 1). A floor of 1
+    /// against a population of 2 would have passed with one of the two commands
+    /// renamed out of the shape — `checked == 1 >= 1`, `unparsed` empty because
+    /// the parameter no longer matches, and that command silently unscanned:
+    /// exactly the "a root that stops being scanned reports zero silently"
+    /// argument that split these floors, at half scale. gh.rs has two
+    /// group-taking commands and will have two until someone adds one, so an
+    /// exact floor costs a one-line edit when that happens and catches a rename
+    /// of EITHER until then.
+    ///
+    /// **`mod.rs`'s stays slack** (45 against ~49), and that asymmetry is
+    /// argued rather than left over: it gains and loses group-taking commands
+    /// most rounds, so an exact floor there would fail on every unrelated
+    /// addition and be relaxed within a week — which is how a guard stops
+    /// guarding. Its floor pins that the scan still SEES the class; gh.rs's
+    /// pins the class exactly.
+    const FILES: &[(&str, usize)] = &[("src/orchestration/mod.rs", 45), ("src/gh.rs", 2)];
 
     let mut unparsed = Vec::new();
     for (rel, floor) in FILES {

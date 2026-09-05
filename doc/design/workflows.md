@@ -2684,11 +2684,18 @@ messages, and the `{{WORKFLOW_PATH}}` variable rendered into `workflow.md` and
 what makes it legitimate for their text to move for a named workflow; the four
 role templates are pinned and were not touched.
 
-**No reader is left on the `default` file** (#2663), and
+**No reader reads the `default` file DIRECTLY** (#2663) — every one goes
+through the pair above — and
 `only_the_argued_residuals_still_read_the_default_workflow_directly`
 (`src-tauri/tests/workflow.rs`) is what keeps that true: default-deny over
 `src-tauri/src`, failing both when a new site appears and when an allow-listed
 row goes stale.
+
+The qualifier is load-bearing, not throat-clearing (rev-final round 1, finding
+3): plenty of readers still END UP at `.orrerix/workflow.yml`, including the
+`gh.rs` arm three paragraphs down, because that is what `default` resolves to.
+What the scan forbids is reaching it by a function that can only ever answer
+for `default` — the word its own test name carries.
 
 The plan predicted two residuals; both are closed, and each was closed the same
 way. `orch_workflow_preview_sync` with no `name` was the second, and it stopped
