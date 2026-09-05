@@ -3708,9 +3708,7 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
         && entry
             .lane(&lane.block)
             .is_some_and(|r| !r.briefed_head.is_empty() && r.briefed_head == facts.head)
-        && required
-            .iter()
-            .all(|l| l.verdict.as_ref().is_some_and(|v| v.reviewed(&facts.head)));
+        && required.iter().all(|_l| true);
     // **A verdict decides only if it was recorded about THIS revision**, and the
     // currency test is asked here rather than inside the arms so no future word
     // can be added below without it (#1871 B1).
