@@ -61580,7 +61580,7 @@ fn a_codex_pane_finds_its_session_by_cwd_after_the_baseline_and_refuses_a_contes
 }
 
 /// A torn header is `Waiting`, not a wrong binding — the mid-write case a poll
-/// every two seconds will hit sooner or later.
+/// on a five-second tick will hit sooner or later.
 ///
 /// Separate from the test above because it is about a file that exists and
 /// cannot be read, which is a different question from a file that names a
