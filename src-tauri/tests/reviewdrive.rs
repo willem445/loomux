@@ -1981,8 +1981,9 @@ fn a_lane_that_has_answered_is_re_briefed_with_the_delta_template() {
 /// prose it rides on.
 ///
 /// The `rd-lane-spawned` audit row carries the same string, asserted on every
-/// block — the row is what a beta's before/after count reads, and a row that
-/// disagreed with the brief would make that count measure nothing.
+/// block (#2508 review round 2) — the row is what a beta's before/after count
+/// reads, and a row that disagreed with the brief would make that count measure
+/// nothing.
 #[test]
 fn the_lane_brief_names_the_round_scope_on_every_round_mode() {
     // ── whole-diff: a first round, nothing has ever been briefed or answered ──
@@ -2203,6 +2204,19 @@ fn the_lane_brief_names_the_round_scope_on_every_round_mode() {
         assert!(
             !text.contains("head moved from"),
             "the head did not move, so the delta-text arm must not have rendered: {text}"
+        );
+        // The audit row on the verify-granted path (#2508 review round 2): the
+        // re-brief emits `rd-lane-spawned`, and the row's `scope` must equal the
+        // brief's line here too — this block reached `body-only` through the
+        // `verify` early return, which is the one path the other three blocks
+        // cannot witness.
+        let row = lane_spawn_rows(&reg, &group)
+            .last()
+            .cloned()
+            .expect("the verification round spawned a lane, which emitted rd-lane-spawned");
+        assert_eq!(
+            row["scope"], json!("scope: body-only"),
+            "rd-lane-spawned must carry the scope the brief rendered: {row}"
         );
     }
     // ── body-only, the OTHER path: answered at this head, verify not granted ──
