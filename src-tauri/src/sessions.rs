@@ -4,19 +4,20 @@
 //! Copilot CLI:    ~/.copilot/session-state/<uuid>/workspace.yaml
 //! OpenCode:       <xdg-data>/opencode/opencode.db (one SQLite store, #722)
 //! pi:             ~/.pi/agent/sessions/--<encoded-path>--/<ts>_<uuid>.jsonl (#2126)
+//! codex:          ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl (#2515)
 //!
 //! Every scanner is best-effort: unreadable or malformed entries are
 //! skipped, and a missing tool simply yields an empty list. New agent
 //! sources can be added by implementing another `scan_*` function and
 //! extending `list_sessions`.
 //!
-//! Three of the four enumerate FILES, one queries a DATABASE, and that shows
+//! Four of the five enumerate FILES, one queries a DATABASE, and that shows
 //! up in the shape of the scan below: the candidate/`session-index.json`
 //! machinery (#493) exists to avoid re-reading the head of a file that hasn't
 //! changed, which is a cost opencode's store simply doesn't have — see
 //! `scan_opencode`. pi is on the file side, so it is one
 //! `collect_pi_candidates` plus one `parse_candidate` arm and gets the index
-//! for free.
+//! for free, and codex (#2515 C2) the same.
 //!
 //! **The pure discovery core lives in [`loomux_engine::sessions`]** (#888 slice
 //! A4, batch 14) — store roots, one session's record, and the by-id cwd
@@ -59,7 +60,8 @@ use std::time::UNIX_EPOCH;
 // scan tests must never read the developer's own `~/.pi`.
 pub use loomux_engine::sessions::{
     detect_orch_signature, find_session_cwd, set_claude_projects_root_for_test,
-    set_copilot_session_state_root_for_test, set_pi_sessions_root_for_test,
+    set_codex_sessions_root_for_test, set_copilot_session_state_root_for_test,
+    set_pi_sessions_root_for_test,
 };
 
 // Was `pub(crate)`: `opencodedb`'s `norm_path` comparison, `digest`'s
@@ -73,7 +75,8 @@ pub(crate) use loomux_engine::sessions::{
 // Was module-private: only the scan machinery below calls these, so a bare
 // `use` keeps them reachable from nowhere else, exactly as before.
 use loomux_engine::sessions::{
-    pi_sessions_root, read_copilot_session, scan_claude_jsonl, scan_pi_jsonl, tidy_title,
+    codex_rollout_thread_id_of, codex_sessions_root, pi_sessions_root, read_copilot_session,
+    scan_claude_jsonl, scan_codex_jsonl, scan_pi_jsonl, tidy_title, walk_codex_session_files,
     walk_pi_session_files,
 };
 
@@ -83,11 +86,19 @@ use loomux_engine::sessions::{
 #[doc(hidden)] // pub for integration tests
 pub use loomux_engine::sessions::pi_sessions_root_from;
 
+// `codex_sessions_root_from` is the pure resolver behind `codex_sessions_root`,
+// re-exported for the same reason and reachable from nowhere else:
+// `tests/codexsessions.rs` pins each of its branches, and a test binary can
+// only reach it through this crate.
+#[doc(hidden)] // pub for integration tests
+pub use loomux_engine::sessions::codex_sessions_root_from;
+
 #[derive(Serialize)]
 pub struct SessionInfo {
     /// Session id understood by the agent's `--resume` flag.
     pub id: String,
-    /// Which agent owns the session: "claude" | "copilot" | "opencode" | "pi".
+    /// Which agent owns the session: "claude" | "copilot" | "opencode" | "pi" |
+    /// "codex".
     ///
     /// The frontend declares this same set as a union type
     /// (`SessionInfo["source"]` in `src/pty.ts`), and nothing checks the two
@@ -125,9 +136,10 @@ pub struct SessionInfo {
 struct Candidate {
     /// The file whose `(mtime, len)` both keys and validates this session's
     /// index entry: claude's `<id>.jsonl`, copilot's `workspace.yaml`, pi's
-    /// `<timestamp>_<id>.jsonl`.
+    /// `<timestamp>_<id>.jsonl`, codex's `rollout-<ts>-<id>.jsonl` — or, for a
+    /// rollout codex has since compressed, that same name plus `.zst`.
     path: PathBuf,
-    /// "claude" | "copilot" | "pi" — which parser this candidate needs.
+    /// "claude" | "copilot" | "pi" | "codex" — which parser this candidate needs.
     source: &'static str,
     /// Claude's filename IS the session id, so it's free at collection time;
     /// copilot's only authoritative id lives inside `workspace.yaml` (see
@@ -279,6 +291,70 @@ fn collect_pi_candidates(out: &mut Vec<Candidate>) {
         });
         None
     });
+}
+
+/// Every codex rollout in the human's OWN store, as metadata-only candidates
+/// (#2515 C2).
+///
+/// **Which store is the whole question, exactly as it is for opencode and pi.**
+/// A solo pane — the only kind this tab can offer to reopen — is launched with
+/// no `CODEX_HOME` of loomux's own, so it writes where an unadorned `codex`
+/// writes. That is the one enumerated here; a group's sessions are reopened
+/// THROUGH the group, with its roster, board and MCP identity
+/// (`resumeOrchSession`), never as a bare `resume` pane.
+///
+/// Routes through the engine's testable `codex_sessions_root()` rather than a
+/// second `dirs::home_dir()` inline — the #457 gap, not reopened — and through
+/// the engine's `walk_codex_session_files`, so the browser and the by-id lookup
+/// cannot disagree about which files a codex store holds. That walker's doc
+/// carries the vendor citations, the local-date reasoning, the skipped
+/// `archived_sessions/` residual, and why both `.jsonl` and `.jsonl.zst` are
+/// visited.
+///
+/// **The id comes from the file NAME here, and the header overrides it in**
+/// `parse_candidate` — the same two-source rule pi's rows follow. It matters
+/// more for codex than for pi, because a COMPRESSED rollout has no header this
+/// crate can read at all: the name is then the only source of an id, and
+/// without it a week-old session would have no row rather than a row with an
+/// unknown workspace.
+///
+/// A file whose metadata cannot be read is skipped (#493), and so is one whose
+/// name does not parse as a rollout's — the walker has already refused
+/// everything that is not `rollout-*.jsonl[.zst]`, so what is left here is the
+/// narrower "well-formed prefix, no id in it".
+fn collect_codex_candidates(out: &mut Vec<Candidate>) {
+    let Some(root) = codex_sessions_root() else {
+        return;
+    };
+    // Always `None`, so the walk never short-circuits and every file is seen;
+    // the rows accumulate through the captured `out`.
+    walk_codex_session_files(&root, |path| -> Option<()> {
+        let id = codex_id_from_rollout_name(path)?;
+        let (modified_ms, len) = candidate_meta(path)?;
+        out.push(Candidate {
+            path: path.to_path_buf(),
+            source: "codex",
+            id: Some(id),
+            modified_ms,
+            len,
+        });
+        None
+    });
+}
+
+/// The thread id a walked rollout's file name carries, for the row's `id` before
+/// anything is parsed.
+///
+/// A thin `&Path` wrapper over the engine's own name grammar rather than a
+/// second copy of it: the `.zst` strip and the
+/// "offset 20 up to `_` or the end" rule live once, next to the vendor citation
+/// that justifies them, and this side only decides which `&Path` to ask about.
+/// Widening the engine's own helper to take a `&Path` was the alternative and is
+/// worse: it would push a filesystem type into a pure string parser for one
+/// caller's convenience.
+fn codex_id_from_rollout_name(path: &Path) -> Option<String> {
+    let name = path.file_name().and_then(|s| s.to_str())?;
+    loomux_engine::sessions::codex_rollout_thread_id_of(name).map(str::to_string)
 }
 
 // ---------- opencode: the human's OWN store (#722 slice C2) ----------
@@ -916,6 +992,32 @@ fn build_resume_command(cli: &str, session_id: &str, cwd: &str, store: &LaunchIn
         // Without this arm the `_` fallback below would answer for pi —
         // emitting `claude --resume <id>`, i.e. the WRONG CLI handed an id
         // belonging to another vendor's store.
+        // #2515 C2. `codex resume <id>` continues a recorded session:
+        // "Session id (UUID) or session name. UUIDs take precedence if it
+        // parses" (`codex resume --help`, 0.153.4), resolved by id over the
+        // WHOLE store rather than per-cwd, which is what makes a bare resume
+        // line work from anywhere.
+        //
+        // A subcommand, not a flag, and that is the one structural difference
+        // from every other arm here — it is why `panerestore.ts` excises a
+        // trailing `resume <id>` positionally rather than by flag name.
+        //
+        // No `-C <cwd>`: this row came out of the human's OWN store and the
+        // pane is opened in the session's own recorded directory by the
+        // caller, so codex is already launched where the session ran and has
+        // no cwd question to prompt about. No `-p`/profile either — that is
+        // loomux's group wiring, and a session with a recorded orchestration
+        // membership never reaches this string (see the module doc above).
+        //
+        // No posture arm, and that is #460's rule rather than an omission:
+        // nothing records a launch intent for a codex pane, so there is no
+        // unambiguous ON record to honor and a bare resume is the smaller
+        // grant. An approval posture is never inferred here.
+        //
+        // Without this arm the `_` fallback below would answer for codex —
+        // emitting `claude --resume <id>`, i.e. the WRONG CLI handed an id
+        // belonging to another vendor's store.
+        "codex" => format!("codex resume {session_id}"),
         "pi" => format!("pi --session {session_id}"),
         _ => {
             let base = format!("claude --resume {session_id}");
@@ -1083,6 +1185,31 @@ fn parse_candidate(c: &Candidate) -> Option<Parsed> {
         // command that works rather than one that names a session pi has never
         // heard of. A row with NEITHER is dropped, like a copilot directory
         // whose `workspace.yaml` carries no `id`.
+        let id = match (head.id.is_empty(), c.id.clone()) {
+            (false, _) => head.id,
+            (true, Some(from_name)) => from_name,
+            (true, None) => return None,
+        };
+        return Some(Parsed { id, title: head.title, cwd: head.cwd, orch_role, orch_gid });
+    }
+    if c.source == "codex" {
+        let head = scan_codex_jsonl(&c.path);
+        let (orch_role, orch_gid) = match head.orch {
+            Some((role, gid)) => (Some(role), gid),
+            None => (None, None),
+        };
+        // Same two-source rule as pi's arm above: the header's id WINS over the
+        // one collection read off the file name, and falls back to it when the
+        // header carries none. `codex resume <id>` is matched against what the
+        // header recorded, so a renamed or hand-copied rollout yields a resume
+        // command that works rather than one naming a thread codex has never
+        // heard of.
+        //
+        // The fallback is not an edge case for codex the way it is for pi: a
+        // COMPRESSED rollout has no header this crate can read, so every
+        // session older than a week takes the file-name branch. That is
+        // precisely why the row is not dropped when the head is empty — see
+        // `collect_codex_candidates`.
         let id = match (head.id.is_empty(), c.id.clone()) {
             (false, _) => head.id,
             (true, Some(from_name)) => from_name,
@@ -1281,6 +1408,7 @@ fn scan_sessions() -> (Vec<SessionInfo>, ScanStats) {
     collect_claude_candidates(&mut candidates);
     collect_copilot_candidates(&mut candidates);
     collect_pi_candidates(&mut candidates);
+    collect_codex_candidates(&mut candidates);
     let files_seen = candidates.len();
     candidates.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
     candidates.truncate(LIST_LIMIT);

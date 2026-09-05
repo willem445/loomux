@@ -5,6 +5,7 @@
 //! Claude Code:    `~/.claude/projects/<encoded-path>/<uuid>.jsonl`
 //! Copilot CLI:    `~/.copilot/session-state/<uuid>/workspace.yaml`
 //! pi:             `~/.pi/agent/sessions/--<encoded-path>--/<ts>_<uuid>.jsonl`
+//! codex:          `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl`
 //!
 //! Everything here is best-effort in the same sense the whole scanner is:
 //! unreadable or malformed entries are skipped, and a missing tool simply
@@ -485,6 +486,18 @@ pub fn find_session_cwd(source: &str, session_id: &str) -> Result<Option<String>
             None => Ok(None),
         };
     }
+    // #2515 C2, and named BEFORE the claude fallback for exactly the reason
+    // the pi arm above is: a codex THREAD id is a UUID, indistinguishable by
+    // shape from a claude session id, so without this arm one would be probed
+    // for in `~/.claude/projects` -- where it can only ever miss, and a miss
+    // reads as `Ok(None)`, i.e. "no such session", with nothing red to say the
+    // wrong store was consulted.
+    if source == "codex" {
+        return match codex_sessions_root() {
+            Some(root) => find_codex_session_cwd(&root, &session),
+            None => Ok(None),
+        };
+    }
     match claude_projects_root() {
         Some(root) => find_claude_session_cwd(&root, &session),
         None => Ok(None),
@@ -900,6 +913,568 @@ fn find_copilot_session_cwd(root: &Path, session_id: &PathSegment) -> Result<Opt
         }
     }
     Ok(None)
+}
+
+// ---------- codex (#2515 C2) ----------
+//
+// Codex keeps one JSONL "rollout" file per thread, under a date-directory tree
+// inside its own home:
+//
+//     $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<thread id>.jsonl
+//
+// Facts pinned against `openai/codex` at tag `rust-v0.153.4`, read blob by blob
+// through the GitHub blob API; quoted in `doc/design/codex.md`. Three of them
+// shape everything below, and two are corrections to what this slice was
+// planned from (posted on #2515 before any of this was written):
+//
+//  1. THE DATE DIRECTORIES ARE LOCAL-DATED. `precompute_new_rollout_path`
+//     (`rollout/src/recorder.rs`) builds them from `OffsetDateTime::now_local()`,
+//     so "today" has two answers either side of local midnight and a
+//     UTC-derived guess is wrong for part of every day. Nothing here computes a
+//     date at all -- `walk_codex_session_files` enumerates whatever directories
+//     exist -- precisely so that question never has to be answered.
+//
+//  2. THE FILE NAME CARRIES TWO IDS, NOT AN ID AND A COUNTER. The slice plan
+//     called the second half `_{n}`; `RolloutFileName::render`
+//     (`rollout/src/rollout_file_name.rs`) emits
+//     `format!("rollout-{timestamp}-{}.jsonl", self.thread_id)` when the thread
+//     id and rollout id agree and
+//     `format!("rollout-{timestamp}-{}_{}.jsonl", self.thread_id, self.rollout_id)`
+//     when they do not -- which is what `thread/revert` produces. The trailing
+//     half is a second UUID, so the id this module matches is not a fixed-width
+//     field; see `codex_rollout_thread_id`.
+//
+//  3. A ROLLOUT OLDER THAN A WEEK IS COMPRESSED IN PLACE, and this is the fact
+//     a `*.jsonl` walk gets silently wrong. `rollout/src/compression.rs` starts
+//     `spawn_rollout_compression_worker` -- "a best-effort background job that
+//     compresses cold local rollout files", fire-and-forget, with no
+//     configuration gate -- and it rewrites `<name>.jsonl` to `<name>.jsonl.zst`
+//     once `MIN_ROLLOUT_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60)`
+//     has passed. A walk matching only `.jsonl` would therefore list the last
+//     seven days of sessions and answer `Ok(None)` -- "no such session" -- for
+//     every older one: the probe-the-wrong-shape, miss-reads-as-absent failure
+//     this whole dispatch exists to fix, reproduced one file extension over,
+//     and arriving on a schedule rather than by chance. Both representations
+//     are walked; see `walk_codex_session_files` for what a compressed file can
+//     and cannot answer.
+
+thread_local! {
+    /// Test seam for `codex_sessions_root()`, with the same thread-scoping
+    /// rationale as `CLAUDE_PROJECTS_ROOT_OVERRIDE` and checked BEFORE the
+    /// environment for the same reason the copilot and pi seams are:
+    /// `CODEX_HOME` is a genuine production override a developer may have set,
+    /// and a test must still win over it.
+    static CODEX_SESSIONS_ROOT_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only seam: fixture the directory `find_session_cwd`'s codex half scans,
+/// for the calling thread only. See `set_claude_projects_root_for_test` for why
+/// this is a real `pub` function rather than `#[cfg(test)]`.
+#[doc(hidden)] // pub for integration tests
+pub fn set_codex_sessions_root_for_test(root: Option<PathBuf>) {
+    CODEX_SESSIONS_ROOT_OVERRIDE.with(|c| *c.borrow_mut() = root);
+}
+
+/// The sessions root a `codex` launched from THIS process's environment would
+/// write to, as a pure function of the two inputs the vendor's own resolution
+/// reads -- so every branch is testable without `std::env::set_var`, which is
+/// unsynchronized mutation racing every other test thread in the binary (the
+/// argument `pi_sessions_root_from` and `opencode_store_from` both make).
+///
+/// `CODEX_HOME` names codex's HOME, not its sessions directory; the sessions
+/// live one level inside it, at `<CODEX_HOME>/sessions`
+/// (`SESSIONS_SUBDIR = "sessions"`, `rollout/src/lib.rs`).
+///
+/// **EMPTY is unset -- empty, not blank.** The vendor's `find_codex_home`
+/// (`utils/home-dir/src/lib.rs`) reads
+/// `std::env::var("CODEX_HOME").ok().filter(|val| !val.is_empty())` and falls
+/// back to `~/.codex`. It tests `is_empty()`, never `trim()`, so a value of one
+/// space is a real (and hopeless) path to codex itself. Trimming here would be
+/// this module disagreeing with the tool it is reading after; not trimming
+/// costs nothing, because a whitespace path is not a directory and the caller
+/// already answers "no store" to that. The slice plan said "blank"; the vendor
+/// says empty, and the vendor wins.
+///
+/// **A `CODEX_HOME` that is not a directory yields no store, and never a
+/// fallback.** The vendor hard-errors on one ("CODEX_HOME points to {val:?},
+/// but that path is not a directory"). This cannot error -- `find_session_cwd`
+/// reserves `Err` for a store that exists and cannot be listed -- so it answers
+/// with a root whose `exists()` fails, i.e. nothing found. What it must never
+/// do is silently fall back to `~/.codex`: that would read a DIFFERENT store
+/// from the one codex would refuse to run against at all, and hand back rows
+/// for sessions the configured store does not contain.
+#[doc(hidden)] // pub for integration tests
+pub fn codex_sessions_root_from(
+    env_codex_home: Option<&str>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let codex_home = match env_codex_home.filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => home?.join(".codex"),
+    };
+    Some(codex_home.join("sessions"))
+}
+
+/// `pub`: `collect_codex_candidates` stayed in `src-tauri` and routes through
+/// this same testable root lookup rather than a second, untestable
+/// `dirs::home_dir()` inline -- the #457 gap, not reopened for codex. It also
+/// routes through [`walk_codex_session_files`], so the browser and the by-id
+/// lookup cannot disagree about where a codex store keeps its files, or about
+/// which representations of one count.
+pub fn codex_sessions_root() -> Option<PathBuf> {
+    if let Some(r) = CODEX_SESSIONS_ROOT_OVERRIDE.with(|c| c.borrow().clone()) {
+        return Some(r);
+    }
+    codex_sessions_root_from(
+        std::env::var("CODEX_HOME").ok().as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+/// The suffix codex's compression worker appends when it rewrites a cold
+/// rollout in place (`COMPRESSED_SUFFIX`, `rollout/src/compression.rs`).
+const CODEX_COMPRESSED_SUFFIX: &str = ".zst";
+
+/// The canonical `.jsonl` name of a rollout file, whichever representation is
+/// on disk -- `None` for a name that is not a rollout's at all.
+///
+/// This is the vendor's own `parse_rollout_file_name`
+/// (`rollout/src/compression.rs`) read back in Rust:
+///
+/// ```text
+/// let name = name.strip_suffix(COMPRESSED_SUFFIX).unwrap_or(name);
+/// if name.starts_with("rollout-") && name.ends_with(".jsonl") { Some(name) } else { None }
+/// ```
+///
+/// Stripping `.zst` HERE, once, is what lets everything downstream reason about
+/// ONE name shape instead of two -- the same split the vendor keeps, where a
+/// discovered `RolloutFile` carries a physical `path` beside a
+/// `plain_file_name` that is "always the canonical `.jsonl` filename used for
+/// timestamp and id parsing".
+fn codex_plain_rollout_name(name: &str) -> Option<&str> {
+    let plain = name.strip_suffix(CODEX_COMPRESSED_SUFFIX).unwrap_or(name);
+    (plain.starts_with("rollout-") && plain.ends_with(".jsonl")).then_some(plain)
+}
+
+/// Whether a walked rollout path is the COMPRESSED representation, and so has
+/// no content readable here.
+///
+/// `pub` because `collect_codex_candidates` stayed in `src-tauri` and must ask
+/// the same question this module's own scanner asks, rather than re-deriving
+/// "does it end in .zst" a second time and drifting the day the vendor adds a
+/// second codec.
+pub fn codex_rollout_is_compressed(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.ends_with(CODEX_COMPRESSED_SUFFIX))
+}
+
+/// The THREAD id a canonical rollout file name carries, or `None` when the name
+/// does not have the shape.
+///
+/// `RolloutFileName::parse` is the pin: strip `rollout-`, strip `.jsonl`, take
+/// `core[..19]` as the timestamp, require `core[19..20] == "-"`, then read the
+/// ids out of `core[20..]` as `ids.split_once('_').unwrap_or((ids, ids))`. So
+/// the thread id is everything from offset 20 up to the FIRST `_`, or all of it
+/// when there is none.
+///
+/// **The trailing half of a `_`-bearing name is the ROLLOUT id, not a sequence
+/// number** (correction 2 in this section's header). `codex resume <id>` names
+/// a THREAD -- "Session id (UUID) or session name", resolved by
+/// `find_thread_path_by_id_str` over the whole store -- so the leading half is
+/// the one a lookup compares against, and a reverted thread keeps answering for
+/// its own id.
+///
+/// Deliberately NOT a UUID validity check, and deliberately looser than the
+/// vendor about the timestamp: this answers "what does this file name claim",
+/// and the claim is then compared against a session id that has already been
+/// through [`PathSegment`]. The vendor additionally requires `core[..19]` to
+/// PARSE as a date; requiring that here would drop a file whose name is
+/// otherwise well-formed because its timestamp is odd, which fails toward
+/// hiding a real session. Failing toward listing one is the right direction for
+/// a browser, and for a lookup that is settled by equality anyway.
+fn codex_rollout_thread_id(plain_name: &str) -> Option<&str> {
+    let core = plain_name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    if core.get(19..20)? != "-" {
+        return None;
+    }
+    let ids = core.get(20..)?;
+    let thread = ids.split_once('_').map_or(ids, |(thread, _)| thread);
+    (!thread.is_empty()).then_some(thread)
+}
+
+/// The THREAD id a rollout FILE NAME carries, in whichever representation it is
+/// on disk — the one entry point the rest of the workspace uses, so nobody has
+/// to know that the `.zst` strip and the id grammar are two steps.
+///
+/// `pub` because `collect_codex_candidates` stayed in `src-tauri` and needs a
+/// row's id BEFORE anything is parsed — which for a compressed rollout is the
+/// only id there will ever be, since its header cannot be read on this side.
+/// The two halves stay private so the `.zst`-then-grammar order lives in exactly
+/// one place.
+pub fn codex_rollout_thread_id_of(file_name: &str) -> Option<&str> {
+    codex_rollout_thread_id(codex_plain_rollout_name(file_name)?)
+}
+
+/// Walk every rollout file a codex store can hold -- BOTH representations --
+/// calling `visit` on each and stopping at its first `Some`.
+///
+/// The tree is `<root>/YYYY/MM/DD/rollout-*.jsonl[.zst]`, so this is a
+/// depth-BOUNDED three-level descent rather than a recursive walk: a store is a
+/// directory of years, of months, of days, of files, and nothing deeper is ever
+/// looked at. The bound is what keeps a browser refresh from descending into
+/// something arbitrarily deep that happens to sit under a human's `CODEX_HOME`.
+///
+/// **The directory NAMES are not parsed, matched or dated**, and that is the
+/// point rather than laziness -- see correction 1 in this section's header: the
+/// vendor dates them from local time, so any date this side computed would be
+/// wrong for part of every day. Enumerating what exists asks nothing about
+/// dates.
+///
+/// **`archived_sessions/` is not walked** -- a disclosed residual, not an
+/// oversight. It is a SIBLING subtree of `sessions/` of the same shape
+/// (`ARCHIVED_SESSIONS_SUBDIR`, `rollout/src/lib.rs`), holding what `codex
+/// archive` moved out of the way. A human who archived a session asked for it
+/// to stop appearing; listing it would undo that, and a by-id lookup finding
+/// one would offer to resume a session they retired. They see no archived rows,
+/// and they see no WRONG rows, which is the failure mode that matters.
+///
+/// **A compressed rollout IS visited, and its content is not readable here.**
+/// `<name>.jsonl.zst` is zstd, and decompressing it for one header line means a
+/// new `src-tauri` dependency and its getrandom audit (constraint 2). So a
+/// compressed file is passed to `visit` -- its NAME still carries the thread id,
+/// which is the whole of what an id lookup needs -- and every content-derived
+/// field lands on the same "found, but the file does not say" answers a torn
+/// header already gets. Listing it with an unknown workspace is strictly better
+/// than what a `.jsonl`-only walk gives, which is not listing a week-old
+/// session at all.
+///
+/// **A plain file HIDES its compressed sibling**, mirroring the vendor's own
+/// `should_skip_compressed_sibling`. Compression publishes by writing the
+/// `.zst` and then removing the `.jsonl`, so a window exists in which both are
+/// on disk and they are ONE session; without this the browser shows it twice.
+///
+/// `pub` for the same reason [`walk_pi_session_files`] is: the other consumer,
+/// `collect_codex_candidates`, stayed in `src-tauri`.
+pub fn walk_codex_session_files<T>(
+    root: &Path,
+    mut visit: impl FnMut(&Path) -> Option<T>,
+) -> Option<T> {
+    let Ok(years) = fs::read_dir(root) else {
+        return None;
+    };
+    for year in years.flatten() {
+        let Ok(months) = fs::read_dir(year.path()) else {
+            continue;
+        };
+        for month in months.flatten() {
+            let Ok(days) = fs::read_dir(month.path()) else {
+                continue;
+            };
+            for day in days.flatten() {
+                let Ok(files) = fs::read_dir(day.path()) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    let Some(plain) = codex_plain_rollout_name(name) else {
+                        continue;
+                    };
+                    // The plain sibling wins -- see the doc comment above. The
+                    // length test is how "this name was compressed" is asked
+                    // without a second `ends_with`: `plain` is a subslice of
+                    // `name`, shorter exactly when a suffix was stripped.
+                    let compressed = plain.len() != name.len();
+                    if compressed && path.with_file_name(plain).exists() {
+                        continue;
+                    }
+                    if let Some(found) = visit(&path) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read one bounded first line out of a file, or `None` when it cannot be
+/// opened.
+///
+/// The ONE derivation of "read this file's header line and nothing else",
+/// shared by [`find_codex_session_cwd`] here and by
+/// `orchestration::pi_session_cwd_in_dir`, which is where it was extracted from
+/// (#2515 C2). Both answer the same question about a JSONL transcript -- what
+/// does its first line say -- for CLIs whose transcripts are append-only and
+/// unbounded, and both are reached from a listing path that runs on every
+/// session-browser refresh. Reading the whole file to answer a question the
+/// first line answers makes the cost of a listing scale with how much WORK a
+/// session did, which is the wrong axis entirely.
+///
+/// `read_line` on a `BufReader` stops at the first `\n`, so the tail is never
+/// touched; `cap` is for the pathological case where a corrupt or mid-write
+/// file carries no newline at all, which would otherwise make "the first line"
+/// mean "everything".
+///
+/// A file that exists but is empty yields `Some("")` -- it opened, and it said
+/// nothing -- which is a different answer from `None`, i.e. it is not there at
+/// all. Callers distinguish the two: an empty header is "found, workspace
+/// unknown", never "no such session".
+pub fn bounded_first_line(path: &Path, cap: u64) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut line = String::new();
+    BufReader::new(file.take(cap)).read_line(&mut line).ok()?;
+    Some(line)
+}
+
+/// How much of a codex rollout [`find_codex_session_cwd`] will read looking for
+/// its `session_meta` line.
+///
+/// The header is the first line and is a few hundred bytes in practice, so this
+/// is not a budget anyone is expected to spend -- it is the ceiling for the one
+/// case where `read_line` would otherwise not stop: a corrupt or mid-write file
+/// with no newline in it at all. Generous on purpose (constraint 8 -- nothing
+/// here is tuned to this repo's own transcripts), and equal to the pi header cap
+/// it shares [`bounded_first_line`] with, because it bounds the same hazard
+/// rather than a measured codex figure.
+///
+/// It fails toward "no recorded cwd" rather than toward a wrong one: a
+/// truncated read cannot parse as JSON, so the session still lists and still
+/// says its workspace is unknown, which is the answer a header-less file
+/// already gets.
+pub const CODEX_SESSION_HEADER_MAX_BYTES: u64 = 64 * 1024;
+
+/// The `session_meta` header of one codex rollout, parsed -- `None` when the
+/// file is compressed, unreadable, empty, or its first line is not a
+/// `session_meta` object.
+///
+/// The line's shape is `SessionMeta` written through `RolloutItemWire`
+/// (`history/src/rollout_payload.rs`, `#[serde(tag = "type", rename_all =
+/// "snake_case")]`), so on disk it is
+/// `{"type":"session_meta","payload":{"id":...,"cwd":...,...}}`. `payload.id` is
+/// the recorder's `conversation_id`, i.e. the THREAD id -- the same value the
+/// file name carries and the same one `codex resume <id>` is matched against.
+///
+/// **A compressed rollout returns `None` without being opened.** That is not the
+/// same fact as a torn header -- it is "this representation cannot be read here
+/// at all" -- but every caller gives the two the same answer, because the
+/// consequence for a reader is identical: the session is real and its header
+/// fields are unknown.
+fn codex_header(path: &Path) -> Option<Value> {
+    if codex_rollout_is_compressed(path) {
+        return None;
+    }
+    let line = bounded_first_line(path, CODEX_SESSION_HEADER_MAX_BYTES)?;
+    let v = serde_json::from_str::<Value>(line.trim_end()).ok()?;
+    (v.get("type").and_then(Value::as_str) == Some("session_meta")).then_some(v)
+}
+
+/// `find_session_cwd`'s codex half, taking the sessions root explicitly so it is
+/// testable against a temp directory instead of the real `~/.codex`.
+///
+/// Same `Ok(Some(""))` vs `Ok(None)` distinction as every other half, for the
+/// same reason: a session whose header carries no `cwd` -- or whose rollout has
+/// been compressed and so cannot be read here at all -- is FOUND with an unknown
+/// workspace, not absent, and `resolve_resume_cwd` has a distinct tag for that.
+///
+/// **The file name proposes and the header disposes.** The name is matched first
+/// because it is free (`codex_rollout_thread_id`, no read at all), and a name
+/// that matches is then CONFIRMED against `payload.id` whenever the header can
+/// be read: a header naming a DIFFERENT thread means this file is not the
+/// session asked for, whatever its name says, and the walk continues. That is
+/// the "header wins" rule, and it is what stops a hand-copied or renamed rollout
+/// answering for a session it does not contain.
+///
+/// **Residual, and it is the price of the cheap half.** A file whose NAME does
+/// not match is never opened, so a rollout renamed away from its own thread id
+/// is not found even though its header would say so. Closing that would mean
+/// reading every header in the store on every miss -- turning a free lookup into
+/// one bounded read per session ever recorded -- for a case only a human editing
+/// the vendor's store by hand can produce. pi's half makes the same trade for
+/// the same reason.
+fn find_codex_session_cwd(root: &Path, session_id: &PathSegment) -> Result<Option<String>, String> {
+    if !root.exists() {
+        return Ok(None); // codex has never run here -- nothing recorded, not an error
+    }
+    Ok(walk_codex_session_files(root, |path| {
+        let name = path.file_name().and_then(|s| s.to_str())?;
+        let plain = codex_plain_rollout_name(name)?;
+        if codex_rollout_thread_id(plain)? != session_id.as_str() {
+            return None;
+        }
+        match codex_header(path) {
+            // Readable header: it decides. One naming another thread
+            // disqualifies the file outright rather than falling back to the
+            // name that pointed here.
+            Some(v) => {
+                let id = v.pointer("/payload/id").and_then(Value::as_str);
+                if id.is_some_and(|id| id != session_id.as_str()) {
+                    return None;
+                }
+                Some(
+                    v.pointer("/payload/cwd")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            }
+            // Compressed, torn, or not a `session_meta` line: found, workspace
+            // unknown. Deliberately NOT `None`, which would read as "no such
+            // session" for a session that demonstrably exists.
+            None => Some(String::new()),
+        }
+    }))
+}
+
+/// What one codex rollout's head-scan yielded -- the codex twin of
+/// [`PiSessionHead`], and a named struct for the same reason: four positions of
+/// mostly-`String` is three transpositions any caller can make with nothing red
+/// to say so.
+///
+/// Every field is `pub`: `parse_candidate` stayed in `src-tauri` and reads all
+/// four. `id`/`cwd` are empty strings rather than `Option`, matching what the
+/// claude and pi scanners already return for the same absences -- "found, but
+/// the file does not say" is a real answer here and a distinct one from "no such
+/// session".
+pub struct CodexSessionHead {
+    /// The header's `payload.id`, or empty when the file carries none (or is
+    /// compressed, and so carries none readable here).
+    pub id: String,
+    /// First user message's text, tidied -- or `(no prompt)`.
+    pub title: String,
+    /// The header's `payload.cwd`, or empty.
+    pub cwd: String,
+    /// Orchestration role + group scraped from a kickoff or notice.
+    pub orch: Option<(String, Option<String>)>,
+}
+
+/// Extract plain text from a codex message `content` array.
+///
+/// **Deliberately not [`content_text`]**, and this is the one place codex's line
+/// format diverges from both formats that function serves. Its doc is explicit
+/// that claude and pi agree on `{type:"text",text}` and that this is its whole
+/// domain; codex's `ContentItem` (`protocol/src/models.rs`, `#[serde(tag =
+/// "type", rename_all = "snake_case")]`) has no `text` variant at all -- a user
+/// turn's blocks are `input_text`, an assistant's `output_text`. Widening the
+/// shared function to accept `input_text` would change what claude and pi rows
+/// title themselves with in order to fix a codex problem, which is a wider blast
+/// radius than a six-line function.
+///
+/// Only `input_text` is read, because the only caller wants a USER turn's text.
+/// An image-only turn yields `None` and is not mistaken for a title, exactly as
+/// on the other two scanners.
+fn codex_content_text(content: &Value) -> Option<String> {
+    let Value::Array(blocks) = content else {
+        return None;
+    };
+    blocks.iter().find_map(|b| {
+        (b.get("type")?.as_str()? == "input_text")
+            .then(|| b.get("text")?.as_str().map(str::to_string))
+            .flatten()
+    })
+}
+
+/// Pull id/title/cwd/orchestration-identity out of a codex rollout by scanning
+/// its head -- the codex counterpart of [`scan_pi_jsonl`] and, like it,
+/// deliberately not a generalisation of either sibling. The three formats agree
+/// on nothing structural: claude tags each line with a top-level
+/// `user`/`summary`, pi tags conversation lines `message` with the role inside,
+/// and codex wraps everything as `{"type":...,"payload":...}` where a
+/// conversation turn is `response_item` and the role sits two levels down.
+///
+/// The header is codex's first line, but this looks for it across the first 60
+/// lines rather than line 1 only, so a leading blank or a partially-flushed line
+/// costs the row its header fields instead of costing it the whole scan -- the
+/// same tolerance the pi scanner has.
+///
+/// **A compressed rollout yields an EMPTY head, not a missing row.** It comes
+/// back with no id, no cwd and the `(no prompt)` title, which the caller turns
+/// into a row whose workspace is unknown; the id it lists under comes from the
+/// file NAME, which a `.zst` still carries. See [`walk_codex_session_files`] for
+/// why nothing is decompressed here.
+///
+/// `pub` for the same reason as [`tidy_title`]: `parse_candidate` stayed in
+/// `src-tauri` and this is how it reads a codex row.
+pub fn scan_codex_jsonl(path: &Path) -> CodexSessionHead {
+    let mut id = String::new();
+    let mut title = String::new();
+    let mut cwd = String::new();
+    let mut orch: Option<(String, Option<String>)> = None;
+
+    // Compressed, or unopenable: the row still exists, and every field it would
+    // have carried is simply unknown. Same shape as a torn header.
+    if codex_rollout_is_compressed(path) {
+        return CodexSessionHead { id, title: "(no prompt)".to_string(), cwd, orch };
+    }
+    let Ok(file) = fs::File::open(path) else {
+        return CodexSessionHead { id, title: "(no prompt)".to_string(), cwd, orch };
+    };
+    for line in BufReader::new(file).lines().take(60).map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("session_meta") => {
+                if cwd.is_empty() {
+                    if let Some(c) = v.pointer("/payload/cwd").and_then(Value::as_str) {
+                        cwd = c.to_string();
+                    }
+                }
+                if id.is_empty() {
+                    if let Some(i) = v.pointer("/payload/id").and_then(Value::as_str) {
+                        id = i.to_string();
+                    }
+                }
+            }
+            Some("response_item") => {
+                let Some(payload) = v.get("payload") else {
+                    continue;
+                };
+                // `ResponseItem::Message` -- the only variant carrying a role and
+                // a content array. Every other one (a function call, a tool
+                // output) is skipped by this test rather than by enumerating
+                // them, so a variant added upstream cannot start titling rows.
+                if payload.get("type").and_then(Value::as_str) != Some("message") {
+                    continue;
+                }
+                if payload.get("role").and_then(Value::as_str) != Some("user") {
+                    continue;
+                }
+                let Some(text) = payload.get("content").and_then(codex_content_text) else {
+                    continue;
+                };
+                // Same precedence as the claude and pi scanners: a kickoff (role
+                // AND group) beats a bare `[orrerix]`-notice match (role only).
+                if orch.as_ref().map_or(true, |(_, g)| g.is_none()) {
+                    if let Some((role, gid)) = detect_orch_signature(&text) {
+                        if orch.is_none() || gid.is_some() {
+                            orch = Some((role.to_string(), gid));
+                        }
+                    }
+                }
+                if !title.is_empty() {
+                    continue;
+                }
+                let trimmed = text.trim();
+                // Skip injected wrappers, as both sibling scanners do -- codex
+                // has no `isMeta` flag to consult either, so the `<` test is the
+                // whole of it here.
+                if !trimmed.is_empty() && !trimmed.starts_with('<') {
+                    title = tidy_title(trimmed, 90);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if title.is_empty() {
+        title = "(no prompt)".to_string();
+    }
+    CodexSessionHead { id, title, cwd, orch }
 }
 
 #[cfg(test)]
