@@ -46641,6 +46641,25 @@ fn an_apply_with_no_confirmation_records_that_rather_than_a_match() {
 }
 
 #[test]
+fn an_unknown_group_offers_no_workflows_rather_than_the_process_working_directory() {
+    // rev-std 3. `available` used to pass the group's repo `unwrap_or_default()`,
+    // and `""` is not "no repo": `Path::new("").join(".orrerix")` resolves against
+    // whatever directory the PROCESS happens to be running in, so the answer was
+    // about the wrong machine entirely. Read-only and bounded, but an answer
+    // about the wrong tree is worse than no answer.
+    let (reg, _d) = test_registry();
+    let status = reg.workflow_status(&parse_gid("no-such-group"));
+    assert_eq!(status["available"], json!(Vec::<String>::new()), "{status}");
+
+    // Positive control, in the same process and therefore the same CWD: a group
+    // that DOES have a repo still lists that repo's workflows, so the assertion
+    // above is the unknown-group arm and not `available` having gone silent.
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    assert_eq!(reg.workflow_status(&g.id)["available"], json!(["b", "default"]));
+}
+
+#[test]
 fn a_no_op_reapply_still_reconciles_the_group_dir() {
     // Premortem 2. `write_instruction_files` is audited rather than propagated,
     // so an apply whose write failed leaves the switch live with a stale or
