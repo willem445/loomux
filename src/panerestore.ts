@@ -1008,9 +1008,10 @@ const CODEX_SOLO_PROFILE_RE = new RegExp(
 const LEAD_AGENT_DISALLOW_RE = /(^|\s)--disallowedTools\s+Agent(?=\s|$)/;
 
 /** Excise ONE `--disallowedTools Agent` pair from a claude command the MCP
- *  arm has already matched (#2519 C1). The backend mints exactly one, and the
- *  round-trip test pins that; a second occurrence would be the human's, and
- *  the same one-flag rule that keeps `Edit` safe keeps it safe too. */
+ *  arm has already matched (#2519 C1). That launch path (#2519 slice B,
+ *  #2677) mints exactly one, and the round-trip test pins that; a second
+ *  occurrence would be the human's, and the same one-flag rule that keeps
+ *  `Edit` safe keeps it safe too. */
 function stripLeadAgentFlag(command: string): string {
   const m = LEAD_AGENT_DISALLOW_RE.exec(command);
   if (!m) return command;
