@@ -794,7 +794,8 @@ pub fn drive_ssh_add_with_transcript(
         (None, false) => reap_bounded(&mut child, &mut killer),
     };
     let secret = String::from_utf8_lossy(passphrase).into_owned();
-    let detail = scrub_secret(last_meaningful_line(&seen), &secret);
+    let _ = &secret;
+    let detail = last_meaningful_line(&seen).to_string();
     let outcome = match terminal {
         Some(other) => other,
         None if gave_up => SshAddOutcome::BadPassphrase { detail },
