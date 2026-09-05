@@ -212,9 +212,6 @@ pub fn classify_ssh_add_line(line: &str) -> SshAddEvent {
     if line.contains("Enter passphrase for") {
         return SshAddEvent::Prompt;
     }
-    if line.contains("Bad passphrase, try again for") {
-        return SshAddEvent::BadPassphrase;
-    }
     if line.contains("Identity added") {
         return SshAddEvent::Added;
     }
