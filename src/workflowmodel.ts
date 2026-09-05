@@ -68,8 +68,15 @@ export function isBlockKind(v: string): v is BlockKind {
  *  since its model ids name a provider (`opencode/deepseek-v4-flash-free`) and
  *  reach a catalog no other adapter here can. Which CLIs can host which *kinds*
  *  is a separate question the backend owns (`CLI_CAPS` / `cli_can_host`):
- *  membership here is spawnability, not capability. */
-export const WORKFLOW_CLIS = ["claude", "copilot", "gemini", "opencode", "pi"] as const;
+ *  membership here is spawnability, not capability.
+ *
+ *  `codex` (#2515 C1) is the sharpest illustration of that last sentence. It is
+ *  in this list — a `cli: codex` worker or orchestrator block spawns — and the
+ *  backend still refuses a `codex` reviewer or planner outright, because its
+ *  only containment axis is an all-or-nothing `sandbox_mode`. A pane's
+ *  validation surface must not try to reproduce that rule; it belongs to
+ *  `cli_can_host`, which quotes the measured reason back. */
+export const WORKFLOW_CLIS = ["claude", "codex", "copilot", "gemini", "opencode", "pi"] as const;
 export type WorkflowCli = (typeof WORKFLOW_CLIS)[number];
 
 export function isWorkflowCli(v: string): v is WorkflowCli {
