@@ -1,0 +1,13 @@
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:36.7374948Z ^[[1m^[[92m     Running^[[0m unittests src/lib.rs (target/debug/deps/loomux_engine-dd81e6e3a7797d60)
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:36.7461047Z running 594 tests
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:37.3525341Z failures:
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:37.3525574Z 
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:37.3526349Z ---- harness::claude::tests::a_session_id_is_compared_canonically_and_a_non_uuid_is_a_mismatch stdout ----
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:37.3527096Z 
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:37.3528933Z thread 'harness::claude::tests::a_session_id_is_compared_canonically_and_a_non_uuid_is_a_mismatch' (6706) panicked at crates/loomux-engine/src/harness/claude.rs:918:9:
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:37.3530649Z assertion failed: session_ids_match(minted, "550E8400-E29B-41D4-A716-446655440000")
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:37.3531279Z 
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:37.3531291Z 
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:37.3531500Z failures:
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:37.3532309Z     harness::claude::tests::a_session_id_is_compared_canonically_and_a_non_uuid_is_a_mismatch
+build (ubuntu-22.04)	Test backend	2026-09-04T23:07:37.3532907Z 

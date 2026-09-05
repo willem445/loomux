@@ -1,0 +1,14 @@
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.000000Z TAP version 13
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.003000Z ok 1 - a passing pin
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.006000Z not ok 2 - a ledger row must carry the head its run measured
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.009000Z ok 3 - another passing pin
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.012000Z not ok 4 - a bullet count must equal the run’s own failed figure
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.015000Z 1..4
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.018000Z # tests 4
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.021000Z # suites 0
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.024000Z # pass 2
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.027000Z # fail 2
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.030000Z # cancelled 0
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.033000Z # skipped 0
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.036000Z # todo 0
+build (ubuntu-22.04)	Test frontend	2026-09-05T00:21:00.039000Z # duration_ms 73.4229

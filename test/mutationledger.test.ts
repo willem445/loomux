@@ -40,6 +40,8 @@ type Finding = { severity: string; line: number; message: string; detail: string
 type CheckResult = { findings: Finding[]; counts: Record<string, number>; rows: number };
 
 const suitesOf = (name: string): Suite[] => ml.readSuites(log(name)) as Suite[];
+const LF = String.fromCharCode(10);
+const CRLF = String.fromCharCode(13, 10);
 const RUN_ROUND1 = '33928049423';
 const RUN_ROUND13 = '33928069681';
 
@@ -87,6 +89,26 @@ test('a ledger cannot be built at all from a log with no totals', () => {
 // ---------------------------------------------------------------------------
 // Reading a cargo log
 // ---------------------------------------------------------------------------
+
+// These fixtures are checked out CRLF on this repo's Windows baseline (core.autocrlf=true)
+// and are LF in the blob, so a reader that keyed on either alone would parse on the machine
+// it was written on and not on a fresh checkout — with nothing red to say which one you have.
+test('a log parses the same whether it arrives LF or CRLF', () => {
+  const lf = log('red-round13').split(CRLF).join(LF);
+  const crlf = lf.split(LF).join(CRLF);
+  assert.notEqual(lf, crlf, 'the two forms must actually differ, or this pin is one form twice');
+  const a = ml.selectSuite(ml.readSuites(lf), { target: 'loomux_engine' }) as Suite;
+  const b = ml.selectSuite(ml.readSuites(crlf), { target: 'loomux_engine' }) as Suite;
+  assert.deepEqual([a.passed, a.failed, a.failures.length], [588, 6, 6]);
+  assert.deepEqual(a.failures, b.failures);
+});
+
+test('a posted body is read the same whether it arrives LF or CRLF', () => {
+  const crlf = body('good').split(CRLF).join(LF).split(LF).join(CRLF);
+  const r = ml.checkBody(crlf, CHECK_LOGS, { runHeads: HEADS }) as CheckResult;
+  assert.equal(r.rows, 2);
+  assert.equal(r.counts.MISMATCH, 0);
+});
 
 test('the figures come off the run’s own `test result:` line', () => {
   const s = ml.selectSuite(suitesOf('red-round13'), { target: 'loomux_engine' }) as Suite;
