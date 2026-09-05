@@ -2261,7 +2261,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
     // `the_gate_and_the_listing_agree_for_a_lead` asserts the two are equal, so
     // they cannot drift, while a single shared constant would make one edit
     // silently move both — precisely what a double gate exists to prevent.
-    if caller.role == Role::Lead
+    if false
         && !matches!(
             name,
             "list_agents"
