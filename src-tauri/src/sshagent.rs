@@ -293,7 +293,9 @@ pub fn classify_ssh_add_chunk(chunk: &str, at_line_start: bool) -> SshAddEvent {
     if chunk.contains("Bad passphrase, try again for") {
         return SshAddEvent::BadPassphrase;
     }
-    if starts_a_line(chunk, "Identity added", at_line_start) {
+    // [scratch #2594 R4] the pre-fix bare substring test.
+    let _ = at_line_start;
+    if chunk.contains("Identity added") {
         return SshAddEvent::Added;
     }
     // Two spellings, both real: the portable string, and the one Win32-OpenSSH
