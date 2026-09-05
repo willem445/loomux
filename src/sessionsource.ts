@@ -20,4 +20,4 @@
 // checks the two against each other** — the row crosses IPC as a plain string.
 // A source added there without a widening here is a row the frontend
 // mis-handles rather than rejects, which is why both halves land in one PR.
-export type SessionSource = "claude" | "copilot" | "opencode" | "pi";
+export type SessionSource = "claude" | "copilot" | "opencode" | "pi" | "codex";

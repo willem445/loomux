@@ -207,8 +207,9 @@ From here you can:
   falls back to PowerShell rather than failing to start.
 - **Name** a pane with `F2` so you can tell your agents apart.
 - **Restore a past agent session** with the session browser (`Ctrl+Shift+P`) —
-  it scans your machine for resumable Claude Code, Copilot CLI, OpenCode and pi
-  sessions and drops the one you pick back into a pane, in its original folder.
+  it scans your machine for resumable Claude Code, Copilot CLI, OpenCode, pi and
+  Codex sessions and drops the one you pick back into a pane, in its original
+  folder.
   See the [session browser](features/session-browser.html).
 
 ## Your first agent pane

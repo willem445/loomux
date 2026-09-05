@@ -18,7 +18,8 @@ use loomux_lib::sessions::{
     find_session_cwd, list_sessions_for_test, set_claude_projects_root_for_test,
     set_copilot_session_state_root_for_test, set_launch_intent_path_for_test,
     set_legacy_copilot_posture_path_for_test, set_opencode_store_for_test,
-    set_pi_sessions_root_for_test, set_session_index_path_for_test, LIST_LIMIT,
+    set_codex_sessions_root_for_test, set_pi_sessions_root_for_test,
+    set_session_index_path_for_test, LIST_LIMIT,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,16 +51,23 @@ fn seam() -> Seam {
     let claude = tmp.path().join("claude-projects");
     let copilot = tmp.path().join("copilot-session-state");
     let pi = tmp.path().join("pi-sessions");
+    let codex = tmp.path().join("codex-sessions");
     let index = tmp.path().join("session-index.json");
     fs::create_dir_all(&claude).unwrap();
     fs::create_dir_all(&copilot).unwrap();
     fs::create_dir_all(&pi).unwrap();
+    fs::create_dir_all(&codex).unwrap();
     set_claude_projects_root_for_test(Some(claude.clone()));
     set_copilot_session_state_root_for_test(Some(copilot.clone()));
     // #2126 P2: a fourth file-backed source joined the scan, so it is bound
     // here for the reason stated on the Seam doc above — an unbound root walks
     // the developer's real ~/.pi and its rows count against LIST_LIMIT.
     set_pi_sessions_root_for_test(Some(pi));
+    // #2515 C2: the fifth source, bound for the reason above — and codex is the
+    // one most likely to be non-empty on a developer's machine, since `~/.codex`
+    // is where the OpenAI desktop app writes too. Its rows would count against
+    // LIST_LIMIT here.
+    set_codex_sessions_root_for_test(Some(codex));
     set_session_index_path_for_test(Some(index.clone()));
     set_launch_intent_path_for_test(Some(tmp.path().join("launch-intent.json")));
     set_legacy_copilot_posture_path_for_test(Some(tmp.path().join("copilot-posture.json")));
@@ -71,6 +79,7 @@ fn clear_seams() {
     set_claude_projects_root_for_test(None);
     set_copilot_session_state_root_for_test(None);
     set_pi_sessions_root_for_test(None);
+    set_codex_sessions_root_for_test(None);
     set_session_index_path_for_test(None);
     set_launch_intent_path_for_test(None);
     set_legacy_copilot_posture_path_for_test(None);

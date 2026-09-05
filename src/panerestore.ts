@@ -355,6 +355,117 @@ const OPENCODE_SESSION_FLAG_NAMES = [...SESSION_FLAG_NAMES, "--session"];
  *  other's. The doc above each says which vendor's facts it rests on. */
 const PI_SESSION_FLAG_NAMES = [...SESSION_FLAG_NAMES, "--session"];
 
+/** codex names a session with NO FLAG AT ALL — `codex resume <id>` is a
+ *  SUBCOMMAND (#2515 C2), so it is the one CLI here whose session identity
+ *  cannot be excised by flag name and the reason this module grew a second
+ *  excision beside `stripSessionFlagsFrom*`.
+ *
+ *  Its own vocabulary, verbatim from `codex resume --help` at 0.153.4:
+ *
+ *      Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT]
+ *        [SESSION_ID]  Session id (UUID) or session name. UUIDs take precedence
+ *                      if it parses. If omitted, use --last to pick the most
+ *                      recent recorded session
+ *        --last        Continue the most recent session without showing the picker
+ *
+ *  So three shapes have to be recognised, and `--last` is why the middle one
+ *  cannot be folded into the general "consume the following value unless it
+ *  starts with --" rule the flag excision uses: here a following `--last` IS
+ *  part of the resume invocation rather than the next flag.
+ *
+ *   - `resume <id>` — the form loomux and the Sessions tab both emit;
+ *   - `resume --last` — a human's, and a picker-free resume of the newest;
+ *   - a bare trailing `resume` — the picker, which loomux never emits but a
+ *     human may have typed.
+ *
+ *  **Residual, and it is peculiar to a bare word.** Every other identity token
+ *  this module excises begins with `--`, which prose does not; `resume` does
+ *  not, so a codex line carrying an UNQUOTED prompt whose words happen to run
+ *  "… resume something" would have those two words removed. loomux never
+ *  records such a line — it appends no prompt to any agent command, the
+ *  no-replay rule `agentResumeCommand` states — so the exposure is a
+ *  hand-typed custom command only, and a quoted prompt is immune by the same
+ *  `tokenizeWithPositions` property that protects a quoted `--resume`. */
+const CODEX_RESUME_SUBCOMMAND = "resume";
+
+/** True when `raw` — the RAW slice of one token — is a token `resume` consumes
+ *  as its argument: a session id, or the `--last` switch.
+ *
+ *  **A FLAG is anything starting with `-`, not with `--`** (#2515 C2 review
+ *  round 1, W2). The first version tested `--`, and codex has seven SHORT root
+ *  options that a `--` test counts as a session id — `codex --help` at 0.153.4:
+ *  `-c/--config`, `-i/--image`, `-m/--model`, `-p/--profile`, `-s/--sandbox`,
+ *  `-C/--cd`, `-a/--ask-for-approval`. Restoring a hand-typed
+ *  `codex -C /repo resume -c model=o3 old-id` therefore ATE the `-c`, emitting
+ *  `codex -C /repo model=o3 old-id resume new-id`.
+ *
+ *  `--last` is the one `-`-prefixed token that IS consumed, because it is
+ *  `resume`'s own no-id switch rather than a flag with a value.
+ *
+ *  A quoted token's raw slice starts with `"`, so it is neither a flag nor an
+ *  id — the same immunity that protects a quoted `--resume`.
+ *
+ *  **Residual, narrowed but not closed.** On a hand-typed
+ *  `codex resume -c model=o3 old-id` the `resume` token is now dropped ALONE,
+ *  leaving `old-id` as a stray root positional — clap rejects the line. That is
+ *  a LOUD failure and never a wrong-session resume, which is the property that
+ *  matters; closing it would mean modelling every codex flag's arity here, and
+ *  guessing that wrong is how a flag's VALUE gets eaten instead. No line loomux
+ *  emits is affected: it writes `resume <id>` and nothing else after it. */
+function isCodexResumeArgument(raw: string): boolean {
+  return raw === "--last" || !raw.startsWith("-");
+}
+
+/** Excise every `resume [<id>|--last]` occurrence from a codex command STRING,
+ *  slicing the ORIGINAL rather than tokenizing and rejoining — the same
+ *  whitespace-preserving contract, and the same one-leading-space absorption,
+ *  as `stripSessionFlagsFromCommand` above (#449).
+ *
+ *  Only ever reached for a line `programFromRestore` has already identified as
+ *  codex's; see `CODEX_RESUME_SUBCOMMAND` for why that gate is load-bearing
+ *  here in a way it is not for a `--`-prefixed flag. */
+function stripCodexResumeFromCommand(command: string): string {
+  const tokens = tokenizeWithPositions(command);
+  const dropRanges: Array<[number, number]> = [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (command.slice(tokens[i].start, tokens[i].end) !== CODEX_RESUME_SUBCOMMAND) continue;
+    let dropStart = tokens[i].start;
+    let dropEnd = tokens[i].end;
+    if (i + 1 < tokens.length) {
+      const nextRaw = command.slice(tokens[i + 1].start, tokens[i + 1].end);
+      if (isCodexResumeArgument(nextRaw)) {
+        dropEnd = tokens[i + 1].end;
+        i++;
+      }
+    }
+    if (dropStart > 0 && /\s/.test(command[dropStart - 1])) dropStart -= 1;
+    dropRanges.push([dropStart, dropEnd]);
+  }
+  if (!dropRanges.length) return command;
+  let result = "";
+  let cursor = 0;
+  for (const [s, e] of dropRanges) {
+    result += command.slice(cursor, s);
+    cursor = e;
+  }
+  return result + command.slice(cursor);
+}
+
+/** The same excision for the already-discrete `argv` array — no quoting concept
+ *  there, same coverage. */
+function stripCodexResumeFromArgv(tokens: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] === CODEX_RESUME_SUBCOMMAND) {
+      const next = tokens[i + 1];
+      if (next !== undefined && isCodexResumeArgument(next)) i++;
+      continue;
+    }
+    out.push(tokens[i]);
+  }
+  return out;
+}
+
 /** True when `raw` — the RAW slice of ONE token, quotes included if it was a
  *  quoted token — is a session flag written bare (no value attached: not
  *  even a trailing `=`). A quoted token's raw slice always starts with `"`,
@@ -538,6 +649,17 @@ function stripSessionFlagsFromArgv(
  *      to hit. Excision uses `PI_SESSION_FLAG_NAMES` so a `--session` recorded
  *      by the Sessions tab is dropped rather than combined with it, which pi
  *      refuses.
+ *   7. **codex resumes with a SUBCOMMAND, `resume <id>`, appended last**
+ *      (#2515 C2) — the only CLI here that names a session with no flag at
+ *      all. Two consequences the other six arms do not have. Its excision is
+ *      `stripCodexResumeFromCommand`, not `stripSessionFlagsFrom*`, because
+ *      there is no flag name to match on; and the token must land at the END
+ *      of the line rather than anywhere among the flags, because codex's usage
+ *      is `codex [OPTIONS] <COMMAND> [ARGS]` and its root options are
+ *      inherited by the subcommand rather than the other way round. Every
+ *      other recorded flag survives, so a pane keeps the `-C`/`-p`/`-m` it was
+ *      launched with — which for codex includes the `-C <cwd>` that stops it
+ *      prompting about which directory to resume into.
  *
  *  Prefers the string `command`; falls back to structured `argv`, then to a
  *  bare `claude --resume` (the historical default — a bare fallback with no
@@ -555,6 +677,19 @@ export function agentResumeCommand(
   const isCopilot = program === "copilot";
   const isOpencode = program === "opencode";
   const isPi = program === "pi";
+  const isCodex = program === "codex";
+  // codex takes the subcommand route entirely: it has no session FLAG, so
+  // running the flag excision over its line could only ever remove something
+  // that is not its session identity. Handled and returned before the shared
+  // flag path below rather than threaded through it (property 7).
+  if (isCodex) {
+    if (command && command.trim()) {
+      return { command: `${stripCodexResumeFromCommand(command)} resume ${sessionId}` };
+    }
+    if (argv && argv.length) {
+      return { argv: [...stripCodexResumeFromArgv(argv), "resume", sessionId] };
+    }
+  }
   const names = isOpencode
     ? OPENCODE_SESSION_FLAG_NAMES
     : isPi
@@ -616,6 +751,18 @@ export function agentResumeCommand(
  *  for pi, which is the honest consequence of one flag meaning
  *  open-or-create — pinned in `test/panerestore.test.ts` so a later reader finds
  *  the reason rather than an apparent duplication. */
+/** **codex keeps NO identity here, and for opencode's reason rather than pi's**
+ *  (#2515 C2): no codex flag pre-assigns a thread id. Its TUI `Cli` does carry
+ *  a `resume_session_id`, but it is `#[clap(skip)]` — "Internal … Set by the
+ *  top-level `codex resume {SESSION_ID}` wrapper; not exposed as a public flag"
+ *  — so there is nothing to append. The recorded `resume` subcommand is dropped
+ *  along with any stale id and the pane starts a genuinely new thread, whose id
+ *  the store watcher learns afterwards.
+ *
+ *  Appending `--session-id` instead (what the shared arm below would do) hands
+ *  codex a flag it does not know; re-appending `resume <id>` would be worse
+ *  still, since this arm is only reached once the caller has established that
+ *  the session is NOT resumable. */
 export function agentFreshCommand(
   command: string | null,
   argv: string[] | null,
@@ -623,6 +770,11 @@ export function agentFreshCommand(
 ): { command?: string; argv?: string[] } {
   const program = programFromRestore(command, argv);
   const isOpencode = program === "opencode";
+  if (program === "codex") {
+    // Drop the resume subcommand, append nothing — see the doc above.
+    if (command && command.trim()) return { command: stripCodexResumeFromCommand(command) };
+    if (argv && argv.length) return { argv: stripCodexResumeFromArgv(argv) };
+  }
   const names = isOpencode
     ? OPENCODE_SESSION_FLAG_NAMES
     : program === "pi"
@@ -663,8 +815,17 @@ export function agentFreshCommand(
  *  so `CliCaps::mcp_argv_seam` is true for it and `solo_prepare` mints a solo pi
  *  pane a real channel identity. That identity's config file is deleted at agent
  *  exit exactly like claude's, so it has to be excised here for the same reason;
- *  see `PI_SOLO_MCP_RE`. */
-export type SoloCli = "claude" | "copilot" | "pi";
+ *  see `PI_SOLO_MCP_RE`.
+ *
+ *  **codex joined with #2515 C2, and it is the seam rule again.** codex has no
+ *  MCP config FLAG — its servers are `[mcp_servers.*]` tables in a TOML config
+ *  — but it does have a flag that SELECTS which config file is layered on:
+ *  `-p/--profile <name>`, which loads `CODEX_HOME/<name>.config.toml`. So the
+ *  identity still arrives on the command line, one indirection further out, and
+ *  `CliCaps::mcp_argv_seam` is true for it. What is excised here is that flag
+ *  and its value; see `CODEX_SOLO_PROFILE_RE` for why only a loomux-named
+ *  profile is touched. */
+export type SoloCli = "claude" | "copilot" | "pi" | "codex";
 
 /** Every `SoloCli`, as a **total** record — the shape that makes widening the
  *  union without widening the list a compile error (#2126 P2, review round 2).
@@ -678,7 +839,12 @@ export type SoloCli = "claude" | "copilot" | "pi";
  *
  *  The value is `true` rather than anything meaningful because the KEYS are the
  *  data; nothing reads the value. */
-const SOLO_MCP_CLI_SET: Record<SoloCli, true> = { claude: true, copilot: true, pi: true };
+const SOLO_MCP_CLI_SET: Record<SoloCli, true> = {
+  claude: true,
+  copilot: true,
+  pi: true,
+  codex: true,
+};
 
 /** The CLIs a solo launch may mint a channel identity for — `SoloCli` as a
  *  runtime value, so the launcher's toggle gate, its mint gate and this module's
@@ -770,16 +936,52 @@ const COPILOT_SOLO_MCP_RE = new RegExp(
  *  and owned by the slice that decides to emit it: the seam row and the
  *  adapter-presence question belong to #2126 P1. */
 const PI_SOLO_MCP_RE = new RegExp(`(^|\\s)--mcp-config\\s+(${QUOTED_OR_BARE_VALUE})(?=\\s|$)`);
+/** codex's solo identity is `-p <profile>` (long form `--profile`), naming a
+ *  `CODEX_HOME/<profile>.config.toml` that loomux wrote and that agent exit
+ *  deletes — so it must be excised here for the same reason claude's
+ *  `--mcp-config` path is: replaying it boots codex against a profile file that
+ *  is no longer there.
+ *
+ *  **Only a LOOMUX-NAMED profile is matched, and that is the whole safety
+ *  story.** `-p` is an ordinary codex flag a human uses for their own profiles
+ *  (`codex -p work`), so an unconditional match would silently delete the
+ *  human's own flag on every restore. loomux names every profile it mints
+ *  `<brand>-…`, and this pattern requires that prefix — so `-p work` survives
+ *  untouched and `-p orrerix-solo-3` does not. That is strictly stronger than
+ *  pi's neighbouring residual, where a human's own `--mcp-config` IS stripped
+ *  and re-minted, because there the flag carries no loomux-owned namespace to
+ *  recognise.
+ *
+ *  The prefixes come from `MCP_SERVERS` — the same current-and-legacy brand
+ *  pair the two patterns above alternate over — so a line recorded before the
+ *  rename is still recognised, and a third spelling cannot reach one form and
+ *  miss another.
+ *
+ *  Program-gated like pi's, for the same reason and one more: `-p` is a
+ *  short flag other CLIs spell differently (`--prompt`, `--print`), and a
+ *  brand-prefixed value is not proof of which tool's line it sits on.
+ *
+ *  A profile NAME cannot contain whitespace — codex restricts it to ASCII
+ *  alphanumerics, `_` and `-` — so this needs no quote-aware value grammar the
+ *  way a PATH does. It tolerates surrounding quotes anyway rather than assuming
+ *  nobody ever writes them.
+ *
+ *  Space form only, which is what loomux emits; an `=`-attached `--profile=x`
+ *  is left alone, and is a line loomux never wrote. */
+const CODEX_SOLO_PROFILE_RE = new RegExp(
+  `(^|\\s)(?:-p|--profile)\\s+"?(?:${MCP_SERVERS.join("|")})-[^"\\s]*"?(?=\\s|$)`
+);
 
 /** Remove a recorded agent command's solo channel-identity MCP flags (#439):
  *  `--mcp-config <path> --strict-mcp-config --allowedTools mcp__<server>`
- *  (claude) or `--additional-mcp-config @<path> --allow-tool <server>`
- *  (copilot) — the exact, contiguous flag group `launcher.ts:1343` appends via
+ *  (claude), `--additional-mcp-config @<path> --allow-tool <server>`
+ *  (copilot), `--mcp-config <path>` (pi) or `-p <brand>-<name>` (codex) — the
+ *  exact, contiguous flag group `launcher.ts:1343` appends via
  *  `soloPrepare`'s `mcp_args`. That path is guaranteed gone by the time ANY
  *  restore replays it: agent exit deletes the config file and clears the
  *  token (mod.rs:18236), so replaying it hard-errors claude (missing file)
  *  and authenticates nothing on copilot. This never inspects the path's
- *  CONTENT — only the fixed flag tokens either CLI's mint always emits — so a
+ *  CONTENT — only the fixed flag tokens each CLI's mint always emits — so a
  *  config file that happens to live under a "solo"-named folder can't be
  *  mistaken for one; it only has to tolerate the path containing whitespace,
  *  which the quoted-path regex above does.
@@ -816,12 +1018,23 @@ export function stripSoloMcpFlags(
     }
     // Program-gated, and ordered LAST so the two anchored patterns above always
     // get first refusal — see `PI_SOLO_MCP_RE`.
-    if (programFromRestore(command, null) === "pi") {
+    const program = programFromRestore(command, null);
+    if (program === "pi") {
       const pi = PI_SOLO_MCP_RE.exec(command);
       if (pi) {
         return {
           cli: "pi",
           command: command.slice(0, pi.index) + command.slice(pi.index + pi[0].length),
+        };
+      }
+    }
+    if (program === "codex") {
+      const codex = CODEX_SOLO_PROFILE_RE.exec(command);
+      if (codex) {
+        return {
+          cli: "codex",
+          command:
+            command.slice(0, codex.index) + command.slice(codex.index + codex[0].length),
         };
       }
     }
@@ -850,6 +1063,16 @@ export function stripSoloMcpFlags(
         programFromRestore(null, argv) === "pi"
       ) {
         return { cli: "pi", argv: [...argv.slice(0, i), ...argv.slice(i + 2)] };
+      }
+      // Same brand-prefix requirement as the string form — see
+      // `CODEX_SOLO_PROFILE_RE` — so a human's own `-p work` is not excised.
+      if (
+        (argv[i] === "-p" || argv[i] === "--profile") &&
+        argv[i + 1] !== undefined &&
+        (MCP_SERVERS as readonly string[]).some((s) => argv[i + 1].startsWith(`${s}-`)) &&
+        programFromRestore(null, argv) === "codex"
+      ) {
+        return { cli: "codex", argv: [...argv.slice(0, i), ...argv.slice(i + 2)] };
       }
     }
     return { cli: null, argv }; // untouched, same guarantee as the command branch
@@ -1026,13 +1249,20 @@ export function programFromRestore(command: string | null, argv: string[] | null
  *  coincidence: this answer is matched against `listSessions()` rows, so a CLI
  *  the scanner lists but this returns `null` for is a pane that can never
  *  adopt the session sitting in the sidebar under its own cwd. Everything else
- *  — codex, gemini, a plain shell, a program loomux does not know — is null,
- *  because there is no store to match it against. */
+ *  — gemini, a plain shell, a program loomux does not know — is null, because
+ *  there is no store to match it against. (codex was the first example in that
+ *  list until #2515 C2 gave it a store to match against; it is now one of the
+ *  five, which is exactly the coupling this doc describes rather than an
+ *  exception to it.) */
 export function sessionCliFromCommand(command: string | null | undefined): Cli | null {
   const first = command?.trim().split(/\s+/)[0];
   if (!first) return null;
   const program = normalizeAgentProgram(first);
-  return program === "claude" || program === "copilot" || program === "opencode" || program === "pi"
+  return program === "claude" ||
+    program === "copilot" ||
+    program === "opencode" ||
+    program === "pi" ||
+    program === "codex"
     ? program
     : null;
 }

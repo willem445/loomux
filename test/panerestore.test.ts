@@ -533,12 +533,36 @@ test("sessionCliFromCommand normalizes a path-qualified or .exe-suffixed program
   assert.equal(sessionCliFromCommand("/usr/local/bin/opencode"), "opencode");
 });
 
+test("sessionCliFromCommand names codex, whose store #2515 C2 taught loomux to read", () => {
+  // The pre-widening specimen this replaces asserted the OPPOSITE — codex was
+  // the named example of a CLI with no store — so widening the union without
+  // this line would have left the set's newest member pinned by nothing at all.
+  assert.equal(sessionCliFromCommand("codex"), "codex");
+  // The two shapes a recorded codex line really takes: the Sessions tab's
+  // resume, and a solo pane carrying its minted profile.
+  assert.equal(sessionCliFromCommand("codex resume 019ff1a2-b3c4-7d5e-8f60-112233445566"), "codex");
+  assert.equal(sessionCliFromCommand("codex -C /repo -p orrerix-solo-1"), "codex");
+  // Same path/extension normalization #457 gave the others, applied to the new
+  // member rather than assumed to carry over — codex ships as a bundled
+  // binary under %LOCALAPPDATA% on Windows, so a path-qualified command is the
+  // ordinary case for it rather than an exotic one.
+  assert.equal(
+    sessionCliFromCommand("C:\\Users\\x\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe"),
+    "codex"
+  );
+});
+
 test("sessionCliFromCommand is null for a CLI with no session store loomux reads", () => {
-  // Not "unknown programs are opencode now": gemini and codex are real agent
+  // Not "unknown programs are opencode now": gemini and hermes are real agent
   // CLIs loomux can launch, and neither has a scanner — so there is nothing to
   // match a pane of theirs against, and claiming one would be worse than null.
+  //
+  // `codex` was the second specimen here until #2515 C2 gave it a scanner.
+  // Relocated rather than relaxed (#1225): `hermes` is still genuinely outside
+  // the set, so the property keeps a witness, and codex's new POSITIVE answer
+  // is pinned in the test above rather than quietly dropped from this one.
   assert.equal(sessionCliFromCommand("gemini"), null);
-  assert.equal(sessionCliFromCommand("codex --yolo"), null);
+  assert.equal(sessionCliFromCommand("hermes --resume"), null);
   assert.equal(sessionCliFromCommand("pwsh"), null);
   assert.equal(sessionCliFromCommand(""), null);
   assert.equal(sessionCliFromCommand(null), null);
@@ -1638,13 +1662,20 @@ test("the argv-seam CLI set is one list, not three hand-typed copies (#2126)", (
   // of the pair and a third implicit answer; missing one is silent — a CLI
   // offered the toggle but never minted for, or minted for with the toggle
   // hidden.
-  assert.deepEqual([...SOLO_MCP_CLIS].sort(), ["claude", "copilot", "pi"]);
+  assert.deepEqual([...SOLO_MCP_CLIS].sort(), ["claude", "codex", "copilot", "pi"]);
   assert.ok(isSoloMcpCli("pi"));
   assert.ok(isSoloMcpCli("claude"));
   assert.ok(isSoloMcpCli("copilot"));
+  // #2515 C2. codex's seam is one indirection out from the other three — the
+  // flag names a PROFILE FILE that carries the MCP servers, rather than the
+  // MCP config itself — but it is still a flag on the command line, which is
+  // what this set is about.
+  assert.ok(isSoloMcpCli("codex"));
   // Everything else stays lazy — adopted delivery-only on the human's first
-  // Connect gesture, never eagerly minted.
-  for (const other of ["opencode", "gemini", "codex", "custom", "", null, undefined]) {
+  // Connect gesture, never eagerly minted. `codex` was in this list until
+  // #2515 C2 and is deliberately not merely deleted from it: it moved to the
+  // positive assertion above, so the widening is pinned in both directions.
+  for (const other of ["opencode", "gemini", "custom", "", null, undefined]) {
     assert.ok(!isSoloMcpCli(other), `${other} must not be offered an eager solo identity`);
   }
 
@@ -1655,8 +1686,215 @@ test("the argv-seam CLI set is one list, not three hand-typed copies (#2126)", (
     claude: 'claude --mcp-config "c.json" --strict-mcp-config --allowedTools mcp__orrerix',
     copilot: 'copilot --additional-mcp-config "@c.json" --allow-tool orrerix',
     pi: 'pi --mcp-config "c.json"',
+    codex: "codex -p orrerix-solo-1",
   };
   for (const cli of SOLO_MCP_CLIS) {
     assert.equal(stripSoloMcpFlags(minted[cli], null).cli, cli, `${cli}'s minted flags are not excised`);
   }
+});
+
+// ---------- #2515 C2: codex names a session with a SUBCOMMAND ----------
+//
+// Every other CLI this module rewrites names its session with a FLAG, so the
+// excision can match on a flag name. codex does not: `codex resume <id>` is a
+// subcommand, and `resume --last` is a second form of it whose argument looks
+// exactly like the next flag. Both facts are read off `codex resume --help` at
+// 0.153.4 (`Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT]`, and `--last`
+// "Continue the most recent session without showing the picker"), quoted beside
+// `CODEX_RESUME_SUBCOMMAND`.
+//
+// The line is not hypothetical: it is what a Sessions-tab restore records for
+// the pane (`codex resume <id>`, straight from the backend's `build_resume_
+// command`), which is exactly the input the NEXT tab restore feeds back in.
+
+test("resume rewrites a codex line with the resume subcommand, never a flag", () => {
+  assert.deepEqual(agentResumeCommand("codex -C /repo", null, "cx-a"), {
+    command: "codex -C /repo resume cx-a",
+  });
+  // Every other recorded flag survives, and `-C` above all: it is what stops
+  // codex prompting about which directory to resume into.
+  assert.deepEqual(agentResumeCommand('codex -C "C:\\my repo" -m gpt-5.1 -p work', null, "cx-b"), {
+    command: 'codex -C "C:\\my repo" -m gpt-5.1 -p work resume cx-b',
+  });
+  // argv form, same grammar.
+  assert.deepEqual(agentResumeCommand(null, ["codex", "-C", "/repo"], "cx-c"), {
+    argv: ["codex", "-C", "/repo", "resume", "cx-c"],
+  });
+});
+
+test("a codex line already carrying a resume is rewritten, never doubled", () => {
+  // THE COMPOUNDING FAILURE THIS EXISTS TO STOP, and the reason the excision
+  // could not be skipped for a subcommand: `codex resume A resume B` is not a
+  // command codex can parse, and every restore would add another pair.
+  assert.deepEqual(agentResumeCommand("codex -C /repo resume old-id", null, "new-id"), {
+    command: "codex -C /repo resume new-id",
+  });
+  assert.deepEqual(agentResumeCommand(null, ["codex", "resume", "old-id"], "new-id"), {
+    argv: ["codex", "resume", "new-id"],
+  });
+  // Idempotent under repetition: two restores of the same pane converge rather
+  // than accumulating, which is the property a naive append loses.
+  const once = agentResumeCommand("codex -C /repo", null, "x").command!;
+  const twice = agentResumeCommand(once, null, "x").command!;
+  assert.equal(twice, once);
+});
+
+test("`resume --last` is excised as one unit, not left behind as a stray flag", () => {
+  // `--last` is the one argument to `resume` that STARTS WITH `--`, so the
+  // general "consume the following value unless it looks like a flag" rule the
+  // flag excision uses would drop `resume` and strand `--last`. The pane would
+  // then boot `codex --last`, an unknown root flag — a hard error rather than a
+  // wrong resume, but a broken pane either way.
+  assert.deepEqual(agentResumeCommand("codex -C /repo resume --last", null, "cx-a"), {
+    command: "codex -C /repo resume cx-a",
+  });
+  assert.deepEqual(agentResumeCommand(null, ["codex", "resume", "--last"], "cx-a"), {
+    argv: ["codex", "resume", "cx-a"],
+  });
+  // A BARE trailing `resume` (codex's interactive picker) has no argument at
+  // all, and must not swallow whatever follows it — here, nothing.
+  assert.deepEqual(agentResumeCommand("codex resume", null, "cx-a"), {
+    command: "codex resume cx-a",
+  });
+  // ...nor a flag that follows it. `--search` is a ROOT option — it is in
+  // `codex --help`, not in `codex resume --help` — and codex's root options are
+  // inherited BY the subcommand, so moving it ahead of `resume` is a valid
+  // rewrite of a valid line, which is why this expectation is what it is.
+  //
+  // The comment here used to say `--search` "belongs to the subcommand", which
+  // is backwards, and a wrong rationale on a correct assertion is how a later
+  // round "fixes" the assertion instead (review round 1, W3 — and the round
+  // that proposed exactly that fix, R1).
+  //
+  // The case the old comment was reaching for is `--all`, which really IS
+  // resume-only. This rule relocates it to root too, where clap rejects it —
+  // a loud failure on a hand-typed line, never a wrong-session resume, and the
+  // residual `isCodexResumeArgument` documents rather than a case to assert as
+  // desired output.
+  assert.deepEqual(agentResumeCommand("codex resume --search", null, "cx-a"), {
+    command: "codex --search resume cx-a",
+  });
+});
+
+test("the codex excision is program-gated: another CLI's line keeps its own words", () => {
+  // THE NEGATIVE CONTROL, and it is sharper for codex than for any other arm
+  // here, because `resume` is a bare WORD rather than a `--`-prefixed token.
+  // A claude line is rewritten by the flag path exactly as before, and its
+  // `-p` — which for codex is the solo-profile flag — is untouched.
+  assert.deepEqual(agentResumeCommand("claude -p x", null, "s1"), {
+    command: "claude -p x --resume s1",
+  });
+  // A copilot line keeps the `=` form (property 2) — the codex arm must not
+  // have intercepted it.
+  assert.deepEqual(agentResumeCommand("copilot --model gpt-5", null, "s1"), {
+    command: "copilot --model gpt-5 --resume=s1",
+  });
+  // And a quoted `resume` on a codex line is content, not the subcommand — the
+  // same quote-immunity that protects a quoted `--resume`.
+  assert.deepEqual(agentResumeCommand('codex -C /repo --prompt "please resume this"', null, "cx"), {
+    command: 'codex -C /repo --prompt "please resume this" resume cx',
+  });
+});
+
+test("a fresh codex respawn keeps NO session id, because no codex flag can assign one", () => {
+  // opencode's reason, not pi's: codex's TUI `Cli` does carry a
+  // `resume_session_id`, but it is `#[clap(skip)]` — "Internal … Set by the
+  // top-level `codex resume {SESSION_ID}` wrapper; not exposed as a public
+  // flag" — so there is nothing to append. Appending `--session-id` (what the
+  // shared arm would do) hands codex a flag it does not know.
+  assert.deepEqual(agentFreshCommand("codex -C /repo resume old-id", null, "new-id"), {
+    command: "codex -C /repo",
+  });
+  assert.deepEqual(agentFreshCommand(null, ["codex", "resume", "old-id"], "new-id"), {
+    argv: ["codex"],
+  });
+  // NEGATIVE CONTROL for the arm, not just for the CLI: pi DOES keep its
+  // identity across the same fallback, so this asserts a real difference in
+  // behaviour rather than a function that drops ids for everyone.
+  assert.deepEqual(agentFreshCommand("pi --session old-id", null, "new-id"), {
+    command: "pi --session-id new-id",
+  });
+});
+
+test("a solo codex pane's minted profile is excised, and a human's own -p is not", () => {
+  // loomux namespaces every profile it mints `<brand>-…`, and the excision
+  // requires that prefix. Without it, `-p` — an ordinary codex flag — would be
+  // deleted from a human's line on every restore.
+  assert.deepEqual(stripSoloMcpFlags("codex -C /repo -p orrerix-solo-1", null), {
+    cli: "codex",
+    command: "codex -C /repo",
+  });
+  // The legacy brand too: this module reads command lines saved by a PAST
+  // session, and one recorded before the rename still names the old server.
+  assert.equal(stripSoloMcpFlags("codex -p loomux-solo-2", null).cli, "codex");
+  // Long form, and the argv shape.
+  assert.equal(stripSoloMcpFlags("codex --profile orrerix-solo-1", null).cli, "codex");
+  assert.deepEqual(stripSoloMcpFlags(null, ["codex", "-p", "orrerix-solo-1", "-C", "/repo"]), {
+    cli: "codex",
+    argv: ["codex", "-C", "/repo"],
+  });
+
+  // THE HUMAN'S OWN PROFILE — the assertion this arm is built around, and the
+  // reason it is stronger than pi's neighbouring residual, where a human's own
+  // `--mcp-config` IS stripped and re-minted. `cli: null` also means the
+  // command comes back byte-identical, which is asserted rather than assumed.
+  const own = "codex -C /repo -p work";
+  assert.deepEqual(stripSoloMcpFlags(own, null), { cli: null, command: own });
+  assert.deepEqual(stripSoloMcpFlags(null, ["codex", "-p", "work"]), {
+    cli: null,
+    argv: ["codex", "-p", "work"],
+  });
+  // A profile merely CONTAINING the brand, rather than prefixed by it, is the
+  // human's too — the prefix is the namespace, not a substring test.
+  assert.equal(stripSoloMcpFlags("codex -p my-orrerix-thing", null).cli, null);
+
+  // PROGRAM-GATED: `-p` means something else on other CLIs (claude's `--print`
+  // short form among them), so a brand-prefixed value on a non-codex line is
+  // not proof of whose flag it is.
+  assert.equal(stripSoloMcpFlags("claude -p orrerix-solo-1", null).cli, null);
+});
+
+
+test("a short root flag after `resume` is a flag, not a session id (#2515 C2 review W2)", () => {
+  // THE DEFECT THIS PINS. `isCodexResumeArgument` tested `--`, and codex has
+  // SEVEN short root options — `codex --help` at 0.153.4: `-c/--config`,
+  // `-i/--image`, `-m/--model`, `-p/--profile`, `-s/--sandbox`, `-C/--cd`,
+  // `-a/--ask-for-approval`. Each was consumed as a session id.
+  //
+  // The reported instance, exactly: `-c` was eaten, so the rebuilt line put
+  // `model=o3` where codex reads the root `[PROMPT]` positional.
+  assert.deepEqual(agentResumeCommand("codex -C /repo resume -c model=o3", null, "new-id"), {
+    command: "codex -C /repo -c model=o3 resume new-id",
+  });
+
+  // Every one of the seven, so the fix is pinned against the FLAG SET rather
+  // than against the one example a review happened to name. A loop, because
+  // seven hand-written assertions is seven chances to leave one out — and each
+  // asserts the flag AND its value both survive.
+  for (const flag of ["-c", "-i", "-m", "-p", "-s", "-C", "-a"]) {
+    assert.deepEqual(
+      agentResumeCommand(`codex resume ${flag} value`, null, "cx"),
+      { command: `codex ${flag} value resume cx` },
+      `${flag} must not be consumed as a session id`
+    );
+  }
+
+  // NEGATIVE CONTROL, and it is what stops the fix from being "never consume
+  // anything": a real id still IS consumed, so the excision has not simply
+  // stopped working. Without this the loop above passes against a predicate
+  // that returns false unconditionally.
+  assert.deepEqual(agentResumeCommand("codex resume old-id", null, "new-id"), {
+    command: "codex resume new-id",
+  });
+  // …and `--last`, the one `-`-prefixed token that IS resume's own argument,
+  // is still consumed — the case a blanket "anything with a dash is a flag"
+  // would have broken.
+  assert.deepEqual(agentResumeCommand("codex resume --last", null, "new-id"), {
+    command: "codex resume new-id",
+  });
+
+  // The argv form takes the same rule, since it shares the predicate.
+  assert.deepEqual(agentResumeCommand(null, ["codex", "resume", "-m", "gpt-5"], "cx"), {
+    argv: ["codex", "-m", "gpt-5", "resume", "cx"],
+  });
 });

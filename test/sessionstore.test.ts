@@ -192,9 +192,20 @@ test("every source the backend's scanner can emit is spellable on the wire (#212
   // `src/`. This test is the runtime companion to that, and the annotation is
   // documentation of intent rather than an enforced pin; said plainly so a
   // mutation table's "no test reddened" row is read correctly.
-  const sources: SessionInfo["source"][] = ["claude", "copilot", "opencode", "pi"];
-  assert.equal(sources.length, 4);
+  const sources: SessionInfo["source"][] = ["claude", "copilot", "opencode", "pi", "codex"];
+  assert.equal(sources.length, 5);
   const pi: SessionInfo = { ...row("pi-1"), source: "pi", resume_command: "pi --session pi-1" };
   assert.equal(pi.source, "pi");
   assert.ok(pi.resume_command.startsWith("pi "), pi.resume_command);
+  // #2515 C2's member, kept beside the pre-widening one rather than replacing
+  // it. Its resume command is the shape no other source has — a SUBCOMMAND, so
+  // the assertion is on `codex resume ` and not merely on the program name,
+  // which would pass for a line that named codex and then did nothing.
+  const codex: SessionInfo = {
+    ...row("019ff1a2-b3c4-7d5e-8f60-112233445566"),
+    source: "codex",
+    resume_command: "codex resume 019ff1a2-b3c4-7d5e-8f60-112233445566",
+  };
+  assert.equal(codex.source, "codex");
+  assert.ok(codex.resume_command.startsWith("codex resume "), codex.resume_command);
 });

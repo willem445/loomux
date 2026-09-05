@@ -138,6 +138,21 @@ export function planSessionAdoption(
     sessions.filter(
       (s) =>
         s.cli === pane.cli &&
+        // An UNKNOWN workspace is never a match, on either side (#2515 C2
+        // review round 1, premortem 1). `cwd` is the empty string for a
+        // session whose transcript records none — a torn header, and, since
+        // C2, EVERY codex rollout older than a week, whose `.jsonl.zst` this
+        // crate deliberately does not decompress. Without this guard those
+        // rows normalize to `""` and match any pane whose own `cwd` is `""`,
+        // so a pane would adopt an unrelated session's id — silently, and
+        // with the adoption machinery working exactly as designed.
+        //
+        // Refused rather than made to work: "" means "nobody recorded a
+        // directory", so the two sides are not known to be equal — they are
+        // both unknown, which is the one case equality must not claim. The
+        // pane simply stays unadopted, which is what it already does for a
+        // session in another folder.
+        normalizeCwd(s.cwd) !== "" &&
         normalizeCwd(s.cwd) === normalizeCwd(pane.cwd) &&
         s.modifiedMs >= pane.eligibleSinceMs &&
         !claimed.has(s.id)
@@ -180,8 +195,24 @@ export function dormantResumeCandidate(
   record: { cli: Cli; cwd: string | null },
   sessions: readonly SessionRecord[]
 ): SessionRecord | null {
-  if (!record.cwd) return null;
-  const cwd = record.cwd;
+  // An UNKNOWN workspace is never a match — the SAME rule
+  // `planSessionAdoption` applies above, read here off the NORMALIZED string
+  // rather than the raw one (#2515 C2 review round 2, N2).
+  //
+  // `!record.cwd` alone tests truthiness of what the pane recorded, and
+  // `normalizeCwd` collapses more than the empty string: it trims, folds
+  // separators and strips trailing ones, so `"/"`, `"\\"`, `"//"` and a run of
+  // spaces all normalize to `""` while being perfectly truthy. A pane whose
+  // cwd is `/` therefore passed this guard and then matched, by `"" === ""`,
+  // the newest session with no recorded workspace — which since C2 means any
+  // codex rollout older than a week, not a rare torn header.
+  //
+  // Round 1 fixed exactly this comparison sixty lines up and left this one,
+  // which is the CLAUDE.md one-rule bullet's own signature: the fix for a
+  // one-rule finding ships a second of the same class. Both matchers now read
+  // the empty case by one rule.
+  const cwd = record.cwd ?? "";
+  if (normalizeCwd(cwd) === "") return null;
   const matches = sessions.filter((s) => s.cli === record.cli && normalizeCwd(s.cwd) === normalizeCwd(cwd));
   if (!matches.length) return null;
   return matches.reduce((newest, s) => (s.modifiedMs > newest.modifiedMs ? s : newest));

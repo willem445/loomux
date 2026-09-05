@@ -287,18 +287,41 @@ test("the row's mark and the pane header's mark are one resolution, not two that
   // object — so the check here is that the row's answer equals the answer
   // `agentMark` gives the header's input, for every launchable CLI.
   //
-  // The specimen that made this necessary is `codex`: covered by no session
+  // The specimen that made this necessary WAS `codex`: covered by no session
   // store, so the old `harness` route answered null for it while the header
   // drew a letter badge. It is asserted BY NAME here, and only here, because a
   // regression test for a specific divergence should name the specimen that
   // diverged; the population sweep above is the general guard.
+  //
+  // #2515 C2 gave codex a session store, so it is no longer outside the
+  // membership test and can no longer witness the divergence W1 was about.
+  // `gemini` takes the role — same class, still outside — and codex keeps a
+  // strictly weaker assertion of its own below, explicitly labelled: the
+  // original specimen must still DRAW, which is the half of W1 that survives
+  // its change of class (#1225's "give the converged case its own weaker,
+  // labelled assertion").
   for (const agent of AGENTS.filter((a) => a.id !== "custom")) {
     const input = localPane(agent.command);
     assert.deepEqual(agentRowMark(row("working", { mark: input })), agentMark(input), agent.id);
   }
+  const gemini = agentRowMark(row("working", { mark: localPane("gemini") }));
+  assert.equal(gemini?.program, "gemini", "the specimen W1's class is witnessed by draws nothing again");
+  assert.equal(
+    sessionCliFromCommand("gemini"),
+    null,
+    "gemini is outside the session-store set — that is what makes it the witness"
+  );
+  // W1's ORIGINAL specimen, kept, on the strictly weaker property that
+  // survives its move into the session-store set: it must still draw its own
+  // mark. What it can no longer witness is the divergence itself, since
+  // `harness` now answers for it.
   const codex = agentRowMark(row("working", { mark: localPane("codex") }));
   assert.equal(codex?.program, "codex", "the specimen W1 was found on draws nothing again");
-  assert.equal(sessionCliFromCommand("codex"), null, "codex is still outside the session-store set");
+  assert.equal(
+    sessionCliFromCommand("codex"),
+    "codex",
+    "codex joined the session-store set in #2515 C2 — this is why it is no longer the witness"
+  );
 });
 
 test("a row with no launch line draws nothing, rather than a badge that guesses", () => {
@@ -341,19 +364,26 @@ test("a remote pane and its local twin draw the same mark for the same CLI", () 
 });
 
 test("the mark's cache key moves whenever the resolver's answer would (#2371 review round 3, finding 1)", () => {
-  // THE SCENARIO THE FINDING NAMES, first and by itself: a `codex` pane promoted
+  // THE SCENARIO THE FINDING NAMES, first and by itself: a `hermes` pane promoted
   // in place to a `gemini` orchestrator. `Pane.key` is readonly and survives
   // `respawnFresh`, so the row element outlives it — and `harness` is
   // `sessionCliFromCommand`, which answers null for BOTH, so the old guard saw
-  // no change and the row kept `codex`'s badge while the header drew `gemini`'s.
-  const codex = localPane("codex");
+  // no change and the row kept `hermes`'s badge while the header drew `gemini`'s.
+  //
+  // THE FINDING NAMED `codex`, and #2515 C2 moved it out of the class: it has a
+  // session store now, so `sessionCliFromCommand` answers for it and it is no
+  // longer a both-sides-null pair. Relocated to `hermes`, which still is
+  // (#1225) — and the two `assert.equal(..., null)` lines below are what make
+  // this a real reproduction rather than a pair that merely differs, so they
+  // are re-proved on the new specimen rather than deleted.
+  const hermes = localPane("hermes");
   const gemini = localPane("gemini");
-  assert.equal(sessionCliFromCommand("codex"), null);
+  assert.equal(sessionCliFromCommand("hermes"), null);
   assert.equal(sessionCliFromCommand("gemini"), null, "both sides are outside the session-store set — that IS the bug");
-  assert.notEqual(markKey(codex), markKey(gemini), "the key must move where `harness` did not");
+  assert.notEqual(markKey(hermes), markKey(gemini), "the key must move where `harness` did not");
   // And the answers really do differ, so the key is tracking something visible
   // rather than moving for its own sake.
-  assert.notEqual(agentMark(codex)?.program, agentMark(gemini)?.program);
+  assert.notEqual(agentMark(hermes)?.program, agentMark(gemini)?.program);
 
   // Every input the resolver reads moves the key, one at a time from one base —
   // disjoint fixtures would hold under an implementation that ignored a field.

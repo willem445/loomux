@@ -61,7 +61,7 @@ A row without a **Resume** button says why it has none:
 | What the row says | What happened | What to do |
 | --- | --- | --- |
 | *Running now* | The group has live agents in this window | Click **Focus** on the row — it brings that group's orchestrator pane back into view, out of the dock or out from behind a fullscreen pane, in whichever project tab holds it |
-| *Session not yet identified* | Copilot and OpenCode mint their session ids after boot, and orrerix has not learned this one yet (or its watcher timed out). Claude Code and pi never show this row — orrerix assigns their ids before the pane starts | Wait for it. If the watcher timed out there is nothing to resume by hand — start a fresh orchestrator, which reattaches to this group's existing board and roster |
+| *Session not yet identified* | Copilot, OpenCode and Codex mint their session ids after boot, and orrerix has not learned this one yet (or its watcher timed out). Claude Code and pi never show this row — orrerix assigns their ids before the pane starts | Wait for it. If the watcher timed out there is nothing to resume by hand — start a fresh orchestrator, which reattaches to this group's existing board and roster |
 | *Recorded session is no longer in the … store* | The CLI's own history no longer holds that conversation | Start a fresh orchestrator — it reattaches to this group's existing board and roster |
 | *This group's record could not be read* | The group's `group.json` is missing or damaged | Repair or remove that file; until then orrerix cannot tell which CLI ran the group |
 
@@ -83,11 +83,30 @@ Below that, the individual agent sessions orrerix found on this machine:
   `$PI_CODING_AGENT_SESSION_DIR` somewhere, pi writes session files straight
   into it with no per-folder subdirectory — both shapes are read, so a store
   you have used both ways lists everything in it.
+- **Codex CLI** — `~/.codex/sessions/<year>/<month>/<day>/rollout-<time>-<id>.jsonl`
+  (`$CODEX_HOME` is honoured, and it names Codex's *home*, so the sessions live
+  one level inside it — exactly as Codex itself resolves it), titled by the first
+  real prompt and resumed with `codex resume <id>`.
 
 If you have moved your pi store using the `sessionDir` key in
 `~/.pi/agent/settings.json` rather than either environment variable, orrerix
 does not read that file and will list no pi sessions. It will not list *wrong*
 ones.
+
+Two things about **Codex**'s store are worth knowing, because you will see both.
+
+Codex compresses its own older transcripts in place, so a session older than
+about a week lists **without a title or a folder**. Orrerix still finds it and
+can still resume it — the conversation is intact, and Codex reads it back
+itself — but orrerix does not unpack it just to read a title, so the row says
+*(no prompt)* and shows no working directory. Listing those sessions without
+the details is the deliberate choice: the alternative was not listing a
+week-old session at all.
+
+Sessions you have **archived** are not listed. `codex archive` moves a session
+into a separate store and orrerix reads only the live one — so archiving
+something in Codex takes it out of this list too, which is what archiving it
+was for. `codex unarchive <id>` brings it back.
 
 Only *your own* opencode and pi sessions are listed — the ones a solo pane or
 your own terminal created. Sessions belonging to an orchestration group live in
@@ -95,6 +114,13 @@ that group's own store and are reopened by restoring the group from the
 **Orchestrations** list above, not as standalone panes: a bare
 `opencode --session <id>` or `pi --session <id>` pane would come back with no
 MCP tools and no task board.
+
+Codex is listed differently, and it is worth saying why: it keeps every session
+in *one* store, so a group's Codex sessions sit in the same place as your own
+and **do** appear here. Resuming one from this list gives you the conversation
+and nothing else — no MCP tools, no task board, no roster — so if the session
+belonged to a group, restore the group from **Orchestrations** instead. The row
+is a way back into the transcript, not a way back into the group.
 
 Clicking a session opens a new pane in the session's original working directory
 and resumes it there. The pane is auto-named from the session.

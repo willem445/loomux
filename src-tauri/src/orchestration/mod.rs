@@ -6730,23 +6730,17 @@ pub fn pi_session_cwd_in_dir(dir: &Path, session_id: &str) -> Result<Option<Stri
     // version's doc comment claimed this bound while `read_to_string`
     // quietly took the lot.
     //
-    // `read_line` on a `BufReader` stops at the first `\n`, so the tail is
-    // never touched; the extra cap is for the pathological case where a
-    // corrupt or mid-write file carries no newline at all, which would
-    // otherwise make "the first line" mean "everything".
+    // The read itself is `loomux_engine::sessions::bounded_first_line` (#2515
+    // C2), which is where those mechanics and that bound's rationale now live.
+    // It is shared with codex's header read rather than copied, because the two
+    // CLIs are asking the identical question of an identical file shape — an
+    // append-only JSONL whose first line is the metadata — and two copies of
+    // "read one bounded line" is two places for the bound to be forgotten.
     //
     // A file that exists but is empty (created and not yet written
     // through) reads as "no recorded cwd", not as absent: the session id
     // is real, its workspace is merely unknown.
-    let cwd = fs::File::open(&path)
-        .ok()
-        .and_then(|f| {
-            let mut line = String::new();
-            BufReader::new(f.take(PI_SESSION_HEADER_MAX_BYTES))
-                .read_line(&mut line)
-                .ok()
-                .map(|_| line)
-        })
+    let cwd = loomux_engine::sessions::bounded_first_line(&path, PI_SESSION_HEADER_MAX_BYTES)
         .and_then(|line| serde_json::from_str::<Value>(line.trim_end()).ok())
         .filter(|v| v.get("type").and_then(Value::as_str) == Some("session"))
         .and_then(|v| v.get("cwd").and_then(Value::as_str).map(str::to_string))

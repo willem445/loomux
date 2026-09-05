@@ -219,3 +219,144 @@ test("a pi pane adopts a pi session, and never one of another CLI's (#2126)", ()
     []
   );
 });
+
+test("a codex pane adopts a codex session, and never one of another CLI's (#2515 C2)", () => {
+  // codex joined `Cli` with #2515 C2, and the hole it would otherwise leave is
+  // the one #2126 and #722 each left before it: every codex pane unadoptable
+  // while the sidebar lists the very session it should adopt. The pi test above
+  // is kept intact — this is an ADDITION, since a per-CLI property is only
+  // witnessed by the CLI it is about.
+  const out = planSessionAdoption(
+    [pane({ cli: "codex" })],
+    [
+      session({
+        id: "019ff1a2-b3c4-7d5e-8f60-112233445566",
+        cli: "codex",
+        resumeCommand: "codex resume 019ff1a2-b3c4-7d5e-8f60-112233445566",
+      }),
+    ],
+    new Set()
+  );
+  assert.deepEqual(out, [{ key: "p1", sessionId: "019ff1a2-b3c4-7d5e-8f60-112233445566" }]);
+
+  // THE FIXTURE THAT MAKES THAT FAIL-ABLE, copied in shape from the pi test
+  // above: the two candidates COLLIDE on everything the matcher reads except
+  // the CLI, so a matcher ignoring `cli` sees an ambiguity and refuses both,
+  // and one that crossed CLIs adopts the wrong id.
+  const both = planSessionAdoption(
+    [pane({ key: "pane-codex", cli: "codex" }), pane({ key: "pane-claude", cli: "claude" })],
+    [session({ id: "cx-1", cli: "codex" }), session({ id: "cl-1", cli: "claude" })],
+    new Set()
+  );
+  assert.deepEqual(
+    [...both].sort((a, b) => a.key.localeCompare(b.key)),
+    [
+      { key: "pane-claude", sessionId: "cl-1" },
+      { key: "pane-codex", sessionId: "cx-1" },
+    ]
+  );
+
+  // And a codex pane with only another CLI's session in the folder adopts
+  // nothing. The negative arm matters more for codex than for pi: a codex
+  // thread id is a bare UUID, indistinguishable by SHAPE from a claude session
+  // id, so nothing but the `cli` field can keep the two apart.
+  assert.deepEqual(
+    planSessionAdoption([pane({ cli: "codex" })], [session({ id: "cl-1", cli: "claude" })], new Set()),
+    []
+  );
+});
+
+test("an unknown workspace never matches a pane, on either side (#2515 C2 review premortem 1)", () => {
+  // A session whose transcript records no cwd carries `cwd: ""` — a torn
+  // header, and, since C2, EVERY codex rollout older than a week, whose
+  // `.jsonl.zst` this project deliberately does not decompress. `normalizeCwd`
+  // maps that to `""`, which would equal a pane whose own cwd is `""`.
+  //
+  // The fixture COLLIDES on purpose: same cli, same (empty) cwd, eligible,
+  // unclaimed — every field the matcher reads agrees, so this fails against any
+  // implementation that does not special-case the empty string, and holds only
+  // for one that refuses it.
+  assert.deepEqual(
+    planSessionAdoption(
+      [pane({ cli: "codex", cwd: "" })],
+      [session({ id: "cx-unknown", cli: "codex", cwd: "" })],
+      new Set()
+    ),
+    [],
+    "an unknown workspace on both sides is two unknowns, not a match"
+  );
+
+  // Either side alone is equally refused — the guard reads the SESSION's cwd,
+  // so this pins that a real pane cannot adopt an unknown-workspace row.
+  assert.deepEqual(
+    planSessionAdoption(
+      [pane({ cli: "codex", cwd: "C:\\repo" })],
+      [session({ id: "cx-unknown", cli: "codex", cwd: "" })],
+      new Set()
+    ),
+    []
+  );
+
+  // POSITIVE CONTROL, and the reason the two empties above are not vacuous: the
+  // SAME pane and the SAME session adopt normally once the session records a
+  // real directory. Without this, a matcher that refused everything would pass.
+  assert.deepEqual(
+    planSessionAdoption(
+      [pane({ cli: "codex", cwd: "C:\\repo" })],
+      [session({ id: "cx-known", cli: "codex", cwd: "C:\\repo" })],
+      new Set()
+    ),
+    [{ key: "p1", sessionId: "cx-known" }]
+  );
+});
+
+test("dormantResumeCandidate refuses an unknown workspace, on either side (#2515 C2 review N2)", () => {
+  // THE SIBLING of the premortem-1 guard, and the reason it needed its own
+  // test: round 1 fixed `planSessionAdoption`'s comparison and left this one,
+  // which does the same `normalizeCwd(s.cwd) === normalizeCwd(cwd)` sixty lines
+  // down. Nothing covered this function against an unknown-cwd session at all.
+  //
+  // A session with no recorded workspace is never the answer, even though the
+  // pane here has a perfectly ordinary cwd.
+  assert.equal(
+    dormantResumeCandidate({ cli: "codex", cwd: "C:\\repo" }, [
+      session({ id: "cx-unknown", cli: "codex", cwd: "" }),
+    ]),
+    null
+  );
+
+  // AND THE HALF THE RAW-STRING GUARD MISSED, which is the actual defect:
+  // `normalizeCwd` collapses `/`, `\`, `//` and a run of spaces to `""`, so
+  // each of these is TRUTHY and passed `!record.cwd` — then matched an
+  // unknown-workspace session by `"" === ""`. Every one of them is asserted,
+  // because a guard that handled only the empty string would pass a test that
+  // used only the empty string.
+  for (const paneCwd of ["/", "\\", "//", "   ", "\\\\"]) {
+    assert.equal(
+      dormantResumeCandidate({ cli: "codex", cwd: paneCwd }, [
+        session({ id: "cx-unknown", cli: "codex", cwd: "" }),
+      ]),
+      null,
+      `a pane cwd of ${JSON.stringify(paneCwd)} normalizes to empty and must not match`
+    );
+  }
+
+  // POSITIVE CONTROL, and what stops every assertion above from passing
+  // against a function that returns null unconditionally: a real pane cwd and a
+  // real session cwd still produce the candidate.
+  assert.equal(
+    dormantResumeCandidate({ cli: "codex", cwd: "C:\\repo" }, [
+      session({ id: "cx-known", cli: "codex", cwd: "C:\\repo" }),
+    ])?.id,
+    "cx-known"
+  );
+  // ...and a drive root still works, since `normalizeCwd("C:\\")` is `"c:"` and
+  // not empty — the guard must refuse what normalizes to nothing, not every
+  // short path.
+  assert.equal(
+    dormantResumeCandidate({ cli: "codex", cwd: "C:\\" }, [
+      session({ id: "cx-root", cli: "codex", cwd: "C:\\" }),
+    ])?.id,
+    "cx-root"
+  );
+});
