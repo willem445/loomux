@@ -40976,7 +40976,6 @@ impl OrchRegistry {
             // else self-heals it: the per-spawn render never REMOVES a file. The
             // write is idempotent, and this arm is a human-gated action rather
             // than a poll, so paying it here costs nothing worth saving.
-            self.reconcile_instruction_files(&info);
             drop(_io);
             return Ok(self.workflow_status(group));
         }
