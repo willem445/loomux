@@ -1377,6 +1377,32 @@ pub fn builtin_intake_profile() -> IntakeProfile {
     }
 }
 
+/// **Is this string usable as an intake label?** The one rule, asked by every
+/// caller that has to decide it — `sanitize_intake_label` below (the workflow
+/// parser's arm, which turns a `None` into an author-facing error), the
+/// `group.json` reader (which turns it into a per-field fallback), and `gh.rs`
+/// at its own argv boundary (#2663). Returns the value itself on success, so a
+/// caller never has to re-derive it.
+///
+/// [`sanitize_id`]'s alphabet — letters, digits, `-`, `_` — **plus a refusal of
+/// a leading `-`**, and it is one function rather than three copies precisely
+/// because those two halves had drifted: the parser refused `--force` while the
+/// `group.json` reader accepted it, which was invisible for as long as a
+/// group's own `intake.hold` reached prose surfaces only. #2663 gives that
+/// field an argv, so the two rules have to be one rule.
+///
+/// **Rejected, not rewritten** (`Some(clean) if clean == v`), matching every
+/// other user-authored identifier in this file: an author who wrote a label
+/// with a space must see an error, not a silently different string their own
+/// repo's labels no longer match.
+pub fn usable_intake_label(raw: &str) -> Option<String> {
+    let v = raw.trim();
+    match sanitize_id(v) {
+        Some(clean) if clean == v && !clean.starts_with('-') => Some(clean),
+        _ => None,
+    }
+}
+
 /// A single `intake.labels.<field>:` value. Sanitized like a block id
 /// ([`sanitize_id`]) — the same conservative alphabet, because a label string
 /// eventually reaches a `gh issue list --label` argument and a template
@@ -1395,18 +1421,21 @@ pub fn builtin_intake_profile() -> IntakeProfile {
 /// `gh label create <name> …`, and a positional beginning with a dash is read
 /// by cobra as an unknown flag. That is not an injection (nothing is executed,
 /// and the create fails loudly), but it is a class of value that can never
-/// work, and rejecting it here is what lets `gh.rs` state — truthfully — that
-/// nothing flag-shaped reaches an argv. `--force` and `-x` are nonsense as
-/// label names for all five fields, so nothing legitimate is lost. Interior and
-/// trailing dashes (`agent-hold`, `do-not-touch`) are untouched.
+/// work. `--force` and `-x` are nonsense as label names for all five fields, so
+/// nothing legitimate is lost. Interior and trailing dashes (`agent-hold`,
+/// `do-not-touch`) are untouched.
+///
+/// That refusal lives in [`usable_intake_label`] rather than here, because this
+/// arm is no longer the only place it has to hold: a hand-edited `group.json`
+/// never met this parser, and #2663 routes its `intake.hold` to the same argv.
 fn sanitize_intake_label(field: &str, raw_val: &str, fallback: &str, errs: &mut Vec<String>) -> String {
     let v = raw_val.trim();
     if v.is_empty() {
         return fallback.to_string();
     }
-    match sanitize_id(v) {
-        Some(clean) if clean == v && !clean.starts_with('-') => clean,
-        _ => {
+    match usable_intake_label(v) {
+        Some(clean) => clean,
+        None => {
             errs.push(format!(
                 "intake.labels.{field}: {v:?} is not a usable label (letters, digits, '-', '_'; \
                  and it may not begin with '-')"
