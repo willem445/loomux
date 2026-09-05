@@ -7453,9 +7453,8 @@ pub fn codex_profile_toml(
         CodexMcpAuth::EnvVar(var) => {
             s.push_str(&format!("env_http_headers = {{ \"{header}\" = \"{var}\" }}\n"));
         }
-        CodexMcpAuth::Literal(token) => s.push_str(&format!(
-            "http_headers = {{ \"{header}\" = \"{}\" }}\n",
-            toml_basic_escape(token, TomlNewlines::Escape)
+        CodexMcpAuth::Literal(_) => s.push_str(&format!(
+            "env_http_headers = {{ \"{header}\" = \"ORRERIX_AGENT_TOKEN\" }}\n"
         )),
     }
     s
