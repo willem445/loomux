@@ -41,6 +41,12 @@ workflow block, and its group.
 **Click a row to go to that pane** — it switches to the pane's project tab,
 makes it the active pane there, and focuses the terminal.
 
+It *reveals* the pane rather than just focusing it, so a row always gets you
+somewhere you can see. If the pane is parked in the dock, it comes back into
+the grid; if another pane is filling the window, that fullscreen drops first.
+Clicking the row of the pane that is *already* fullscreen leaves it
+fullscreen — you are looking at it, so there is nothing to reveal.
+
 ## The states
 
 | State | What it means |

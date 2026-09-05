@@ -394,6 +394,199 @@ there as an on-state, the same class as the task board's own filter chip.
   attention change is a wire change for a lag nobody has measured.
 - **The list is this window's open panes.** An agent with no pane open, or a
   pane in another orrerix window, is not here; the session browser is.
+- **An agent-initiated reveal of a hidden pane is deliberately partial.**
+  `focus_agent` on a pane that is docked or behind a fullscreen sibling makes
+  it the active pane and focuses it, but leaves it hidden — constraint 1 will
+  not let an agent resize a PTY to uncover it. The human's own Agents row
+  reveals it fully, and the pane's attention badge is what points them at it.
+  Swapping the fullscreen to the target instead was considered and rejected on
+  the same ground as the human case: it is a layout change nobody asked for,
+  and here nobody human asked for anything at all.
 - **No keyboard chord.** Out of scope for this slice — a new chord needs the
   `agent-cli-reference` sweep `doc/design/side-dock.md` describes, and the two
   buttons plus the tablist cover the gesture.
+
+## Reveal, not focus (#2365)
+
+A row click used to be three steps — switch to the pane's tab, `Grid.setActive`,
+`Pane.focus()` — and all three are blind to the two states that make a pane
+invisible while its PTY stays bound.
+
+**Maximize.** `Grid.toggleMaximize` lifts the target's element out of the split
+tree into a top layer under `.grid-root` and `styles.css` hides everything else
+with `.grid-root.has-maximized > :not(.maximized) { display: none }`. So
+`setActive` on a pane behind a maximized sibling toggles a class inside a
+`display:none` subtree, and `term.focus()` on a hidden textarea is a browser
+no-op. The row click *ran*, correctly, and did nothing anyone could see.
+
+**The dock.** A minimized pane is out of the tree entirely, so the same two
+steps have no element to act on — and `toggleMaximize` refuses a docked pane
+outright (`if (!this.leaves.has(pane)) return`), which means a pane the blind
+`setActive` had made *active* from the dock could not even be maximized back
+into view.
+
+Every surface that says "go to this pane" was one of these three-step copies:
+the Agents row (`deps.focus`), `orch-focus` → `OrchWiring.focusPty`, and the
+Sessions tab's live-group copy, which said "focus its orchestrator pane instead
+of resuming it" and offered nothing to click at all. They are now one function,
+`revealPane` in `main.ts`, over one rule, `revealPlan` in `panefocus.ts`.
+
+### Where each half lives, and why
+
+The rule is DOM-free and in `panefocus.ts` — already the module that owns
+focus/maximize decisions — so all twelve crossings of
+`{tab active} × {docked} × {maximized: self | other | none}` are pinned under
+`node --test` rather than hand-validated. `Grid` executes the steps it owns (it
+is the holder of the dock and the lifted element); `main.ts` executes the tab
+step, because it is the only holder of `tabs`. No layer is crossed that is not
+crossed today.
+
+### Decision: reveal EXITS fullscreen rather than swapping it
+
+When a *different* pane is maximized, the reveal drops fullscreen and returns to
+the layout the human already knows. The alternative — swapping the fullscreen to
+the target — was rejected: it keeps the human in a mode they did not choose for
+this pane, and it hides whatever they *had* maximized with no visible cause,
+which is the same class of silent disappearance this issue is about. Exiting is
+one step back to a layout that is on screen and reversible with one
+`Ctrl+Shift+M`.
+
+Revealing the maximized pane **itself** leaves fullscreen alone
+(`maximized: "self"` emits no `exit-maximize`). A human who maximized a pane and
+then clicked its own Agents row is already looking at it; yanking them out would
+be a layout change nobody asked for. That is a negative control in the tests,
+not just a branch.
+
+A dock restore stands in for the exit: `Grid.restore` already exits fullscreen
+on its way in, so emitting both would be one redundant relayout — and under
+constraint 1 a redundant relayout is a redundant PTY fit.
+
+### Constraint 1: who asked decides whether a PTY may be resized
+
+**This section said something false in round 0 and round 1, and the correction
+is the interesting part.** It read: *"`exitMaximize` and `restore` are the same
+discrete-human-click class … No new fit is added, no passive or continuous
+trigger reaches one."* The first half is true of the two surfaces that clause
+was written about — the Agents row and the Sessions Focus button. It was false
+of the third surface this same section lists three paragraphs above:
+`orch-focus` → `OrchWiring.focusPty`.
+
+`orch-focus` has no human on its path at all. It is emitted from exactly one
+place, `Registry::focus_agent`, reached from exactly one place, the
+`focus_agent` MCP tool — advertised to every orchestrator in its own template
+and gated only by `require_orchestrator`. So rewiring `focusPty` to a reveal
+handed an unprompted agent tool call the ability to drop the human out of a
+fullscreen they chose, or pull a pane they had docked back into the split tree.
+Both genuinely resize a PTY — `toggleMaximize`'s own doc says the maximized
+pane *"alone issues one debounced fit"*, `restore`'s says re-attaching
+*"triggers a single genuine fit"*, and a restore re-seats the pane beside the
+active one so its new siblings fit too. That is precisely the trigger class
+constraint 1 bars.
+
+**The repo had already adjudicated this exact case, seventy lines away.**
+`shouldPreserveMaximize` (#155, `src/panefocus.ts`) exists because an
+orchestrator-driven *spawn* used to collapse the human's fullscreen: *"the
+human is watching one pane full-screen and an agent spawning in the background
+must not yank them back to the grid."* `Grid.placeLeaf` honours it. The reveal
+path re-opened the same question and had no equivalent answer.
+
+So `revealPlan` takes a `humanInitiated` bit, and the two structural steps —
+`restore-from-dock` and `exit-maximize`, the only two that resize anything —
+are gated on it:
+
+- **A human gesture** (Agents row click, Sessions **Focus** button, the
+  Mine-row click's reveal) may exit a fullscreen and un-dock a pane. This is
+  the discrete-human-click class constraint 1 sanctions, through the existing
+  `resizeburst` coalescing, so no *new* fit is added there.
+- **An agent-initiated reveal** (`orch-focus`) gets `switch-tab` /
+  `set-active` / `focus` and nothing structural. The agent can still say which
+  pane it wants attention on — the tab comes forward, the pane becomes the one
+  receiving keystrokes — and it cannot resize a thing. `switch-tab` is not
+  gated because it moves no PTY.
+- **The plain case** — a visible pane in the tab already showing — touches no
+  layout at all whoever asked: its plan is exactly `["set-active", "focus"]`,
+  which is what the app did before.
+
+The bit is a **required** parameter on `revealPlan`, `Grid.reveal` and
+`revealPane` rather than an option with a default, so a future caller fails to
+compile instead of silently inheriting the permissive answer.
+
+Pinned by three tests, and the negative control is the load-bearing half: for
+each of the twelve states, the agent plan must contain neither structural step
+**and** the identical state asked for by a human must still contain the one it
+is owed. Asserting only the agent half would pass equally well against a
+`revealPlan` that had stopped emitting structural steps for anybody, which is
+the regression the pair exists to tell apart; a population control asserts that
+8 of the 12 human crossings really are owed one, so the control cannot go
+vacuous. Deleting the gate reddens exactly the three agent tests; inverting it
+reddens those three plus the two human ones.
+
+### The maximize trigger is INFERRED, not observed
+
+This is the honest limit of the diagnosis. Nothing in the report or the logs
+records a maximize; what the reading establishes is that no frontend path
+reachable from a row click can *remove* a pane (`Grid.closePane(pane, false)`
+has three callers, none of them reachable from a click, and `captureLayout`
+walks every leaf), and that fullscreen is the app's **only** mechanism for
+hiding a pane while leaving its PTY bound. So maximize is the inferred trigger
+because it is the only candidate the code admits — not because anyone saw it
+happen.
+
+The fix does not depend on that inference being right. It makes every reveal
+path handle *both* hiding states, so whichever one was in play, the pane comes
+back. Deciding the next occurrence by log rather than by reading would need a
+`ui_breadcrumb` command recording maximize/minimize/close-without-kill; that is
+a new public command and was deliberately left out of this slice.
+
+### Deviation from the plan: `liveSessionAction` is role-gated
+
+The plan for this slice specified `liveSessionAction({ groupLive, paneInWindow })`
+and wired it into the Sessions **Mine**-row click for every orchestration-routed
+row. Implemented literally, that regresses a live worker rejoin: the backend
+refusal it stands in for is role-gated —
+`if record.role == "orchestrator" { if record.group_live { return Err(…) } }`
+in `src-tauri/src/orchestration/mod.rs` — so a worker or reviewer row in a live
+group is **rejoined**, not refused. With a 2-input rule, clicking a live
+worker's row would have revealed the group's *orchestrator* pane instead of
+rejoining that worker.
+
+So the rule takes a third input, `isOrchestratorRow`, and
+`groupLive && !isOrchestratorRow → "resume"`. The crossings go 4 → 8 and the
+live-worker case is pinned as a negative control over both pane placements. The
+rule stays in the pure module rather than becoming a condition at the `main.ts`
+call site, which is this slice's own boundary argument: a rule the backend
+enforces should not live in untested DOM glue.
+
+`explain` (a live group whose orchestrator pane is in no window here) exists so
+the app never calls into a refusal it can already predict — the round-trip could
+only come back with advice the human has no way to act on.
+
+### Review round 1: two corrections, and one precondition that stays a comment
+
+**`revealPane` is two steps, not three.** It used to end on a `pane.focus()` of
+its own, after `Grid.reveal` had already run the plan's `focus` step — a second
+focus of the same terminal. Harmless, and precisely the redundant step this
+section claims the design does not emit, so the claim and the code disagreed.
+The trailing call is gone. The deletion is safe because the plan *always* ends
+in `focus`: `no plan ever contains a removing step` asserts
+`plan.slice(-2) === ["set-active", "focus"]` on all twelve crossings, and
+deleting `plan.push("focus")` reddens it along with three others.
+
+**`Grid.reveal` has a precondition, and it is a comment rather than a guard.**
+It passes `tabIsActive: true` unconditionally — the grid cannot know the answer —
+so its plan omits `switch-tab`. A caller that has *not* put the pane's tab on
+screen therefore runs every step under `display:none` and has re-entered exactly
+the blindness this whole section is about, with nothing red to say so.
+`revealPane` is the only caller and it switches tabs first.
+
+A source-scanning guard was written for that and **withdrawn**, which is worth
+recording because the reason generalises. `reveal` is an ordinary method name in
+this tree — `EditorWidget.reveal(line, col)` (`src/editorwidget.ts`), and
+`src/filemenu.ts` — so a textual check keyed on the call shape cannot separate
+`Grid.reveal` from the others: run against the real tree it refused two
+known-good files on its first pass. Anchoring it on `.grid.reveal(` instead
+would have passed, but `Grid.allGrids()` hands out bare `Grid` values, so the
+evasion it left open is the one a new caller is most likely to take. A guard
+whose green is an accident is worse than no guard, so the precondition is
+carried in prose — here and on the method — and the residual is stated rather
+than implied.

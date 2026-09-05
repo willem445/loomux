@@ -57,7 +57,12 @@ import { dockChipAttention } from "./attention";
 import { dockChipQueue, queuePresentation } from "./queuebadge";
 import { dockChipMail, mailboxPresentation } from "./mailboxbadge";
 import { planGroupMinimize } from "./group";
-import { shouldFocusNewPane, shouldRestoreFocus, shouldPreserveMaximize } from "./panefocus";
+import {
+  shouldFocusNewPane,
+  shouldRestoreFocus,
+  shouldPreserveMaximize,
+  revealPlan,
+} from "./panefocus";
 import { startDragSession } from "./dragsession";
 import { planEvenInsert, planRemoval, readGrow } from "./paneequalize";
 import { equalizeWeights, type SplitShape } from "./paneautosize";
@@ -774,6 +779,102 @@ export class Grid {
     // one. Inside the early-return guard above, so re-focusing the pane that is
     // already active stays free.
     this.onActive();
+  }
+
+  /** The pane currently filling the grid, or null when nothing is maximized.
+   *  Read-only, for a caller building a `revealPlan` state — the alternative
+   *  is reaching into `maximized`, and a second reader of a private field is
+   *  how the two come to disagree. */
+  get maximizedPane(): Pane | null {
+    return this.maximized;
+  }
+
+  /** Whether this pane is parked in the dock rather than sitting in the split
+   *  tree. Same purpose as `maximizedPane`: the reveal decision needs it and
+   *  must not learn it by inspecting `minimizedPanes`. */
+  isDocked(pane: Pane): boolean {
+    return this.minimizedPanes.includes(pane);
+  }
+
+  /** Make a pane actually VISIBLE, then active (#2365).
+   *
+   *  `setActive` alone is maximize- and dock-blind: on a pane behind a
+   *  maximized sibling it flips a class under `display:none`, and a docked
+   *  pane is not in the tree at all — which is how an orchestrator pane
+   *  became unreachable while its PTY stayed bound and every surface in the
+   *  app kept telling the human to focus it. This performs the structural
+   *  steps first, in the order `revealPlan` decides them.
+   *
+   *  The TAB step is not here: `Grid` does not know about tabs. `main.ts`'s
+   *  `revealPane` does it, and `revealPlan` puts it first for both of us.
+   *
+   *  PRECONDITION — READ THIS BEFORE ADDING A CALLER (#2365 review round 1,
+   *  premortem 2). This passes `tabIsActive: true` UNCONDITIONALLY, because
+   *  the grid cannot know the answer. So the plan omits `switch-tab`, and if
+   *  the pane’s workspace is not the one on screen every step below runs under
+   *  `display:none` — the caller has reinvented the exact blindness this method
+   *  exists to fix, with nothing red to say so. `main.ts`’s `revealPane` is the
+   *  only caller today and it switches tabs first; any new one must too.
+   *
+   *  Residual, stated rather than implied: this is a COMMENT, not a guard. A
+   *  source scan was written for it and withdrawn — `reveal` is an ordinary
+   *  method name in this tree (`EditorWidget.reveal(line, col)`,
+   *  `src/filemenu.ts`), so a textual check cannot separate this method from
+   *  the others and refused two known-good files on its first run. A guard that
+   *  green-lights by accident is worse than none, so the precondition is
+   *  carried here and in `doc/design/agents-tab.md` instead.
+   *
+   *  Constraint 1 (no PTY resize for a UI feature) — and WHO ASKED decides it.
+   *  `restore` and `exitMaximize` genuinely resize a PTY: see their own docs
+   *  below ("it alone issues one debounced fit"; "triggers a single genuine
+   *  fit", plus the siblings that make room). That is permitted from a
+   *  DISCRETE human click — the dock chip, the ⤢ button, an Agents row, the
+   *  Sessions Focus button — and barred from anything else, so `humanInitiated`
+   *  gates both. An agent-initiated reveal (`orch-focus`, emitted by the
+   *  orchestrator's `focus_agent` MCP tool, with no human on the path) gets
+   *  `setActive` + `focus` only and cannot resize anything: it must not drop
+   *  the human out of a fullscreen they chose, nor pull a pane they docked back
+   *  into the split tree. Same ruling as `shouldPreserveMaximize` (#155), which
+   *  closed this exact class for the SPAWN path; this is the reveal path.
+   *  Human clicks go through the existing resizeburst coalescing, so no NEW fit
+   *  is added there either, and the plain case (a visible pane in the showing
+   *  tab) touches no layout at all whoever asked. */
+  reveal(pane: Pane, humanInitiated: boolean): void {
+    const plan = revealPlan({
+      // The grid does not own the tab question; `main.ts` answers that half
+      // and has already switched by the time this runs. Passing `true` keeps
+      // ONE rule for the steps this method does own.
+      tabIsActive: true,
+      docked: this.isDocked(pane),
+      maximized: this.maximized === null ? null : this.maximized === pane ? "self" : "other",
+      // Required, not defaulted: a caller that forgets it fails to compile
+      // rather than silently getting the permissive answer. Constraint 1 is
+      // not a default anyone should inherit by omission.
+      humanInitiated,
+    });
+    for (const step of plan) {
+      switch (step) {
+        case "restore-from-dock":
+          // Also exits any fullscreen on its way in — which is why the plan
+          // never emits `exit-maximize` alongside it.
+          this.restore(pane);
+          break;
+        case "exit-maximize":
+          this.exitMaximize();
+          break;
+        case "set-active":
+          this.setActive(pane);
+          break;
+        case "focus":
+          pane.focus();
+          break;
+        case "switch-tab":
+          // Not this layer's step — see the doc comment. Unreachable while
+          // `tabIsActive` is passed true; named so the switch stays
+          // exhaustive and a new RevealStep fails to compile here.
+          break;
+      }
+    }
   }
 
   // ---------- maximize ----------
