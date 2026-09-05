@@ -10669,23 +10669,43 @@ fn the_workflow_path_a_delegate_is_told_about_is_the_groups_own_file() {
 /// scan is what noticed: the stale-row assertion below refused to carry a row
 /// that matched nothing, rather than letting the count go quietly wrong.
 ///
-/// **Three spellings, not one.** This slice rerouted one `load_workflow` site,
-/// EIGHT `workflow_path` sites and one `workflow_file_exists` site; all three
-/// functions are still `pub` and still answer only for `default`, so a trigger
-/// watching `load_workflow` alone would have been blind to the nine likelier
-/// regressions (rev-final round 2, finding 2 — the scan's own doc had disclosed
-/// a *different* limit while missing this one). Adding an audit line or a
-/// template var as `workflow::workflow_path(&g.repo)` type-checks, reads
-/// naturally, and is exactly what eight lines in `mod.rs` said one commit ago;
-/// a group running `b.yml` would then be told in its own audit trail that it
-/// runs `.orrerix/workflow.yml`.
+/// **Three spellings, not one**, and the counts below are measured at both ends
+/// rather than recalled — the first version of this paragraph guessed them and
+/// got all four wrong (rev-std round 2, finding 1; the widening itself was
+/// rev-final round 2, finding 2).
+///
+/// `git grep -c -F <spelling> <base> -- src-tauri/src` at base `34f92793`, and
+/// the same count at head:
+///
+/// | spelling | base | head | rerouted |
+/// | --- | --- | --- | --- |
+/// | `workflow::load_workflow(` | 13 (`gh.rs` 1, `mod.rs` 11, `rdtick.rs` 1) | 1 | 12 |
+/// | `workflow::workflow_path(` | 12 (all `mod.rs`) | 0 | 12 |
+/// | `workflow::workflow_file_exists(` | 2 (`mod.rs`) | 0 | 2 |
+///
+/// So **26 sites moved, and 14 of them — every `workflow_path` and every
+/// `workflow_file_exists` — were invisible to a trigger watching
+/// `load_workflow` alone.** All three functions are still `pub` and still answer
+/// only for `default`. Adding an audit line or a template var as
+/// `workflow::workflow_path(&g.repo)` type-checks, reads naturally, and is
+/// exactly what twelve lines in `mod.rs` said one commit ago; a group running
+/// `b.yml` would then be told in its own audit trail that it runs
+/// `.orrerix/workflow.yml`.
 ///
 /// A textual scan, with the limits that implies — it reads call TEXT, so a
-/// caller that bound the function to a local first would be invisible. What it
-/// is defence in depth over is a NEW group-scoped reader being added against one
-/// of those three, which is how the reroute would realistically erode; the
-/// compiler cannot help there, because all of them exist and all of them
-/// type-check.
+/// caller that bound the function to a local first would be invisible. **So
+/// would an UNQUALIFIED call**: `use loomux_engine::workflow::load_workflow;`
+/// followed by a bare `load_workflow(&g.repo)` matches none of the three
+/// patterns, and this is worth naming concretely rather than leaving inside
+/// "textual", because widening the trigger from one spelling to three makes the
+/// scan look stronger against exactly that shape than it is (rev-std round 2,
+/// premortem 1). Nothing in `src-tauri/src` imports any of the three today, and
+/// nothing here enforces that.
+///
+/// What it IS defence in depth over is a NEW group-scoped reader being added
+/// against one of those three in the spelling the rest of the file uses, which
+/// is how the reroute would realistically erode; the compiler cannot help
+/// there, because all of them exist and all of them type-check.
 #[test]
 fn only_the_argued_residuals_still_read_the_default_workflow_directly() {
     /// The default-only spellings this watches. Each is matched with its
