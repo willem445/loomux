@@ -1736,6 +1736,31 @@ mod tests {
         // against, not as INVARIANT 9's ceiling.
         let tight = HeldFacts { max_review_rounds: 1, counters: Counters { review_rounds: 1, ..Counters::default() }, ..f.clone() };
         assert!(held_notice(1, HeldReason::ReviewLimit, &tight).contains("review rounds 1/1"));
+
+        // **#2509's clause, and `f` above is its control.** At the bound the two
+        // figures are equal whether or not the drive already had its extra
+        // round, so `review rounds 3/3` is the SAME string for a drive that has
+        // had three rounds and one that has had four — which is precisely why
+        // the clause exists, and why asserting only the figures would leave it
+        // deletable with the suite green.
+        assert!(
+            !held_notice(1, HeldReason::ReviewLimit, &f).contains("grace"),
+            "the control: an ungraced drive says nothing about a grace"
+        );
+        let graced = HeldFacts {
+            counters: Counters { body_only_grace: true, ..f.counters.clone() },
+            ..f.clone()
+        };
+        let notice = held_notice(1, HeldReason::ReviewLimit, &graced);
+        assert!(
+            notice.contains("review rounds 3/3, plus a body-only grace round"),
+            "a graced drive must say so, or the orchestrator deciding whether to spend \
+             reset_counters cannot tell three rounds from four: {notice}"
+        );
+        assert!(
+            notice.contains("drive_review(pr, session, reset_counters: true)"),
+            "…and the clause must not have displaced the remedy: {notice}"
+        );
     }
 
     #[test]

@@ -9059,6 +9059,9 @@ fn a_body_only_fail_at_the_bound_buys_one_more_round_then_the_next_one_parks() {
     record_fail_for(&reg, &group, &lane, "fail - the retry loop is unbounded");
     let handed = reg.rd_drive_group_with(&group, &gh, 30_000);
     let (_pr, worker) = handed.handbacks.first().cloned().expect("arc 5 hands the PR back");
+    // Round one's brief, captured NOW — it is the control for the grace clause
+    // asserted two rounds below, and the pane it lives in may be reused.
+    let ordinary = lane_brief(&reg, &worker);
     assert_eq!(status_state(&reg, &group), "fix-wait");
     assert_eq!(
         review_rounds(&reg, &group),
@@ -9101,6 +9104,50 @@ fn a_body_only_fail_at_the_bound_buys_one_more_round_then_the_next_one_parks() {
         .first()
         .cloned()
         .expect("and the grace really does reach the worker");
+
+    // **The sentence the worker is handed, read back.** Without this the whole
+    // `grace_clause` paragraph is reachable, rendered, and deletable with the
+    // suite green — and it is the one thing that stops "attempt 3 of 3",
+    // appearing for the second round running, reading as a broken counter.
+    let graced_brief = lane_brief(&reg, &worker2);
+    assert!(
+        !graced_brief.contains("{{"),
+        "an unregistered placeholder survived into the grace brief: {graced_brief}"
+    );
+    assert!(
+        graced_brief.contains("This is a GRACE round PAST the review bound"),
+        "the grace round must announce itself: {graced_brief}"
+    );
+    assert!(
+        graced_brief.contains("The attempt count below still reads at the bound"),
+        "…and pre-empt the number it contradicts, which is the whole reason the \
+         clause exists: {graced_brief}"
+    );
+    assert!(
+        graced_brief.contains("This is attempt 3 of 3."),
+        "…the number really is the one being explained: {graced_brief}"
+    );
+    // One paragraph. The clause crosses five `\` continuations in the source and
+    // would ship the source indent between them if one ever collapsed (#1457).
+    let what = graced_brief
+        .lines()
+        .find(|l| l.contains("This is a GRACE round PAST"))
+        .unwrap_or_else(|| panic!("the grace clause rendered on its own line: {graced_brief}"));
+    assert!(
+        !what.contains("          "),
+        "the grace clause must arrive as one paragraph on one line: {what:?}"
+    );
+    // **The control, on the SAME drive**: round one was an ordinary round, and
+    // its brief must carry none of this. Without it the assertions above pass
+    // against a template that renders the sentence unconditionally.
+    //
+    // Captured at the time rather than re-read here, because the drive may have
+    // resumed the worker into the SAME pane — in which case re-reading it now
+    // would hand back the GRACE brief and the control would be about nothing.
+    assert!(
+        !ordinary.contains("GRACE round PAST"),
+        "an ordinary review round must not claim to be a grace: {ordinary}"
+    );
     let rows = rows_for(&reg, &group, "rd-round-grace");
     assert_eq!(rows.len(), 1, "exactly one grace row: {rows:?}");
     assert_eq!(rows[0]["pr"], json!(1758), "{rows:?}");
@@ -9207,6 +9254,12 @@ fn a_code_fail_at_the_bound_still_parks_immediately() {
         rows_for(&reg, &group, "rd-round-grace")
     );
     assert!(!status_grace(&reg, &group), "…so it is still there for a body-only round");
+    // …and neither the hold nor the hand-back before it claims a grace.
+    let notices = drive_notices(&reg, &group, 1758).join("\n");
+    assert!(
+        !notices.contains("grace"),
+        "a drive that never earned a grace must not mention one: {notices}"
+    );
 }
 
 /// How many times `src` **assigns** to `field` — `x.field = …`. A comparison

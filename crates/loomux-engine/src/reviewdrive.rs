@@ -684,12 +684,19 @@ impl DriveLimits {
 /// decision with evidence rather than a coin flip, because the two orderings
 /// differ by a whole round. [`counter_exhausted`] is where it is spelled;
 /// §2.2's `rebase-limit` row is what decides it.
-/// **Every field is required, not just the block.** `DriveEntry::counters`
+/// **Every COUNT is required, not just the block.** `DriveEntry::counters`
 /// carries no `serde(default)` for the reason on that field — zeros silently
-/// grant a full fresh budget — and a per-field default would have reopened the
-/// same hole one level down, where `"counters": {}` parses to three zeros and
-/// `"counters": {"review_rounds": 2}` quietly forgives the CI attempts. The
-/// block being mandatory is worth nothing if its contents are optional.
+/// grant a full fresh budget — and a per-field default on a count would have
+/// reopened the same hole one level down, where `"counters": {}` parses to three
+/// zeros and `"counters": {"review_rounds": 2}` quietly forgives the CI attempts.
+/// The block being mandatory is worth nothing if its contents are optional.
+///
+/// **The one `serde(default)` below is `body_only_grace`, and it is an argued
+/// exception rather than a hole in that rule** (#2509): it is a bool, not a
+/// count, a defaulted `false` grants one round once rather than a whole fresh
+/// budget, and it is the TRUE reading of a file written before the field
+/// existed. The full argument is on the field. Read the rule above as being
+/// about the three counts — a NEW count still takes no default.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Counters {
     pub review_rounds: u32,
