@@ -89,7 +89,7 @@ pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(27);
 /// `try_start_agent` exists for — that pays it. A shared budget makes the setup
 /// phase cost at most this much however many steps inside it run, and it cannot
 /// borrow from the conversation.
-const AGENT_SETUP_BUDGET: Duration = Duration::from_secs(10);
+const AGENT_SETUP_BUDGET: Duration = Duration::from_secs(20);
 
 /// How long the whole `ssh-add` conversation may take before it is abandoned.
 ///
