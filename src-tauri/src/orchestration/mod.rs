@@ -8083,7 +8083,7 @@ pub fn spawn_opens_minimized(role: Role, group_opted_expanded: bool) -> bool {
 /// So a class cannot be exempt from the count, named in the refusal message,
 /// and omitted from the panel's total independently of each other.
 pub fn counts_against_max_agents(role: Role) -> bool {
-    !role.is_fixture()
+    !matches!(role, Role::Orchestrator | Role::Manager)
 }
 
 /// Whether this agent is a LIVE manager of `group` — the singleton rule, as one
