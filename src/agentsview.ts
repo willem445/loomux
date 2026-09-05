@@ -33,6 +33,7 @@ import {
   ORDER_CHOICES,
   agentIdentityLine,
   agentRowMark,
+  listSlots,
   filterChips,
   visibleGroups,
 } from "./agentsviewmodel";
@@ -322,29 +323,28 @@ export class AgentsView {
       if (want !== el) this.listEl.insertBefore(el, want);
       prev = el;
     };
-    for (const group of groups) {
-      // The headerless group renders no header at all — there is nothing to
-      // call it, and an invented one ("Other") would be a claim. Its rows are
-      // still placed, in the position `groupRows` gave the group.
-      if (group.tab !== null) {
-        const key: GroupKey = group.tab.id;
-        seenGroups.add(key);
-        const header = this.groups.get(key) ?? this.createGroup();
-        this.groups.set(key, header);
+    // WHAT to place, and under which key, is a pure projection — `listSlots`,
+    // pinned in `test/agentsviewmodel.test.ts` (#2371 review round 2,
+    // premortem). What is left here is the placement and the sweep, which is
+    // the part this repo validates by hand.
+    for (const slot of listSlots(groups)) {
+      if (slot.kind === "header") {
+        seenGroups.add(slot.key);
+        const header = this.groups.get(slot.key) ?? this.createGroup();
+        this.groups.set(slot.key, header);
         // A rename re-labels the header in place. Guarded, so the common case
         // (nothing renamed) writes no text at all.
-        if (header.title !== group.tab.title) {
-          header.title = group.tab.title;
-          header.el.textContent = group.tab.title;
+        if (header.title !== slot.title) {
+          header.title = slot.title;
+          header.el.textContent = slot.title;
         }
         place(header.el);
-      }
-      for (const row of group.rows) {
-        seenRows.add(row.key);
+      } else {
+        seenRows.add(slot.key);
         rowCount += 1;
-        const els = this.rows.get(row.key) ?? this.createRow(row);
-        this.rows.set(row.key, els);
-        this.updateRow(els, row);
+        const els = this.rows.get(slot.key) ?? this.createRow(slot.row);
+        this.rows.set(slot.key, els);
+        this.updateRow(els, slot.row);
         place(els.el);
       }
     }

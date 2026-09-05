@@ -48,6 +48,10 @@ function facts(patch: FactsPatch = {}): PaneFacts {
     kind: "orch",
     tab: { id: "ws-1", title: "loomux", index: 0 },
     harness: "claude",
+    // The launch line the header resolves its own mark from, carried on the
+    // facts so the row and the header share one resolution (#2371 review round
+    // 2, W1). Built from a COMMAND, the way `Pane.agentMarkInput` builds it.
+    mark: { command: "claude", argv: null, knownCli: null, remote: false },
     orch: { group: "g", agentId: "w-1", role: "worker" },
     sessionId: "s-1",
     alive: true,
@@ -368,7 +372,24 @@ test("toAgentRow carries the identity fields through and derives the state", () 
     state: "question",
     notes: 3,
     tab: { id: "ws-1", title: "loomux", index: 0 },
+    mark: { command: "claude", argv: null, knownCli: null, remote: false },
   });
+});
+
+test("the mark input is carried onto the row untouched (#2371 review W1)", () => {
+  // The row must hand the resolver exactly what the pane header hands it —
+  // untouched, not re-derived — or the two surfaces can answer differently
+  // about one pane. `harness` is deliberately NOT it: a `codex` pane is a real
+  // agent pane that no session store covers, so `harness` is null while its
+  // launch line names the program perfectly well.
+  const codex = facts({
+    harness: null,
+    mark: { command: "codex --resume", argv: null, knownCli: null, remote: false },
+  });
+  const projected = toAgentRow(codex);
+  assert.deepEqual(projected.mark, codex.mark);
+  assert.equal(projected.harness, null, "a codex pane is outside the session-store set, and that is correct");
+  assert.notEqual(projected.mark.command, null, "…while its launch line still names the program");
 });
 
 test("the tab a reading named is carried onto the row, and so is its absence", () => {
@@ -400,6 +421,7 @@ function row(name: string, state: AgentState, tab: TabRef | null = null): AgentR
     state,
     notes: null,
     tab,
+    mark: { command: "claude", argv: null, knownCli: null, remote: false },
   };
 }
 
@@ -597,10 +619,29 @@ test("renaming a tab re-labels its group without splitting it", () => {
   const renamed: TabRef = { ...WS.mike, title: "MIKE renamed" };
   const after = [row("m1", "working", renamed), row("m2", "working", renamed)];
   assert.deepEqual(shape(after, "tab"), [["MIKE renamed", "m1", "m2"]]);
-  // The mid-rename tick: one row still carries the old title. Still ONE group —
-  // and it wears the fresher label, not the stale one.
+  // A hypothetical tick where two rows of one tab carry DIFFERENT titles. Still
+  // ONE group — that is the property this test is for, and it holds whichever
+  // label wins.
+  //
+  // WHICH label wins is LAST IN INPUT ORDER, and nothing here is "fresher"
+  // (#2371 review round 2, R2 — an earlier version of this comment claimed the
+  // group "wears the fresher label", which the code cannot do: there is no
+  // timestamp on a `TabRef`, so the tie is decided by argument order and this
+  // fixture merely happens to put the renamed reading last). Both orders are
+  // asserted, so the rule is pinned rather than illustrated by one lucky
+  // arrangement.
   const midway = [row("m1", "working", WS.mike), row("m2", "working", renamed)];
   assert.deepEqual(shape(midway, "tab"), [["MIKE renamed", "m1", "m2"]]);
+  const reversed = [row("m1", "working", renamed), row("m2", "working", WS.mike)];
+  assert.deepEqual(
+    shape(reversed, "tab"),
+    [["mike", "m1", "m2"]],
+    "the label is the LAST reading in input order — reverse the input and the other title wins",
+  );
+  // In production this case cannot arise at all: `main.ts`'s walk reads one
+  // title per tab and hands the same `TabRef` to every pane in it. The rule is
+  // stated so the tie is decided somewhere rather than by bucket-insertion
+  // luck, not because a caller is expected to produce a split reading.
 });
 
 test("two tabs sharing a name stay two groups", () => {

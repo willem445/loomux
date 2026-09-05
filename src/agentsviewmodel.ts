@@ -117,29 +117,58 @@ export function visibleGroups(
   return groupRows(rows.filter((r) => matchesFilter(r, filter)), order);
 }
 
+/** One element the Agents list renders, in the order it renders them. `key` is
+ *  the map key its element is held under — a tab id for a header, a pane key
+ *  for a row — and the two kinds are keyed in SEPARATE maps, so a tab and a
+ *  pane sharing a string cannot collide. */
+export type ListSlot =
+  | { readonly kind: "header"; readonly key: string; readonly title: string }
+  | { readonly kind: "row"; readonly key: string; readonly row: AgentRow };
+
+/** The exact sequence of elements `AgentsView.renderGroups` places, as data.
+ *
+ *  Extracted so the reconcile ORDER is testable at all (#2371 review round 2,
+ *  premortem). `renderGroups` is DOM wiring, which this repo validates by hand,
+ *  but the thing most likely to be wrong in it is not the DOM calls — it is
+ *  *what order and under what keys*, and that is a pure projection. So the view
+ *  keeps only the placement and the sweep, and the sequence is pinned here.
+ *
+ *  The headerless group contributes its rows and NO header: there is nothing to
+ *  call it, and an invented "Other" would be a claim. That is why a header's
+ *  key is read off `tab.id` inside the branch rather than from a sentinel — the
+ *  map never holds an entry for a group that has no header. */
+export function listSlots(groups: readonly AgentGroup[]): ListSlot[] {
+  const slots: ListSlot[] = [];
+  for (const group of groups) {
+    if (group.tab !== null) slots.push({ kind: "header", key: group.tab.id, title: group.tab.title });
+    for (const row of group.rows) slots.push({ kind: "row", key: row.key, row });
+  }
+  return slots;
+}
+
 /** The agent-type mark for a row (#2371), or `null` when there is nothing to
  *  draw.
  *
- *  ONE CALL, NO BRANCH. `row.harness` is the CLI loomux already knows this pane
- *  runs — `agentCli` off the launch line, or an SSH profile's declared far-end
- *  CLI — which is precisely `agentMark`'s `knownCli` input, so the resolver
- *  answers from the CLI's own name and a CLI added tomorrow shows up as itself.
- *  A `harness === "claude" ? … : …` here would be the #722/#841 defect: the
- *  fourth CLI silently inheriting the third one's badge.
+ *  ONE CALL, NO BRANCH, AND — the part that took a review round to get right —
+ *  THE SAME INPUT THE PANE HEADER USES. `row.mark` is `Pane.agentMarkInput`
+ *  carried through untouched, so the row and the header are two renderings of
+ *  one resolution rather than two resolutions that agree by inspection. Every
+ *  answer this function can give is `agentMark`'s own: the licensed mark, the
+ *  letter badge, the neutral remote badge, or `null` for a pane with no launch
+ *  line at all ("a plain shell is not an agent, and a row of `?` badges over
+ *  every terminal is noise dressed as information").
  *
- *  `null` falls out of the resolver's own rule rather than being a case here: a
- *  row with no harness has no launch line to read, and `agentMark` answers
- *  `null` for that — "a plain shell is not an agent, and a row of `?` badges
- *  over every terminal is noise dressed as information".
- *
- *  RESIDUAL, stated because it is a real gap and not a rounding: `AgentRow`
- *  does not carry remoteness, so an SSH pane whose profile declares no
- *  `defaultCli` reads `harness: null` and draws nothing, where the pane HEADER
- *  draws the neutral "remote — agent CLI unknown" badge for the same pane. Both
- *  decline to name a CLI; the header is the surface that can afford to explain
- *  why, and the row's identity line already says the pane is what it is. */
+ *  IT USED TO READ `row.harness`, AND THAT WAS THE DEFECT (#2371 review round
+ *  2, W1). `harness` is `sessionCliFromCommand`, a closed four-name membership
+ *  test built for session-store adoption, so a local `codex`, `gemini`,
+ *  `hermes` or `ante` pane — half of `AGENTS` — read `null` and drew NOTHING on
+ *  its row while its own header drew `Agent CLI: codex`. It was the #722/#841
+ *  outcome reached by a whitelist instead of a ternary, and widening the
+ *  whitelist would have fixed four names while leaving the next CLI to
+ *  rediscover it. Sharing the derivation is what makes "a CLI added tomorrow
+ *  shows up as itself" true rather than merely claimed. */
 export function agentRowMark(row: AgentRow): AgentMarkView | null {
-  return agentMark({ knownCli: row.harness });
+  return agentMark(row.mark);
 }
 
 /** The quiet line under a row's name: which CLI, which role/block, which group

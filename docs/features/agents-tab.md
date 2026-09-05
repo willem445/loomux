@@ -38,10 +38,12 @@ Each row carries the agent CLI's mark, the pane's name, its state, and a quiet
 line naming whichever of these the pane has: the agent CLI it is running, its
 orchestration role or workflow block, and its group.
 
-The mark is the same one the pane header wears — GitHub's Copilot glyph where a
-vendor publishes a licensed one, a lettered badge otherwise. A pane running no
-agent (a plain shell, or a program orrerix does not recognise) carries no mark
-rather than a guess.
+The mark is the same one the pane header wears, resolved from the same reading —
+GitHub's Copilot glyph where a vendor publishes a licensed one, a lettered badge
+otherwise, and for a remote pane whose profile does not say which agent runs on
+the far end, a neutral badge that says orrerix does not know. A pane running no
+agent at all — a plain shell, or a launch line naming no program — carries no
+mark rather than a guess.
 
 **Click a row to go to that pane** — it switches to the pane's project tab,
 makes it the active pane there, and focuses the terminal.

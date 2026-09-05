@@ -347,21 +347,46 @@ elements inside `.sessions-inner` only. Constraint 1 is untouched.
 
 ### The row's agent-type mark
 
-`agentRowMark(row)` is one call — `agentMark({ knownCli: row.harness })` — and
-that is the whole design. `harness` is the CLI loomux already knows this pane
-runs (`agentCli` off the launch line, or an SSH profile's declared far-end CLI),
-which is exactly `agentMark`'s `knownCli` input, so a CLI added tomorrow shows up
-as itself. A `harness === "claude" ? … : …` here would be the #722/#841 defect:
-the fourth CLI silently inheriting the third one's badge. `null` falls out of the
-resolver's own rule rather than being a case here — a row with no harness has no
-launch line to read, and a row of `?` badges over every terminal is noise dressed
-as information.
+`agentRowMark(row)` is one call — `agentMark(row.mark)` — where `row.mark` is
+`Pane.agentMarkInput` carried through untouched. **That getter is the single
+source for every surface that draws a pane's agent mark**, the pane header
+included, so the row and the header are two renderings of one resolution rather
+than two resolutions that agree by inspection. Every answer the row can give is
+the resolver's own: the licensed mark, the letter badge, the neutral remote
+badge, or `null` for a pane with no launch line at all — a row of `?` badges over
+every terminal is noise dressed as information.
 
-**Residual.** `AgentRow` does not carry remoteness, so an SSH pane whose profile
-declares no `defaultCli` reads `harness: null` and draws nothing, where the pane
-*header* draws the neutral "remote — agent CLI unknown" badge for the same pane.
-Both decline to name a CLI; the header is the surface that can afford to explain
-why, and the row's identity line already says what the pane is.
+**It read `harness` first, and that was a defect** (#2371 review round 2, W1).
+The reasoning was that `harness` is "the CLI loomux already knows this pane
+runs", so it must be exactly `agentMark`'s `knownCli`. It is not. `harness` is
+`sessionCliFromCommand`, a **closed four-name membership test** — `claude`,
+`copilot`, `opencode`, `pi` — and that set exists because its answer is matched
+against `listSessions()` rows, not because those are the CLIs that deserve an
+icon. So half of `AGENTS` (`codex`, `gemini`, `hermes`, `ante`) read a null
+`harness` and drew **nothing** on their row while their own pane header drew
+`Agent CLI: codex`; and an SSH profile declaring `defaultCli: "codex"` drew a
+mark where its local twin drew none. It was the #722/#841 outcome — a CLI losing
+its identity — reached by a whitelist instead of a ternary.
+
+Widening that whitelist would have fixed the four names that exist today and
+left the fifth to rediscover the same bug. Sharing the derivation is what makes
+"a CLI added tomorrow shows up as itself" *true* rather than merely claimed:
+adding a row to `AGENTS` now needs no change here at all, which is precisely
+what `agenticons.ts`'s total letter fallback was built for.
+
+**`harness` stays, and its `null` is still correct.** It answers "which session
+store covers this pane", which is a real question with a legitimately narrower
+answer — it feeds `agentIdentityLine` and `notesApplyToPane`. What changed is
+that it no longer decides what a pane *is*. Its doc comment now says so.
+
+**Pinned from three sides**, because a shared derivation is only shared while
+someone keeps it that way: `test/agentsviewmodel.test.ts` walks `AGENTS` and
+builds each fixture from that entry's own `command` (not from a `harness` naming
+it — the fixture that hid this), asserts the row's answer equals the header's
+input's answer for every one, and covers the remote/local twin;
+`test/agenticons.test.ts` scans `Pane.agentMarkInput` for the three inputs and
+scans `refreshAgentMark` and `facts` for the fact that both resolve *from that
+getter*, since a correct getter nothing calls is the same failure in a new spot.
 
 ## Slice B: the tab, the view, and the two things it is wired to
 

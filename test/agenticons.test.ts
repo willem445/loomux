@@ -534,42 +534,79 @@ test("the pane header actually renders the mark", () => {
   assert.match(pane, /agentMark\(/, "src/pane.ts never calls agentMark");
 });
 
-/** The body of `Pane.refreshAgentMark`, on its own. Scoped to the ONE method rather than
+/** The body of one named member of `Pane`, on its own. Scoped to the ONE member rather than
  *  scanning all of pane.ts, so an unrelated mention of `sshDefaultCli` elsewhere in a
  *  ten-thousand-line file cannot satisfy the assertions below — a consumer scan that can be
  *  satisfied by the wrong line is a pin that reads like coverage and isn't. */
-function refreshAgentMarkBody(): string {
+function paneMemberBody(header: RegExp, what: string): string {
   const pane = read("../src/pane.ts");
-  const m = pane.match(/private refreshAgentMark\(\): void \{([\s\S]*?)\n {2}\}/);
-  assert.ok(m, "Pane.refreshAgentMark is gone or no longer matches the expected shape");
-  return m[1];
+  const m = pane.match(new RegExp(header.source + "[\\s\\S]*?\\n {2}\\}"));
+  assert.ok(m, `${what} is gone or no longer matches the expected shape`);
+  return m[0];
 }
 
 test("the pane feeds its SSH state to the resolver, not just its launch line", () => {
   // REVIEW NB1. The round-1 blocker (an SSH pane captioned "Agent CLI: ssh") was fixed in
   // TWO places, and only one of them was pinned: the resolver's own logic is covered by the
   // SSH test above, but nothing checked that pane.ts still HANDS it the ssh state. Deleting
-  // these two lines from `refreshAgentMark` left the whole suite green — the resolver stayed
-  // correct and became unreachable, which is the exact regression this round exists for and
-  // the one a reader would be least likely to spot in a refactor.
+  // these two lines left the whole suite green — the resolver stayed correct and became
+  // unreachable, which is the exact regression this round exists for and the one a reader
+  // would be least likely to spot in a refactor.
+  //
+  // THE SITE MOVED, AND THIS GUARD CAUGHT THE MOVE (#2371 review round 2, W1). The two lines
+  // used to live in `refreshAgentMark`; they now live in `agentMarkInput`, the one getter
+  // BOTH the pane header and the Agents row resolve from, because reading them in two places
+  // is how the row came to draw a different answer from the header for the same pane. So the
+  // scan is repointed rather than relaxed — the property is unchanged and now covers two
+  // surfaces instead of one — and `refreshAgentMark` gets its own assertion below, since a
+  // correct getter nothing calls is the same "correct and unreachable" failure in a new spot.
   //
   // `knownCli` and `remote` are asserted separately because they answer different questions
   // and can be lost independently: without `knownCli` a remote Claude pane degrades to the
   // neutral badge (wrong but honest), while without `remote` it falls through to the launch
   // line and wears the transport again (the original defect).
-  const body = refreshAgentMarkBody();
+  const body = paneMemberBody(/  get agentMarkInput\(\): AgentMarkInput \{/, "Pane.agentMarkInput");
   assert.match(
     body,
     /knownCli:\s*this\.sshDefaultCli/,
-    "refreshAgentMark no longer passes the SSH profile's far-end CLI — a remote agent pane " +
+    "agentMarkInput no longer passes the SSH profile's far-end CLI — a remote agent pane " +
       "cannot name its agent, however correct the resolver is"
   );
   assert.match(
     body,
     /remote:\s*this\.isSshPane/,
-    "refreshAgentMark no longer marks SSH panes as remote — the resolver will read argv[0] " +
+    "agentMarkInput no longer marks SSH panes as remote — the resolver will read argv[0] " +
       'and caption the pane "Agent CLI: ssh" again (#992 review B1)'
   );
+  // The launch line is the third input and is what a LOCAL pane is named from. It was never
+  // at risk before, because it was the only thing being passed; it is asserted now that it
+  // shares a getter with two fields that were.
+  assert.match(body, /command:\s*this\.spawnCommand/, "agentMarkInput no longer reads the launch command");
+  assert.match(body, /argv:\s*this\.spawnArgv/, "agentMarkInput no longer reads the launch argv");
+});
+
+test("both mark surfaces resolve from that one getter, so neither can answer alone", () => {
+  // The other half of the move: a getter carrying the right fields that nothing calls is
+  // exactly as broken as the missing fields it replaced. Both consumers are pinned by NAME
+  // rather than by counting call sites, so adding a third surface is not a failure — losing
+  // one is.
+  const header = paneMemberBody(/  private refreshAgentMark\(\): void \{/, "Pane.refreshAgentMark");
+  assert.match(
+    header,
+    /agentMark\(this\.agentMarkInput\)/,
+    "the pane header no longer resolves from agentMarkInput — it has its own derivation again, " +
+      "which is the divergence #2371 review W1 found"
+  );
+  const facts = paneMemberBody(/  facts\(tab: TabRef \| null = null\): PaneFacts \{/, "Pane.facts");
+  assert.match(
+    facts,
+    /mark:\s*this\.agentMarkInput/,
+    "PaneFacts no longer carries agentMarkInput — the Agents row is resolving from something " +
+      "else, which is how four of eight launchable CLIs drew no icon (#2371 review W1)"
+  );
+  // Non-vacuity: the two bodies really are different regions of the file, so a broken
+  // `paneMemberBody` that returned the same slab twice cannot pass both assertions above.
+  assert.notEqual(header, facts, "the member scan returned one body for two members");
 });
 test("pi draws a P in its own dye, and the roster's letters stay distinguishable (#2126)", () => {
   const view = agentMark({ command: "pi --session-id abc" });

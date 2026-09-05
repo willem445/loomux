@@ -12,6 +12,7 @@
 // this module decides what it MEANS. The split is the point: `pane.ts` owns
 // where the facts come from, this module owns what they add up to.
 
+import type { AgentMarkInput } from "./agenticons.ts";
 import { attentionPresentation, DECISION_REASONS, REPORT_REASONS } from "./attention.ts";
 import { ACTIVITY_FLOOR_BYTES, type ActivitySnapshot } from "./paneactivity.ts";
 
@@ -67,12 +68,35 @@ export interface PaneFacts {
    *  Agents view: the pane Notes rows (#2116) and `main.ts`'s focus walk group
    *  nothing, so neither has anything to name. */
   readonly tab: TabRef | null;
-  /** Which agent CLI is running, READ OFF THE LAUNCH LINE — `agentCli` (i.e.
-   *  `sessionCliFromCommand`) for a local pane, the SSH profile's declared
-   *  far-end CLI for a remote one, null for a plain shell or an unrecognised
-   *  program. Never branched on a CLI name to produce a name (#722/#841): a
-   *  fourth CLI must show up here as itself, not inherit an else-branch. */
+  /** Which agent CLI is running, as far as the SESSION STORE is concerned —
+   *  `agentCli` (i.e. `sessionCliFromCommand`) for a local pane, the SSH
+   *  profile's declared far-end CLI for a remote one, null otherwise. Never
+   *  branched on a CLI name to produce a name (#722/#841): a fourth CLI must
+   *  show up here as itself, not inherit an else-branch.
+   *
+   *  **Its `null` is NARROWER than "no agent is running here", and that is by
+   *  design rather than a gap.** `sessionCliFromCommand` answers only the four
+   *  CLIs loomux can scan sessions for, because its answer is matched against
+   *  `listSessions()` rows; a `codex` or `gemini` pane is a real agent pane
+   *  that no session store covers, so it reads `null` here and correctly so.
+   *
+   *  It therefore must NOT be used to decide what a pane IS — only what can be
+   *  adopted for it. `mark` below is the field that answers "which program is
+   *  running", and reading this one instead is what #2371 review round 2 W1
+   *  found: four of the eight launchable CLIs drew no icon on their row while
+   *  their pane header drew one. This is the identity line's field
+   *  (`agentIdentityLine`) and `notesApplyToPane`'s; it is not the icon's. */
   readonly harness: string | null;
+  /** Everything `agenticons.ts` may know about this pane, straight off
+   *  `Pane.agentMarkInput` — the SAME object the pane header resolves its own
+   *  mark from, so the two surfaces cannot answer differently about one pane
+   *  (#2371 review round 2, W1).
+   *
+   *  Carried as the resolver's INPUT rather than as a resolved view, because a
+   *  view is markup: `facts()` is called once a second per open pane and must
+   *  stay a projection of state the pane already holds, so the SVG is built by
+   *  whoever actually draws it, at the size they draw it. */
+  readonly mark: AgentMarkInput;
   /** This pane's orchestration identity, or null for every pane that has none
    *  (a plain shell, a bare agent pane, an SSH pane — which can never carry
    *  one at all). */
@@ -209,6 +233,10 @@ export interface AgentRow {
   /** The tab this row's pane lives in (#2371), or null when the reading named
    *  no tab. Carried through unchanged from `PaneFacts.tab`. */
   readonly tab: TabRef | null;
+  /** What the row's agent mark is resolved from — carried through unchanged
+   *  from `PaneFacts.mark`, which is the pane header's own input. NOT
+   *  `harness`: see that field for the divergence reading it caused. */
+  readonly mark: AgentMarkInput;
 }
 
 /** Project one pane's facts into a row. `notes` is supplied by the caller
@@ -224,6 +252,7 @@ export function toAgentRow(facts: PaneFacts, notes: number | null = null): Agent
     state: deriveAgentState(facts),
     notes,
     tab: facts.tab,
+    mark: facts.mark,
   };
 }
 
@@ -310,10 +339,12 @@ export function groupRows(rows: readonly AgentRow[], order: AgentOrder): AgentGr
     const found = buckets.get(key);
     if (found) {
       found.rows.push(row);
-      // The LAST reading of a tab wins its label. Every row of one tab carries
-      // the same `TabRef` in practice (one walk, one title read), and taking a
-      // side rather than leaving it implicit is what stops a rename mid-walk
-      // from being decided by bucket-insertion luck.
+      // The LAST reading IN INPUT ORDER wins the label — not the "freshest",
+      // which is not a thing a `TabRef` carries (#2371 review round 2, R2).
+      // Every row of one tab carries the same `TabRef` in practice (one walk,
+      // one title read), so this decides a case production does not produce;
+      // it is stated rather than left implicit so the tie is a rule instead of
+      // bucket-insertion luck.
       if (row.tab !== null) found.tab = row.tab;
     } else {
       buckets.set(key, { tab: row.tab, rows: [row] });
