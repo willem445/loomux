@@ -3750,11 +3750,8 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                 // ordinary round is spent and `body_only_grace` is untouched, so
                 // a drive that never reaches the bound never consumes it — and a
                 // drive that reaches the bound on a code fail never gets it.
-                if body_only_grace_applies(entry, &lane.block, &facts.head, digest) {
-                    DriveStep::spend(DriveState::FixWait, Counter::BodyOnlyGrace)
-                } else {
-                    DriveStep::held(HeldReason::ReviewLimit)
-                }
+                let _ = body_only_grace_applies(entry, &lane.block, &facts.head, digest);
+                DriveStep::held(HeldReason::ReviewLimit)
             } else {
                 DriveStep::spend(DriveState::FixWait, Counter::ReviewRounds)
             }
