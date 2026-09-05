@@ -741,7 +741,6 @@ pub fn drive_ssh_add_with_transcript(
         // when the bytes ran out first.
         // `as_ref` because a match guard may not move out of the binding it
         // reads, and this status is not `Copy`.
-        None if status.as_ref().is_some_and(|st| st.success()) => SshAddOutcome::Added,
         None => SshAddOutcome::Failed { detail },
     };
     (outcome, seen)
