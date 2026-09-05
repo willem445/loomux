@@ -10731,8 +10731,11 @@ fn only_the_argued_residuals_still_read_the_default_workflow_directly() {
              `hold_label_of(group)` reads the group's own profile while `allowed_labels`, \
              `label_spec_for` and `gh_label_vocabulary_sync` all resolve `default`'s, so the \
              human's one-click veto would stop working for exactly the group that renamed it. \
-             Unreachable at this head (nothing but a hand-edited group.json pins a name); \
-             #1689 slice D1's picker is what makes it reachable, and it is D1's to close",
+             REACHABLE as of #1689 slice B: apply_workflow pins a name AND rewrites \
+             guardrails.intake from the named file, so this is live for any group that \
+             applies a workflow renaming `hold`. Not reachable by a human GESTURE until \
+             slice D2 wires Review & apply. Closing it means giving gh.rs's three \
+             default-resolving sites a group",
         ),
         (
             "mod.rs",
