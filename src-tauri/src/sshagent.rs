@@ -900,7 +900,10 @@ impl Conversation {
     ) -> Option<SshAddOutcome> {
         let at_line_start =
             self.consumed == 0 || matches!(self.seen.as_bytes()[self.consumed - 1], b'\n' | b'\r');
-        match classify_ssh_add_chunk(&self.seen[self.consumed..], at_line_start) {
+        // Bound to a local first: a temporary in a `match` scrutinee lives to
+        // the end of the `match`, and the arms below take `&mut self`.
+        let event = classify_ssh_add_chunk(&self.seen[self.consumed..], at_line_start);
+        match event {
             SshAddEvent::Added => Some(SshAddOutcome::Added),
             SshAddEvent::NoAgent => Some(SshAddOutcome::NoAgent { hint: agent_hint() }),
             // ssh-add's own exit: an empty passphrase ends the retry loop.
@@ -1573,24 +1576,85 @@ mod tests {
         assert_eq!(started.get(), 2, "the phase stops at the step that settled it");
     }
 
+    // ---- a failed write is a refusal, on EVERY answer ----
+
+    /// A console that has gone away: every write and every flush fails.
+    #[derive(Debug)]
+    struct BrokenConsole;
+    impl std::io::Write for BrokenConsole {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the console went away"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the console went away"))
+        }
+    }
+
+    /// A console that takes everything — the control for every assertion about
+    /// a refusal, which an implementation that refused unconditionally would
+    /// satisfy just as well.
+    #[derive(Debug)]
+    struct WorkingConsole;
+    impl std::io::Write for WorkingConsole {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
-    fn a_failed_write_becomes_a_refusal_that_names_it() {
-        // #2594 item 3. The re-arm's write used to be `let _ = send_answer(…)`,
-        // so a console that had gone away mid-conversation was reported as a
-        // fifteen-second `Timeout` — the exact failure `send_answer`'s own doc
-        // says a dropped result caused the first time. Every answer now goes
-        // through this one mapping, the re-send included.
-        let broken = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the console went away");
-        match write_refusal(Err(broken)) {
+    fn the_re_send_surfaces_a_failed_write_instead_of_dropping_it() {
+        // #2594 item 3. The re-send was `let _ = send_answer(…)`, so a console
+        // that went away mid-conversation was reported as a fifteen-second
+        // `Timeout` — the exact failure `send_answer`'s own doc says a dropped
+        // result caused the first time round. It was the last write on this path
+        // still dropping its result.
+        let mut broken: Box<dyn std::io::Write + Send> = Box::new(BrokenConsole);
+        let mut conv = Conversation::new();
+        conv.answered = true;
+        match conv.rearm(&mut broken, b"hunter2") {
             Some(SshAddOutcome::Failed { detail }) => {
                 assert!(detail.contains("could not answer ssh-add"), "got: {detail}");
                 assert!(detail.contains("the console went away"), "the cause survives: {detail}");
             }
-            other => panic!("a failed write must refuse, got {other:?}"),
+            other => panic!("a failed re-send must refuse, got {other:?}"),
         }
-        // The control: a write that worked decides nothing, so the conversation
-        // carries on rather than refusing every run.
-        assert_eq!(write_refusal(Ok(())), None);
+
+        // The control: the same re-send over a live console decides nothing, so
+        // this cannot be passed by refusing every run.
+        let mut working: Box<dyn std::io::Write + Send> = Box::new(WorkingConsole);
+        let mut conv = Conversation::new();
+        conv.answered = true;
+        assert_eq!(conv.rearm(&mut working, b"hunter2"), None);
+        assert!(conv.rearmed, "…and the one permitted re-send is spent either way");
+    }
+
+    #[test]
+    fn the_first_answer_surfaces_a_failed_write_too() {
+        // The sibling of the test above, on the path that always surfaced it.
+        // Pinned here because `step` is where both answers now go through the
+        // same mapping — the reason there is one place left to drop a result.
+        let mut broken: Box<dyn std::io::Write + Send> = Box::new(BrokenConsole);
+        let mut conv = Conversation::new();
+        conv.seen.push_str("Enter passphrase for /k/id: ");
+        match conv.step(&mut broken, b"hunter2") {
+            Some(SshAddOutcome::Failed { detail }) => {
+                assert!(detail.contains("could not answer ssh-add"), "got: {detail}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // Over a live console the same ask is answered and decides nothing…
+        let mut working: Box<dyn std::io::Write + Send> = Box::new(WorkingConsole);
+        let mut conv = Conversation::new();
+        conv.seen.push_str("Enter passphrase for /k/id: ");
+        assert_eq!(conv.step(&mut working, b"hunter2"), None);
+        assert!(conv.answered);
+        // …and the ask is consumed, which is what makes it decidable once and
+        // puts the tail's start mid-line for the anchor above.
+        assert_eq!(conv.consumed, conv.seen.len());
     }
 
     #[test]
