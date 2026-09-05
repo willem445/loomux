@@ -91,6 +91,10 @@ where
 /// file's #778 work exists to close. Being lenient is safe because nothing here
 /// builds a path from the id: it is a map key, and the leniency decides which
 /// VOCABULARY answers, never who may touch what.
+fn scratch_parse(group: Option<&str>) -> Option<GroupId> {
+    GroupId::parse(group?).ok()
+}
+
 fn group_rails(app: &tauri::AppHandle, group: Option<GroupId>) -> Option<Guardrails> {
     app.state::<Arc<OrchRegistry>>().guardrails_of(&group?)
 }
@@ -752,10 +756,7 @@ pub async fn gh_label_vocabulary(
     repo: String,
     group: Option<String>,
 ) -> GhLabelVocabulary {
-    // Parsed at the boundary, in this command's own body (CLAUDE.md constraint
-    // 6): an unusable id is `None`, which is the no-group arm — see
-    // [`group_rails`] for why all three no-group cases are one arm.
-    let gid = group.as_deref().and_then(|g| GroupId::parse(g).ok());
+    let gid = scratch_parse(group.as_deref());
     run_blocking(move || {
         let rails = group_rails(&app, gid);
         Ok(gh_label_vocabulary_sync(&repo, rails.as_ref()))
