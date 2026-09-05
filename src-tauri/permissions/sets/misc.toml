@@ -18,7 +18,6 @@ permissions = [
     "allow-save-settings",
     "allow-load-ssh-profiles",
     "allow-save-ssh-profiles",
-    "allow-ssh-add-identity",
     "allow-load-board-prefs",
     "allow-save-board-prefs",
     "allow-load-session-log",
