@@ -1022,6 +1022,97 @@ test("stripSoloMcpFlags handles the argv form the same way", () => {
   });
 });
 
+// ---------- the lead marker (#2519 C1) ----------
+// A lead pane's claude launch line carries solo's MCP block PLUS loomux's
+// `--disallowedTools Agent` (the backend's `mcp_args` for a lead = solo's
+// string + that flag, which disables the CLI's OWN Agent tool so the lead's
+// children are loomux workers, never claude sub-agents). On restore the whole
+// minted set is excised and a fresh one re-appended — so if the Agent flag is
+// not excised beside the block it shipped with, the relaunched lead line
+// carries it twice.
+
+test("stripSoloMcpFlags removes the lead's --disallowedTools Agent beside the solo MCP flags", () => {
+  assert.deepEqual(
+    stripSoloMcpFlags(
+      'claude --model opus --mcp-config "C:/Users/w/AppData/Roaming/loomux/orchestration/lead-groups/configs/orrerix-1.json" --strict-mcp-config --allowedTools mcp__orrerix --disallowedTools Agent --resume abc',
+      null
+    ),
+    { cli: "claude", command: "claude --model opus --resume abc" }
+  );
+});
+
+test("a persisted lead line round-trips through strip + re-append without duplicating flags", () => {
+  const persisted =
+    'claude --mcp-config "C:/Users/w/AppData/Roaming/loomux/orchestration/lead-groups/configs/orrerix-1.json" --strict-mcp-config --allowedTools mcp__orrerix --disallowedTools Agent';
+  const { cli, command } = stripSoloMcpFlags(persisted, null);
+  assert.equal(cli, "claude");
+  assert.ok(command, "a stripped line leaves a command to re-append to");
+  // The shape the C2 restore path builds: strip → leadPrepare → append fresh
+  // mcp_args (the same string the backend hands a first launch).
+  const relaunch = appendSoloMcpArgs(
+    command,
+    undefined,
+    '--mcp-config "C:/Users/w/AppData/Roaming/loomux/orchestration/lead-groups/configs/orrerix-2.json" --strict-mcp-config --allowedTools mcp__orrerix --disallowedTools Agent'
+  ).command!;
+  assert.equal(relaunch.split("--disallowedTools Agent").length - 1, 1, "exactly one Agent disallow");
+  assert.equal(relaunch.split("--strict-mcp-config").length - 1, 1, "exactly one strict-mcp-config");
+  assert.equal(relaunch.split("--allowedTools mcp__orrerix").length - 1, 1, "exactly one allow-list");
+});
+
+test("a human's own --disallowedTools Edit survives the lead excision — bare and comma-list", () => {
+  const bare =
+    'claude --disallowedTools Edit --mcp-config "C:/configs/solo-6.json" --strict-mcp-config --allowedTools mcp__orrerix --resume abc';
+  assert.deepEqual(stripSoloMcpFlags(bare, null), {
+    cli: "claude",
+    command: "claude --disallowedTools Edit --resume abc",
+  });
+  const list =
+    'claude --disallowedTools Edit,Agent --mcp-config "C:/configs/solo-6.json" --strict-mcp-config --allowedTools mcp__orrerix';
+  assert.deepEqual(stripSoloMcpFlags(list, null), {
+    cli: "claude",
+    command: "claude --disallowedTools Edit,Agent",
+  });
+});
+
+test("a human's own --disallowedTools Agent with NO loomux identity comes back byte-identical", () => {
+  // The excision is gated on the MCP block having matched — the marker is only
+  // loomux's when it shipped with the minted identity. A plain claude line
+  // naming the Agent tool is the human's own permission decision.
+  const cmd = "claude --disallowedTools Agent --resume abc";
+  assert.deepEqual(stripSoloMcpFlags(cmd, null), { cli: null, command: cmd });
+});
+
+test("the lead flag pair is excised in the argv form too, a human's pair surviving", () => {
+  assert.deepEqual(
+    stripSoloMcpFlags(null, [
+      "claude",
+      "--mcp-config",
+      "C:/configs/orrerix-1.json",
+      "--strict-mcp-config",
+      "--allowedTools",
+      "mcp__orrerix",
+      "--disallowedTools",
+      "Agent",
+    ]),
+    { cli: "claude", argv: ["claude"] }
+  );
+  assert.deepEqual(
+    stripSoloMcpFlags(null, [
+      "claude",
+      "--disallowedTools",
+      "Edit",
+      "--mcp-config",
+      "C:/configs/orrerix-1.json",
+      "--strict-mcp-config",
+      "--allowedTools",
+      "mcp__orrerix",
+      "--resume",
+      "abc",
+    ]),
+    { cli: "claude", argv: ["claude", "--disallowedTools", "Edit", "--resume", "abc"] }
+  );
+});
+
 // #1153 phase 3. A tab saved before the rename records the OLD MCP identity,
 // and the config path it names is just as dead as a new one's. If these flags
 // are not recognised, the excision silently does nothing and the pane is

@@ -52,7 +52,10 @@ export interface OrchCli {
    *  through the repo's workflow file, never the built-in roster, so this value
    *  is only ever the fallback a declared block inherits when it pins no
    *  `model:` of its own (mirroring the backend's `default_model(cli,
-   *  Role::Manager)`). */
+   *  Role::Manager)`). `lead` (#2519) also renders no launcher field — it is
+   *  minted by the subagents toggle, never the per-role form — and copies its
+   *  row's ORCHESTRATOR default: a lead is a human-driven pane in the
+   *  orchestrator's model class, not an executing one. */
   defaults: Record<OrchRole, string>;
 }
 
@@ -61,8 +64,9 @@ export const ORCH_CLIS: OrchCli[] = [
     id: "claude",
     models: ["sonnet", "opus", "haiku", "fable"],
     // Reasoning-heavy roles (orchestrator, planner) default to the strong
-    // tier; executing roles (worker, reviewer) to the mid tier.
-    defaults: { orchestrator: "opus", worker: "sonnet", reviewer: "sonnet", planner: "opus", manager: "opus" },
+    // tier; executing roles (worker, reviewer) to the mid tier. `lead` copies
+    // the orchestrator's tier (#2519 — the human-driven class).
+    defaults: { orchestrator: "opus", worker: "sonnet", reviewer: "sonnet", planner: "opus", manager: "opus", lead: "opus" },
   },
   {
     // The one row that carries a FULL vendor catalog rather than a shortcut, and
@@ -136,7 +140,7 @@ export const ORCH_CLIS: OrchCli[] = [
       "grok-4.6",
       "mai-code-1.1-flash",
     ],
-    defaults: { orchestrator: "auto", worker: "auto", reviewer: "auto", planner: "auto", manager: "auto" },
+    defaults: { orchestrator: "auto", worker: "auto", reviewer: "auto", planner: "auto", manager: "auto", lead: "auto" },
   },
   {
     // #722. Model ids here are `provider_id/model_id` — the `/` is part of the
@@ -171,6 +175,7 @@ export const ORCH_CLIS: OrchCli[] = [
       reviewer: INHERIT_MODEL,
       planner: INHERIT_MODEL,
       manager: INHERIT_MODEL,
+      lead: INHERIT_MODEL,
     },
   },
   {
@@ -200,6 +205,7 @@ export const ORCH_CLIS: OrchCli[] = [
       reviewer: INHERIT_MODEL,
       planner: INHERIT_MODEL,
       manager: INHERIT_MODEL,
+      lead: INHERIT_MODEL,
     },
   },
 ];

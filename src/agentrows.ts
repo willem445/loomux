@@ -488,3 +488,41 @@ export function groupRows(rows: readonly AgentRow[], order: AgentOrder): AgentGr
 export function needsYouCount(rows: readonly AgentRow[]): number {
   return rows.filter((r) => r.state === "attention" || r.state === "question").length;
 }
+
+/** The pane key of the lead pane this pane reports to, or null when it nests
+ *  under nobody (#2519 C1) — the Agents tab's child-indent input (C2 renders
+ *  it; this module only decides what it MEANS, like every projection here).
+ *
+ *  The relationship is (same group, same tab), and BOTH halves are load-
+ *  bearing. A lead's children join the lead's group (`spawn_agent` from a lead
+ *  places them in it) and open in the lead's tab (C2 registers the tab as the
+ *  group's owner), so:
+ *
+ *  - group alone is not enough — `groupRows` already scopes everything to one
+ *    tab block, and an indent rendered from a cross-tab match would point at a
+ *    parent that is not on screen;
+ *  - tab alone is not enough — a worker of an ORCHESTRATOR group can share a
+ *    tab with an unrelated lead, and it nests under nobody.
+ *
+ *  Only `worker`-class panes can be children: the backend refuses a lead every
+ *  other kind, and a lead (role `"lead"`), an orchestrator, a manager or a
+ *  plain pane resolves to null even when the group/tab pair matches its own
+ *  record — nobody is their own parent. Matching reads exactly the fields
+ *  `PaneFacts` already projects (orch group + role, tab id); no caller-side
+ *  filtering of leads is required, and none should be added — the population
+ *  the scan runs over is the whole fleet the caller hands in. */
+export function parentKey(facts: PaneFacts, fleet: readonly PaneFacts[]): string | null {
+  const orch = facts.orch;
+  if (orch === null || orch.role !== "worker") return null;
+  const tab = facts.tab;
+  if (tab === null) return null;
+  const lead = fleet.find(
+    (p) =>
+      p.orch !== null &&
+      p.orch.role === "lead" &&
+      p.orch.group === orch.group &&
+      p.tab !== null &&
+      p.tab.id === tab.id,
+  );
+  return lead === undefined ? null : lead.key;
+}

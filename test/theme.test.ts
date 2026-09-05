@@ -412,6 +412,10 @@ test("one role table: every surface that names an agent role paints it the same 
     // the four above. Rose is the destructive-action dye and lime sits too close to
     // the worker's jade.
     manager: "--id-orchid",
+    // #2519. The same constraint one class on: cyan is the one identity hue
+    // distinct from the five above (rose and lime are spoken for by the
+    // manager's own argument, and orchid is the manager's).
+    lead: "--id-cyan",
   };
 
   // The role list comes from the TYPE, so a fifth role cannot be added to the app and
