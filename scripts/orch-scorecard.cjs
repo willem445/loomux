@@ -331,6 +331,12 @@ function scorePr(ctx, pr) {
     // scorecard can put them beside `refused` and `held` without a reader
     // having to know which rd-* actions are new.
     lanes_released: 0, workers_released: 0,
+    // #2509: how often the one-shot body-only grace saved a drive from
+    // `held(review-limit)`. Worth its own counter rather than a share of
+    // hand-backs, because the question it answers is whether the grace is
+    // earning its keep — a grace that fires and then parks anyway cost a round
+    // for nothing, and only `rounds_grace` beside `held.review-limit` shows it.
+    rounds_grace: 0,
   };
   const refusedByReason = {};
   const heldByReason = {};
@@ -399,6 +405,7 @@ function scorePr(ctx, pr) {
         case 'rd-pruned': driver.pruned += 1; break;
         case 'rd-lane-released': driver.lanes_released += 1; break;
         case 'rd-worker-released': driver.workers_released += 1; break;
+        case 'rd-round-grace': driver.rounds_grace += 1; break;
         default: driver[row.action] = (driver[row.action] || 0) + 1; break;
       }
       continue;

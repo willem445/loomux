@@ -2109,6 +2109,18 @@ you believe is in force and is not, so orrerix will not load the file at all.
 timeouts are backstops on a wait, and every notify-TTL wait in orrerix clamps the
 same way.
 
+**One drive can take one more review round than `max_review_rounds` says, and
+only one.** If a round's blocking fail comes back on a reviewer the driver had
+re-briefed about the **PR body alone** - the head had not moved since a full
+round was already spent on it, and every required reviewer had already answered
+about that code - the driver hands the worker back once more instead of stopping
+at the bound. A body fix is a text edit with nothing to build and nothing to
+re-check, and stopping a drive on one costs you a cancel, a manual worker resume
+and a re-drive. It is granted **once per drive**, it is not available for a fail
+about the code, and the next blocking fail after it stops the drive whatever it
+is about. `review_drive_status` shows it as `grace_used`, and the audit log
+records it as `rd-round-grace`.
+
 `drive_timeout_minutes` is the odd one of the three and its range says so. The other
 two bound **one** wait on one fallible signal - a reviewer answering, a worker
 pushing - which is the same quantity a notify watch's TTL is, so they take that
