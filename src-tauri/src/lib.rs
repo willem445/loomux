@@ -199,7 +199,6 @@ pub fn run() {
             pty::change_dir,
             pty::discover_git_bash,
             pty::discover_ssh,
-            sshagent::ssh_add_identity,
             sessions::list_sessions,
             sessions::record_copilot_launch_posture,
             sessions::record_claude_launch_posture,
