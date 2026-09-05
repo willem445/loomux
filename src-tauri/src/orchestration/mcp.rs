@@ -3196,10 +3196,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // `a_lead_may_spawn_a_worker_and_nothing_else` asserts WHICH check
             // said no, by the vocabulary each refusal quotes.
             if caller.role == Role::Lead {
-                let declared = block.as_deref().and_then(|id| {
-                    reg.group(&caller.group).and_then(|g| g.guardrails.block(id).map(|b| b.kind))
-                });
-                let effective = declared.or(kind);
+                let effective = kind;
                 if effective != Some(Role::Worker) {
                     return Err(format!(
                         "kind must be worker — a lead pane opens helper workers and nothing \
