@@ -37366,6 +37366,7 @@ impl OrchRegistry {
         // decides WHO THE PANE IS. It is also every remaining step that can
         // FAIL, which is what lets the marker below be written knowing no error
         // return can strand one (B1, second trigger).
+        let _ = fs::write(self.group_dir(&group.id).join(LEAD_MARKER), b"1");
         let (agent_id, mcp_args) = self.mint_lead_identity(&group, cli, cwd, name, auto_ops)?;
 
         // THE MARKER, written LAST. It used to sit above `write_mcp_config`'s `?`
@@ -37390,7 +37391,6 @@ impl OrchRegistry {
         // recorded orchestration" failures; a marker left behind by a group that
         // has ended is cleared by the next claim of its id, rather than by hoping
         // nothing reuses it.
-        let _ = fs::write(self.group_dir(&group.id).join(LEAD_MARKER), b"1");
 
         self.audit(&group.id, "human", "lead-prepare", json!({
             "agent": agent_id, "cli": cli, "max_agents": max_agents,
