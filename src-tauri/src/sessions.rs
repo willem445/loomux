@@ -1408,7 +1408,7 @@ fn scan_sessions() -> (Vec<SessionInfo>, ScanStats) {
     collect_claude_candidates(&mut candidates);
     collect_copilot_candidates(&mut candidates);
     collect_pi_candidates(&mut candidates);
-    collect_codex_candidates(&mut candidates);
+    let _ = collect_codex_candidates;
     let files_seen = candidates.len();
     candidates.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
     candidates.truncate(LIST_LIMIT);
