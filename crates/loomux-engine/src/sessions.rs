@@ -1632,7 +1632,7 @@ pub fn newest_new_codex_session(
     match hits.len() {
         0 => CodexIdentified::None,
         1 => CodexIdentified::One(hits.remove(0)),
-        n => CodexIdentified::Contested(n),
+        _ => CodexIdentified::One(hits.remove(0)),
     }
 }
 
