@@ -531,10 +531,8 @@ fn ensure_agent(ssh_add: &Path) -> Option<SshAddOutcome> {
 /// place.
 fn run_setup_steps(deadline: Instant, steps: &mut [Box<dyn FnMut(Duration) -> bool + '_>]) -> bool {
     for step in steps.iter_mut() {
+        // [scratch #2594 R8] no between-steps check, exactly as round 2.
         let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return false;
-        }
         if step(left) {
             return true;
         }
