@@ -33711,7 +33711,7 @@ impl OrchRegistry {
         self.agents
             .lock_safe()
             .values()
-            .any(|a| a.group == id && a.status != AgentStatus::Dead)
+            .any(|a| a.group == id && a.status != AgentStatus::Dead && a.role != Role::Lead)
     }
 
     // ---------- cost containment: pause, idle-kill, spawn-rate, usage ----------
