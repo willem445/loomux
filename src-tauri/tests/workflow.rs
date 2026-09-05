@@ -10735,7 +10735,8 @@ fn only_the_argued_residuals_still_read_the_default_workflow_directly() {
              guardrails.intake from the named file, so this is live for any group that \
              applies a workflow renaming `hold`. Not reachable by a human GESTURE until \
              slice D2 wires Review & apply. Closing it means giving gh.rs's three \
-             default-resolving sites a group",
+             default-resolving sites a group, which is #2663 and a blocking \
+             prerequisite for slice D2",
         ),
         (
             "mod.rs",
