@@ -142,6 +142,29 @@ Two entries at most. Each names a CONCRETE input or sequence that triggers the
 failure ("a stacked PR whose base ref was renamed rather than deleted"). An
 entry with no input is filler; delete it.
 
+## Rule 6 - the round's scope is the line your brief names
+
+Your kickoff brief carries the round's scope on one machine-readable line, and
+that line decides how wide the round measures (#2508). The late blockers that
+cost extra rounds (#2308's permissive shim arm, #2239's VT-escape injection,
+#2391's constraint-1 violation and inert CSS) all lived in round-1 code a delta
+round never measured - which is why round 1 measures everything:
+
+- `scope: whole-diff` - measure the WHOLE diff, not a delta: every call site of
+  a changed function, CSS rendered in a browser (never judged by reading the
+  source), a PTY-resize constraint (CLAUDE.md hard constraint 1) traced across
+  ALL its callers, and every new match arm checked against the closed set it is
+  in. Round 1 is always this mode.
+- `scope: delta since <sha>` - round 2 or later with the head moved: re-run
+  your pass over what moved since that revision - AND the whole numbered
+  body-claim pass, never only the sentence that changed.
+- `scope: body-only` - the head has not moved: a verification-only round. Read
+  the body as it stands, check what it asserts against the tree, and do not go
+  looking for code findings (one you see is still in scope).
+
+A brief that names no scope line is a finding against the brief, not a licence
+to guess: report which mode you assumed and what you measured to it.
+
 ## Record your verdict
 
 `review_verdict(...)` with `pass` or `fail`, and a summary in this order: the

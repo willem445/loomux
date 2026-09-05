@@ -1853,7 +1853,17 @@ two remaining ways a fresh pane can appear.
   same kind of pane id and the same brief, so before this the only way to tell
   nine panes from six was to count them by hand across three PRs. It records
   what HAPPENED — a resume that was attempted and fell through is `false` —
-  which is why the failure is its own row rather than a flag here.
+  which is why the failure is its own row rather than a flag here. Since #2508
+  it also carries `scope`, the round's scope line **verbatim, `scope: ` prefix
+  included** — the value is `scope: whole-diff` | `scope: delta since <sha>` |
+  `scope: body-only` (§5.5), never the bare mode, so a counter filtering the
+  field must match the full line. The one fact about the round nothing else on
+  the row records, so a beta's before/after count of whole-diff rounds reads
+  the log rather than re-deriving it from round numbers and head moves. **A
+  round whose pane is replaced writes one row per open, not one per round**
+  (#2163) — a round can emit several `scope: whole-diff` rows for one
+  `(pr, block)` — so a counter sums distinct `(pr, block, round)` triples,
+  which the row's `round` field carries, rather than raw rows.
 - `rd-lane-resume-failed` carries `block`, `session`, `head` and a `detail`
   QUOTING what refused, never a diagnosis of it (§2.2's `worker-unresumable`
   row makes the same distinction for the same reason). One row per resume that
@@ -2033,6 +2043,42 @@ arc 2 on arc 7, so the claim holds for a head this drive handed back and does
 **not** hold for its first pass over a head it never did, where the receipts race
 is unchanged. A flat sentence would be the wider claim, and this text lands in a
 reviewer's pane as fact.
+
+**Both reviewer templates state the round's scope on one machine-readable line
+(#2508)** — `scope: whole-diff` | `scope: delta since <sha>` | `scope:
+body-only` — so a repo's reviewer persona can key how wide the round measures
+off something the driver wrote rather than a round count it would have to
+re-derive. The measured reason it exists: on the beta7 driver, every LATE
+blocker the final validator caught was in round-1 code the delta-scoped rounds
+never measured (#2308's permissive shim arm, #2239's VT-escape injection,
+#2391's constraint-1 violation and inert CSS), and each cost 2–3 extra rounds
+because the one lane that reads the whole PR sees it only once, last. The
+rev-std persona (`.github/agents/rev-std.md` Rule 6) reads the line: `whole-diff`
+means every call site of a changed function, CSS rendered in a browser, a
+PTY-resize constraint traced across all callers, every new match arm checked
+against the closed set it is in; `delta since` names the revision to re-run the
+pass over — with the whole body-claim pass still owed; `body-only` is
+verification-only (E2, #2308).
+
+The derivation is the lane's own history plus the two facts the brief's arms
+already read, in a fixed order: `verify` decides first (a verification round
+reads the body as it stands, which is `body-only` by definition, and the grant
+can arrive on a lane with no record — the undriven-to-driven transition — so the
+lane history cannot be asked before it); then a lane with no record has never
+measured this PR and gets `whole-diff`, whatever the round counter says — which
+is also why **round 1 never says delta**, structurally, since there is no
+previous revision to name; a re-brief at an unchanged head is `body-only`; a
+re-brief at a moved head names the revision it deltas from. The scope is
+therefore **per lane**, not per round counter: a fresh lane joining at a later
+round is a lane whose round 1 it is, and it measures the whole diff. The same
+string rides the `rd-lane-spawned` audit row (§5.4). **The classification is
+derived once** — `rd_lane_brief`'s WHAT_MOVED arm reads the scope line rather
+than re-deriving `rec.at_head == brief.head` beside it (rev-std's finding on
+the parallel matches) — and the pin asserts each mode against the template arm
+and the prose it selects, so the two reads cannot drift apart silently. All
+three values, both paths to `body-only`, and the round-1 negative control are
+pinned in `tests/reviewdrive.rs`
+(`the_lane_brief_names_the_round_scope_on_every_round_mode`).
 
 ## 6. Kick-back notice shapes
 

@@ -2697,6 +2697,18 @@ before this the second kind got a brand-new reviewer every round, told about a v
 never given. Where a session genuinely cannot be reopened the driver opens a fresh reviewer, as it
 always did, and the audit log says so (`rd-lane-resume-failed`) with what refused.
 
+**Every reviewer brief names the round's scope on one line.** `scope: whole-diff`, `scope: delta
+since <commit>`, or `scope: body-only` — so a repo's reviewer persona can key how wide the round
+measures off something machine-readable instead of counting rounds. The first time a lane is
+briefed — round 1, or a fresh lane joining later — the scope is the whole diff; a re-brief at a
+new commit names the commit it is a delta from; a re-brief at an unchanged commit (a body-only
+fix) is body-only, a verification round over the body as it stands. The scope is per lane, not per
+round: a reviewer that joins late measures the whole diff, because it has never seen the PR
+before. The audit row for the spawn (`rd-lane-spawned`) carries that line verbatim, `scope: `
+prefix included, so a tool counting whole-diff rounds filters on the full line and sums distinct
+`(pr, block, round)` triples — a round whose reviewer pane is replaced writes one row per open,
+not one per round.
+
 **One reviewer per round, never two.** If a PR's body changes while its reviewer is still writing,
 the driver waits for that reviewer and hands it the update, rather than starting a second one
 beside it — two panes reviewing one round is two reviews paid for and one verdict slot to put them
