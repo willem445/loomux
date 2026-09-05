@@ -194,6 +194,52 @@ fn a_codex_effort_knob_rides_the_profile_and_an_empty_one_emits_no_key() {
 }
 
 // ---------------------------------------------------------------------------
+/// The profile sets NEITHER MCP timeout, and that absence is a decision
+/// (#2515 C1, review round 1 finding 2).
+///
+/// This pins an absence, so it needs the control that an absence assertion
+/// always needs: the document must demonstrably be the MCP-server document, or
+/// "no timeout key" would also pass on an empty string.
+///
+/// **Why absent rather than set.** The first version of this file wrote
+/// `tool_timeout_sec = 30.0` and `startup_timeout_sec = 20.0` and documented
+/// them as raises over codex's "60s" and "10s" defaults. Both defaults were
+/// wrong — transcribed from the slice plan rather than read from the source —
+/// and the real ones are `DEFAULT_STARTUP_TIMEOUT = 30s` and
+/// `DEFAULT_TOOL_TIMEOUT = 300s` (`codex-mcp/src/rmcp_client.rs` at the pin,
+/// applied by `connection_manager.rs`'s `.unwrap_or`). So the shipped values
+/// were reductions, the tool timeout by 10×, under a rationale arguing for the
+/// opposite: a `spawn_agent` behind a large group can legitimately outrun 30
+/// seconds, and stock codex would have waited 300.
+///
+/// The numbers are deliberately NOT asserted here. Pinning "30 and 300" would
+/// be pinning someone else's constants, which orrerix cannot keep honest and
+/// which would go stale silently the day codex changes them. What orrerix
+/// controls, and all it should assert, is that it writes no number at all.
+#[test]
+fn a_codex_profile_sets_no_mcp_timeout_and_says_why() {
+    let body = codex_profile_toml(
+        7777,
+        CodexMcpAuth::EnvVar("ORRERIX_AGENT_TOKEN"),
+        Path::new(CWD),
+        true,
+        "high",
+        Some("contract"),
+    );
+    // The control: this really is the document that declares the MCP server, so
+    // the absences below are about a populated entry rather than about nothing.
+    assert!(body.contains("[mcp_servers.orrerix]"), "{body}");
+    assert!(body.contains("url = \"http://127.0.0.1:7777/mcp\""), "{body}");
+
+    for key in ["startup_timeout_sec", "tool_timeout_sec"] {
+        assert!(
+            !body.contains(key),
+            "the profile must set no {key}: codex's own default is more generous than anything \
+             orrerix would write, and the first version of this file set BOTH lower while \
+             claiming to raise them:\n{body}"
+        );
+    }
+}
 // 2. The token — two shapes, and each must NOT be the other
 // ---------------------------------------------------------------------------
 

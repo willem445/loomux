@@ -477,13 +477,48 @@ having to remember the rule.
 | `developer_instructions` | the block's role contract | see §The contract. |
 | `[sandbox_workspace_write] network_access` | `true` | off by default under `workspace-write`, and a worker that cannot reach GitHub is not a worker. |
 | `[projects."<cwd>"] trust_level` | `trusted` | see §Trust. |
-| `[mcp_servers.<brand>]` | `url`, timeouts, one header map | loomux's own server, over streamable HTTP. One server contract, six spellings. |
+| `[mcp_servers.<brand>]` | `url`, one header map, `default_tools_approval_mode` | orrerix's own server, over streamable HTTP. One server contract, six spellings. **No timeouts** — see below. |
 
 `default_tools_approval_mode = "auto"` is codex's own default, **spelled out
 rather than inherited**: a human's `config.toml` can set a different one
 globally, and an agent whose `report` needs approving has nobody to approve it.
 The profile layer wins over the user layer, so stating it is what makes the
 pane's tool surface independent of their setting.
+
+### Neither MCP timeout is written, and that is the decision
+
+The first version of this design set `tool_timeout_sec = 30` and
+`startup_timeout_sec = 20`, documented as RAISES over codex's "60s" and "10s"
+defaults. Both defaults were wrong. They came from #2515's slice plan (which
+took them from the published config reference) and were transcribed here without
+being read from the source — the failure CLAUDE.md names as "a routed
+instruction's factual premise is a claim to verify, not text to transcribe".
+Caught in review round 1.
+
+At the pin, codex resolves both keys in `codex-mcp/src/connection_manager.rs`
+with `.unwrap_or(DEFAULT_…)` against `codex-mcp/src/rmcp_client.rs`:
+
+```rust
+pub(crate) const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
+```
+
+So the shipped values were **reductions** — the tool timeout by 10× — under a
+rationale ("orrerix's tools do real work behind a call, and one timing out reads
+to an agent as the tool being broken") that argues for the opposite. A
+`spawn_agent` behind a large group can legitimately outrun 30 seconds; stock
+codex would have waited 300.
+
+Writing a key whose only effect is to make the pane worse than the vendor's own
+default is indefensible, so both keys are gone. Nothing is lost that pi's
+`PI_MCP_TIMEOUT_MS` buys: that constant raises the pi adapter's shorter default
+*to* 30s, and codex already gives ten times that.
+
+`a_codex_profile_sets_no_mcp_timeout_and_says_why` pins the absence. It
+deliberately does not assert 30 and 300: those are someone else's constants,
+orrerix cannot keep them honest, and pinning them would go stale silently the day
+codex changes them. What orrerix controls — and all it should assert — is that it
+writes no number at all.
 
 ### Trust: the single most important line
 
@@ -638,6 +673,18 @@ Three things differ from copilot's watcher, each for a codex reason:
   being installed.
 
 A torn header is `Waiting`, not a wrong binding: the next poll reads it whole.
+
+**Residual, and it is the deadline's other edge.** A pane whose first turn is
+more than ten minutes late stays unidentified: the rollout file does not exist
+until the session first `persist()`s, so the watcher polls for something not yet
+written, gives up at `CODEX_SESSION_TIMEOUT`, and audits `session-untracked`.
+Resume and usage never bind for that pane, and it looks exactly like codex being
+absent. Ten minutes is chosen against the alternative — a shorter deadline loses
+more panes, a longer one widens the window in which another pane's new session
+in the same directory is a candidate — but it is a trade, not a fix. The real fix
+is a signal that a session STARTED, which codex does not offer on the TUI path.
+Raised as a premortem in review round 1 and recorded here rather than left in a
+review comment nobody re-reads.
 
 ## Readiness
 

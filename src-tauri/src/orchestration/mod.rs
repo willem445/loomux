@@ -7431,18 +7431,36 @@ pub fn codex_profile_file_name(agent: &PathSegment) -> Result<String, String> {
     Ok(format!("{name}.config.toml"))
 }
 
-/// Timeout (secs) on loomux's entry in a codex profile, raised from codex's own
-/// 60s default for the reason [`PI_MCP_TIMEOUT_MS`] gives, and to the same
-/// number: loomux's tools do real work behind a call, and one timing out reads
-/// to an agent as the tool being broken.
-const CODEX_MCP_TOOL_TIMEOUT_SECS: f64 = 30.0;
-
-/// Startup timeout (secs) for that entry, raised from codex's 10s default.
-/// The server is on loopback and answers immediately in the ordinary case;
-/// what this covers is a cold pane racing the app's own MCP listener during a
-/// group launch, where losing the handshake costs the pane its whole tool
-/// surface for the session and nothing retries.
-const CODEX_MCP_STARTUP_TIMEOUT_SECS: f64 = 20.0;
+// **The generated profile deliberately sets NEITHER MCP timeout** (#2515 C1,
+// review round 1 finding 2), and the absence is the decision rather than an
+// omission — which is why it is written down where the keys would have been.
+//
+// The first version of this file wrote `tool_timeout_sec = 30.0` and
+// `startup_timeout_sec = 20.0`, documented as RAISES over codex's "60s" and
+// "10s" defaults. Both defaults were wrong: they came from #2515's slice plan,
+// which took them from the published config reference, and I transcribed them
+// onto a permanent surface instead of reading the source. At the pin codex
+// resolves both keys in `codex-mcp/src/connection_manager.rs` with
+// `.unwrap_or(DEFAULT_…)` against `codex-mcp/src/rmcp_client.rs`:
+//
+//     pub(crate) const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+//     pub(crate) const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
+//
+// So the shipped values were REDUCTIONS — the tool timeout by 10× — carrying a
+// rationale ("loomux's tools do real work behind a call, and one timing out
+// reads to an agent as the tool being broken") that argues for the exact
+// opposite. A `spawn_agent` behind a large group can legitimately run well past
+// 30 seconds; stock codex would have waited 300.
+//
+// Writing a key whose only effect is to make the pane worse than the vendor's
+// own default is indefensible, so both keys are gone and codex's defaults
+// stand. Nothing is lost that pi's `PI_MCP_TIMEOUT_MS` buys: that constant
+// raises the pi adapter's own shorter default TO 30s, and codex already gives
+// ten times that.
+//
+// `a_codex_profile_sets_no_mcp_timeout_and_says_why` pins the absence, so a
+// later edit that re-adds a number has to argue with a test rather than with a
+// comment.
 
 /// How a codex pane's profile presents this agent's token.
 ///
@@ -7707,8 +7725,10 @@ pub fn codex_profile_toml(
     ));
     s.push_str(&format!("[mcp_servers.{MCP_SERVER}]\n"));
     s.push_str(&format!("url = \"http://127.0.0.1:{port}/mcp\"\n"));
-    s.push_str(&format!("startup_timeout_sec = {CODEX_MCP_STARTUP_TIMEOUT_SECS:?}\n"));
-    s.push_str(&format!("tool_timeout_sec = {CODEX_MCP_TOOL_TIMEOUT_SECS:?}\n"));
+    // No `startup_timeout_sec`, no `tool_timeout_sec` — see the block where
+    // those constants used to be. codex's own defaults (30s and 300s) are more
+    // generous than anything loomux would set, and the first version of this
+    // function set both LOWER while claiming to raise them.
     // `auto` is codex's own default, spelled out rather than inherited: a
     // human's `config.toml` may set a different `default_tools_approval_mode`
     // globally, and an agent whose `report` needs approving has nobody to

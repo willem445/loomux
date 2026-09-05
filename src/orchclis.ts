@@ -223,13 +223,22 @@ export const ORCH_CLIS: OrchCli[] = [
     // `codex --help` reports in front of this list, and a hardcoded shortcut
     // here could only ever be a staler copy of a live answer.
     //
-    // **Both knobs are real on codex, and only one is loomux-settable.** Effort
-    // is `model_reasoning_effort` in the generated profile, over
-    // `low|medium|high|xhigh` — loomux's `max` has no codex spelling and is
-    // REFUSED on a codex block rather than dropped. Context is
-    // model-determined, with no variant key. Neither is a launcher field on
-    // this row; both are read from the backend's `agent_cli_knobs`, which
-    // quotes `CliCaps` directly, so nothing here can disagree with it.
+    // **Both knobs are real on codex, and only one is orrerix-settable.** Effort
+    // is `model_reasoning_effort` in the generated profile, and codex accepts
+    // EVERY level orrerix has: its `ReasoningEffort::from_str` maps `max`
+    // alongside `none`/`minimal`/`ultra`/`persistent` and a `Custom(String)`
+    // catch-all, so its vocabulary is a strict SUPERSET of orrerix's five and
+    // the backend's row takes `EFFORT_LEVELS` whole. (An earlier version of
+    // this comment said `max` had no codex spelling and was refused on a codex
+    // block. Both halves were false — carried over from #2515's slice plan,
+    // which the PR's own D7 correction retracts — and nothing in the parser
+    // refuses it: `validate_knob` errors only for a value outside the CLI's own
+    // list.) Context is model-determined, with no variant key.
+    //
+    // Neither is a launcher field on this row; both are read from the backend's
+    // `agent_cli_knobs`, which quotes `CliCaps` directly, so nothing here can
+    // disagree with it — which is exactly why the wrong sentence above survived
+    // to review: no code depended on it.
     //
     // Membership here is spawnability. codex hosts a worker or an
     // orchestrator; a reviewer, planner or manager on it is refused by

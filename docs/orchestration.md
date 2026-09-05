@@ -102,8 +102,11 @@ value, which orrerix emits nothing for, so the CLI runs exactly as it would
 with no flag at all.
 
 - **Thinking level** sets how hard the model reasons before answering
-  (`low`/`medium`/`high`/`xhigh`/`max`), on Claude Code only. Copilot CLI and
-  Gemini CLI grey the control out with a reason shown inline: Copilot's
+  (`low`/`medium`/`high`/`xhigh`/`max`), on Claude Code, pi and Codex. Each of
+  the three accepts every level orrerix offers, by a different route: Claude
+  Code takes a `--effort` flag, pi a `--thinking` flag, and Codex the
+  `model_reasoning_effort` key in the profile orrerix generates for it. Copilot
+  CLI and Gemini CLI grey the control out with a reason shown inline: Copilot's
   effort level lives in `~/.copilot/settings.json` with no flag or
   environment variable to set it, and orrerix never writes a user's global
   settings file to reach it; Gemini's thinking level is a settings-file key
