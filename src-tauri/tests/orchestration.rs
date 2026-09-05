@@ -178,7 +178,7 @@ use loomux_lib::orchestration::{
     // #865: done-row cap on list_tasks — the pure keep/drop rule and its default.
     filter_done_rows, LIST_TASKS_DONE_CAP,
     unconfirmed_delivery_notice, delivery_eaten_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AgentEntry, AgentRecord, AgentStatus, ApproveItem, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, KickoffOrigin, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
+    AgentEntry, AgentRecord, AgentStatus, ApproveItem, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, GroupInfo, Guardrails, HeldReason, HumanInput, KickoffOrigin, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
     // #407: promotion of a standalone pane to orchestrator.
     promote_to_orchestrator_sync, PromoteConfig, SessionOrigin,
     PersonaInject, Task, TaskNote, TaskSummary,
@@ -45939,6 +45939,451 @@ fn advanced_orchestrator_toggle_never_reidentifies_a_live_delegate() {
         .is_err(),
         "the built-in 'worker' block id must be gone from the roster after the toggle"
     );
+}
+
+// ───────── #1689 slice B: applying a NAMED workflow to a live group ─────────
+//
+// `apply_workflow` is `set_advanced_orchestrator`'s shape with a named file and
+// a diff. What these pin is the half a toggle never had to answer: a switch
+// both ADDS and REMOVES block ids, so a live pane, a bare resume, the group
+// dir's instruction files and the armed gate each need a stated answer.
+
+/// A repo declaring TWO workflows with DISJOINT delegate ids and different
+/// gates: `default` (`.orrerix/workflow.yml`, ids `w-a`/`rev-a`) and `b`
+/// (`.orrerix/workflows/b.yml`, ids `w-b`/`rev-b`).
+///
+/// Disjoint on purpose — it is what makes "did a live pane keep its block",
+/// "does a new spawn use the new roster" and "is the old id refused now" three
+/// separately observable facts rather than one.
+fn two_workflow_repo() -> tempfile::TempDir {
+    let td = tempfile::tempdir().unwrap();
+    let dir = td.path().join(".orrerix");
+    fs::create_dir_all(dir.join("workflows")).unwrap();
+    fs::write(
+        dir.join("workflow.yml"),
+        "version: 1\nname: plain\n\
+         blocks:\n\
+         \x20 - id: w-a\n    kind: worker\n\
+         \x20 - id: rev-a\n    kind: reviewer\n    prompt: Everything.\n\
+         gates:\n  merge:\n    reviewers: [rev-a]\n",
+    )
+    .unwrap();
+    write_workflow_b(td.path(), "sonnet");
+    td
+}
+
+/// `b.yml`, with `w-b`'s model as the one thing a caller varies — the
+/// same-name re-apply case (#1566's apply-an-edit path) edits exactly this.
+fn write_workflow_b(repo: &std::path::Path, worker_model: &str) {
+    fs::write(
+        repo.join(".orrerix").join("workflows").join("b.yml"),
+        format!(
+            "version: 1\nname: focused-b\n\
+             blocks:\n\
+             \x20 - id: w-b\n    kind: worker\n    model: {worker_model}\n\
+             \x20 - id: rev-b\n    kind: reviewer\n    prompt: Security only.\n\
+             gates:\n  merge:\n    reviewers: [rev-b]\n\
+             intake:\n  labels:\n    hold: do-not-touch\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn wf(name: &str) -> workflow::WorkflowName {
+    workflow::WorkflowName::parse(name).unwrap()
+}
+
+/// A group launched in workflow mode on `default`, with a paused orchestrator
+/// pane so every notice this section asserts on is observable.
+fn switchable_group(reg: &OrchRegistry, repo: &tempfile::TempDir) -> GroupInfo {
+    let g = reg
+        .create_group(
+            &repo.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 8, ..rails() },
+        )
+        .unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(reg, &g.id, &orch.id, 7301);
+    g
+}
+
+fn group_json(reg: &OrchRegistry, g: &GroupInfo) -> Value {
+    serde_json::from_str(
+        &fs::read_to_string(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn applying_a_named_workflow_swaps_the_roster_for_future_spawns_only() {
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    assert_eq!(g.guardrails.workflow.as_str(), "default", "the launch pins the plain file");
+
+    // Spawned under the OLD roster, before the switch.
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    assert_eq!(w.block, "w-a");
+
+    let status = reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
+    assert_eq!(status["workflow"], json!("b"), "{status}");
+    assert_eq!(status["name"], json!("focused-b"), "the file's own name: field: {status}");
+    assert_eq!(status["drift"], Value::Null, "right after an apply the group runs what the file says");
+
+    // The live delegate keeps the identity a human already approved.
+    assert_eq!(
+        reg.agent(&w.id).unwrap().block,
+        "w-a",
+        "a switch must not retro-swap a live delegate's block"
+    );
+
+    // FUTURE spawns resolve against the new roster: the b-only id works…
+    let w2 = reg
+        .spawn_agent_ex(&g.id, Role::Worker, Some("w-b".into()), "w2", "t", false, None, None, None, None, None)
+        .unwrap();
+    assert_eq!(w2.block, "w-b");
+    // …and the a-only id is refused, by the roster's own unknown-block path,
+    // NAMING what the group can spawn now.
+    let err = reg
+        .spawn_agent_ex(&g.id, Role::Worker, Some("w-a".into()), "w3", "t", false, None, None, None, None, None)
+        .unwrap_err();
+    assert!(err.contains("unknown block"), "{err}");
+    assert!(err.contains("w-b"), "the refusal must name the ACTIVE roster: {err}");
+
+    // group.json carries the name, the roster and the intake profile that came
+    // out of the same document — one atomic write, so nothing on disk can
+    // disagree about which file this group consented to.
+    let v = group_json(&reg, &g);
+    assert_eq!(v["guardrails"]["workflow"], json!("b"));
+    let ids: Vec<&str> =
+        v["guardrails"]["blocks"].as_array().unwrap().iter().map(|b| b["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"w-b") && ids.contains(&"rev-b"), "{ids:?}");
+    assert!(!ids.contains(&"w-a"), "the old roster must be gone from disk too: {ids:?}");
+    assert_eq!(
+        v["guardrails"]["intake"]["labels"]["hold"],
+        json!("do-not-touch"),
+        "the intake vocabulary travels with the roster it was resolved from (#382 NB2)"
+    );
+
+    // The gate is re-armed from the new file — the state `gate_status_line`
+    // and `list_verdicts` read.
+    let gate = reg.merge_gate(&g.id).unwrap();
+    assert_eq!(gate.reviewers, vec!["rev-b".to_string()]);
+
+    let entries = reg.audit_log(&g.id);
+    let switched = entries
+        .iter()
+        .find(|e| e.action == "workflow-switched")
+        .unwrap_or_else(|| panic!("no workflow-switched row: {entries:?}"));
+    assert_eq!(switched.detail["from"], json!("default"));
+    assert_eq!(switched.detail["to"], json!("b"));
+    assert_eq!(switched.detail["actor"], json!("human"));
+    assert_eq!(switched.detail["diff"]["added"], json!(["rev-b", "w-b"]));
+    assert_eq!(switched.detail["diff"]["removed"], json!(["rev-a", "w-a"]));
+    assert_eq!(switched.detail["diff"]["gate_changed"], json!(true));
+    assert_eq!(switched.detail["diff"]["intake_changed"], json!(true));
+}
+
+#[test]
+fn the_orchestrator_is_told_which_ids_it_may_spawn_by_now() {
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
+
+    let notice = delivered_texts(&reg, &g.id)
+        .into_iter()
+        .find(|t| t.contains("workflow switched"))
+        .unwrap_or_else(|| panic!("the orchestrator must receive the switch notice"));
+    assert!(notice.contains("'default' → 'b'"), "{notice}");
+    assert!(notice.contains("w-b (worker"), "the roster rows must name kind and model: {notice}");
+    assert!(notice.contains("removed: rev-a, w-a"), "{notice}");
+    assert!(notice.contains("merge gate requires all of [rev-b]"), "{notice}");
+    assert!(
+        notice.contains("a bare resume of its session will be refused"),
+        "the one consequence the pane cannot discover for itself: {notice}"
+    );
+    assert!(is_one_paragraph(&notice), "a delivered notice is ONE paragraph: {notice:?}");
+}
+
+#[test]
+fn a_bare_resume_of_a_removed_blocks_session_is_refused_by_the_new_roster() {
+    // The consent rule's other half, and it needs no new mechanism: the bare
+    // resume inherits the RECORDED block id (#254) and `spawn_agent_bound`'s
+    // unknown-block path then refuses it against the roster that is live now.
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    let orch_id = reg
+        .list_agents(&g.id)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["role"] == json!("orchestrator"))
+        .and_then(|a| a["id"].as_str().map(str::to_string))
+        .unwrap();
+    let co = reg.resolve_token(&reg.agent(&orch_id).unwrap().token).unwrap();
+    let cwd = repo.path().to_string_lossy().to_string();
+
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    assert_eq!(w.block, "w-a");
+    let session = reg
+        .list_agents(&g.id)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == json!(w.id))
+        .and_then(|a| a["session"].as_str().map(str::to_string))
+        .expect("the spawned worker must have a session id");
+    reg.mark_dead(&w.id, Some(0));
+
+    // Positive control: the SAME bare resume succeeds while `w-a` is still
+    // declared, so the refusal below is the switch and not the resume shape.
+    let ok = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "resume_session": session, "cwd": cwd, "task": "round 2" },
+    }))
+    .unwrap();
+    assert_eq!(ok["isError"], false, "{ok:?}");
+    let resumed = reg
+        .list_agents(&g.id)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["session"] == json!(session) && a["status"] != json!("dead"))
+        .and_then(|a| a["id"].as_str().map(str::to_string))
+        .unwrap();
+    reg.mark_dead(&resumed, Some(0));
+
+    reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
+
+    let refused = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "resume_session": session, "cwd": cwd, "task": "round 3" },
+    }))
+    .unwrap();
+    assert_eq!(refused["isError"], true, "a removed block's bare resume must be refused: {refused:?}");
+    let text = refused["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("w-a"), "the refusal must name the block it could not find: {text}");
+    assert!(text.contains("w-b"), "and the roster it CAN spawn from: {text}");
+}
+
+#[test]
+fn a_switch_reconciles_the_group_dirs_instruction_files() {
+    // The plan's open unknown, answered in `doc/design/workflows.md` and pinned
+    // here: `set_advanced_orchestrator` writes no instruction files at all, and
+    // the per-spawn render (#1187) never REMOVES one. Only
+    // `write_instruction_files` sweeps a removed block's stale `<id>.md`
+    // against the manifest (#423) — so an apply has to call it.
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    let dir = reg.state_root().join(g.id.as_str());
+    assert!(dir.join("w-a.md").is_file(), "the launch wrote the old roster's files");
+
+    reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
+
+    assert!(dir.join("w-b.md").is_file(), "the new block's instructions must exist before its first spawn");
+    assert!(dir.join("rev-b.md").is_file());
+    assert!(!dir.join("w-a.md").is_file(), "the removed block's file must be SWEPT, not left stale");
+    assert!(!dir.join("rev-a.md").is_file());
+}
+
+#[test]
+fn a_refused_apply_changes_nothing_at_all() {
+    // Three refusals, one negative control: group.json's BYTES before and
+    // after, so "nothing changed" is checked rather than sampled field by
+    // field.
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    fs::write(
+        repo.path().join(".orrerix").join("workflows").join("broken.yml"),
+        "version: 1\nblocks:\n  - id: m\n    kind: wizard\n",
+    )
+    .unwrap();
+    let g = switchable_group(&reg, &repo);
+    let path = reg.state_root().join(g.id.as_str()).join("group.json");
+    let before = fs::read(&path).unwrap();
+    let gate_before = reg.merge_gate(&g.id).unwrap();
+
+    let missing = reg.apply_workflow(&g.id, &wf("nope"), "human").unwrap_err();
+    assert!(missing.contains("workflows/nope.yml"), "the refusal names the file it looked for: {missing}");
+    let broken = reg.apply_workflow(&g.id, &wf("broken"), "human").unwrap_err();
+    assert!(broken.contains("is invalid"), "{broken}");
+
+    assert_eq!(fs::read(&path).unwrap(), before, "a refused apply must not touch group.json");
+    assert_eq!(reg.merge_gate(&g.id).unwrap(), gate_before, "nor the armed gate");
+    let ids: Vec<String> = reg.group(&g.id).unwrap().guardrails.blocks.iter().map(|b| b.id.clone()).collect();
+    assert!(ids.contains(&"w-a".to_string()), "nor the live roster: {ids:?}");
+    assert!(
+        !reg.audit_log(&g.id).iter().any(|e| e.action == "workflow-switched"),
+        "nor leave a trail claiming a switch that never happened"
+    );
+}
+
+#[test]
+fn a_switch_that_moves_the_orchestrators_cli_is_refused_but_still_previewed() {
+    // A live session cannot change the program it is running — the same reason
+    // `promote_orchestrator_cli` refuses it. The PREVIEW still resolves, so the
+    // modal can say what would change and why it cannot, rather than a bare
+    // error naming neither.
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    fs::write(
+        repo.path().join(".orrerix").join("workflows").join("c.yml"),
+        "version: 1\nname: other-cli\n\
+         blocks:\n\
+         \x20 - id: orchestrator\n    kind: orchestrator\n    cli: copilot\n\
+         \x20 - id: w-c\n    kind: worker\n",
+    )
+    .unwrap();
+    let g = switchable_group(&reg, &repo);
+    let before = fs::read(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap();
+
+    let preview = reg.workflow_switch_preview(&g.id, &wf("c")).unwrap();
+    assert_eq!(preview["diff"]["orchestrator_cli_changed"], json!(true), "{preview}");
+    let refusal = preview["refusal"].as_str().unwrap_or("");
+    assert!(refusal.contains("different CLI"), "the preview explains: {refusal}");
+    assert!(!preview["diff"]["added"].as_array().unwrap().is_empty(), "and still carries the diff: {preview}");
+
+    let err = reg.apply_workflow(&g.id, &wf("c"), "human").unwrap_err();
+    assert_eq!(err, refusal, "the apply refuses with exactly the sentence the preview showed");
+    assert_eq!(
+        fs::read(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap(),
+        before,
+        "a refused apply changes nothing"
+    );
+}
+
+#[test]
+fn apply_refuses_while_workflow_mode_is_off_and_names_the_fix() {
+    // The design call recorded in `doc/design/workflows.md`: the toggle is this
+    // group's ONE consent surface for "does this group obey repo-authored
+    // workflow files", and an apply answers only WHICH one. Arming the toggle
+    // from a picker would be the app granting itself that consent.
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    assert!(!g.guardrails.advanced_orchestrator);
+
+    let err = reg.apply_workflow(&g.id, &wf("b"), "human").unwrap_err();
+    assert!(err.contains("workflow mode is off"), "{err}");
+    assert!(err.contains("turn it on first"), "the refusal names the fix: {err}");
+    assert_eq!(
+        reg.workflow_switch_preview(&g.id, &wf("b")).unwrap_err(),
+        err,
+        "the preview refuses identically, so the picker can explain before the click"
+    );
+    let ids: Vec<String> = reg.group(&g.id).unwrap().guardrails.blocks.iter().map(|b| b.id.clone()).collect();
+    assert!(ids.contains(&"worker".to_string()), "the built-in roster stands: {ids:?}");
+}
+
+#[test]
+fn re_applying_the_active_name_after_a_model_edit_is_one_row_and_reaches_the_next_spawn() {
+    // #1566's apply-an-edit path and AC 4's one-row model swap are the SAME
+    // mechanism, deliberately: there is no second way to adopt an edit.
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
+
+    // An unedited re-apply is a no-op, and says so by writing nothing.
+    let audits_before = reg.audit_log(&g.id).len();
+    reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
+    assert_eq!(
+        reg.audit_log(&g.id).len(),
+        audits_before,
+        "re-applying an unedited file must not audit or notify"
+    );
+
+    write_workflow_b(repo.path(), "opus");
+    let preview = reg.workflow_switch_preview(&g.id, &wf("b")).unwrap();
+    assert_eq!(preview["empty"], json!(false));
+    assert_eq!(
+        preview["diff"]["changed"],
+        json!([{ "id": "w-b", "fields": ["model"] }]),
+        "a model edit is exactly one row naming one key: {preview}"
+    );
+    assert!(preview["diff"]["added"].as_array().unwrap().is_empty(), "{preview}");
+    assert!(preview["diff"]["removed"].as_array().unwrap().is_empty(), "{preview}");
+
+    reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
+    let a = reg
+        .spawn_agent_ex(&g.id, Role::Worker, Some("w-b".into()), "w", "t", false, None, None, None, None, None)
+        .unwrap();
+    let req = reg.spawn_request_for_test(&a.id).expect("a spawn request");
+    let i = req.argv.iter().position(|t| t == "--model").expect("a --model flag");
+    assert_eq!(req.argv[i + 1], "opus", "the edit must reach the next spawn's command line: {:?}", req.argv);
+}
+
+#[test]
+fn drift_is_null_after_an_apply_set_by_an_edit_and_cleared_by_re_applying() {
+    // The badge and the resume audit read ONE comparison (`roster_drift`), so
+    // they cannot disagree about whether this group has drifted.
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
+    assert_eq!(reg.workflow_status(&g.id)["drift"], Value::Null);
+
+    write_workflow_b(repo.path(), "opus");
+    let drifted = reg.workflow_status(&g.id);
+    assert_eq!(
+        drifted["drift"]["note"],
+        json!("the file has changed since this group was launched"),
+        "{drifted}"
+    );
+    // Sorted for the comparison: `on_disk` is the roster in FILE order with the
+    // synthesized orchestrator prepended (`clamped`), and pinning that order here
+    // would be pinning a detail of a different function.
+    let mut on_disk: Vec<String> = drifted["drift"]["on_disk_blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    on_disk.sort();
+    assert_eq!(on_disk, vec!["orchestrator", "rev-b", "w-b"], "{drifted}");
+    let ids: Vec<String> = reg.group(&g.id).unwrap().guardrails.blocks.iter().map(|b| b.id.clone()).collect();
+    assert!(ids.contains(&"w-b".to_string()), "the PINNED roster still runs — drift is a badge: {ids:?}");
+
+    reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
+    assert_eq!(reg.workflow_status(&g.id)["drift"], Value::Null, "adopting the edit clears it");
+}
+
+#[test]
+fn the_status_offers_every_declared_name_and_pins_the_one_that_runs() {
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    let status = reg.workflow_status(&g.id);
+    assert_eq!(status["available"], json!(["b", "default"]), "{status}");
+    assert_eq!(status["workflow"], json!("default"));
+    reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
+    assert_eq!(reg.workflow_status(&g.id)["workflow"], json!("b"));
+}
+
+#[test]
+fn the_toggle_after_a_switch_arms_the_switched_file() {
+    // The toggle reads `guardrails.workflow`, which the apply persisted — so
+    // OFF and back ON returns to `b`, not to `default`. This is what makes the
+    // toggle-off refusal above a two-step rather than a dead end.
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
+
+    reg.set_advanced_orchestrator(&g.id, false, "human").unwrap();
+    assert!(!reg.merge_gate_declared(&g.id), "toggle-off clears the gate");
+    assert_eq!(
+        reg.group(&g.id).unwrap().guardrails.workflow.as_str(),
+        "b",
+        "toggle-off leaves the NAME recorded, so ON comes back to the same file"
+    );
+
+    let status = reg.set_advanced_orchestrator(&g.id, true, "human").unwrap();
+    assert_eq!(status["name"], json!("focused-b"), "the toggle re-armed b, not default: {status}");
+    assert_eq!(reg.merge_gate(&g.id).unwrap().reviewers, vec!["rev-b".to_string()]);
 }
 
 #[test]
