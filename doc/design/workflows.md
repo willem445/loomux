@@ -1139,15 +1139,24 @@ its own argument for what a digest would be *for* before it gets one.
 
 The verdict file carries the digest on **line 5**, and since #2168 E2 that line
 is `<digest> verified-body` when the verdict is a body verification. Both halves
-read the digest as line 5's **first field**, and the shim's own `body-unchanged`
-loop makes two passes over the reviewer list — one asking whether any of them
-verified the body as it stands, one deciding each stale pass against that answer
-— because the question is a property of the reviewer set and not of one member.
-A build that compared line 5 whole would find no match and refuse, which is the
-right direction for an unknown but is a merge this build's own driver would have
-reported satisfied, so the two are cross-checked by an executed test
-(`the_shim_takes_a_body_verification_pass_for_the_lanes_it_supersedes`) rather
-than by agreement in prose.
+read it the same way: split a trailing `verified-body` off the line, then run
+`sanitize_digest` over **what remains** — the whole field, not its first
+whitespace-separated word. Rust does that in `parse_verdict_file`; the shim
+reproduces it in `loomux_verdict_line5`, which every one of its line-5 readers
+goes through. **Do not implement a new reader from the first-field shortcut**: it
+accepts prose beginning with a hex word, which is looser than Rust on the half
+that refuses merges, and this slice shipped and retracted that twice (#2308
+rounds 4 and 5).
+
+The shim's `body-unchanged` loop then makes two passes over the reviewer list —
+one asking whether any of them verified the body as it stands, one deciding each
+stale pass against that answer — because the question is a property of the
+reviewer set and not of one member. The two halves are cross-checked by an
+executed test that runs **both** of them over one set of verdict files
+(`the_shim_and_the_gate_agree_about_which_passes_a_verification_covers`), rather
+than by agreement in prose; the end-to-end
+`the_shim_takes_a_body_verification_pass_for_the_lanes_it_supersedes` exercises
+the shim alone and cannot see a divergence.
 
 Fail-closed, like the head binding: a verdict with **no** digest (recorded by a
 build older than this one, or with the body unreadable at record time) can never

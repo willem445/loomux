@@ -1408,11 +1408,18 @@ loomux_sha256() { # stdin → 64 hex chars, or empty
 # runs both halves over the same files, including those two.
 loomux_verdict_line5() { # $1=verdict file → sets v_digest, v_mark
   v_raw=$(head -n5 "$1" 2>/dev/null | tail -n1)
-  v_l=$(printf '%s' "$v_raw" | tr -d '\r')
-  loomux_norm_guard "$v_raw" "$v_l" "a verdict file's line 5"
-  v_mark=0
   v_sp=' '
   v_tb=$(printf '\t')
+  v_cr=$(printf '\r')
+  # `str::lines()` strips ONE TRAILING `\r` per line and keeps every interior
+  # one, so this does too (#2308 round 5, rev-std NB). `tr -d` deleted them all,
+  # which could turn a digest with a CR through it into 64 hex for the shim while
+  # Rust still read it as unreadable — loose, on the half that refuses merges,
+  # the same class as the two findings above. It is also no longer a normalizer:
+  # a parameter expansion cannot fail the way a missing coreutil can, so #509's
+  # empty-output hazard does not arise and there is nothing here to guard.
+  v_l=${v_raw%"$v_cr"}
+  v_mark=0
   # `trim_end` before the mark split, exactly as `parse_verdict_file` orders it.
   while :; do
     case "$v_l" in *"$v_sp"|*"$v_tb") v_l=${v_l%?} ;; *) break ;; esac

@@ -3646,10 +3646,13 @@ pub const VERIFIED_BODY_MARK: &str = "verified-body";
 ///
 /// Line 5 is the digest **alone** unless this verdict is a body verification, in
 /// which case it is `<digest> verified-body` (#2168 E2). Both halves of the gate
-/// therefore read the digest as line 5's FIRST field rather than as the whole
-/// line — a build that compared the whole line would find no match and refuse,
-/// which is the direction every unknown here takes, but it would be refusing a
-/// merge this build's own review driver had already reported satisfied.
+/// therefore split a trailing [`VERIFIED_BODY_MARK`] off the line and run
+/// [`sanitize_digest`] over **what remains**, which is what
+/// [`parse_verdict_file`] does and what the shim's `loomux_verdict_line5`
+/// reproduces. Reading the first whitespace FIELD instead is the approximation
+/// this slice shipped twice and retracted twice: it accepts prose that begins
+/// with a hex word, which is looser than the Rust half on the side that refuses
+/// merges (#2308 rounds 4 and 5).
 pub fn verdict_file_text(v: &ReviewVerdict) -> String {
     let digest = sanitize_digest(&v.body_digest);
     // The marker is meaningless without a digest to qualify it: what it says is
@@ -3680,11 +3683,13 @@ pub fn verdict_file_text(v: &ReviewVerdict) -> String {
 /// Line 5 (the body digest, #565) is read **tolerantly**: a file written before
 /// #565 has the first line of its summary there, and swallowing it would mangle
 /// durable prose a human reads. So a line 5 that is not a valid digest is handed
-/// back to the summary, and the digest reads empty — *unknown*. The shim is
-/// stricter (it takes line 5's first field as-is and refuses anything that isn't
-/// 64 hex), and the two still agree on the only thing a gate decides: no readable
-/// digest means the body cannot be shown unchanged, so `body-unchanged` refuses.
-/// The divergence is confined to which text is displayed as the summary.
+/// back to the summary, and the digest reads empty — *unknown*. The shim
+/// reproduces this function's own split and [`sanitize_digest`] rather than
+/// approximating either (`loomux_verdict_line5`, #2308 round 5), so the two
+/// agree on the only thing a gate decides: no readable digest means the body
+/// cannot be shown unchanged, so `body-unchanged` refuses. The divergence that
+/// remains is confined to which text is displayed as the summary — the shim has
+/// no summary to display.
 ///
 /// Line 5 may carry [`VERIFIED_BODY_MARK`] after the digest (#2168 E2), and the
 /// split is **shape-checked, not whitespace-split**: the line is read as

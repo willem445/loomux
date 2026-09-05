@@ -25490,14 +25490,16 @@ fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
         // 12 → 13 with #437's `_tag` (the tag a release id resolves to, CR-
         // stripped before it is matched against a grant) — also deliberate, also
         // guarded: an empty result there would key the grant lookup on nothing.
-        // 13 → 15 with #2168 E2's `loomux_verdict_line5`, the one helper that
+        // 13 → 14 with #2168 E2's `loomux_verdict_line5`, the one helper that
         // reproduces `parse_verdict_file`'s line-5 split and `sanitize_digest`
-        // for every site that reads a verdict's digest. Both are deliberate and
-        // both are GUARDED rather than exempted: an empty result there feeds the
-        // digest comparison the `body-unchanged` clause decides on, so #509's
-        // "empty matches every pattern" is exactly the hazard, not an exception
-        // to it.
-        ("gh", gh_shim_sh("C:/gh.exe", &paths), 15usize),
+        // for every site that reads a verdict's digest. Its one `tr` is the
+        // case fold, and it is GUARDED rather than exempted: an empty result
+        // there feeds the digest comparison the `body-unchanged` clause decides
+        // on, so #509's "empty matches every pattern" is exactly the hazard, not
+        // an exception to it. The CR strip briefly added a second site and no
+        // longer does — `str::lines()` drops one TRAILING `\r` and keeps the
+        // rest, which is a parameter expansion, not a normalizer.
+        ("gh", gh_shim_sh("C:/gh.exe", &paths), 14usize),
         ("git", git_shim_sh("C:/git.exe", &paths), 1usize),
     ];
     let mut all_sites: Vec<(String, String)> = Vec::new();

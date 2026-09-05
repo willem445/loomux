@@ -7412,8 +7412,8 @@ fn a_body_verification_mark_rides_line_5_and_a_reviewer_cannot_type_one() {
     assert_eq!(
         text.lines().nth(4),
         Some(format!("{digest} {}", workflow::VERIFIED_BODY_MARK).as_str()),
-        "the mark rides line 5 AFTER the digest — the shim reads the digest as that \
-         line's first field"
+        "the mark rides line 5 AFTER the digest — both halves split the mark off and \
+         run sanitize_digest over what remains"
     );
     assert_eq!(
         text.lines().nth(5),
