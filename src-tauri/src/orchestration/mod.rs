@@ -10339,8 +10339,11 @@ fn read_intake(g: &Value) -> workflow::IntakeProfile {
     let source = workflow::intake_source_from_str(i["source"].as_str().unwrap_or(""))
         .unwrap_or(default.source);
     let label = |k: &str, fallback: &str| -> String {
-        workflow::usable_intake_label(i["labels"][k].as_str().unwrap_or(""))
-            .unwrap_or_else(|| fallback.to_string())
+        let v = i["labels"][k].as_str().unwrap_or("");
+        match workflow::sanitize_id(v) {
+            Some(clean) if clean == v.trim() => clean,
+            _ => fallback.to_string(),
+        }
     };
     workflow::IntakeProfile {
         source,
