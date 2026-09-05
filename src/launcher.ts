@@ -600,6 +600,12 @@ export class WelcomeForm {
       this.sshPassphraseInput,
       "used once to load that key into your ssh-agent — never saved"
     );
+    // Hidden until something names a key. `field()` leaves `hidden` at the
+    // HTMLElement default of `false`, so without this the row paints in the
+    // window before the profile read resolves — and forever when that read
+    // returns null or an empty list (#2397 review W1). The kind switch below
+    // is what re-decides it; this is the state it starts from.
+    this.sshPassphraseField.hidden = true;
     const sshRow = (...fields: HTMLElement[]): HTMLElement => {
       const row = document.createElement("div");
       row.className = "dlg-row";
@@ -983,6 +989,15 @@ export class WelcomeForm {
       // picked rather than at submit, where their latency would be a stall.
       void this.loadSshProfilesOnce();
       void this.resolveSshProgram();
+      // Both ssh-section visibility rules run here, on ONE schedule. Driving
+      // the warning from the kind switch and the passphrase row only from the
+      // identity listener + `applySshProfile` is the asymmetry CLAUDE.md names:
+      // `applySshProfile` runs from the picker's `change` and from the profile
+      // read's `if (store.profiles.length)` arm, so a human with NO saved
+      // connections — the first-run case — reached the form with the row
+      // painted and Identity file empty, where a typed passphrase is a silent
+      // no-op (#2397 review W1).
+      this.updateSshPassphraseField();
       this.updateSshWarning();
     }
     // Same control, honest caption per kind: a folder to browse or edit, a repository
