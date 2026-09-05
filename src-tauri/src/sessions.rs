@@ -93,6 +93,12 @@ pub use loomux_engine::sessions::pi_sessions_root_from;
 #[doc(hidden)] // pub for integration tests
 pub use loomux_engine::sessions::codex_sessions_root_from;
 
+// The head-scan budget, for the test that pins it. A test cannot assert a bound
+// it has to hard-code: a literal here would keep passing if the const moved, and
+// the fixture has to be built FROM the cap to sit either side of it.
+#[doc(hidden)] // pub for integration tests
+pub use loomux_engine::sessions::{CODEX_HEAD_MAX_BYTES, CODEX_HEAD_MAX_LINES};
+
 #[derive(Serialize)]
 pub struct SessionInfo {
     /// Session id understood by the agent's `--resume` flag.

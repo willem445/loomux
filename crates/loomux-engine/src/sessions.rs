@@ -1277,14 +1277,16 @@ pub const CODEX_SESSION_HEADER_MAX_BYTES: u64 = 64 * 1024;
 /// to them would put two untested edits in a diff about codex. Codex is the
 /// source where it is most likely to matter, because its own format documents
 /// the image variant.
-const CODEX_HEAD_MAX_BYTES: u64 = CODEX_SESSION_HEADER_MAX_BYTES * CODEX_HEAD_MAX_LINES;
+#[doc(hidden)] // pub for integration tests
+pub const CODEX_HEAD_MAX_BYTES: u64 = CODEX_SESSION_HEADER_MAX_BYTES * CODEX_HEAD_MAX_LINES;
 
 /// How many lines of a codex rollout [`scan_codex_jsonl`] reads.
 ///
 /// Named rather than inlined because [`CODEX_HEAD_MAX_BYTES`] is derived from
 /// it: the two are one decision, and a literal `60` in the loop beside a
 /// product that used a different number would be the drift this avoids.
-const CODEX_HEAD_MAX_LINES: u64 = 60;
+#[doc(hidden)] // pub for integration tests
+pub const CODEX_HEAD_MAX_LINES: u64 = 60;
 
 /// The `session_meta` header of one codex rollout, parsed -- `None` when the
 /// file is compressed, unreadable, empty, or its first line is not a

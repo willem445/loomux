@@ -19,7 +19,8 @@ use loomux_lib::sessions::{
     set_codex_sessions_root_for_test, set_copilot_session_state_root_for_test,
     set_launch_intent_path_for_test, set_legacy_copilot_posture_path_for_test,
     set_opencode_store_for_test, set_pi_sessions_root_for_test,
-    set_session_index_path_for_test, SessionInfo,
+    set_session_index_path_for_test, SessionInfo, CODEX_HEAD_MAX_BYTES,
+    CODEX_HEAD_MAX_LINES,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -392,4 +393,79 @@ fn an_absent_codex_store_contributes_nothing_rather_than_failing_the_scan() {
     let (rows, _) = list_sessions_for_test();
     assert!(codex_rows(&rows).is_empty(), "still no codex rows");
     assert_eq!(rows.iter().filter(|r| r.source == "claude").count(), 1, "the scan ran");
+}
+
+#[test]
+fn the_head_scan_is_bounded_by_size_and_not_only_by_line_count() {
+    // #2515 C2 review round 1, premortem 2. The scan read the first 60 lines
+    // with NO cap on how big a line could be, and codex's own `ContentItem` has
+    // `InputImage` and `InputAudio` variants — so one `response_item` line can
+    // carry a base64 payload of any size, times up to `LIST_LIMIT` rows per cold
+    // scan. Time was never the exposed axis; what the process holds while
+    // parsing was, and nothing measured it.
+    //
+    // The bound is asserted through its OBSERVABLE consequence rather than by
+    // measuring memory, which a unit test cannot do honestly: content past the
+    // budget is not read, so a title sitting beyond it is not found.
+    let s = seam();
+    let date = ("2026", "09", "01");
+
+    // Header, then one line that alone exceeds the whole budget, then a real
+    // user turn AFTER it. Under the bound the turn is never reached.
+    let padding = "x".repeat(CODEX_HEAD_MAX_BYTES as usize + 1);
+    let body = format!(
+        "{}{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\
+         \"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{}\"}}]}}}}\n{}",
+        header(THREAD_A, "/home/dev/alpha"),
+        padding,
+        user_turn("this title sits past the budget")
+    );
+    let f = write_raw(&s.codex, date, &rollout_name("2026-09-01T09-00-00", THREAD_A), &body);
+    stamp(&f, 1_700_000_500_000);
+
+    let (rows, _) = list_sessions_for_test();
+    let codex = codex_rows(&rows);
+    assert_eq!(codex.len(), 1, "the row still lists — the bound must not drop it");
+    assert_eq!(codex[0].id, THREAD_A);
+    // The header is line one, well inside the budget, so it IS read: this is the
+    // positive control that keeps the assertion below from passing against a
+    // scanner that simply stopped working.
+    assert_eq!(codex[0].cwd, "/home/dev/alpha", "the header is inside the budget and must be read");
+    // ...and the title past the budget is NOT.
+    assert_eq!(
+        codex[0].title, "(no prompt)",
+        "a turn beyond the size budget must not be read — that IS the bound"
+    );
+}
+
+#[test]
+fn the_head_scan_still_reads_a_turn_that_sits_inside_the_budget() {
+    // THE DISCRIMINATING TWIN of the test above, and the reason its `(no prompt)`
+    // means something: the identical shape with padding UNDER the budget finds
+    // the title. Without this, a scanner that read nothing at all would pass.
+    let s = seam();
+    let date = ("2026", "09", "02");
+    let padding = "x".repeat(1024);
+    let body = format!(
+        "{}{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\
+         \"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{}\"}}]}}}}\n{}",
+        header(THREAD_B, "/home/dev/beta"),
+        padding,
+        user_turn("this title sits inside the budget")
+    );
+    let f = write_raw(&s.codex, date, &rollout_name("2026-09-02T09-00-00", THREAD_B), &body);
+    stamp(&f, 1_700_000_600_000);
+
+    let (rows, _) = list_sessions_for_test();
+    let codex = codex_rows(&rows);
+    assert_eq!(codex.len(), 1);
+    // The FIRST user turn wins, and here that is the padding line itself — which
+    // is the honest expectation rather than the second turn's text.
+    assert!(
+        codex[0].title.starts_with('x'),
+        "a turn inside the budget is read; got {:?}",
+        codex[0].title
+    );
+    // And the line budget is still a bound in its own right.
+    assert!(CODEX_HEAD_MAX_LINES > 0);
 }
