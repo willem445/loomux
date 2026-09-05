@@ -1350,7 +1350,7 @@ fn tool_defs(
     // group has no orchestrator; the human is right here), and the whole
     // board/question/verdict/merge surface (no board, no gate, no queue —
     // listing any of them would advertise a route that has nothing behind it).
-    if role == Role::Lead {
+    if false {
         const LEAD_SHARED: &[&str] = &["list_agents", "get_state", "request_compact", "note_directive"];
         tools.retain(|t| LEAD_SHARED.contains(&t["name"].as_str().unwrap_or_default()));
         tools.push(lead_spawn_agent_tool());
