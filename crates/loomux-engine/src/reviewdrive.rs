@@ -3838,6 +3838,21 @@ pub struct ReleaseCandidate {
 /// until the next hand-back reuses it, per #1960), so the failure direction is
 /// the old behaviour rather than anything new.
 ///
+/// **A worker session two drives share is the one case where a release reaches a
+/// pane that is not only this drive's**, and it is disclosed rather than guarded
+/// against, because the guard would have to be a claim about another drive's
+/// intentions. Nothing stops two `drive_review` calls on different PRs naming one
+/// worker session, and after both hand back they name one pane; the `report(done)`
+/// that arrives is consumed by whichever drive `rd_owner` matches, so exactly one
+/// of them releases it. The other learns on its next tick — `rd_pane_exit` reads
+/// the death and names the initiator (`ended by driver-release`), so it parks
+/// `held(worker-unresumable)` with a truthful line instead of waiting out
+/// `fix-stalled`. That is faster and more informative than the pre-#2501
+/// behaviour on the same fixture, where the second drive sat ninety minutes for a
+/// report it was never going to be handed; what it is NOT is free, and a repo
+/// that drives two PRs off one worker session is already the #338/#359 shape the
+/// exit notices warn about.
+///
 /// The lane rule retries instead of expiring — it is a standing property of the
 /// tick's facts — but it is **bounded by which states read those facts**, and
 /// that bound is worth naming rather than leaving to be discovered. `facts.

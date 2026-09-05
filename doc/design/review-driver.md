@@ -892,6 +892,17 @@ this note first.
    for — a spawn is cheap and a SLOT is what drives are starving on — and the
    conversation is identical on both paths, which is what makes it a trade rather
    than a loss.
+   **The residual, which is a pane that is not only this drive's.** Nothing stops
+   two `drive_review` calls on different PRs naming one worker session, and after
+   both hand back they name one pane. The `report(done)` is consumed by whichever
+   drive `rd_owner` matches, so exactly one releases it, and the other learns on
+   its next tick: `rd_pane_exit` reads the death, names the initiator (`ended by
+   driver-release`), and the drive parks `held(worker-unresumable)` — a truthful
+   line one tick after the fact, where before #2501 it sat out `fix-stalled`
+   waiting for a report it was never going to be handed. Disclosed rather than
+   guarded, because the guard would be a claim about another drive's intentions;
+   and a repo driving two PRs off one worker session is already the #338/#359
+   shape §6's notices warn about.
    **What reopens this item again**, in the same spirit as the sentence above it:
    a measurement showing a released pane cost a review — a reviewer that had more
    to say, a worker that was not finished — or a drive that released a pane it

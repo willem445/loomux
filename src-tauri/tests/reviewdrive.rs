@@ -8014,6 +8014,9 @@ fn a_lane_that_answered_is_released_only_once_its_own_turn_has_ended() {
         let repo = Repo::new();
         let gh = FakeGh::green(HEAD_A);
         let (group, lane) = briefed(&reg, &repo, &gh);
+        // The digest a verdict binds to is computed from the body override, so it
+        // must agree with the one FakeGh serves or every pass reads as stale.
+        reg.set_pr_body_override(Some("b".to_string()));
         let session_before = live_lanes(&reg, &group)
             .first()
             .and_then(|l| l["session"].as_str().map(str::to_string))
@@ -8104,6 +8107,7 @@ fn a_released_lane_frees_its_delegate_slot_on_the_tick_that_releases_it() {
     let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
     let (_pr, _block, lane) =
         opened.lanes_opened.first().cloned().expect("the second tick opens the lane");
+    reg.set_pr_body_override(Some("b".to_string()));
 
     // The control: the group is genuinely full.
     let refused = reg.spawn_agent(&group, Role::Worker, "w2", "", false, None);
@@ -8208,6 +8212,7 @@ fn a_released_lane_is_resumed_on_its_own_session_for_the_next_round() {
     let repo = Repo::new();
     let gh = FakeGh::green(HEAD_A);
     let (group, lane) = briefed(&reg, &repo, &gh);
+    reg.set_pr_body_override(Some("b".to_string()));
     let session = live_lanes(&reg, &group)
         .first()
         .and_then(|l| l["session"].as_str().map(str::to_string))
@@ -8262,6 +8267,9 @@ fn the_driver_releases_nothing_outside_the_two_narrowed_states() {
         let repo = Repo::new();
         let gh = FakeGh::green(HEAD_A);
         let (group, lane) = briefed(&reg, &repo, &gh);
+        // The digest a verdict binds to is computed from the body override, so it
+        // must agree with the one FakeGh serves or every pass reads as stale.
+        reg.set_pr_body_override(Some("b".to_string()));
 
         match arm {
             // Briefed, and has said nothing. The commonest pane in a drive, and
@@ -8344,6 +8352,7 @@ fn a_released_pane_reaches_the_audit_log_and_never_the_orchestrators_pane() {
     let repo = Repo::new();
     let gh = FakeGh::green(HEAD_A);
     let (group, lane) = briefed(&reg, &repo, &gh);
+    reg.set_pr_body_override(Some("b".to_string()));
     let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
     with_pane(&reg, &orch.id, 7101);
 
