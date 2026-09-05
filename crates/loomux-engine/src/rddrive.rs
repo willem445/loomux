@@ -1214,10 +1214,14 @@ pub enum PaneStanding {
 /// free, so [`crate::reviewdrive::DriveEntry::release_pane`] drops it from the
 /// record and it is not in this list at all. What is left is exactly what the
 /// two sentences below promise: panes that are still running, for the
-/// orchestrator to resume or dispose of. A release on the tick that writes one
-/// of these lines is forbidden by
-/// [`releasable`](crate::reviewdrive::releasable)'s first condition, precisely
-/// so that stays true.
+/// orchestrator to resume or dispose of. What keeps that true is the ORDER
+/// rather than a prohibition: every release this tick performed happened before
+/// the arm that writes these lines, and each one takes its pane out of
+/// [`DriveEntry::owned_panes`](crate::reviewdrive::DriveEntry::owned_panes), so
+/// the list is assembled from what is actually left.
+/// [`releasable`](crate::reviewdrive::releasable)'s first condition is about the
+/// proposed STEP and does not by itself promise this — a tick whose step was
+/// live can still park when the arm refuses (rev-final W1).
 ///
 /// A worker mid-edit is still never killed, and "an idle reviewer lane" is still
 /// not told from "a lane mid-review" by any LLM judgment §3 forbids — the

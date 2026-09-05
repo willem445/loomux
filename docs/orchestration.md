@@ -2627,8 +2627,9 @@ fresh pane. Nothing is lost but the pane: a reviewer asked again comes back to a
 read, exactly as it did before.
 
 It kills nothing else. A reviewer that has not answered, one whose verdict belongs to an older
-commit, a worker that is still working or that reported blocked, a drive that is parking or
-ending — all keep their panes, and so does every pane in the group that is not this drive's.
+commit, a worker that is still working or that reported blocked, a drive that is being parked or
+ended by the move it is making this tick — all keep their panes, and so does every pane in the
+group that is not this drive's.
 The driver never goes looking for a pane to free because it is short of slots: it releases on
 facts about the pane, never on how full the group is. Killing anything else is still yours or the
 orchestrator's — or the idle reaper's, where you have set one — and `cap-full` is still the

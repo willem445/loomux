@@ -356,7 +356,8 @@ const FORBIDDEN_CALLS: [(&str, &str); 7] = [
 /// this file that drive a real tick over a real registry and assert what
 /// survives — including the negative controls, which are the ones that matter: a
 /// briefed-but-silent lane, a stale verdict, a `blocked` worker and a parking
-/// drive all keep their panes.
+/// STEP all keep their panes — plus the positive counterpart, a `fail`-route
+/// hand-back at the cap where the lane IS released and the drive does not park.
 const PERMITTED_RELEASE: (&str, &str, usize, &str) = (
     "release_driven_pane",
     "src/orchestration/rdtick.rs",
@@ -8292,7 +8293,7 @@ fn a_released_lane_is_resumed_on_its_own_session_for_the_next_round() {
 /// leaves every pane in the group alive.
 #[test]
 fn the_driver_releases_nothing_outside_the_two_narrowed_states() {
-    for arm in ["silent lane", "stale verdict", "parking drive"] {
+    for arm in ["silent lane", "stale verdict", "parking step"] {
         let dir = tempfile::tempdir().unwrap();
         let reg = relaunch_registry(dir.path());
         let repo = Repo::new();
@@ -8316,9 +8317,20 @@ fn the_driver_releases_nothing_outside_the_two_narrowed_states() {
                 report_as(&reg, &group, &lane, Role::Reviewer, "approved");
                 gh.set_facts("OPEN", HEAD_B);
             }
-            // It answered `escalate` at this head, which parks the drive: §6's
-            // notice hands these panes to a human, and says they are still
+            // It answered `escalate` at this head, which makes the STEP a park:
+            // §6's notice hands these panes to a human and says they are still
             // running.
+            //
+            // **A parking STEP is what this arm spans, and it is not the same as
+            // a parking DRIVE** (rev-final R1). `releasable`'s condition 1 reads
+            // the step `decide` proposed; a tick whose step is live can still
+            // end parked when the arm itself refuses, and there the release has
+            // already happened. That case is the opposite claim and has its own
+            // test — `a_fail_route_hand_back_at_the_cap_is_fed_by_the_lane_it_
+            // releases`, where the drive must NOT park and the lane MUST be
+            // released. Naming this arm for the step is what keeps the two
+            // distinguishable instead of one label covering a property it
+            // cannot see.
             _ => {
                 let caller = Caller {
                     agent_id: lane.clone(),
@@ -8354,11 +8366,11 @@ fn the_driver_releases_nothing_outside_the_two_narrowed_states() {
             Some(false),
             "{arm}: the lane's pane must still be alive"
         );
-        if arm == "parking drive" {
+        if arm == "parking step" {
             assert_eq!(
                 status_state(&reg, &group),
                 "held",
-                "{arm}: the fixture's premise — an escalation parks the drive"
+                "{arm}: the fixture's premise — an escalation makes the step a park"
             );
         }
     }
@@ -8408,5 +8420,113 @@ fn a_released_pane_reaches_the_audit_log_and_never_the_orchestrators_pane() {
         1,
         "the release must be reconstructible from the audit log, which is what makes \
          demoting its exit notice honest"
+    );
+}
+
+/// **rev-final W1: the release must land BEFORE the step's own arm**, or the
+/// feature reintroduces the orchestrator wake it exists to remove.
+///
+/// The path is the ordinary `fail` round, and #2501's own worker rule is what
+/// makes it common: the previous round released the worker's pane, so the
+/// hand-back that follows a `fail` has no live pane to reuse and must SPAWN —
+/// under the live-delegate cap, while the lane pane this same tick is about to
+/// release is still counted. Release after the arm and the spawn is refused, the
+/// drive parks `held(cap-refused)` on a notice asking an orchestrator to free a
+/// slot, and only then is one freed. A parked drive does not self-advance, so
+/// that is a full orchestrator turn — the exact cost #2501 measured, in the
+/// scenario it measured it in.
+///
+/// **The fixture's cap is real and the reuse decline is the mechanism**, not a
+/// shortcut. Two slots: the worker holds one and the driver's lane the other. The
+/// worker's pane is alive and idle but its last delivery is on record as not
+/// having landed, so `rd_reuse_pane` declines it (#2089's `unconfirmed`) and the
+/// hand-back falls through to a spawn — which is what a released previous pane
+/// produces in production, reached here without needing a second round. The pane
+/// stays ALIVE, so it still counts against the cap; that is the whole point.
+///
+/// Three assertions, and each fails under the pre-fix order: the drive reaches
+/// `fix-wait` rather than `held`, a hand-back actually happened, and the lane was
+/// released on that same tick. The `rd-held` check is the discriminator — under
+/// the old order the drive parks with `cap-refused` and the first assertion is
+/// what catches it.
+#[test]
+fn a_fail_route_hand_back_at_the_cap_is_fed_by_the_lane_it_releases() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let group = reg
+        .create_group(&repo.path(), Guardrails { max_agents: 2, ..rails() })
+        .unwrap()
+        .id;
+    let w = reg.spawn_agent(&group, Role::Worker, "w", "", false, None).unwrap();
+    let session = w.session_id.clone().expect("claude mints a session id at spawn");
+    // Alive, idle, and NOT delivery-ready: the reuse arm declines it, so the
+    // hand-back has to spawn — while this pane still holds its slot.
+    with_pane(&reg, &w.id, 7301);
+    make_pane_ready(&reg, 7301, false);
+
+    let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
+    assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
+    reg.set_pr_body_override(Some("b".to_string()));
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, _block, lane) =
+        opened.lanes_opened.first().cloned().expect("the second tick opens the lane");
+
+    // The premise: the group is genuinely full, so the hand-back's spawn can
+    // only succeed if the release has already freed a slot.
+    let refusal = reg
+        .spawn_agent(&group, Role::Worker, "probe", "", false, None)
+        .err()
+        .expect("the cap must refuse a third delegate");
+    assert!(
+        loomux_lib::orchestration::is_live_cap_refusal(&refusal),
+        "the premise must be the LIVE-DELEGATE CAP, not a rate limit: {refusal}"
+    );
+
+    // The lane answers `fail` at this head and ends its turn — the two facts
+    // that make it releasable on the very tick the fail routes.
+    let reviewer = Caller {
+        agent_id: lane.clone(),
+        group: group.clone(),
+        role: Role::Reviewer,
+        role_hint: None,
+    };
+    dispatch(
+        &reg,
+        &reviewer,
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "fail", "summary": "one finding" } }),
+    )
+    .expect("the lane records its verdict");
+    report_as(&reg, &group, &lane, Role::Reviewer, "request_changes");
+
+    let report = reg.rd_drive_group_with(&group, &gh, 30_000);
+
+    assert_eq!(
+        status_state(&reg, &group),
+        "fix-wait",
+        "the drive must take the fix route, not park at the cap on a slot this same tick \
+         freed: held rows {:?}",
+        audit_details(&reg, &group, "rd-held")
+    );
+    assert_eq!(
+        report.handbacks.len(),
+        1,
+        "…because the hand-back's spawn found the slot the release had just made: {:?}",
+        report.handbacks
+    );
+    assert_eq!(
+        report.released.iter().map(|(_, _, a)| a.clone()).collect::<Vec<_>>(),
+        vec![lane.clone()],
+        "…and it is THIS lane that was released, on the same tick"
+    );
+    assert!(
+        audit_details(&reg, &group, "rd-held").is_empty(),
+        "no hold at all: a `cap-refused` here would be the driver asking for what it was \
+         about to free"
     );
 }

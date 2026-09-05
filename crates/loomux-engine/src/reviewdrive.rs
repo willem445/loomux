@@ -3798,11 +3798,24 @@ pub struct ReleaseCandidate {
 /// what keeps §6's exit notices true. A parked drive's notice says its panes are
 /// "still running" and that a `drive_review` resume speaks to them again
 /// ([`PaneStanding::Owned`](crate::rddrive::PaneStanding::Owned)); a terminal
-/// one hands them to the orchestrator to dispose of. Releasing on the tick that
-/// writes one of those lines would make the line false in the same breath. A
-/// lane released on an EARLIER tick is simply not in
-/// [`DriveEntry::owned_panes`] any more, so the notice keeps naming exactly the
-/// panes that are still there.
+/// one hands them to the orchestrator to dispose of. A lane released on an
+/// EARLIER tick is simply not in [`DriveEntry::owned_panes`] any more, so the
+/// notice keeps naming exactly the panes that are still there.
+///
+/// **This is a condition on the STEP, and the drive can still end the tick
+/// parked despite it** (rev-final W1). The step is what `decide` proposed; the
+/// tick's ARM can then refuse and park on its own — `Advance{to: FixWait}` whose
+/// `rd_handback` cannot resume the worker becomes `held(worker-unresumable)` or
+/// `held(cap-refused)` — and by then the release has happened, because the tick
+/// performs it BEFORE the arm. Saying "a parking DRIVE releases nothing" would
+/// be false there, so it is not said anywhere; what holds is the step.
+///
+/// **Nothing is lost by the narrower reading, and one thing is gained.** The
+/// notices are built after the release, off the live record, so a hold's line
+/// still names only panes that are actually there. And releasing before the arm
+/// is what stops the commonest way that hold was reached at all: the freed slot
+/// is available to `rd_handback`'s own spawn, so a drive whose lane has just
+/// answered no longer hits the live-delegate cap handing the fix back.
 ///
 /// **2. A lane's verdict must be CURRENT.** Asked with
 /// [`lane_verdict_is_current`] — the same function `review-wait` decides with,
@@ -3823,8 +3836,9 @@ pub struct ReleaseCandidate {
 ///
 /// A lane that has been briefed and has not answered; a lane whose verdict binds
 /// to an older revision; a worker that reported `blocked` or has said nothing; a
-/// pane belonging to a drive that is parking or ending this tick; and every pane
-/// in the group that is not this drive's. The orchestrator's kill authority is
+/// pane belonging to a drive whose STEP parks or ends it this tick (see
+/// condition 1 for why that is not the same as "a drive that parks"); and every
+/// pane in the group that is not this drive's. The orchestrator's kill authority is
 /// untouched by all of it — this narrows what the DRIVER may do, and adds
 /// nothing anywhere else.
 ///
@@ -3869,7 +3883,9 @@ pub fn releasable(
     facts: &DriveFacts,
     step: &DriveStep,
 ) -> Vec<ReleaseCandidate> {
-    // Condition 1. A step that parks or ends the drive releases nothing.
+    // Condition 1. A STEP that parks or ends the drive releases nothing — which
+    // is not the same as "a drive that parks": the arm can refuse and park after
+    // this has answered. See the doc above (rev-final W1).
     if let DriveStep::Advance { to, .. } = step {
         if to.is_parked() || to.is_terminal() {
             return Vec::new();

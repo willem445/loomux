@@ -633,9 +633,12 @@ check" is not "it is dead".
 **The drive kills none of the panes it still holds, and since #2501 that is a
 narrower sentence than "the driver kills nothing".** A pane the driver has
 RELEASED — §3.1 item 5's two states — is already gone by the time any exit runs,
-and is not in these lists at all; `releasable`'s first condition forbids a
-release on the very tick that writes an exit notice, precisely so the notice's
-"still running" stays true. A worker mid-edit is still never killed, and "an idle
+and is not in these lists at all. What makes that so is the ORDER, not a
+prohibition: the tick performs its releases before the arm that writes an exit
+notice, and a released pane leaves `owned_panes`, so every notice is assembled
+from what is actually left. `releasable`'s first condition is about the proposed
+STEP and does not on its own promise this — a tick whose step is live can still
+park when the arm refuses (rev-final W1). A worker mid-edit is still never killed, and "an idle
 reviewer lane" is still not told from "a lane mid-review" by any LLM judgment §3
 forbids: the release reads `idle_since_ms` and a recorded verdict, both of which
 orrerix already holds.
@@ -723,7 +726,11 @@ this note first.
    *which* two states, and the note says so rather than implying otherwise: that
    half is pinned behaviourally, by `releasable`'s unit tests and by
    `tests/reviewdrive.rs`'s negative controls — a briefed-but-silent lane, a
-   stale verdict, a `blocked` worker and a parking drive all keep their panes.
+   stale verdict, a `blocked` worker and a drive whose STEP parks all keep their
+   panes. The positive counterpart is pinned too, and it is the one rev-final's
+   W1 asked for: a `fail`-route hand-back with the group at its cap, where the
+   answering lane IS released and the drive does not park —
+   `a_fail_route_hand_back_at_the_cap_is_fed_by_the_lane_it_releases`.
    **This item is UNCHANGED by #1960, and that is the reason it was fixed the
    way it was.** The driver was exhausting the group's live-delegate cap with
    its own idle panes — a new pane per resume, none released, five of the six
@@ -854,9 +861,16 @@ this note first.
      and nothing else: `blocked` is INVARIANT 3 territory and parks the drive for
      an orchestrator that is about to speak to that very pane.
    Three conditions bound both, and each excludes a case the previous version of
-   this item was right to worry about. **The step must leave the drive live**, so
-   a tick that parks or terminates releases nothing and §6's exit notices keep
-   saying something true about the panes they name. **The pane must be idle**
+   this item was right to worry about. **The STEP must leave the drive live** —
+   the step `decide` proposed, which is not the same claim as "a drive that
+   parks releases nothing" and is deliberately not written as one (rev-final
+   W1). A tick whose step is live can still end parked, because the arm can
+   refuse on its own: an `Advance` into `fix-wait` whose hand-back cannot resume
+   the worker becomes `held(worker-unresumable)` or `held(cap-refused)`, and by
+   then the release has happened. What keeps §6's exit notices true is not that
+   condition but the ORDER — the tick releases before the arm runs, and a
+   released pane leaves `owned_panes`, so every notice is assembled from the
+   panes that are actually left. **The pane must be idle**
    (`idle_since_ms`), which is `reap_idle_agents`' own signal, so "an idle
    reviewer lane" is never told from "a lane mid-review" by judging a screen.
    **The session must resolve**, through `rd_lane_session`'s three sources, and
@@ -903,6 +917,18 @@ this note first.
    guarded, because the guard would be a claim about another drive's intentions;
    and a repo driving two PRs off one worker session is already the #338/#359
    shape §6's notices warn about.
+   **A second residual, and it is the ordering one.** The tick releases BEFORE it
+   runs the step's own arm, which is what makes a freed slot available to the
+   hand-back that follows on the `fail` route — without that order, a drive whose
+   lane had just answered could be refused its hand-back at the live-delegate cap
+   and park `held(cap-refused)` on a notice asking for the slot the same tick was
+   about to free, which is an orchestrator wake this feature exists to remove
+   (rev-final W1). The price is that a release is not conditional on the drive
+   surviving the tick: where the arm itself refuses — a hand-back whose session
+   will not resume — the drive parks `held(worker-unresumable)` with its lane
+   already released. That is the right way round (the lane had answered; the hold
+   is about the worker) and it costs nothing, because the hold's notice is built
+   afterwards off the live record and so names only panes that are still there.
    **What reopens this item again**, in the same spirit as the sentence above it:
    a measurement showing a released pane cost a review — a reviewer that had more
    to say, a worker that was not finished — or a drive that released a pane it
