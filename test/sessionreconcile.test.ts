@@ -219,3 +219,49 @@ test("a pi pane adopts a pi session, and never one of another CLI's (#2126)", ()
     []
   );
 });
+
+test("a codex pane adopts a codex session, and never one of another CLI's (#2515 C2)", () => {
+  // codex joined `Cli` with #2515 C2, and the hole it would otherwise leave is
+  // the one #2126 and #722 each left before it: every codex pane unadoptable
+  // while the sidebar lists the very session it should adopt. The pi test above
+  // is kept intact — this is an ADDITION, since a per-CLI property is only
+  // witnessed by the CLI it is about.
+  const out = planSessionAdoption(
+    [pane({ cli: "codex" })],
+    [
+      session({
+        id: "019ff1a2-b3c4-7d5e-8f60-112233445566",
+        cli: "codex",
+        resumeCommand: "codex resume 019ff1a2-b3c4-7d5e-8f60-112233445566",
+      }),
+    ],
+    new Set()
+  );
+  assert.deepEqual(out, [{ key: "p1", sessionId: "019ff1a2-b3c4-7d5e-8f60-112233445566" }]);
+
+  // THE FIXTURE THAT MAKES THAT FAIL-ABLE, copied in shape from the pi test
+  // above: the two candidates COLLIDE on everything the matcher reads except
+  // the CLI, so a matcher ignoring `cli` sees an ambiguity and refuses both,
+  // and one that crossed CLIs adopts the wrong id.
+  const both = planSessionAdoption(
+    [pane({ key: "pane-codex", cli: "codex" }), pane({ key: "pane-claude", cli: "claude" })],
+    [session({ id: "cx-1", cli: "codex" }), session({ id: "cl-1", cli: "claude" })],
+    new Set()
+  );
+  assert.deepEqual(
+    [...both].sort((a, b) => a.key.localeCompare(b.key)),
+    [
+      { key: "pane-claude", sessionId: "cl-1" },
+      { key: "pane-codex", sessionId: "cx-1" },
+    ]
+  );
+
+  // And a codex pane with only another CLI's session in the folder adopts
+  // nothing. The negative arm matters more for codex than for pi: a codex
+  // thread id is a bare UUID, indistinguishable by SHAPE from a claude session
+  // id, so nothing but the `cli` field can keep the two apart.
+  assert.deepEqual(
+    planSessionAdoption([pane({ cli: "codex" })], [session({ id: "cl-1", cli: "claude" })], new Set()),
+    []
+  );
+});

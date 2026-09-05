@@ -173,6 +173,11 @@ test("a fourth source names itself, on the badge and on the restored pane (#2126
   // live in main.ts's dormant card.
   assert.equal(sessionBadgeLabel("pi"), "PI");
   assert.equal(restoredPaneName("pi", "fix the login bug"), "pi · fix the login bug");
+  // The FIFTH source (#2515 C2), asserted beside the fourth rather than
+  // instead of it: the property is "a new scanner is named correctly on
+  // ARRIVAL", and it is only witnessed by an arrival that has happened.
+  assert.equal(sessionBadgeLabel("codex"), "CODEX");
+  assert.equal(restoredPaneName("codex", "fix the login bug"), "codex · fix the login bug");
 
   // The property, not the row: every source the wire can carry labels itself,
   // and no two collapse onto one label.
@@ -193,9 +198,9 @@ test("a fourth source names itself, on the badge and on the restored pane (#2126
   // reaches the UI without reaching this array costs this test its coverage of
   // that source — it does not fail. Stated so a reader knows which half is
   // enforced.
-  const sources = ["claude", "copilot", "opencode", "pi"];
+  const sources = ["claude", "copilot", "opencode", "pi", "codex"];
   const labels = sources.map(sessionBadgeLabel);
-  assert.deepEqual(labels, ["CLAUDE", "COPILOT", "OPENCODE", "PI"]);
+  assert.deepEqual(labels, ["CLAUDE", "COPILOT", "OPENCODE", "PI", "CODEX"]);
   assert.equal(new Set(labels).size, sources.length, "two sources share one badge label");
 });
 
