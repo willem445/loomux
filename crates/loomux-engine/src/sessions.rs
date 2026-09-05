@@ -30,7 +30,7 @@ use crate::pathseg::PathSegment;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 

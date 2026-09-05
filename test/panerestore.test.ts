@@ -533,12 +533,36 @@ test("sessionCliFromCommand normalizes a path-qualified or .exe-suffixed program
   assert.equal(sessionCliFromCommand("/usr/local/bin/opencode"), "opencode");
 });
 
+test("sessionCliFromCommand names codex, whose store #2515 C2 taught loomux to read", () => {
+  // The pre-widening specimen this replaces asserted the OPPOSITE — codex was
+  // the named example of a CLI with no store — so widening the union without
+  // this line would have left the set's newest member pinned by nothing at all.
+  assert.equal(sessionCliFromCommand("codex"), "codex");
+  // The two shapes a recorded codex line really takes: the Sessions tab's
+  // resume, and a solo pane carrying its minted profile.
+  assert.equal(sessionCliFromCommand("codex resume 019ff1a2-b3c4-7d5e-8f60-112233445566"), "codex");
+  assert.equal(sessionCliFromCommand("codex -C /repo -p orrerix-solo-1"), "codex");
+  // Same path/extension normalization #457 gave the others, applied to the new
+  // member rather than assumed to carry over — codex ships as a bundled
+  // binary under %LOCALAPPDATA% on Windows, so a path-qualified command is the
+  // ordinary case for it rather than an exotic one.
+  assert.equal(
+    sessionCliFromCommand("C:\\Users\\x\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe"),
+    "codex"
+  );
+});
+
 test("sessionCliFromCommand is null for a CLI with no session store loomux reads", () => {
-  // Not "unknown programs are opencode now": gemini and codex are real agent
+  // Not "unknown programs are opencode now": gemini and hermes are real agent
   // CLIs loomux can launch, and neither has a scanner — so there is nothing to
   // match a pane of theirs against, and claiming one would be worse than null.
+  //
+  // `codex` was the second specimen here until #2515 C2 gave it a scanner.
+  // Relocated rather than relaxed (#1225): `hermes` is still genuinely outside
+  // the set, so the property keeps a witness, and codex's new POSITIVE answer
+  // is pinned in the test above rather than quietly dropped from this one.
   assert.equal(sessionCliFromCommand("gemini"), null);
-  assert.equal(sessionCliFromCommand("codex --yolo"), null);
+  assert.equal(sessionCliFromCommand("hermes --resume"), null);
   assert.equal(sessionCliFromCommand("pwsh"), null);
   assert.equal(sessionCliFromCommand(""), null);
   assert.equal(sessionCliFromCommand(null), null);
@@ -1638,13 +1662,20 @@ test("the argv-seam CLI set is one list, not three hand-typed copies (#2126)", (
   // of the pair and a third implicit answer; missing one is silent — a CLI
   // offered the toggle but never minted for, or minted for with the toggle
   // hidden.
-  assert.deepEqual([...SOLO_MCP_CLIS].sort(), ["claude", "copilot", "pi"]);
+  assert.deepEqual([...SOLO_MCP_CLIS].sort(), ["claude", "codex", "copilot", "pi"]);
   assert.ok(isSoloMcpCli("pi"));
   assert.ok(isSoloMcpCli("claude"));
   assert.ok(isSoloMcpCli("copilot"));
+  // #2515 C2. codex's seam is one indirection out from the other three — the
+  // flag names a PROFILE FILE that carries the MCP servers, rather than the
+  // MCP config itself — but it is still a flag on the command line, which is
+  // what this set is about.
+  assert.ok(isSoloMcpCli("codex"));
   // Everything else stays lazy — adopted delivery-only on the human's first
-  // Connect gesture, never eagerly minted.
-  for (const other of ["opencode", "gemini", "codex", "custom", "", null, undefined]) {
+  // Connect gesture, never eagerly minted. `codex` was in this list until
+  // #2515 C2 and is deliberately not merely deleted from it: it moved to the
+  // positive assertion above, so the widening is pinned in both directions.
+  for (const other of ["opencode", "gemini", "custom", "", null, undefined]) {
     assert.ok(!isSoloMcpCli(other), `${other} must not be offered an eager solo identity`);
   }
 
@@ -1655,6 +1686,7 @@ test("the argv-seam CLI set is one list, not three hand-typed copies (#2126)", (
     claude: 'claude --mcp-config "c.json" --strict-mcp-config --allowedTools mcp__orrerix',
     copilot: 'copilot --additional-mcp-config "@c.json" --allow-tool orrerix',
     pi: 'pi --mcp-config "c.json"',
+    codex: "codex -p orrerix-solo-1",
   };
   for (const cli of SOLO_MCP_CLIS) {
     assert.equal(stripSoloMcpFlags(minted[cli], null).cli, cli, `${cli}'s minted flags are not excised`);

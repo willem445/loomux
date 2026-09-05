@@ -705,7 +705,7 @@ test("the needs-you badge is unchanged by grouping, in either order", () => {
 //
 // Red arm (mechanically): make `isAgentPane` return true unconditionally and
 // the three "is not an agent row" tests redden together; drop its catalog arm
-// and `the four launchable CLIs no session store covers` reddens alone; drop
+// and `the three launchable CLIs no session store covers` reddens alone; drop
 // its `harness` arm and the issue's own positive control reddens alone; make
 // `agentRows` skip the filter and the badge test reddens.
 
@@ -794,14 +794,22 @@ test("an SSH pane that declares no far-end CLI is not an agent row (#2514)", () 
   assert.equal(isAgentPane(pane), false);
 });
 
-test("the four launchable CLIs no session store covers are still agent rows (#2514)", () => {
+test("the three launchable CLIs no session store covers are still agent rows (#2514)", () => {
   // THE ARM `harness` CANNOT CARRY, and the reason the predicate is not just
   // `harness !== null || orch !== null`. `sessionCliFromCommand` is a closed
-  // four-name membership test — it is matched against `listSessions()` rows —
+  // FIVE-name membership test — it is matched against `listSessions()` rows —
   // while the launcher starts panes on eight CLIs. Resting membership on it
-  // would drop these four out of the tab AND out of the badge: an agent asking
+  // would drop these three out of the tab AND out of the badge: an agent asking
   // the human a question, invisible.
-  for (const program of ["codex", "gemini", "hermes", "ante"]) {
+  //
+  // WAS FOUR UNTIL #2515 C2, and codex is the one that left: it gained a
+  // session store, so it is now inside the membership test and can no longer
+  // witness what happens to a CLI outside it. Relocated rather than relaxed
+  // (#1225) — the three below are still genuinely outside, which the negative
+  // control on each one re-proves rather than assumes, and the class is
+  // non-empty so the property still has a witness. codex's own row is covered
+  // by the harness arm now, like every other session-store CLI's.
+  for (const program of ["gemini", "hermes", "ante"]) {
     const pane = shell({
       name: program,
       mark: { command: `${program} --resume`, argv: null, knownCli: null, remote: false },

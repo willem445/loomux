@@ -2247,8 +2247,14 @@ export class WelcomeForm {
         // match the addendum's stated "full membership at spawn" contract).
         // Every other CLI stays lazy regardless: it gets no identity here and
         // is adopted as a delivery-only member only if/when the human actually
-        // connects it (`orch_solo_adopt`), so a codex/gemini/custom launch
-        // mints nothing nobody asked for. Best-effort: a failed mint must
+        // connects it (`orch_solo_adopt`), so a gemini/custom launch mints
+        // nothing nobody asked for. (codex used to be the example here and is
+        // no longer one: #2515 C2 put it in `SOLO_MCP_CLIS`, because its MCP
+        // seam IS a command-line flag — the `-p <profile>` naming a profile
+        // file loomux wrote. It still mints no SESSION id above, which is a
+        // different question: codex has no public pre-mint flag, so its
+        // identity is learned from its store rather than assigned.)
+        // Best-effort: a failed mint must
         // never block the launch — which is also what makes widening
         // `SOLO_MCP_CLIS` ahead of a backend row SAFE: `solo_prepare` derives
         // its answer from `CliCaps::mcp_argv_seam` and returns a delivery-only
