@@ -66,6 +66,7 @@ const KEY_CUSTOM = "loomux.customAgentCommand";
 const KEY_REPOS = "loomux.recentRepos";
 const KEY_AUTOPILOT = "loomux.singlePaneAutopilot";
 const KEY_CHANNEL_TOOLS = "loomux.soloChannelTools";
+const KEY_SUBAGENTS = "loomux.orrerixSubagents";
 
 // One-time cleanup (#194): the removed agents-mode toggle left this key behind in
 // every existing profile. Drop it on load so stale profiles don't carry it
@@ -109,6 +110,38 @@ export const channelToolsFromStored = (v: string | null): boolean => v !== "0";
 export const getChannelTools = (): boolean => channelToolsFromStored(localStorage.getItem(KEY_CHANNEL_TOOLS));
 export const setChannelTools = (on: boolean): void =>
   localStorage.setItem(KEY_CHANNEL_TOOLS, on ? "1" : "0");
+
+/** Interpret a persisted orrerix-subagents value. Default OFF — the INVERSE of
+ *  `channelToolsFromStored`'s polarity, and deliberately so (#2519 C1): the
+ *  other launcher toggles default ON because doing nothing should not silently
+ *  downgrade a capability the user already has, while this toggle gates minting
+ *  a lead pane a real group it can spawn workers into — real groups, real
+ *  processes, a cap's worth of live agents. That is a gesture to opt INTO, so
+ *  an absent, stale, or corrupted value reads OFF, and only the exact "1"
+ *  `setSubagents(true)` writes turns it on. Pure so the default-OFF semantics
+ *  are unit-testable without a localStorage shim. */
+export const subagentsFromStored = (v: string | null): boolean => v === "1";
+
+/** The "orrerix subagents" toggle (#2519): whether the launcher offers minting
+ *  a pane a real lead group it can spawn `worker` children into. Persisted like
+ *  the other launcher prefs, and guarded with try/catch around BOTH the read
+ *  and the write because this module is also imported by DOM-free unit tests —
+ *  a refused read degrades to OFF (the default), a refused write is swallowed
+ *  (there is nothing to recover, same policy as `addRecentRepo`). */
+export const getSubagents = (): boolean => {
+  try {
+    return subagentsFromStored(localStorage.getItem(KEY_SUBAGENTS));
+  } catch {
+    return false; // no localStorage (unit-test context) or the read was refused
+  }
+};
+export const setSubagents = (on: boolean): void => {
+  try {
+    localStorage.setItem(KEY_SUBAGENTS, on ? "1" : "0");
+  } catch {
+    /* write failed (quota / security) — nothing to recover, same as before */
+  }
+};
 
 /** The agent preselected in the launcher; updated on every launch. */
 export function getDefaultAgent(): AgentDef {

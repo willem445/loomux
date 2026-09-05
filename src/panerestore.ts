@@ -972,6 +972,61 @@ const CODEX_SOLO_PROFILE_RE = new RegExp(
   `(^|\\s)(?:-p|--profile)\\s+"?(?:${MCP_SERVERS.join("|")})-[^"\\s]*"?(?=\\s|$)`
 );
 
+/** The lead marker a claude line will carry beside its MCP block (#2519 C1):
+ *  the lead launch path (#2519 slice B, #2677 — not yet on main as this strip
+ *  ships) appends `--disallowedTools Agent` to solo's `mcp_args`, which
+ *  disables the CLI's OWN Agent/subagent tool so the lead's children are
+ *  loomux workers, never claude sub-agents (the no-recursion rule —
+ *  `spawn_agent` refuses `kind: lead`, and so does the command line). On
+ *  restore it must be excised beside the identity it shipped with, or the C2
+ *  restore path's strip → re-prepare round trip would append a fresh copy and
+ *  the relaunched lead line would carry the flag twice.
+ *
+ *  Shape matches the anchored patterns above: the leading whitespace is part
+ *  of the match (so the strip leaves no double space) and the trailing
+ *  boundary is a lookahead (so the next flag's space is not consumed).
+ *  The value grammar is the bare token `Agent` — the exact string that launch
+ *  path emits — so a human's `--disallowedTools Edit` survives, and so does a
+ *  comma-list like `--disallowedTools Edit,Agent`, whose value token is not
+ *  `Agent`.
+ *
+ *  **Gated on the MCP block having matched**, i.e. excised only from a line
+ *  the CLAUDE_SOLO_MCP_RE arm has already identified as loomux-minted. The
+ *  marker is only loomux's when it shipped with the minted identity; a plain
+ *  `claude --disallowedTools Agent` is a human's own permission decision and
+ *  comes back byte-identical (`cli: null`, the no-mutation contract above).
+ *
+ *  **Owned residual (review F2, #2678): the gate cannot tell a minted lead
+ *  line from a SOLO line a human gave their own `--disallowedTools Agent` to**
+ *  — the two are byte-shape-identical, so the excision takes the human's flag
+ *  on restore and a solo re-prepare re-appends no Agent flag, silently
+ *  re-enabling claude's own subagent tool. Disambiguating needs the persisted
+ *  pane record's role (the tabstore `lead` field and launch path — #2519
+ *  slices B/C2), which v1 does not thread into this function. Pinned by the
+ *  test that performs the edit (`…indistinguishable from a minted lead
+ *  line…`), not by this prose alone. */
+const LEAD_AGENT_DISALLOW_RE = /(^|\s)--disallowedTools\s+Agent(?=\s|$)/;
+
+/** Excise ONE `--disallowedTools Agent` pair from a claude command the MCP
+ *  arm has already matched (#2519 C1). That launch path (#2519 slice B,
+ *  #2677) mints exactly one, and the round-trip test pins that; a second
+ *  occurrence would be the human's, and the same one-flag rule that keeps
+ *  `Edit` safe keeps it safe too. */
+function stripLeadAgentFlag(command: string): string {
+  const m = LEAD_AGENT_DISALLOW_RE.exec(command);
+  if (!m) return command;
+  return command.slice(0, m.index) + command.slice(m.index + m[0].length);
+}
+
+/** Excise ONE `["--disallowedTools", "Agent"]` pair from an argv array the
+ *  claude arm has already matched — the discrete-element form of
+ *  `stripLeadAgentFlag` (no whitespace to reason about, so exact element
+ *  equality is the whole match). */
+function stripLeadAgentFlagArgv(argv: string[]): string[] {
+  const i = argv.findIndex((t, k) => t === "--disallowedTools" && argv[k + 1] === "Agent");
+  return i < 0 ? argv : [...argv.slice(0, i), ...argv.slice(i + 2)];
+}
+
 /** Remove a recorded agent command's solo channel-identity MCP flags (#439):
  *  `--mcp-config <path> --strict-mcp-config --allowedTools mcp__<server>`
  *  (claude), `--additional-mcp-config @<path> --allow-tool <server>`
@@ -985,6 +1040,12 @@ const CODEX_SOLO_PROFILE_RE = new RegExp(
  *  config file that happens to live under a "solo"-named folder can't be
  *  mistaken for one; it only has to tolerate the path containing whitespace,
  *  which the quoted-path regex above does.
+ *
+ *  A claude line identified by the block additionally has loomux's lead
+ *  marker `--disallowedTools Agent` excised beside it (#2519 C1) — see
+ *  `LEAD_AGENT_DISALLOW_RE` for why the excision is gated on the block, why a
+ *  human's own `--disallowedTools` value survives, and the one indistinguishable
+ *  case that is owned residual rather than handled.
  *
  *  Returns which CLI's flags were found (null when the command carried none
  *  — nothing to re-mint) alongside the command/argv with that group excised.
@@ -1006,7 +1067,9 @@ export function stripSoloMcpFlags(
     if (claude) {
       return {
         cli: "claude",
-        command: command.slice(0, claude.index) + command.slice(claude.index + claude[0].length),
+        command: stripLeadAgentFlag(
+          command.slice(0, claude.index) + command.slice(claude.index + claude[0].length)
+        ),
       };
     }
     const copilot = COPILOT_SOLO_MCP_RE.exec(command);
@@ -1052,7 +1115,10 @@ export function stripSoloMcpFlags(
         argv[i + 3] === "--allowedTools" &&
         (MCP_TOOL_PREFIXES as readonly string[]).includes(argv[i + 4])
       ) {
-        return { cli: "claude", argv: [...argv.slice(0, i), ...argv.slice(i + 5)] };
+        return {
+          cli: "claude",
+          argv: stripLeadAgentFlagArgv([...argv.slice(0, i), ...argv.slice(i + 5)]),
+        };
       }
       if (argv[i] === "--additional-mcp-config" && argv[i + 2] === "--allow-tool" && (MCP_SERVERS as readonly string[]).includes(argv[i + 3])) {
         return { cli: "copilot", argv: [...argv.slice(0, i), ...argv.slice(i + 4)] };

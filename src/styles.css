@@ -1610,7 +1610,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .session-badge.pi { background: color-mix(in srgb, var(--cli-pi) 16%, transparent); color: var(--cli-pi); }
 .session-badge.codex { background: color-mix(in srgb, var(--cli-codex) 16%, transparent); color: var(--cli-codex); }
 /* The agent roles, in the one role table this app has: orchestrator azure, worker
-   jade, reviewer violet, planner amber, manager orchid. Every surface that names a role uses it — this
+   jade, reviewer violet, planner amber, manager orchid, lead cyan. Every surface that names a role uses it — this
    list, .group-role.role-* and the workflow pane's .wf-node-* / .wf-chip-* — and
    test/theme.test.ts reads all four surfaces and fails on a role that disagrees or is
    missing. sessions.ts emits this chip for EVERY OrchRole, so a role with no rule here
@@ -1620,6 +1620,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .session-badge.orch-role.reviewer { background: color-mix(in srgb, var(--id-violet) 16%, transparent); color: var(--id-violet); }
 .session-badge.orch-role.planner { background: color-mix(in srgb, var(--id-amber) 16%, transparent); color: var(--id-amber); }
 .session-badge.orch-role.manager { background: color-mix(in srgb, var(--id-orchid) 16%, transparent); color: var(--id-orchid); }
+.session-badge.orch-role.lead { background: color-mix(in srgb, var(--id-cyan) 16%, transparent); color: var(--id-cyan); }
 /* #1: the PR chip, shown only once the task board records one for this
    session's work — a distinct accent from the role chips so it reads as
    "external reference", not another identity badge. */
@@ -4239,6 +4240,10 @@ button.orch-item:active { transform: translateX(2px) scale(0.995); }
    side: it is the hue furthest from azure/jade/violet/amber. Rose is the
    destructive-action dye and lime sits too close to the worker's jade. */
 .group-role.role-manager { background: color-mix(in srgb, var(--id-orchid) 16%, transparent); color: var(--id-orchid); }
+/* Lead (#2519) — cyan, the same distinctness constraint: the one identity hue
+   left that is distinct from the five role hues above (rose and lime are
+   spoken for by the manager's own argument, and orchid is the manager's). */
+.group-role.role-lead { background: color-mix(in srgb, var(--id-cyan) 16%, transparent); color: var(--id-cyan); }
 /* "manager declared · not open" (#1433): a state of affairs the human should
    see, not an alarm — the pane may be closed because they closed it. The
    manager's own identity color rather than the attention palette, for the
@@ -5215,6 +5220,11 @@ button.orch-item:active { transform: translateX(2px) scale(0.995); }
    fall through to `.wf-node`'s neutral --line stroke and read as no role at
    all, which is the failure the role table exists to prevent. */
 .wf-node-manager { stroke: var(--id-orchid); }
+/* #2519. A lead pane carries an OrchRole like any other identity, so the
+   canvas keeps the one-role-table rule: a class the union declares gets a
+   stroke, never the neutral fall-through. (A lead is never a workflow BLOCK —
+   this rule exists for table completeness, matching the manager's.) */
+.wf-node-lead { stroke: var(--id-cyan); }
 .wf-node-unknown, .wf-node-ghost { stroke: var(--state-danger); stroke-dasharray: 4 3; }
 .wf-node-title { fill: var(--ink); font-size: 12.5px; font-weight: 600; }
 .wf-node-sub { fill: var(--ink-dim); font-size: 11px; }

@@ -12,8 +12,12 @@ import { IDENTITY } from "./theme.ts";
  *  is declarable only in a repo's workflow file — it is never part of
  *  the built-in roster, so widening this union deliberately does NOT widen
  *  `ORCH_ROLES` (roster.ts), which is the launcher's per-role form AND the
- *  built-in roster itself. */
-export type OrchRole = "orchestrator" | "worker" | "reviewer" | "planner" | "manager";
+ *  built-in roster itself. `lead` (#2519) is the same shape of exclusion with
+ *  a stricter reason: it is not declarable ANYWHERE — a lead group is minted
+ *  by the launcher toggle alone and `kind: lead` in a workflow file stays
+ *  "unknown kind is rejected" — so it can never enter `ORCH_ROLES` or
+ *  `ROSTER_ROLES` either. */
+export type OrchRole = "orchestrator" | "worker" | "reviewer" | "planner" | "manager" | "lead";
 
 // Per-group identity: a stable accent color keyed off the order groups first
 // appear. Color is the group-pairing cue ("this orchestrator ↔ its workers");
@@ -71,6 +75,9 @@ const ROLE_LABELS: Record<OrchRole, string> = {
   // #1161. `MGR`, matching the agent-id prefix (`mgr-3`) the backend mints, so
   // the chip and the id it cross-references read as the same word.
   manager: "MGR",
+  // #2519. Same rule as `manager`: the chip spells the agent-id prefix
+  // (`lead-3`) the backend's `Role::Lead` mints.
+  lead: "LEAD",
 };
 
 /** The short chip text for a role ("REV"). The one source for it: the pane badge

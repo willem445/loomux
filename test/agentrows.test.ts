@@ -27,6 +27,7 @@ import {
   matchesFilter,
   sortRows,
   needsYouCount,
+  parentKey,
   type AgentOrder,
   type AgentRow,
   type AgentState,
@@ -1132,4 +1133,161 @@ test("a catalog row cannot be rewritten in place either (#2514 review round 3, p
   for (const a of AGENTS) {
     assert.equal(LAUNCHABLE_AGENT_PROGRAMS.has(a.command), a.command !== "", `${a.id}`);
   }
+});
+
+// ---------- lead nesting (#2519 C1) ----------
+// `parentKey` is the Agents tab's indent input (C2 renders it): the pane key of
+// the lead pane a worker reports to, or null when it nests under nobody. The
+// relationship is (same group, same tab): a lead's children join the lead's
+// group and open in the lead's tab, so BOTH must match — group alone would
+// cross tabs, tab alone would hand a child to an unrelated lead that happens
+// to share the tab.
+
+test("a worker spawned by a lead nests under that lead's pane", () => {
+  const lead = facts({
+    key: "lead-pane",
+    name: "lead-1",
+    orch: { group: "g-lead", agentId: "lead-1", role: "lead" },
+  });
+  const child = facts({
+    key: "child-pane",
+    name: "w-9",
+    orch: { group: "g-lead", agentId: "w-9", role: "worker" },
+  });
+  assert.equal(parentKey(child, [lead, child]), "lead-pane");
+});
+
+test("two leads in two tabs don't cross — each child nests under its own lead", () => {
+  // NOTE (B1, #2678 review round 4): this test's two leads differ in GROUP as
+  // well as tab, so it discriminates only against "the first lead in the
+  // fleet" matching — it cannot see the tab half of the relationship on its
+  // own. The colliding fixtures below (same group, different tab; tab null
+  // with the lead present) are what hold the tab half up.
+  const leadA = facts({
+    key: "lead-a",
+    tab: { id: "ws-a", title: "A", index: 0 },
+    orch: { group: "g-a", agentId: "lead-1", role: "lead" },
+  });
+  const childA = facts({
+    key: "child-a",
+    tab: { id: "ws-a", title: "A", index: 0 },
+    orch: { group: "g-a", agentId: "w-2", role: "worker" },
+  });
+  const leadB = facts({
+    key: "lead-b",
+    tab: { id: "ws-b", title: "B", index: 1 },
+    orch: { group: "g-b", agentId: "lead-2", role: "lead" },
+  });
+  const childB = facts({
+    key: "child-b",
+    tab: { id: "ws-b", title: "B", index: 1 },
+    orch: { group: "g-b", agentId: "w-3", role: "worker" },
+  });
+  const fleet = [leadA, childA, leadB, childB];
+  assert.equal(parentKey(childA, fleet), "lead-a");
+  assert.equal(parentKey(childB, fleet), "lead-b");
+  // And the negative control on the pair: a group mismatch never resolves,
+  // whichever order the fleet is walked in.
+  const orphan = facts({
+    key: "orphan",
+    tab: { id: "ws-a", title: "A", index: 0 },
+    orch: { group: "g-c", agentId: "w-4", role: "worker" },
+  });
+  assert.equal(parentKey(orphan, fleet), null);
+});
+
+// The tab half of the relationship, held by fixtures whose operands COLLIDE
+// (#1182/#1300): under group-only matching BOTH of the next two tests fail
+// (the worker resolves to the lead's key instead of null), which is exactly
+// the implementation the function's doc forbids. `fleet` really is cross-tab
+// by construction — `groupRows` buckets one flat row list by tab id — so a
+// lead-group worker in a different tab is reachable, not hypothetical.
+test("a worker of a lead's group sitting in a DIFFERENT tab nests under nobody (B1)", () => {
+  const lead = facts({
+    key: "lead-a",
+    tab: { id: "ws-a", title: "A", index: 0 },
+    orch: { group: "g-a", agentId: "lead-1", role: "lead" },
+  });
+  const movedWorker = facts({
+    key: "moved-worker",
+    tab: { id: "ws-b", title: "B", index: 1 },
+    orch: { group: "g-a", agentId: "w-2", role: "worker" },
+  });
+  assert.equal(parentKey(movedWorker, [lead, movedWorker]), null);
+});
+
+test("a worker with NO tab in a group whose lead is present nests under nobody (B1)", () => {
+  const lead = facts({
+    key: "lead-a",
+    tab: { id: "ws-a", title: "A", index: 0 },
+    orch: { group: "g-a", agentId: "lead-1", role: "lead" },
+  });
+  const tablessWorker = facts({
+    key: "tabless-worker",
+    tab: null,
+    orch: { group: "g-a", agentId: "w-2", role: "worker" },
+  });
+  assert.equal(parentKey(tablessWorker, [lead, tablessWorker]), null);
+});
+
+test("a pane with no orch identity nests under nobody", () => {
+  const plain = facts({ key: "plain-pane", orch: null });
+  assert.equal(parentKey(plain, [plain]), null);
+});
+
+test("a worker in an ORCHESTRATOR group nests under nobody — even with a lead pane in the same tab", () => {
+  // The discriminator against tab-only matching: an orchestrator's worker
+  // shares a tab with an unrelated lead here, and must still resolve to null,
+  // because the lead is not of ITS group.
+  const orchestrator = facts({
+    key: "orch-pane",
+    orch: { group: "g-orch", agentId: "orch-1", role: "orchestrator" },
+  });
+  const worker = facts({
+    key: "worker-pane",
+    orch: { group: "g-orch", agentId: "w-4", role: "worker" },
+  });
+  const unrelatedLead = facts({
+    key: "lead-pane",
+    orch: { group: "g-lead", agentId: "lead-1", role: "lead" },
+  });
+  const fleet = [orchestrator, worker, unrelatedLead];
+  assert.equal(parentKey(worker, fleet), null);
+  assert.equal(parentKey(orchestrator, fleet), null, "an orchestrator is nobody's child either");
+});
+
+test("a lead pane nests under nobody — including under itself", () => {
+  const lead = facts({
+    key: "lead-pane",
+    orch: { group: "g-lead", agentId: "lead-1", role: "lead" },
+  });
+  assert.equal(parentKey(lead, [lead]), null);
+});
+
+test("needsYouCount is unchanged by lead nesting — the badge counts as it always did", () => {
+  // Positive control: children of a lead reach the badge through the same
+  // states every pane has; a lead and its children never inflate (a report
+  // waits on the lead, not on the human) and never deflate the count.
+  const lead = facts({
+    key: "lead-pane",
+    orch: { group: "g-lead", agentId: "lead-1", role: "lead" },
+  });
+  const wedged = facts({
+    key: "wedge-pane",
+    orch: { group: "g-lead", agentId: "w-2", role: "worker" },
+    attention: { reason: "blocked", detail: "an error" },
+  });
+  const asking = facts({
+    key: "ask-pane",
+    orch: { group: "g-lead", agentId: "w-3", role: "worker" },
+    attention: { reason: "gate", detail: "task is review" },
+  });
+  const reporting = facts({
+    key: "report-pane",
+    orch: { group: "g-lead", agentId: "w-4", role: "worker" },
+    attention: { reason: "report", detail: null },
+  });
+  const rows = agentRows([lead, wedged, asking, reporting]);
+  assert.equal(rows.length, 4, "the lead and every child are agent rows (orch identity)");
+  assert.equal(needsYouCount(rows), 2, "attention + question, exactly as without a lead");
 });
