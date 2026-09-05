@@ -1552,6 +1552,19 @@ If you have *both* a `workflow.yml` and a `workflows/default.yml`, the plain
 `workflow.yml` is the one that is read — rename the other rather than leaving
 two files claiming one name.
 
+**The orchestrator's read-back (`list_blocks`).** Switching a running group to
+another workflow is confirmed by the human before anything applies; when a
+switch lands, the orchestrator's pane gets a one-line
+`[orrerix] workflow switched: <old> → <new>` notice naming the new roster. Its
+kickoff's workflow section tells it what that notice means — spawn by the new
+ids, and read `removed:` as ids it can no longer spawn or bare-resume. Because
+a notice can be compacted away, that section also names the durable read-back:
+the `list_blocks` tool returns the active workflow's name and every block's id,
+capability class, CLI, model and persona — the same roster its spawns resolve
+against, whatever its kickoff quoted at launch. The tool and the paragraph
+naming it are both workflow-conditional: a group running the built-in roster
+sees neither.
+
 **On `.orrerix/` and `.loomux/`.** The config dir used to be `.loomux/`, and a repo
 that still has one keeps working with no action: each file — `workflow.yml`,
 `lessons.md`, `workflow.layout.json` — is looked for in `.orrerix/` first and in
