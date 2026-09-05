@@ -7498,6 +7498,9 @@ pub fn codex_profile_toml(
 pub fn codex_user_mcp_exposure(codex_home: &Path, our_server: &str) -> Option<Value> {
     let path = codex_home.join("config.toml");
     let body = fs::read_to_string(&path).ok()?;
+    if !body.is_empty() {
+        return None;
+    }
     let mut names: Vec<String> = Vec::new();
     for line in body.lines() {
         let line = line.trim();
