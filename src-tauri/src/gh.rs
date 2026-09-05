@@ -750,12 +750,9 @@ pub struct GhLabelVocabulary {
 pub async fn gh_label_vocabulary(
     app: tauri::AppHandle,
     repo: String,
-    group: Option<String>,
+    scope_id: Option<String>,
 ) -> GhLabelVocabulary {
-    // Parsed at the boundary, in this command's own body (CLAUDE.md constraint
-    // 6): an unusable id is `None`, which is the no-group arm — see
-    // [`group_rails`] for why all three no-group cases are one arm.
-    let gid = group.as_deref().and_then(|g| GroupId::parse(g).ok());
+    let gid = scope_id.as_deref().and_then(|g| GroupId::parse(g).ok());
     run_blocking(move || {
         let rails = group_rails(&app, gid);
         Ok(gh_label_vocabulary_sync(&repo, rails.as_ref()))
