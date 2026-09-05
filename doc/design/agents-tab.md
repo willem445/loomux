@@ -234,6 +234,117 @@ something anyone is blocked on.
 `tab` (#2371) is the tab the reading was taken from, and it is the one field on
 `PaneFacts` the pane does not derive — see the next section.
 
+## Membership: which panes are agent panes (#2514)
+
+A human dogfooding beta8 found a plain terminal — a shell, no agent CLI —
+sitting in the Agents tab as an agent that was **working**. Nothing on the
+ladder was wrong. `deriveAgentState` answers *what is this pane doing*, its
+default rung is `working`, and that rung is honestly read as "no evidence of a
+prompt": a shell that is alive, carries no attention reading, and either paints
+above `ACTIVITY_FLOOR_BYTES` or has been typed into satisfies it exactly. The
+ladder was answering a question it was never the right one to ask, because
+nothing had asked the prior one.
+
+So membership is its own function, `isAgentPane(facts)`, and `agentRows(facts)`
+is the rule and the projection in one call.
+
+### Three arms, and why none of them is redundant
+
+```ts
+export function isAgentPane(facts: PaneFacts): boolean {
+  if (facts.orch !== null) return true;
+  if (facts.harness !== null) return true;
+  const program = markProgram(facts.mark);
+  return program !== null && LAUNCHABLE_AGENT_PROGRAMS.has(program);
+}
+```
+
+1. **`orch`** — an orchestration pane is an agent whatever it was launched
+   with, and a manager pane (which arrives through the repo's workflow file)
+   can carry no harness at all.
+2. **`harness`** — the session-store CLI. It is set for a *remote* pane off the
+   SSH profile's declared far-end CLI, where no local launch line names the
+   agent, so it is the only arm that answers there.
+3. **the launch line, against the launcher's own catalog.**
+
+### Arm 3 is the one the issue did not ask for, and it is load-bearing
+
+#2514 proposed `harness !== null || orch !== null` and nothing else. That
+predicate is wrong in a way that is strictly worse than the bug it fixes.
+
+`harness` is `sessionCliFromCommand` — a **closed four-name** membership test
+(`claude | copilot | opencode | pi`), and closed for a good reason: its answer
+is matched against `listSessions()` rows, so it names exactly the CLIs loomux
+can scan sessions for. `src/agents.ts`'s launcher catalog offers **eight**.
+`codex`, `gemini`, `hermes` and `ante` are launchable agent panes whose
+`harness` is `null` by design. Resting membership on it would have dropped
+half the launchable agents out of the Agents tab *and* out of `needsYouCount` —
+an agent asking the human a question, invisible. That is exactly #2371 review
+round 2's W1 one layer down, and `PaneFacts.harness` says so in its own doc:
+its `null` is narrower than "no agent", and it must not be used to decide what
+a pane IS.
+
+The third arm therefore reads `mark` — the pane header's own `AgentMarkInput`,
+carried on the facts since #2371 so the two surfaces cannot disagree — through
+`markProgram`, which is `agentMark`'s resolution order with the rendering taken
+off (extracted here rather than re-derived: knownCli beats the launch line, and
+a remote pane's transport is never read as its agent).
+
+### The catalog, not the resolver
+
+Arm 3 tests catalog membership, **not** "does this resolve to a program at
+all". `agentMarkFor` is total on purpose — a hand-typed `make` pane gets a
+lettered badge — because a badge is a fallback and being in this list is a
+claim. So a custom-command pane naming a program loomux does not recognise is
+not a row, which is also the answer #2514 asks for.
+
+`LAUNCHABLE_AGENT_PROGRAMS` is **derived** from `AGENTS`, through
+`programFromRestore`, so a ninth CLI is one edit to the catalog and none here;
+the `custom` row drops out on its own, its command being empty. The set is
+spelled out once, in `test/agentrows.test.ts`, so widening it is a visible
+decision rather than a silent one.
+
+### One rule, not two
+
+The badge and the rendered list are read off **one** array:
+`AgentsView.refresh` calls `agentRows(this.deps.facts())` and both
+`needsYouCount` and `visibleGroups` consume its result. A caller reaching
+`toAgentRow` directly would be a second place the filter could be forgotten, so
+a default-deny source scan in `test/agentrows.test.ts` asserts that symbol has
+no caller in `src/` outside `agentrows.ts` — decided on the module's own
+exported symbol, which cannot be renamed away without renaming the export, per
+CLAUDE.md's source-scanning-guard rule.
+
+### Two corrections to the issue's own text
+
+Recorded because both were transcribed onto permanent surfaces before being
+checked, and CLAUDE.md's rule is that a routed instruction's factual premise is
+a claim to verify:
+
+- "*a custom-command pane … is excluded, it is the same reason it gets no agent
+  icon*" — it **does** get an icon: `agentMarkFor("foo")` returns a lettered
+  badge. The reason it is excluded is that loomux does not recognise the
+  program, and the user doc says that instead.
+- A shell pane does not get "no icon" either; it gets the neutral `?` badge on
+  its header, and the header keeps it. What changed is that it is not a row.
+
+The issue's "`needsYouCount` and the Sessions live list use the same predicate"
+was also dropped in part: there is no pane-facts-driven live list in the session
+browser — it lists BACKEND sessions — and `main.ts`'s `recordPaneSession` is
+gated on `harness !== null` for a different question (what can be *adopted*
+into a session store), so it is unchanged.
+
+### Residual: an SSH pane that declares no far-end CLI
+
+Such a pane is **not** listed. Its launch line is the transport, and reading
+`ssh` as the pane's CLI is the confident-wrong-answer `agenticons.ts` exists to
+refuse; its profile named nothing. A human who SSHes out and starts an agent by
+hand therefore gets no row until the profile declares the agent — which is the
+same trade the neutral `?` badge already makes on that pane's header, and
+declaring it is a one-field fix. Guessing is not available: the alternative
+(list every remote pane) reinstates exactly this issue for anyone who keeps an
+SSH shell open.
+
 ## Grouping and order (#2371)
 
 The list groups its rows under the tab they live in, with a header carrying the
