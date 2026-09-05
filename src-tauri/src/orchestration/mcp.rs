@@ -1824,8 +1824,7 @@ fn require_spawner(caller: &Caller) -> Result<(), String> {
     if matches!(caller.role, Role::Orchestrator | Role::Lead) {
         Ok(())
     } else {
-        Err("permission denied: opening and driving agent panes is for an orchestrator, or a \
-             lead pane (a human-driven pane launched with orrerix subagents on)"
+        Err("permission denied: this tool is orchestrator-only"
             .into())
     }
 }
