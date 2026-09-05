@@ -7485,19 +7485,30 @@ fn toml_basic_escape(s: &str, newlines: TomlNewlines) -> String {
 /// that shape is derived. Four sites need it: the writer, `solo_prepare` (which
 /// spells it on argv), the per-agent removal, and the orphan sweep.
 ///
-/// **Refuses rather than sanitizes**, and the alphabet is the vendor's, not
-/// loomux's. `ProfileV2Name`'s own `FromStr` accepts a non-empty run of ASCII
-/// alphanumerics, `_` and `-`, and nothing else. [`PathSegment`] is wider (it
-/// also admits `.`, `~`, `:`, `@`, `+`), so an agent id that is a perfectly
-/// good path segment can still be a name codex would reject — and a file
-/// written under a name `-p` cannot select is a pane that boots with no MCP, no
-/// trust and no contract, silently. Refusing here fails the spawn instead, next
-/// to the write that would have been useless.
+/// **Unreachable today, and kept anyway — with the reason stated, because an
+/// unexplained unreachable check is indistinguishable from a forgotten one.**
 ///
-/// Every id loomux mints today (`w-3`, `rev-4`, `orch-1`, `solo-2` — a
-/// `Block::prefix()` and a sequence number) is inside both alphabets; the check
-/// is for the hand-edited `group.json` the parse-at-the-boundary rule exists
-/// for, and it is why this returns a `Result` rather than a `String`.
+/// The two alphabets are `ProfileV2Name`'s (a non-empty run of ASCII
+/// alphanumerics, `_` and `-`) and [`check_segment`]'s (the same run, and then
+/// two FURTHER refusals: no leading `-`, no Windows reserved device name). So
+/// `PathSegment` is strictly NARROWER than what codex accepts, `brand::NAME` is
+/// itself alphanumeric, and every `PathSegment` this is handed therefore
+/// produces a name `-p` can select. The `Err` arm cannot be reached from a
+/// valid `PathSegment` at all.
+///
+/// It stays because the relationship it depends on is somebody else's to
+/// change, in both directions: `check_segment` serves four identifier families
+/// (CLAUDE.md constraint 6) and could widen for one of them, and codex could
+/// narrow `ProfileV2Name`. A file written under a name `-p` cannot select is a
+/// pane that boots with no MCP, no trust and no contract, and NOTHING says so —
+/// codex resolves the profile itself and simply does not find one. Failing the
+/// spawn here, next to the write that would have been useless, is the cheap
+/// side of that trade.
+///
+/// `a_codex_profile_name_is_valid_by_construction_and_the_check_is_the_backstop`
+/// pins the subset relationship rather than pretending to exercise the `Err`
+/// arm with an input that cannot exist — so a widening of either alphabet
+/// reddens a test that tells you this check just became live.
 #[doc(hidden)] // pub for integration tests
 pub fn codex_profile_name(agent: &PathSegment) -> Result<String, String> {
     let name = format!("{}-{agent}", brand::NAME);
