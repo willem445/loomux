@@ -612,7 +612,7 @@ pub fn drive_ssh_add_with_transcript(
         if now >= deadline {
             let _ = killer.kill();
             let _ = child.wait();
-            return (SshAddOutcome::Timeout, seen);
+            return (SshAddOutcome::Failed { detail: "deadline".to_string() }, seen);
         }
         // The child's EXIT is the other way this conversation ends, and it has
         // to be polled for: a ConPTY master read does not return EOF when the
