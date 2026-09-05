@@ -232,7 +232,8 @@ export const ORCH_CLIS: OrchCli[] = [
     // quotes `CliCaps` directly, so nothing here can disagree with it.
     //
     // Membership here is spawnability. codex hosts a worker or an
-    // orchestrator; a reviewer or planner on it is refused by `cli_can_host`,
+    // orchestrator; a reviewer, planner or manager on it is refused by
+    // `cli_can_host`,
     // because its only containment axis is an all-or-nothing `sandbox_mode`.
     id: "codex",
     models: [INHERIT_MODEL],

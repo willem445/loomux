@@ -2299,9 +2299,10 @@ two things worth knowing before your first run:
   pane gets orrerix's rather than yours. Every spawn that finds any records
   what it saw in the audit log (`codex-user-mcp-merged`) so a pane whose tools
   look wrong is diagnosable rather than mysterious.
-- **A `reviewer` and a `planner` block cannot run on codex**, and orrerix
-  refuses the file rather than launching one — see *Why not codex for a
-  reviewer?* below.
+- **A `reviewer`, a `planner` and a `manager` block cannot run on codex**, and
+  orrerix refuses the file rather than launching one — see *Why not codex for a
+  reviewer?* below. All three are classes orrerix denies the editing tools to,
+  and codex has no way to deny them.
 - **`allow:` doesn't apply to a `codex` block**, for gemini's reason and one of
   its own: codex's rules engine can forbid a command prefix, but it loads rules
   only from `~/.codex/rules/` and the repo's `.codex/rules/`, neither of which
@@ -2338,7 +2339,9 @@ review needs, or open enough to let the reviewer rewrite the code it's
 reviewing. Its rules engine could express the missing denial but cannot be
 scoped to one agent. A reviewer that can't be contained would quietly weaken
 the merge gate, so orrerix refuses the pairing rather than shipping it. The
-same reasoning refuses a `planner`, which is read-only and needs strictly more.
+same reasoning refuses a `planner`, which is read-only and needs strictly more,
+and a `manager`, which sits at the reviewer’s tier for the same purpose: it
+reads the codebase to ground its questions and must not write it.
 
 Turning it on live shows the same resolved-roster confirm (name, blocks, any
 declared gate) the launcher's own preview shows at launch time; turning it off

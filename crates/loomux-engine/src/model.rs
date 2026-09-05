@@ -834,8 +834,11 @@ pub const CONTEXT_VARIANTS: &[&str] = &["1m"];
 ///   and a project's `.codex/rules/` — neither of which is per-agent, so
 ///   loomux cannot give one pane a rule set and its neighbour another. That
 ///   leaves `workspace-write`, i.e. no containment at all, so the ceiling is
-///   [`Containment::None`] and a reviewer or planner block is refused by
-///   [`cli_can_host`] at parse time.
+///   [`Containment::None`] and a reviewer, planner or MANAGER block is refused
+///   by [`cli_can_host`] at parse time. Three classes, not the two #2515 D1
+///   named: `Role::Manager` is `NoEdits` too (#1161 — a manager must read the
+///   codebase and must not write it), and it is refused by the same one
+///   comparison rather than by a rule anyone had to remember.
 ///
 ///   Everything loomux configures on codex rides ONE generated profile file
 ///   selected by `-p/--profile` — trust, approval policy, sandbox mode,
