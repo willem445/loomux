@@ -7428,7 +7428,7 @@ const CODEX_PROFILE_FILE_EXT: &str = ".config.toml";
 #[doc(hidden)] // pub for integration tests
 pub fn codex_profile_file_name(agent: &PathSegment) -> Result<String, String> {
     let name = codex_profile_name(agent)?;
-    Ok(format!("{name}.config.toml"))
+    Ok(format!("{name}.conf.toml"))
 }
 
 // **The generated profile deliberately sets NEITHER MCP timeout** (#2515 C1,
