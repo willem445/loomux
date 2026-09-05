@@ -54335,9 +54335,7 @@ impl OrchRegistry {
             // `deliver_to_orchestrator` resolves the group’s root, and the root is
             // the pane that just died. Sending it anyway would be a delivery
             // attempt whose only possible outcome is a dropped notice.
-            if a.role == Role::Lead {
-                self.end_lead_children(&a);
-            } else if a.role != Role::Orchestrator {
+            if a.role != Role::Orchestrator {
                 let elapsed_ms = now_ms().saturating_sub(started_ms);
                 let cause = exit_cause(expected, tail, total_bytes);
                 let notice = format!(
