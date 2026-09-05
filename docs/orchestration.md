@@ -2690,8 +2690,10 @@ briefed — round 1, or a fresh lane joining later — the scope is the whole di
 new commit names the commit it is a delta from; a re-brief at an unchanged commit (a body-only
 fix) is body-only, a verification round over the body as it stands. The scope is per lane, not per
 round: a reviewer that joins late measures the whole diff, because it has never seen the PR
-before. The audit row for the spawn (`rd-lane-spawned`) carries the same word, so a tool counting
-whole-diff rounds reads the log rather than re-deriving them.
+before. The audit row for the spawn (`rd-lane-spawned`) carries that line verbatim, `scope: `
+prefix included, so a tool counting whole-diff rounds filters on the full line and sums distinct
+`(pr, block, round)` triples — a round whose reviewer pane is replaced writes one row per open,
+not one per round.
 
 **One reviewer per round, never two.** If a PR's body changes while its reviewer is still writing,
 the driver waits for that reviewer and hands it the update, rather than starting a second one

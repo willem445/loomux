@@ -662,6 +662,39 @@ gates:
     reviewers: [rev-std]
 "#;
 
+/// A TWO-lane gate — the fixture the scope test's fourth block needs (#2508
+/// review, W1).
+///
+/// The unchanged-head **non-verify** arm of `rd_lane_scope` is reachable only
+/// when a lane must be re-briefed at the head it answered while `verify` cannot
+/// be granted, and on a one-lane gate those two never co-occur: a sole lane
+/// whose pass is bound to the unchanged head makes the `all` in
+/// `decide_review_wait`'s grant true whenever the digest is readable — so the
+/// round is verification and reaches `body-only` through the early return, not
+/// through the arm. With a second lane that has recorded nothing, the grant
+/// fails while `first_stale_lane` still stales the lane that answered (its
+/// pass no longer settles: the digest moved) — so the drive re-briefs lane 0 at
+/// an unchanged head with `verify: false`, which is that arm's only witness.
+const WORKFLOW_TWO_LANE: &str = r#"version: 1
+blocks:
+  - id: worker
+    kind: worker
+  - id: rev-std
+    name: Standard review
+    kind: reviewer
+  - id: rev-final
+    name: Final validation
+    kind: reviewer
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev-std, rev-final]
+merge_queue:
+  enabled: true
+driver:
+  enabled: true
+"#;
+
 /// A throwaway repo one level below its own temp root — `orchestration.rs`'s
 /// `RealRepo` rationale: a worktree is cut SIBLING to the repo, so nesting keeps
 /// it inside the root that `Drop` reclaims.
@@ -1933,9 +1966,23 @@ fn a_lane_that_has_answered_is_re_briefed_with_the_delta_template() {
 /// into existence: round 1 has no previous revision to name, so a delta line
 /// there means the derivation read a lane record that did not exist.
 ///
-/// The `rd-lane-spawned` audit row carries the same string, asserted on the
-/// whole-diff drive — the row is what a beta's before/after count reads, and a
-/// row that disagreed with the brief would make that count measure nothing.
+/// **Four blocks, not three** (#2508 review, W1): `body-only` has TWO paths in
+/// `rd_lane_scope` — the `verify` early return and the unchanged-head arm — and
+/// a one-lane gate can only ever reach the first (a sole answered lane makes
+/// the grant true whenever the digest is readable). The third block pins the
+/// grant path; the fourth pins the arm, on a two-lane gate whose second lane
+/// has recorded nothing, and asserts the brief does NOT announce the
+/// verification grant — the negative control that keeps the two paths distinct.
+///
+/// **The mode is pinned against the brief's own arms, not only against the
+/// golden** (rev-std finding 2): each block asserts scope ⟺ template arm ⟺
+/// WHAT_MOVED text, so an edit to one classification that leaves the other
+/// behind goes red here rather than shipping a scope line that contradicts the
+/// prose it rides on.
+///
+/// The `rd-lane-spawned` audit row carries the same string, asserted on every
+/// block — the row is what a beta's before/after count reads, and a row that
+/// disagreed with the brief would make that count measure nothing.
 #[test]
 fn the_lane_brief_names_the_round_scope_on_every_round_mode() {
     // ── whole-diff: a first round, nothing has ever been briefed or answered ──
@@ -1957,6 +2004,18 @@ fn the_lane_brief_names_the_round_scope_on_every_round_mode() {
         assert!(
             !brief.contains("scope: body-only"),
             "a first-round brief is not a verification round: {brief}"
+        );
+        // Cross-pin (rev-std finding 2): whole-diff ⟺ the first-call template —
+        // the scope's `None` branch and the brief's template-arm `None` branch
+        // read the same lane record, and each block here pins the two reads
+        // against each other.
+        assert!(
+            brief.starts_with("Review PR #1758"),
+            "a whole-diff round renders the first-call template: {brief}"
+        );
+        assert!(
+            !brief.contains("head moved from") && !brief.contains("Re-read the body"),
+            "a first-round brief renders no WHAT_MOVED arm at all: {brief}"
         );
         let row = lane_spawn_rows(&reg, &group)
             .last()
@@ -2018,6 +2077,22 @@ fn the_lane_brief_names_the_round_scope_on_every_round_mode() {
         assert!(
             !delta.contains("scope: body-only"),
             "the head moved, so this is not a body-only round: {delta}"
+        );
+        // Cross-pin (rev-std finding 2): delta ⟺ the moved-head WHAT_MOVED arm,
+        // both naming the same previous revision.
+        assert!(
+            delta.starts_with("DELTA on PR #1758"),
+            "a delta round renders the delta template: {delta}"
+        );
+        assert!(
+            delta.contains(&format!("head moved from {HEAD_A} to {HEAD_B}")),
+            "the delta scope line and the moved-head prose must agree on the revision it \
+             deltas from: {delta}"
+        );
+        assert!(
+            !delta.contains("VERIFICATION-ONLY"),
+            "verify was not granted on a moved head — the brief must not announce the grant: \
+             {delta}"
         );
         let row = lane_spawn_rows(&reg, &group)
             .last()
@@ -2111,6 +2186,131 @@ fn the_lane_brief_names_the_round_scope_on_every_round_mode() {
         assert!(
             !text.contains("scope: delta since"),
             "the head did not move, so there is no revision to delta from: {text}"
+        );
+        // Cross-pins (rev-std finding 2): the mode the scope line names and the
+        // arm the brief's own prose took must be ONE decision. This block
+        // reached `body-only` through the `verify` early return, so the brief
+        // must carry the verification paragraph — the same grant, said twice.
+        assert!(
+            text.starts_with("DELTA on PR #1758"),
+            "a verification round over an answered lane renders the delta template: {text}"
+        );
+        assert!(
+            text.contains("VERIFICATION-ONLY"),
+            "the verification grant and the scope line must agree — one grant, said twice: \
+             {text}"
+        );
+        assert!(
+            !text.contains("head moved from"),
+            "the head did not move, so the delta-text arm must not have rendered: {text}"
+        );
+    }
+    // ── body-only, the OTHER path: answered at this head, verify not granted ──
+    // (#2508 review, W1 — the unchanged-head arm of `rd_lane_scope`, previously
+    // pinned by nothing: the block above reaches `body-only` through the
+    // `verify` early return, and on a ONE-lane gate the arm is unreachable,
+    // because a sole answered lane makes the grant true whenever the digest is
+    // readable. `WORKFLOW_TWO_LANE`'s second lane has recorded nothing, so the
+    // grant fails while `first_stale_lane` still stales the lane that answered
+    // — the only fixture that reaches the arm.)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::with(WORKFLOW_TWO_LANE);
+        const REVIEWED: &str = "the body lane zero passed";
+        const EDITED: &str = "the body somebody edited afterwards";
+        let gh = FakeGh::green(HEAD_A);
+        // The body override is set before the pass is recorded, for the same
+        // reason the block above documents: a pass with no digest never goes
+        // stale, and this block needs lane 0's pass to go stale on the edit.
+        gh.set_body(REVIEWED);
+        reg.set_pr_head_override(Some(HEAD_A.to_string()));
+        reg.set_pr_body_override(Some(REVIEWED.to_string()));
+        let (group, _s) = driven(&reg, &repo, &gh);
+        let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+        with_pane(&reg, &orch.id, 7001);
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+        let (_pr, opened_block, lane) =
+            first.lanes_opened.first().cloned().expect("lane 0 opens");
+        assert_eq!(opened_block, "rev-std", "lane 0 is the gate's first lane");
+        dispatch(
+            &reg,
+            &Caller {
+                agent_id: lane.clone(),
+                group: group.clone(),
+                role: Role::Reviewer,
+                role_hint: None,
+            },
+            "tools/call",
+            &json!({ "name": "review_verdict", "arguments": {
+                "pr": "1758", "verdict": "pass", "summary": "pass - nothing blocking" } }),
+        )
+        .expect("the lane records");
+        dispatch(
+            &reg,
+            &Caller {
+                agent_id: lane.clone(),
+                group: group.clone(),
+                role: Role::Reviewer,
+                role_hint: None,
+            },
+            "tools/call",
+            &json!({ "name": "report", "arguments": {
+                "outcome": "approved", "note": "nothing blocking", "ref": "#1758" } }),
+        )
+        .expect("the lane reports, which ends its turn");
+        assert!(
+            reg.agent(&lane).expect("the lane is on the roster").idle_since_ms.is_some(),
+            "the fixture's premise — that pane has finished its turn, so a re-brief is not \
+             refused as a duplicate"
+        );
+        // The body-only edit at the UNCHANGED head, with lane 1 unanswered:
+        // `first_stale_lane` stales lane 0 (its pass no longer settles — the
+        // digest moved) and `decide_review_wait`'s grant fails (lane 1 has no
+        // pass), so lane 0 is re-briefed with `verify: false` — the arm.
+        gh.set_body(EDITED);
+        reg.set_pr_body_override(Some(EDITED.to_string()));
+        let opened = tick_until_lane(&reg, &gh, &group, 30_000);
+        let agent = opened
+            .unwrap_or_else(|| panic!("the unchanged-head non-verify re-brief must happen"));
+        let text = lane_brief(&reg, &agent);
+        assert!(
+            text.contains("scope: body-only"),
+            "a re-brief at the head the lane answered must be scoped to the body: {text}"
+        );
+        assert!(
+            !text.contains("scope: whole-diff"),
+            "the lane has measured this PR; the round is not a whole-diff one: {text}"
+        );
+        assert!(
+            !text.contains("scope: delta since"),
+            "the head did not move, so there is no revision to delta from: {text}"
+        );
+        // Cross-pins, and the arm's own negative control: `verify` was NOT
+        // granted here, so the brief must NOT announce the verification grant —
+        // the same scope value as the block above reached through the OTHER
+        // branch, which is what makes the two branches distinct subjects.
+        assert!(
+            text.starts_with("DELTA on PR #1758"),
+            "an answered lane re-briefed at an unchanged head renders the delta template: {text}"
+        );
+        assert!(
+            !text.contains("VERIFICATION-ONLY"),
+            "verify was not granted on this path — the brief must not announce the grant: {text}"
+        );
+        assert!(
+            text.contains("Re-read the body, not the diff"),
+            "the unchanged-head WHAT_MOVED arm must have rendered — the scope line and this \
+             prose are one decision: {text}"
+        );
+        let row = lane_spawn_rows(&reg, &group)
+            .last()
+            .cloned()
+            .expect("the re-brief spawned a lane, which emitted rd-lane-spawned");
+        assert_eq!(
+            row["scope"], json!("scope: body-only"),
+            "rd-lane-spawned must carry the scope the brief rendered: {row}"
         );
     }
 }

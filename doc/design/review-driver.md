@@ -1718,11 +1718,17 @@ two remaining ways a fresh pane can appear.
   nine panes from six was to count them by hand across three PRs. It records
   what HAPPENED — a resume that was attempted and fell through is `false` —
   which is why the failure is its own row rather than a flag here. Since #2508
-  it also carries `scope`, the round's scope line exactly as the brief rendered
-  it, from the closed set `whole-diff` | `delta since <sha>` | `body-only`
-  (§5.5) — the one fact about the round nothing else on the row records, so a
-  beta's before/after count of whole-diff rounds reads the log rather than
-  re-deriving it from round numbers and head moves.
+  which is why the failure is its own row rather than a flag here. Since #2508
+  it also carries `scope`, the round's scope line **verbatim, `scope: ` prefix
+  included** — the value is `scope: whole-diff` | `scope: delta since <sha>` |
+  `scope: body-only` (§5.5), never the bare mode, so a counter filtering the
+  field must match the full line. The one fact about the round nothing else on
+  the row records, so a beta's before/after count of whole-diff rounds reads
+  the log rather than re-deriving it from round numbers and head moves. **A
+  round whose pane is replaced writes one row per open, not one per round**
+  (#2163) — a round can emit several `scope: whole-diff` rows for one
+  `(pr, block)` — so a counter sums distinct `(pr, block, round)` triples,
+  which the row's `round` field carries, rather than raw rows.
 - `rd-lane-resume-failed` carries `block`, `session`, `head` and a `detail`
   QUOTING what refused, never a diagnosis of it (§2.2's `worker-unresumable`
   row makes the same distinction for the same reason). One row per resume that
@@ -1910,8 +1916,13 @@ previous revision to name; a re-brief at an unchanged head is `body-only`; a
 re-brief at a moved head names the revision it deltas from. The scope is
 therefore **per lane**, not per round counter: a fresh lane joining at a later
 round is a lane whose round 1 it is, and it measures the whole diff. The same
-string rides the `rd-lane-spawned` audit row (§5.4). All three values, and the
-round-1 negative control, are pinned in `tests/reviewdrive.rs`
+string rides the `rd-lane-spawned` audit row (§5.4). **The classification is
+derived once** — `rd_lane_brief`'s WHAT_MOVED arm reads the scope line rather
+than re-deriving `rec.at_head == brief.head` beside it (rev-std's finding on
+the parallel matches) — and the pin asserts each mode against the template arm
+and the prose it selects, so the two reads cannot drift apart silently. All
+three values, both paths to `body-only`, and the round-1 negative control are
+pinned in `tests/reviewdrive.rs`
 (`the_lane_brief_names_the_round_scope_on_every_round_mode`).
 
 ## 6. Kick-back notice shapes

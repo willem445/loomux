@@ -2038,13 +2038,39 @@ impl OrchRegistry {
                 } else {
                     "changed"
                 };
+                // **The mode is `scope`'s, not re-derived here** (#2508 review,
+                // rev-std finding 2): `rd_lane_scope` already classified this
+                // round from the same `(verify, rec.at_head, brief.head)` facts,
+                // so the arm that picks the WHAT_MOVED text reads that line
+                // instead of re-deriving `rec.at_head == brief.head` beside it —
+                // two parallel matches over one predicate were one edit away
+                // from a scope line contradicting the brief it rides on. In
+                // this arm `scope` is `delta since …` or `body-only` by
+                // construction (`whole-diff` implies no lane record, and the
+                // `None` arm below renders the first-call template, which has
+                // no WHAT_MOVED slot); the final `else` is the unchanged-head
+                // body-only round, and the scope-mode test pins each mode to
+                // its text so a future drift between the two reads goes red.
                 let moved = if verify {
                     // The grant outranks the record: see the block above the
                     // `match`. `verification` opens with a space so it reads as
                     // an appended clause in the other arm; this slot wants it
                     // without one.
                     verification.trim_start().to_string()
-                } else if rec.at_head == brief.head {
+                } else if scope.starts_with("scope: delta since ") {
+                    // **What this brief does NOT claim.** orrerix does not
+                    // compute the per-round delta: the driver's seam is
+                    // `gh`-only by construction (§3.1 item 1, made structural in
+                    // `RdRunner`), so it has no `git diff` to run. It names the
+                    // two revisions and points at the command that answers the
+                    // question exactly — facts it read plus an instruction,
+                    // rather than a delta it invented.
+                    format!(
+                        "What moved: the head moved from {prev_head} to {head}. orrerix does not \
+                         compute the per-round delta; `git diff {prev_head}..{head}` in your \
+                         worktree does."
+                    )
+                } else {
                     // **What this half says changed at #2168 E1.** Until then
                     // the commonest cause of a body-only re-brief was the
                     // worker pasting its CI receipts after the checks settled —
@@ -2070,19 +2096,6 @@ impl OrchRegistry {
                      so a body move you see following one is a deliberate edit rather than \
                      CI receipts landing late."
                         .to_string()
-                } else {
-                    // **What this brief does NOT claim.** orrerix does not
-                    // compute the per-round delta: the driver's seam is
-                    // `gh`-only by construction (§3.1 item 1, made structural in
-                    // `RdRunner`), so it has no `git diff` to run. It names the
-                    // two revisions and points at the command that answers the
-                    // question exactly — facts it read plus an instruction,
-                    // rather than a delta it invented.
-                    format!(
-                        "What moved: the head moved from {prev_head} to {head}. orrerix does not \
-                         compute the per-round delta; `git diff {prev_head}..{head}` in your \
-                         worktree does."
-                    )
                 };
                 render_template(
                     DRIVER_DELTA_TPL,
