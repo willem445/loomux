@@ -264,6 +264,16 @@ function readSuites(text) {
   return suites;
 }
 
+// How a suite is named when the script has to say which ones it found or could not tell
+// apart. The `what` half is load-bearing, not decoration: a crate's lib unittests and its
+// bin unittests both build to `deps/<crate>-<hash>`, so they share a target stem and differ
+// only here — `loomux_server` is 25 tests as `unittests src/lib.rs` and 0 as `unittests
+// src/main.rs` in the same job of the same run. Keyed on the stem alone the two collapse
+// into one label, `selectSuite` sees a single match and silently returns whichever came
+// first, and the ledger then carries one of the two figures with nothing to say the other
+// existed. Measured on run 33932644347's ubuntu leg.
+function suiteLabel(s) { return `${s.job || '(no job)'} / ${s.target} [${s.what}]`; }
+
 // Pick the one suite a row's figures are about.
 //
 // THE ZERO CASE IS AN ERROR, and that is the whole positive control. A log that truncated,
@@ -276,10 +286,11 @@ function selectSuite(suites, opts) {
   let pool = suites;
   if (o.job) pool = pool.filter((s) => s.job === o.job);
   if (o.target) pool = pool.filter((s) => s.target === o.target);
+  if (o.what) pool = pool.filter((s) => String(s.what).includes(o.what));
   if (!pool.length) {
-    const uniq = [...new Set(suites.map((s) => `${s.job || '(no job)'} / ${s.target}`))];
+    const uniq = [...new Set(suites.map(suiteLabel))];
     throw new Error(
-      `no test totals parsed${o.target ? ` for target "${o.target}"` : ''}${o.job ? ` in job "${o.job}"` : ''}. `
+      `no test totals parsed${o.target ? ` for target "${o.target}"` : ''}${o.what ? ` matching "${o.what}"` : ''}${o.job ? ` in job "${o.job}"` : ''}. `
       + (uniq.length
         ? `The log carries ${uniq.length} suite(s): ${uniq.slice(0, 12).join(', ')}${uniq.length > 12 ? ', …' : ''}`
         : 'The log carries NO `test result:` or `# pass` line at all — it is truncated, or the run never reached the test step.'),
@@ -289,11 +300,11 @@ function selectSuite(suites, opts) {
     const red = pool.filter((s) => !s.ok);
     if (red.length === 1) return red[0];
     if (red.length > 1) {
-      throw new Error(`${red.length} suites failed (${red.map((s) => `${s.job} / ${s.target}`).join(', ')}) — name one with --target/--job so the row is attributable`);
+      throw new Error(`${red.length} suites failed (${red.map(suiteLabel).join(', ')}) — name one with --target/--job/--what so the row is attributable`);
     }
   }
-  const uniq = [...new Set(pool.map((s) => `${s.job || '(no job)'} / ${s.target}`))];
-  if (uniq.length > 1) throw new Error(`${uniq.length} suites match: ${uniq.join(', ')} — name one with --target/--job`);
+  const uniq = [...new Set(pool.map(suiteLabel))];
+  if (uniq.length > 1) throw new Error(`${uniq.length} suites match: ${uniq.join(', ')} — name one with --target/--job/--what`);
   return pool[0];
 }
 
@@ -318,7 +329,7 @@ function short(sha) { return sha ? String(sha).slice(0, 8) : '(unknown)'; }
 // `logs` maps a run id to that run's log TEXT. Nothing here fetches anything, which is what
 // lets the suite drive the whole generator over fixtures.
 function buildLedger(spec, logs) {
-  const sel = { target: spec.target, job: spec.job };
+  const sel = { target: spec.target, job: spec.job, what: spec.what };
   const notes = [];
 
   let base = null;
@@ -534,7 +545,7 @@ function checkBody(body, logs, opts) {
 
     let suite;
     try {
-      suite = selectSuite(readSuites(text), { target: o.target, job: o.job, failingOnly: !o.target });
+      suite = selectSuite(readSuites(text), { target: o.target, job: o.job, what: o.what, failingOnly: !o.target });
     } catch (err) {
       add('CHECK', row.n, `run ${id}: ${err.message}`);
       continue;
@@ -663,7 +674,7 @@ function fetchRunHead(id, o) {
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const o = { rows: null, check: null, repo: null, target: null, job: null, cache: null, abridge: null, json: false, quiet: false, help: false, bodyFile: null, logDir: null };
+  const o = { rows: null, check: null, repo: null, target: null, job: null, what: null, cache: null, abridge: null, json: false, quiet: false, help: false, bodyFile: null, logDir: null };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--rows') o.rows = argv[++i];
@@ -671,6 +682,7 @@ function parseArgs(argv) {
     else if (a === '--repo') o.repo = argv[++i];
     else if (a === '--target') o.target = argv[++i];
     else if (a === '--job') o.job = argv[++i];
+    else if (a === '--what') o.what = argv[++i];
     else if (a === '--cache') o.cache = argv[++i];
     else if (a === '--abridge') o.abridge = Number(argv[++i]);
     else if (a === '--body-file') o.bodyFile = argv[++i];
@@ -686,6 +698,7 @@ function parseArgs(argv) {
 const USAGE = `mutation-ledger — build the red-before-green ledger from the runs' own logs (#2507)
 
   node scripts/mutation-ledger.cjs --rows rows.json [--target loomux_engine] [--job "build (ubuntu-22.04)"]
+                                   [--what 'src/lib.rs']   # tells a crate's lib unittests from its bin's
   node scripts/mutation-ledger.cjs --check <pr> [--repo owner/name] [--quiet]
 
   --log-dir <d>   read <run>.log from a directory instead of calling gh (offline)
@@ -727,6 +740,7 @@ function main(argv) {
     const spec = JSON.parse(fs.readFileSync(o.rows, 'utf8'));
     if (o.target) spec.target = o.target;
     if (o.job) spec.job = o.job;
+    if (o.what) spec.what = o.what;
     const ids = (spec.rows || []).map((r) => r.run);
     if (spec.base && spec.base.run != null) ids.push(spec.base.run);
     const logs = loadLogs(ids, o);
@@ -751,7 +765,7 @@ function main(argv) {
   const logs = loadLogs(ids, o);
   const runHeads = {};
   if (!o.logDir) for (const id of ids) runHeads[id] = fetchRunHead(id, o);
-  const result = checkBody(body, logs, { target: o.target, job: o.job, runHeads });
+  const result = checkBody(body, logs, { target: o.target, job: o.job, what: o.what, runHeads });
   if (o.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   else process.stdout.write(`${renderCheck(result, { pr: o.check, quiet: o.quiet })}\n`);
   return 0;
@@ -759,7 +773,7 @@ function main(argv) {
 
 module.exports = {
   stripAnsi, parseRunLog, targetStem, readCargoSuites, readNodeSuites, readSuites, selectSuite,
-  abridge, buildLedger, renderLedger, readTables, splitRow, findLedgerTable, readBullets,
+  suiteLabel, abridge, buildLedger, renderLedger, readTables, splitRow, findLedgerTable, readBullets,
   checkBody, renderCheck, parseArgs, fetchLog, loadLogs, main, USAGE, ABRIDGE, NUMBER_WORDS,
 };
 
