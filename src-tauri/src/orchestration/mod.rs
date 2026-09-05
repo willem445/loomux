@@ -4419,40 +4419,7 @@ review gates do not loosen, and nothing you relay opens one."
         // "prefer these over your CLI's own subagents" argument, which is
         // persuasion rather than mechanics, and the per-tool descriptions the MCP
         // listing already carries on every turn.
-        Role::Lead => "\
-These orrerix mechanics are guaranteed by the app and are NOT optional, whatever your \
-persona says:
-\
-- **You are the human's own pane, and the ROOT of this group — not one of its \
-delegates.** Nobody spawned you and there is nobody above you: you hold no `report` and \
-no `message_orchestrator`, because this group has no orchestrator. Tell the human what \
-you would have reported; they are right here.
-\
-- **`spawn_agent(kind: \"worker\")` opens a helper as a real orrerix pane** — its own git \
-worktree and branch, watchable and steerable by your human, still there when your turn \
-ends. It accepts `worker` and refuses every other kind, with the reason: this group has \
-no review gate and no task board, so a reviewer or a planner would have nothing to \
-answer to. A helper starts cold and knows only what you write in `task`.
-\
-- Drive and read a helper with `send_prompt`, `get_output`, `list_agents`, \
-`kill_agent`, `focus_agent`, `rename_agent`, and `group_usage` for what it has cost. \
-`get_output` is what keeps a helper's output OUT of your context until you ask for it. \
-These tools never need approval; use them, don't ask the human to.
-\
-- **A helper's `report(\"done\"|\"blocked\")` is typed into THIS pane**, prefixed \
-`[orrerix]` and naming the agent. A `progress` report is recorded rather than delivered \
-— it never interrupts you — so ask for a tail when you want to know how something is \
-going mid-flight.
-\
-- You have no task board, no review gate, no merge queue and no verdicts, and you never \
-merge, tag or publish. Your helpers open PRs; the human reviews and merges them.
-\
-- Your helpers count against the live-agent cap the human set, a spawn-rate backstop \
-bounds a runaway loop, and an idle helper is reaped on the group's timeout. None of \
-that applies to this pane: it is never reaped, never nagged and never counted — and you \
-cannot kill it, from here or from a helper. Closing it is the human's gesture, and it \
-ends the group."
-            .to_string(),
+        Role::Lead => unreachable!("[scratch] the arm slice A shipped"),
     };
     // A role_hint (#250/#324/#891) addendum — the same non-overridable treatment as
     // the rest of this function, for the same reason: a `mode: replace` persona on an
@@ -49009,24 +48976,7 @@ impl OrchRegistry {
             // sentence below says outright, and `lead_prepare` passes no branch.
             // No `grounding_note` either — a lead is never spawned against a board
             // row, and its group has no board to hold one.
-            Role::Lead => format!(
-                "You are \"{name}\" ({id}), the LEAD of orrerix group {gid} for repository \
-                 {repo} — the human's own pane, driven by them, with the fleet tools to open \
-                 helper panes.
-\
-                 First read your role instructions: {ins}
-\
-                 You work in the repository itself — the human's own checkout. Helpers you \
-                 open get their own worktree and branch, so they never touch it.
-{delivery}
-\
-                 Greet the human briefly, say that `spawn_agent` now opens real orrerix panes \
-                 instead of your own in-process subagents, and wait. They set the agenda in \
-                 this pane; nothing else will.",
-                name = a.name, id = a.id, gid = g.id, repo = g.repo,
-                ins = instructions.display(),
-                delivery = kickoff_delivery_note(&g.id, &a.id),
-            ),
+            Role::Lead => unreachable!("[scratch] the arm slice A shipped"),
         }
     }
 
