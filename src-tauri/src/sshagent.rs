@@ -72,7 +72,13 @@ use std::time::{Duration, Instant};
 /// paths to enumerate — every path is setup-then-conversation — which is what
 /// makes this total true by construction rather than by a list that the next
 /// person to add a step will forget to update.
-pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(25);
+///
+/// The third term is [`CHILD_REAP_BUDGET`], and it is here for the same reason
+/// one level down: the conversation ends by KILLING a child, and until #2397
+/// review B1 it then waited for that child unbounded. “Enforced” has to survive
+/// the last statement, not just the loop — so the reap is bounded too, and its
+/// budget is part of this sum rather than a step outside it.
+pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(27);
 
 /// One deadline shared by **everything before the conversation** — the first
 /// probe, the start attempt, and the re-probe together.
@@ -107,6 +113,27 @@ const POLL_STEP: Duration = Duration::from_millis(50);
 /// than [`SSH_ADD_TIMEOUT`], so the re-send happens while the run can still
 /// succeed rather than as a formality before the deadline.
 const ANSWER_REARM: Duration = Duration::from_secs(2);
+
+/// How long a killed child gets to actually die before it is abandoned.
+///
+/// **This is what makes [`WORST_CASE_TOTAL`] a bound at all.** `Child::wait` in
+/// `portable-pty` 0.9.0 is `WaitForSingleObject(handle, INFINITE)`, and the kill
+/// in front of it cannot be trusted to have worked: `WinChildKiller::kill`
+/// returns `Err` when `TerminateProcess` **succeeded** (non-zero) and `Ok(())`
+/// when it **failed**, so a kill that did not take is indistinguishable from one
+/// that did — by construction, not by our discarding the result. A child that
+/// survives `TerminateProcess` (a wedged PKCS#11 or smartcard provider, an AV or
+/// filesystem filter stalled on the key path — precisely the state the deadline
+/// fires in) would then block this thread forever: a blocking-pool slot gone for
+/// the life of that process, and a launcher stuck behind "Connecting…" with its
+/// submit latch held and no cancel (#2397 review B1).
+///
+/// Two seconds, matching `GH_CAPTURE_REAP_TIMEOUT` — the same answer
+/// `crates/loomux-engine/src/subproc.rs` gives for the same reason, stated there
+/// as "a bound whose last act is an unbounded `wait()` is not a bound". The
+/// setup phase already got that treatment through `capture_raw_with_timeout`;
+/// this is the conversation phase getting it too.
+const CHILD_REAP_BUDGET: Duration = Duration::from_millis(2000);
 
 /// How long the pty pump gets to deliver whatever it still holds after the
 /// child has exited. ConPTY renders a screen rather than a stream, so a process
@@ -471,6 +498,38 @@ fn send_answer(writer: &mut Box<dyn std::io::Write + Send>, line: &[u8]) -> std:
     result
 }
 
+/// Kill a child and wait for it to die, **bounded**.
+///
+/// Returns its status when it really did exit inside [`CHILD_REAP_BUDGET`], and
+/// `None` when it did not — in which case the child is abandoned rather than
+/// waited on, exactly the trade `subproc::abandon_child_and_readers` makes. A
+/// leaked process is worse than a reaped one and far better than a wedged app:
+/// the alternative here is not "wait a little longer", it is
+/// `WaitForSingleObject(INFINITE)` on the webview's blocking pool.
+///
+/// Polls rather than waits for the same reason `wait_bounded` does — there is no
+/// timed wait on this `Child` trait — reusing [`POLL_STEP`], which is already
+/// this module's answer to "how often is often enough".
+fn reap_bounded(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    killer: &mut Box<dyn portable_pty::ChildKiller + Send + Sync>,
+) -> Option<portable_pty::ExitStatus> {
+    // The result is deliberately unread: in 0.9.0 it is inverted (see
+    // CHILD_REAP_BUDGET), so it carries no information either way. What bounds
+    // this is the deadline below, never the kill.
+    let _ = killer.kill();
+    let deadline = Instant::now() + CHILD_REAP_BUDGET;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(POLL_STEP);
+    }
+}
+
 /// Drive one `ssh-add` conversation on a hidden pty and report what it did.
 ///
 /// `argv` is spawned **as argv** through `CommandBuilder` — no shell, so the
@@ -610,8 +669,7 @@ pub fn drive_ssh_add_with_transcript(
     while terminal.is_none() {
         let now = Instant::now();
         if now >= deadline {
-            let _ = killer.kill();
-            let _ = child.wait();
+            reap_bounded(&mut child, &mut killer);
             return (SshAddOutcome::Timeout, seen);
         }
         // The child's EXIT is the other way this conversation ends, and it has
@@ -723,10 +781,17 @@ pub fn drive_ssh_add_with_transcript(
         }
     }
 
-    let _ = killer.kill();
-    let status = match status {
-        Some(st) => Some(st),
-        None => child.wait().ok(),
+    // Reap only when the answer actually depends on it. `terminal` being set
+    // means a line already decided the outcome, and the `match` below discards
+    // `status` on every one of those arms — so waiting there was an unbounded
+    // block for a value nobody reads (#2397 review B1).
+    let status = match (status, terminal.is_some()) {
+        (Some(st), _) => Some(st),
+        (None, true) => {
+            let _ = killer.kill();
+            None
+        }
+        (None, false) => reap_bounded(&mut child, &mut killer),
     };
     let secret = String::from_utf8_lossy(passphrase).into_owned();
     let detail = scrub_secret(last_meaningful_line(&seen), &secret);
@@ -1048,7 +1113,10 @@ mod tests {
         // the setup phase shares one deadline whatever runs inside it, and the
         // conversation always gets its own. So there is one sum, and a step
         // added to `ensure_agent` tomorrow cannot invent a path this misses.
-        assert_eq!(WORST_CASE_TOTAL, AGENT_SETUP_BUDGET + SSH_ADD_TIMEOUT);
+        assert_eq!(
+            WORST_CASE_TOTAL,
+            AGENT_SETUP_BUDGET + SSH_ADD_TIMEOUT + CHILD_REAP_BUDGET
+        );
         // …and the setup phase cannot borrow from the conversation, which is the
         // property that makes the sum above an upper bound rather than a hope.
         assert!(AGENT_SETUP_BUDGET < WORST_CASE_TOTAL);

@@ -220,7 +220,7 @@ INV-2 refuses on the webview thread outright).
 | `added` | — | the agent now holds the key |
 | `badPassphrase` | `detail` | `ssh-add` rejected it; `detail` is its own last line, scrubbed |
 | `noAgent` | `hint` | nothing to add the key to; `hint` is the platform's one-time fix |
-| `timeout` | — | the conversation outran its 15 s bound and the child was killed (the human waits up to **25 s** end to end — see below) |
+| `timeout` | — | the conversation outran its 15 s bound and the child was killed (the human waits up to **27 s** end to end — see below) |
 | `failed` | `detail` | `ssh-add` missing, a spawn failure, or an unrecognised refusal |
 
 The conversation itself answers **at most one** prompt with the passphrase and
@@ -271,7 +271,7 @@ the whole bound and refuses a launch that would have worked.
 
 #### Two things this widens, named rather than left implicit
 
-**The bound a human experiences is 25 s, and it is enforced rather than summed.**
+**The bound a human experiences is 27 s, and it is enforced rather than summed.**
 The launcher awaits the whole sequence behind one modal "Connecting…", so the
 15 s conversation bound is not the number anyone waits.
 
@@ -283,6 +283,16 @@ fourth-step path, probe + start + probe + drive = **35 s**, against a constant
 claiming 20 and a test that pinned only the two compositions someone had listed.
 The constant had been picked to satisfy that list, so the test certified the
 false number instead of exposing it.
+
+A second review round then found the same claim falsified one layer down: the
+conversation ends by killing its child and then waiting for it, and
+`portable-pty` 0.9.0's `Child::wait` is `WaitForSingleObject(INFINITE)` behind a
+`kill` whose result is **inverted** — `Err` when `TerminateProcess` succeeded,
+`Ok` when it failed — so a child that survives the kill is indistinguishable from
+one that died, and the wait never returns. `CHILD_REAP_BUDGET` bounds it: the
+child is polled for at most 2 s and then **abandoned**, the same trade
+`subproc::abandon_child_and_readers` makes, because a leaked process is far
+better than a wedged app. That budget is the third term of the total.
 
 The fix is structural, because a corrected sum would have had the same defect one
 step later. Everything before the conversation now shares **one** deadline
