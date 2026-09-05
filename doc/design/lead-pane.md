@@ -168,12 +168,20 @@ not any check — is what makes three refusals structural:
    effective-class check reads the recorded *block*: `Some(Role::Lead)` for the
    lead's own block, refused as `resolves to kind "lead"`; `Some(Role::Worker)`
    for a worker block, which is **permitted**; and `None` only when the recorded
-   block id no longer resolves at all. What carries the property there is the
-   missing `lead` arm itself — no block can have kind `Lead` while
-   `kind_from_str` cannot name one, so no resume of any shape yields a lead
-   pane. An earlier draft of this item said "both routes refuse", which is false
-   of the corrupt-data subcase and points a reader at the wrong invariant
-   (rev-final N1 / rev-std round 2).
+   block id no longer resolves at all. An earlier draft of this item said
+   "both routes refuse", which is false of the corrupt-data subcase and points
+   a reader at the wrong invariant (rev-final N1 / rev-std round 2).
+
+   **What carries the property there is the effective-class check, and slice A
+   said otherwise.** Its argument was the vocabulary — "no block can have kind
+   `Lead` while `kind_from_str` cannot name one" — which was true while nothing
+   minted a lead block, and `lead_prepare` is what makes it false: a real group
+   on disk now holds one. Two of the three refusals above are unaffected (both
+   read `kind_from_str` directly); this one is not, and it is the check in
+   `mcp::call_tool` that refuses a lead its own block by the class the block
+   resolves to. `a_lead_cannot_open_a_lead_by_naming_its_own_block` asserts the
+   premise — a minted group really does hold a `Lead`-kind block — before it
+   asserts the refusal, so the test cannot go vacuous the way the sentence did.
 
 `Role::Solo` is absent from that vocabulary for the identical reason and is the
 precedent.
