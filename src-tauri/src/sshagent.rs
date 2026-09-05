@@ -215,9 +215,6 @@ pub fn classify_ssh_add_line(line: &str) -> SshAddEvent {
     if line.contains("Bad passphrase, try again for") {
         return SshAddEvent::BadPassphrase;
     }
-    if line.contains("Identity added") {
-        return SshAddEvent::Added;
-    }
     // Two spellings, both real: the portable string, and the one Win32-OpenSSH
     // prints when the named pipe is not there because the service is stopped.
     if line.contains("Could not open a connection to your authentication agent")
