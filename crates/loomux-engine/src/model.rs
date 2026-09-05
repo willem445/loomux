@@ -481,7 +481,12 @@ impl Containment {
 /// `join(", ")` in error messages). The *reasons* a CLI is or isn't in it —
 /// and what it can do once it is — live in [`CLI_CAPS`], pinned against this
 /// list by `supported_clis_match_the_capability_table`.
-pub const SUPPORTED_CLIS: [&str; 6] = ["claude", "codex", "copilot", "gemini", "opencode", "pi"];
+/// Order is load-bearing, not alphabetical: `supported_clis_match_the_
+/// capability_table` asserts this list equals [`CLI_CAPS`]' orchestration rows
+/// *in the same order*, and codex's row is last there because it was written as
+/// an evaluated-and-rejected row long before #2515 C1 gave it an adapter.
+/// Moving it would churn a large row for nothing.
+pub const SUPPORTED_CLIS: [&str; 6] = ["claude", "copilot", "gemini", "opencode", "pi", "codex"];
 
 /// A per-CLI **ready marker** (#1591) — a shape the CLI's own output takes
 /// once it is genuinely able to accept typed input, for a CLI whose painted

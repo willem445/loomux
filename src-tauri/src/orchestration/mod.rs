@@ -4072,6 +4072,44 @@ const OPENCODE_SESSION_POLL: Duration = Duration::from_secs(2);
 /// direction is one sleeping thread.
 const OPENCODE_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
+// codex session tracking (#2515 C1): copilot's problem again, with codex's own
+// reason for it. `resume_session_id` on the TUI's `Cli` is `#[clap(skip)]` —
+// "Internal … not exposed as a public flag" — so nothing loomux can put on the
+// line pre-assigns an id, and the pane's thread is learned by watching
+// `$CODEX_HOME/sessions` for a rollout that was not there before the spawn.
+/// How often to walk the rollout store for the pane's new thread.
+///
+/// Slower than copilot's tick, and NOT for opencode's reason (a SQLite open).
+/// This walk is three directory levels deep over a store that holds the
+/// human's whole codex history, and it runs once per booting codex pane. The
+/// per-tick cost is bounded by the baseline set rather than by the store's
+/// size — a candidate already in the baseline is rejected on a set lookup and
+/// never opened — but the LISTING is paid every tick regardless, so the tick
+/// is the thing to keep cheap.
+const CODEX_SESSION_POLL: Duration = Duration::from_secs(2);
+/// Give up watching after this long.
+///
+/// opencode's ten minutes rather than copilot's 90 seconds, and the fact that
+/// decides it is READ rather than guessed — which is the one respect in which
+/// this differs from the constant above it.
+/// `RolloutRecorder::new`'s own doc: *"For newly created sessions, this
+/// precomputes path/metadata and **defers file creation/open until an explicit
+/// `persist()` call**."* So a fresh codex pane has a rollout PATH from boot and
+/// no rollout FILE, and nothing on this side can see a path that has not been
+/// written. The file appears when the session first persists — that is, when
+/// the pane does some work.
+///
+/// A 90-second deadline would therefore leave permanently unidentified every
+/// pane whose first turn was late: a kickoff queued behind a busy pane, a human
+/// who walked away from an attended group. The failure would look exactly like
+/// codex not being installed. Ten minutes covers the first turn either way, and
+/// the cost of being wrong in this direction is one sleeping thread.
+///
+/// The widened window does raise the chance that a DIFFERENT pane's new session
+/// in the same directory is seen while this one is still waiting — which is
+/// precisely why the answer there is `Contested` and never "take the newest".
+const CODEX_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Where to look for the session a just-spawned pane is about to mint, plus
 /// the snapshot of what was already there (#722).
 ///
@@ -4091,6 +4129,20 @@ pub enum SessionBaseline {
     /// one function the spawn that creates the store and the usage read that
     /// consumes it already share (#812).
     OpenCode { ids: HashSet<String> },
+    /// The thread ids under `$CODEX_HOME/sessions`, and the root they came
+    /// from (#2515 C1) — copilot's shape, and carried for copilot's reason:
+    /// the poll must not end up reading a different directory than the
+    /// baseline was taken from, which is exactly what would happen if a
+    /// `CODEX_HOME` changed mid-session and the root were re-resolved.
+    ///
+    /// **NOT group-local**, unlike opencode's, and that is a decision rather
+    /// than an omission: codex's only relocation knob is `CODEX_HOME`, which
+    /// moves `auth.json` with it, so a per-group store would boot every pane
+    /// logged out. `doc/design/codex.md` carries the argument. The practical
+    /// consequence for this watcher is that the store it polls is shared with
+    /// the human's own codex sessions, which is why a cwd match is required
+    /// and a contest is refused rather than resolved.
+    Codex { ids: HashSet<String>, root: PathBuf },
 }
 
 impl SessionBaseline {
@@ -4098,18 +4150,21 @@ impl SessionBaseline {
         match self {
             SessionBaseline::Copilot { .. } => "copilot",
             SessionBaseline::OpenCode { .. } => "opencode",
+            SessionBaseline::Codex { .. } => "codex",
         }
     }
     fn poll(&self) -> Duration {
         match self {
             SessionBaseline::Copilot { .. } => COPILOT_SESSION_POLL,
             SessionBaseline::OpenCode { .. } => OPENCODE_SESSION_POLL,
+            SessionBaseline::Codex { .. } => CODEX_SESSION_POLL,
         }
     }
     fn timeout(&self) -> Duration {
         match self {
             SessionBaseline::Copilot { .. } => COPILOT_SESSION_TIMEOUT,
             SessionBaseline::OpenCode { .. } => OPENCODE_SESSION_TIMEOUT,
+            SessionBaseline::Codex { .. } => CODEX_SESSION_TIMEOUT,
         }
     }
 }
@@ -6085,9 +6140,32 @@ pub const GEMINI_SETTINGS_ENV: &str = "GEMINI_CLI_SYSTEM_SETTINGS_PATH";
 /// when the gh/git shims can't be written, and a gemini agent silently losing
 /// its MCP identity because git wasn't installed would be a confusing failure a
 /// long way from its cause. Pure, so the mapping is testable without a spawn.
-pub fn cli_extra_env(cli: &str, cfg: &Path) -> Vec<(String, String)> {
+///
+/// `token` is read by the codex arm alone (#2515 C1), and it is why this
+/// function grew a parameter rather than codex getting its own: codex is the
+/// one adapter whose pane environment carries this agent's *identity* instead
+/// of merely pointing at the file that does. Passing it here keeps the
+/// "one mapping, testable without a spawn" property the doc above claims —
+/// deriving the variable at the call site would put the token's spelling in a
+/// place no test can reach.
+pub fn cli_extra_env(cli: &str, cfg: &Path, token: &str) -> Vec<(String, String)> {
     match cli {
         "gemini" => vec![(GEMINI_SETTINGS_ENV.to_string(), cfg.display().to_string())],
+        // codex (#2515 C1): `cfg` is SELECTED on argv by name (`-p`), so the
+        // path itself needs no variable — what rides here is the agent token,
+        // which the generated profile names in `env_http_headers` and never
+        // contains. That is plan D2, and it is the half of the amendment that
+        // survives verbatim: a GROUP pane has a pane environment, so its secret
+        // goes there. A SOLO pane has none, and `solo_prepare` puts the token
+        // in the file instead — see `CodexMcpAuth`.
+        //
+        // An empty token means the caller minted none (`solo_prepare`'s
+        // no-seam path). Exporting an empty variable would leave the pane
+        // presenting a blank auth header, which the MCP server refuses in a way
+        // that reads like a bug rather than like an absence — so emit nothing.
+        "codex" if !token.is_empty() => {
+            vec![(CODEX_TOKEN_ENV.to_string(), token.to_string())]
+        }
         // pi (#2126): `cfg` is named on ARGV (`--mcp-config`), so none of this
         // pane's MCP identity rides the environment — the one variable here is
         // the boot-time version check, and it is unrelated to `cfg`.
@@ -7006,6 +7084,394 @@ pub fn pi_repo_mcp_exposure(
     }))
 }
 
+// ─────────────────────────── codex (#2515 C1) ───────────────────────────
+//
+// Everything loomux configures on a codex pane rides ONE generated file:
+// `CODEX_HOME/<brand>-<agent>.config.toml`, selected with `-p/--profile`,
+// documented "Layer $CODEX_HOME/<name>.config.toml on top of the base user
+// config" (`utils/cli/src/shared_options.rs` at the pin in
+// `doc/design/codex.md`; the name is built by `resolve_profile_v2_config_path`,
+// `format!("{profile_name}{CONFIG_PROFILE_V2_SUFFIX}")` against `codex_home`).
+// That is a whole `ConfigToml` document layered over the human's own — NOT the
+// narrow `[profiles.<name>]` table, which is the legacy shape and cannot carry
+// `projects`, `mcp_servers` or `developer_instructions` at all.
+//
+// The design note carries the argument for every key and for the three routes
+// not taken (`-c` on argv, a project `.codex/config.toml`, a per-agent
+// `CODEX_HOME`). What lives here is the mechanism.
+
+/// The environment variable a codex GROUP pane carries its agent token in —
+/// the value `env_http_headers` names, never the token itself (#2515 C1, D2).
+///
+/// A literal rather than a value built from [`brand::ENV_PREFIX`] for the
+/// reason [`brand::MCP_TOOL_PREFIX`] is one: a `const` cannot be assembled
+/// from another `const` string, and the pairing is kept honest by a test that
+/// derives it from the prefix instead
+/// (`the_codex_token_env_var_is_the_brand_prefix_plus_agent_token`).
+///
+/// **Deliberately NOT exported under the legacy prefix as well.** Every other
+/// `ORRERIX_`/`LOOMUX_` pair in `agent_pane_env` exists because something
+/// already on disk — a shim, an operator's wrapper — reads the old name. This
+/// variable is read by exactly one thing, the profile file loomux wrote in the
+/// same call, so a second spelling would be a second copy of a secret in the
+/// pane's environment with no reader at all.
+const CODEX_TOKEN_ENV: &str = "ORRERIX_AGENT_TOKEN";
+
+/// The suffix a profile-v2 file takes under `CODEX_HOME`, and the shape the
+/// orphan sweep matches. Named because three sites spell it — the writer, the
+/// per-agent removal and the sweep — and #502's lesson was that a delete path
+/// re-deriving a write path's shape either misses files (they accumulate) or
+/// matches too widely (it deletes something loomux never wrote).
+const CODEX_PROFILE_FILE_EXT: &str = ".config.toml";
+
+/// Timeout (secs) on loomux's entry in a codex profile, raised from codex's own
+/// 60s default for the reason [`PI_MCP_TIMEOUT_MS`] gives, and to the same
+/// number: loomux's tools do real work behind a call, and one timing out reads
+/// to an agent as the tool being broken.
+const CODEX_MCP_TOOL_TIMEOUT_SECS: f64 = 30.0;
+
+/// Startup timeout (secs) for that entry, raised from codex's 10s default.
+/// The server is on loopback and answers immediately in the ordinary case;
+/// what this covers is a cold pane racing the app's own MCP listener during a
+/// group launch, where losing the handshake costs the pane its whole tool
+/// surface for the session and nothing retries.
+const CODEX_MCP_STARTUP_TIMEOUT_SECS: f64 = 20.0;
+
+/// How a codex pane's profile presents this agent's token.
+///
+/// Two shapes, because a pane can only carry a secret on a channel it HAS, and
+/// the two kinds of codex pane do not have the same one. This is an amendment
+/// to #2515's plan D2, agreed before it was written and recorded on the issue:
+/// D2 said the token rides the pane environment and is never in the file,
+/// which is right for the pane D2 was describing and impossible for the other.
+///
+/// - [`Self::EnvVar`] — a GROUP pane. `write_mcp_config` returns the pane
+///   environment alongside the file and the spawn applies it, so the file
+///   names a variable and holds no token byte. D2 verbatim.
+/// - [`Self::Literal`] — a SOLO pane. `solo_prepare` only ever appends a flag
+///   string to a command line the human owns; it sets no environment at all
+///   (its pi arm says so outright). A solo profile naming a variable nothing
+///   sets would connect with no auth header — and the pane would still be
+///   advertised `delivery_only: false`, which is exactly the
+///   advertised-status-disagrees-with-reality defect `solo_prepare` guards
+///   against at its own fallback arm. So the token goes in the file, as every
+///   other CLI's generated config already carries it, in a directory that is
+///   the human's own.
+#[derive(Clone, Copy, Debug)]
+#[doc(hidden)] // pub for integration tests
+pub enum CodexMcpAuth<'a> {
+    /// Name the environment variable; the value never touches the file.
+    EnvVar(&'a str),
+    /// Carry the token itself — a solo pane, which has no environment.
+    Literal(&'a str),
+}
+
+/// Whether a TOML basic string keeps its newlines (a multi-line `"""` body) or
+/// escapes them (a one-line `"…"` value, or a quoted key).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TomlNewlines {
+    Escape,
+    Keep,
+}
+
+/// Escape `s` for a TOML **basic** string — the double-quoted form, which is
+/// the only one that can encode arbitrary text.
+///
+/// **Why not the `'''` literal form #2515's plan named.** A TOML literal string
+/// admits no escapes at all: its content ends at the first closing run of three
+/// apostrophes, and there is nothing one can write instead. "Escaping" it
+/// therefore means REWRITING the role contract on its way to the agent — and a
+/// contract that reaches the model altered is worse than one that is encoded,
+/// because the alteration is invisible from both ends. The basic form encodes
+/// losslessly, and the encoding is total: every `"` becomes `\"`, so a run of
+/// three cannot appear in the body; every `\` becomes `\\`, so a trailing
+/// backslash cannot become a line continuation; and every other control
+/// character becomes `\uXXXX`, which the literal form forbids outright.
+///
+/// `Keep` leaves real newlines in place, for a `"""` body: that is what makes a
+/// multi-KB contract readable when a human opens the file to debug a pane, and
+/// it is safe precisely because the two characters that could close the
+/// delimiter early are already escaped.
+fn toml_basic_escape(s: &str, newlines: TomlNewlines) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' if newlines == TomlNewlines::Keep => out.push('\n'),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Every other C0 control, plus DEL. TOML permits none of them raw
+            // in a basic string, and a role contract folded together from repo
+            // prose is not guaranteed free of them.
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The profile name for one agent — `<brand>-<agent id>`, and the ONE place
+/// that shape is derived. Four sites need it: the writer, `solo_prepare` (which
+/// spells it on argv), the per-agent removal, and the orphan sweep.
+///
+/// **Refuses rather than sanitizes**, and the alphabet is the vendor's, not
+/// loomux's. `ProfileV2Name`'s own `FromStr` accepts a non-empty run of ASCII
+/// alphanumerics, `_` and `-`, and nothing else. [`PathSegment`] is wider (it
+/// also admits `.`, `~`, `:`, `@`, `+`), so an agent id that is a perfectly
+/// good path segment can still be a name codex would reject — and a file
+/// written under a name `-p` cannot select is a pane that boots with no MCP, no
+/// trust and no contract, silently. Refusing here fails the spawn instead, next
+/// to the write that would have been useless.
+///
+/// Every id loomux mints today (`w-3`, `rev-4`, `orch-1`, `solo-2` — a
+/// `Block::prefix()` and a sequence number) is inside both alphabets; the check
+/// is for the hand-edited `group.json` the parse-at-the-boundary rule exists
+/// for, and it is why this returns a `Result` rather than a `String`.
+#[doc(hidden)] // pub for integration tests
+pub fn codex_profile_name(agent: &PathSegment) -> Result<String, String> {
+    let name = format!("{}-{agent}", brand::NAME);
+    if name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')) {
+        return Ok(name);
+    }
+    Err(format!(
+        "agent id {agent:?} cannot become a codex profile name: codex accepts only ASCII \
+         alphanumerics, '_' and '-' in a --profile value, and {name:?} carries something else"
+    ))
+}
+
+/// Recover a profile NAME from the profile FILE path — the inverse of
+/// [`codex_profile_name`] plus [`CODEX_PROFILE_FILE_EXT`], and the one thing
+/// the launch-line builders need that they are not handed.
+///
+/// They receive `cfg`, the generated file, exactly as every other adapter does;
+/// `-p` wants the name that file is stored under. Deriving it from the path
+/// rather than threading the agent id into two fourteen-argument builders keeps
+/// the naming in ONE place — both directions go through the same constant — and
+/// `a_codex_profile_path_round_trips_to_the_name_the_launch_line_spells` pins
+/// the round trip so the pair cannot drift the way #502's write and delete
+/// paths did.
+///
+/// `Path::file_stem` is deliberately not used: the extension has two dots, so a
+/// stem would answer `orrerix-w-3.config` — a name `-p` would look for under a
+/// file that is not there.
+///
+/// `None` for a path that is not one of loomux's profile files. The builders
+/// then emit no `-p` at all, which is the honest degrade: a pane with the
+/// human's own base config and no orrerix layer, rather than one pointed at a
+/// profile that does not exist (codex errors on an unresolvable `--profile`).
+fn codex_profile_name_of_path(cfg: &Path) -> Option<&str> {
+    cfg.file_name()?.to_str()?.strip_suffix(CODEX_PROFILE_FILE_EXT)
+}
+
+/// The generated profile document for one codex pane — the whole of what loomux
+/// configures on codex.
+///
+/// Pure and `pub` so the document is assertable without a spawn, for the reason
+/// `gemini_settings_json`'s doc gives: this file IS a codex agent's trust, its
+/// posture, its identity and its contract, so "does it say what we think it
+/// says" must be answerable directly.
+///
+/// **Key order is load-bearing, not cosmetic.** In TOML every key after a table
+/// header belongs to that table, so the top-level scalars — `approval_policy`,
+/// `sandbox_mode`, `model_reasoning_effort`, `developer_instructions` — must
+/// all be emitted BEFORE the first `[…]` line, or they silently become keys of
+/// whichever table happens to precede them. That would not fail loudly: at best
+/// codex's strict-config check reports an unknown key, and at worst the pane
+/// boots with none of its posture and no obvious cause.
+/// `a_codex_profiles_top_level_keys_all_precede_the_first_table_header` pins it.
+///
+/// Every key, and why:
+///
+/// - `approval_policy` — `never` for an unattended pane (`AskForApproval::Never`,
+///   "Never ask the user to approve commands"), `on-request` otherwise. Unlike
+///   pi, whose posture toggle is a measured no-op, this one is real on codex,
+///   and the attention scan catches the overlay an `on-request` pane raises.
+/// - `sandbox_mode = "workspace-write"` — the only rung a working agent can
+///   use. `read-only` blocks running commands and the network as well as edits
+///   (see `CliCaps`' codex row), and the bypass rung is never emitted by loomux
+///   at all.
+/// - `[sandbox_workspace_write] network_access = true` — off by default under
+///   `workspace-write`, and a worker that cannot reach GitHub is not a worker.
+/// - `[projects."<cwd>"] trust_level = "trusted"` — the single most important
+///   line here. `should_show_trust_screen(config)` is
+///   `config.active_project.trust_level.is_none()`, rendering "Do you trust the
+///   contents of this directory?", and a fresh worktree is always a new project
+///   root (its `.git` is a FILE, so `find_project_root` stops there rather than
+///   walking on to the main clone). Without this line every pane would boot into
+///   that dialog and eat its kickoff. The profile layer reaches the decision
+///   because the loader folds EVERY layer into `merged_so_far` before computing
+///   the project trust context.
+/// - `[mcp_servers.<server>]` — loomux's own server over streamable HTTP,
+///   carrying the same agent-token header every other CLI's config does. One
+///   server contract, six spellings.
+/// - `developer_instructions` — the block's role contract, and a durable
+///   carrier rather than a first-turn paste. codex reads it from CONFIG into
+///   each `TurnContext` and re-inserts it through
+///   `build_initial_context_with_world_state` on the COMPACTION path
+///   (`start_new_context_window` → `replace_compacted_history`), so a compacted
+///   codex pane gets its contract back from this file without loomux doing
+///   anything. That is what makes `ContractCarrier::SystemLayerFull` honest
+///   here even though the key is documented as "inserted as a `developer` role
+///   message" rather than as a system prompt.
+///
+/// **Residual, stated because a reader will look for it:** the key is the
+/// pane's `cwd`, and codex looks the trust up under the PROJECT ROOT
+/// (`find_project_root` walks ancestors for a marker). Every pane loomux
+/// launches is AT a root — a worker's worktree, or the group's repo — so the
+/// two coincide today. A pane launched in a subdirectory of a repo would find
+/// no entry and see the dialog. Writing the ancestor chain instead would mean
+/// re-implementing the vendor's root discovery here; writing the repo root
+/// would trust more of the human's tree than this pane asked for.
+///
+/// **Not written, deliberately:** `model` (the human's own `config.toml` key is
+/// the inherit row — see `default_model`), `[windows] sandbox` (elevated setup
+/// is the human's, and getting it wrong costs them a private desktop their
+/// credentials are not on), and `tui.alternate_screen` (a real key, settable
+/// here — a profile-v2 file is strict-validated as a whole `ConfigToml` — and a
+/// live judgement call about scrollback that #2515 §7.6 leaves to the human).
+#[doc(hidden)] // pub for integration tests
+pub fn codex_profile_toml(
+    port: u16,
+    auth: CodexMcpAuth<'_>,
+    cwd: &Path,
+    unattended: bool,
+    effort: &str,
+    developer_instructions: Option<&str>,
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "# Generated by {} — do not edit; this file is rewritten on every spawn and\n\
+         # removed with the agent that owns it. See doc/design/codex.md.\n\n",
+        brand::NAME
+    ));
+
+    // ── top-level scalars, all of them, before any table header ──
+    s.push_str(&format!(
+        "approval_policy = \"{}\"\n",
+        if unattended { "never" } else { "on-request" }
+    ));
+    s.push_str("sandbox_mode = \"workspace-write\"\n");
+    // Omitted entirely when empty, for the reason the model flag is omitted:
+    // a blank value is an argument, not a silence — and `ReasoningEffort`
+    // refuses the empty string outright ("reasoning_effort must not be empty"),
+    // so an empty key would fail the whole config rather than be ignored.
+    if !effort.is_empty() {
+        s.push_str(&format!("model_reasoning_effort = \"{effort}\"\n"));
+    }
+    if let Some(contract) = developer_instructions {
+        // A multi-line basic string. TOML trims the newline immediately after
+        // the opening delimiter, so the body starts exactly at `contract`'s
+        // first character and nothing is added to what the agent reads.
+        s.push_str(&format!(
+            "developer_instructions = \"\"\"\n{}\"\"\"\n",
+            toml_basic_escape(contract, TomlNewlines::Keep)
+        ));
+    }
+    s.push('\n');
+
+    // ── tables ──
+    s.push_str("[sandbox_workspace_write]\nnetwork_access = true\n\n");
+    s.push_str(&format!(
+        "[projects.\"{}\"]\ntrust_level = \"trusted\"\n\n",
+        toml_basic_escape(&cwd.display().to_string(), TomlNewlines::Escape)
+    ));
+    s.push_str(&format!("[mcp_servers.{MCP_SERVER}]\n"));
+    s.push_str(&format!("url = \"http://127.0.0.1:{port}/mcp\"\n"));
+    s.push_str(&format!("startup_timeout_sec = {CODEX_MCP_STARTUP_TIMEOUT_SECS:?}\n"));
+    s.push_str(&format!("tool_timeout_sec = {CODEX_MCP_TOOL_TIMEOUT_SECS:?}\n"));
+    // `auto` is codex's own default, spelled out rather than inherited: a
+    // human's `config.toml` may set a different `default_tools_approval_mode`
+    // globally, and an agent whose `report` needs approving has nobody to
+    // approve it. The profile layer wins over the user layer, so stating it
+    // here is what makes the pane's tool surface independent of their setting.
+    s.push_str("default_tools_approval_mode = \"auto\"\n");
+    let header = brand::AGENT_TOKEN_HEADER;
+    match auth {
+        CodexMcpAuth::EnvVar(var) => {
+            s.push_str(&format!("env_http_headers = {{ \"{header}\" = \"{var}\" }}\n"));
+        }
+        CodexMcpAuth::Literal(token) => s.push_str(&format!(
+            "http_headers = {{ \"{header}\" = \"{}\" }}\n",
+            toml_basic_escape(token, TomlNewlines::Escape)
+        )),
+    }
+    s
+}
+
+/// What the human's OWN codex config declares that loomux's profile layer does
+/// NOT displace — measured, reported once per spawn, and never refused.
+///
+/// **Why this exists.** codex has no exclusive-MCP switch the TUI can reach:
+/// `--ignore-user-config` is a `codex exec` flag, and `--profile` names a LAYER
+/// over `~/.codex/config.toml` rather than a replacement for it. Layering
+/// merges maps, so every `[mcp_servers.*]` the human declared is part of this
+/// pane's tool surface — user-authored input, in a threat model where the agent
+/// is autonomous. pi's residual, one vendor over, measured the same way
+/// (`pi_repo_mcp_exposure`).
+///
+/// **Measure and warn, never refuse** (constraint 8): a human declaring their
+/// own MCP servers is legitimate and common, and loomux is not in a position to
+/// adjudicate it. What loomux CAN do is put what it saw in the audit trail, so
+/// a human debugging a pane whose `report` went somewhere strange has a row
+/// rather than a mystery.
+///
+/// **What it can and cannot see, stated because the gap matters.** A NAME
+/// collision is the sharp case and is fully visible — but its DIRECTION is the
+/// opposite of pi's, which is why it gets a field of its own: loomux's profile
+/// is the LATER layer, so a user entry sharing loomux's server name is
+/// displaced rather than displacing. The dangerous case here is the quiet one
+/// (the human loses their server on this pane), not loomux losing its own.
+/// What is invisible is everything about the servers themselves: this is a line
+/// scan for `[mcp_servers.<name>]` headers, not a TOML parse, so it cannot see
+/// an inline `mcp_servers = { … }` table, a server's tool list, or whether an
+/// entry is `enabled = false`. An empty result is therefore "nothing statically
+/// visible in the shape loomux looks for", never "nothing there" — the same
+/// absence-is-not-proof line `pi_repo_mcp_exposure` is written on, and it is
+/// pinned by a test rather than only disclosed here.
+///
+/// `None` when the file is absent or declares nothing — the common case, and
+/// the one that must cost no audit row at all.
+#[doc(hidden)] // pub for integration tests
+pub fn codex_user_mcp_exposure(codex_home: &Path, our_server: &str) -> Option<Value> {
+    let path = codex_home.join("config.toml");
+    let body = fs::read_to_string(&path).ok()?;
+    let mut names: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        // `[mcp_servers.<name>]` only. A dotted name (`[mcp_servers.a.b]`) is
+        // taken whole: this reports what it SAW, and narrowing to the first
+        // segment would report a server that is not what is written.
+        let Some(rest) = line.strip_prefix("[mcp_servers.") else { continue };
+        let Some(name) = rest.strip_suffix(']') else { continue };
+        let name = name.trim().trim_matches('"');
+        if !name.is_empty() {
+            names.push(name.to_string());
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    names.sort();
+    names.dedup();
+    let displaced = names.iter().any(|n| n == our_server);
+    Some(json!({
+        "file": path.to_string_lossy(),
+        "servers": names,
+        // Its own field because the direction is the surprising half: loomux's
+        // layer is LATER, so a same-named user entry is the one that loses.
+        "this_pane_displaces_a_user_server_of_the_same_name": displaced,
+        "why": "codex's --profile file is a LAYER over ~/.codex/config.toml, not a replacement \
+                for it, and the TUI has no exclusive-config switch — so these user-declared \
+                servers are part of this pane's tool surface. Reported, not refused. This is a \
+                line scan for [mcp_servers.<name>] headers, so an inline mcp_servers table is \
+                invisible to it and an empty result is not proof of absence.",
+    }))
+}
+
 /// The generic Claude PreCompact / SessionStart(compact) hook body (#417),
 /// written once per machine (`OrchRegistry::ensure_compact_hook_script`) and
 /// invoked per agent with `event`, the group's state dir, and the agent's id
@@ -7310,16 +7776,25 @@ pub fn claude_effective_permission_mode(unattended: bool, read_only: bool) -> &'
 /// path can't drift.
 ///
 /// Returns an empty string for CLIs with no known unattended flag surface
-/// (codex/custom): the toggle is a no-op there rather than inventing flags
-/// that may not exist.
+/// (custom, and anything not in the table): the toggle is a no-op there rather
+/// than inventing flags that may not exist.
+///
+/// **Empty does not always mean "no posture"** (#2515 C1). Two rows return an
+/// empty string for two different reasons, and the arms say which: pi has no
+/// permission prompts to bypass at all, while codex has a real approval policy
+/// that loomux sets in the profile file rather than on the line. A reader who
+/// takes an empty return as "loomux does nothing about this CLI's posture"
+/// would be right about pi and wrong about codex.
 ///
 /// Ante (#292) is launcher-only here, same Tier-A shape as Hermes (#284):
 /// this function and the `AGENTS` catalog entry (`src/agents.ts`) are the only
 /// changes. `SUPPORTED_CLIS`, `build_agent_command`, and `write_mcp_config`
 /// deliberately do NOT gain an ante arm — Ante's MCP servers are configured
 /// exclusively via `~/.ante/settings.json` (no `--mcp-config`-equivalent CLI
-/// flag exists per docs). Ante stays a delivery-only channel member, like
-/// codex. (PR #323 recorded that as "adding ante to `SUPPORTED_CLIS`
+/// flag exists per docs). Ante stays a delivery-only channel member. (It used
+/// to say "like codex"; #2515 C1 gave codex a spawn adapter and a real seam,
+/// so Ante is now alone in that class and the comparison would send a reader
+/// to a row that says the opposite.) (PR #323 recorded that as "adding ante to `SUPPORTED_CLIS`
 /// would hit `solo_prepare`'s `unreachable!` arm"; #267 removed that trap by
 /// deriving the solo seam from [`CliCaps::mcp_argv_seam`] instead of
 /// `SUPPORTED_CLIS` — but the rest of the argument, that loomux has no ante
@@ -7383,6 +7858,22 @@ pub fn single_pane_autopilot_flags(program: &str) -> String {
         // `String::new()`s could not make. Falling through to the `_` arm
         // would produce the same string and evidence nothing.
         "pi" => PI_UNATTENDED_FLAGS.to_string(),
+        // codex (#2515 C1): EMPTY, and unlike pi's empty this one is a
+        // statement about WHERE the posture lives rather than about whether it
+        // exists. codex's approval policy is real and loomux does set it — as
+        // `approval_policy` in the generated profile — but a solo pane's
+        // profile is written by `solo_prepare`, which has already decided the
+        // posture by the time this function is asked, and there is no codex
+        // FLAG that means the same thing. `-a/--ask-for-approval` exists on the
+        // TUI, and emitting it here would give a solo pane a posture its own
+        // profile disagrees with; the bypass flag is never emitted by loomux at
+        // all.
+        //
+        // Wired explicitly rather than falling through to `_`, for the #101
+        // invariant and for the reason pi's arm gives: "they agree there is
+        // nothing to put on the LINE" is a claim, and two independent
+        // `String::new()`s could not make it.
+        "codex" => String::new(),
         _ => String::new(),
     }
 }
@@ -13057,6 +13548,35 @@ pub struct PersonaInject {
     /// `pi-contract-file-unwritable`, carrier `KickoffOnly`) rather than with
     /// a flag pointing at a file that is not there.
     pub pi_append_system_prompt_file: Option<PathBuf>,
+    /// codex `developer_instructions` (#2515 C1) — the block's full contract,
+    /// **by VALUE**, and the fifth of the five persona shapes.
+    ///
+    /// It is the only one that is not a path, and that is forced rather than
+    /// chosen: codex has no `--append-system-prompt`, no `--agent`, and no
+    /// `developer_instructions_file`. `model_instructions_file` exists and is
+    /// the wrong knob — it REPLACES codex's built-in prompt rather than adding
+    /// to it, which would take the agent's own tool discipline away in order
+    /// to give it a role. So the contract travels as a key in the profile file
+    /// `write_codex_profile` writes, and the escaping that makes an arbitrary
+    /// contract safe in TOML is `toml_basic_escape`'s job.
+    ///
+    /// Carrying KB of text in a struct field rather than a path costs nothing
+    /// here: it never reaches argv (Windows `CreateProcessW`'s 32,767-character
+    /// limit, #417, is what makes the other four paths), only a file loomux
+    /// writes in the same call.
+    ///
+    /// `ContractCarrier::SystemLayerFull`, and that is measured rather than
+    /// assumed. The key is documented as "inserted as a `developer` role
+    /// message", which sounds like conversation history a compaction would
+    /// eat — but codex reads it from CONFIG into every `TurnContext` and
+    /// re-inserts it through `build_initial_context_with_world_state` on the
+    /// compaction path itself (`start_new_context_window` →
+    /// `replace_compacted_history`). So a compacted codex pane recovers its
+    /// contract from this file with loomux doing nothing, which is exactly what
+    /// the `SystemLayerFull` tier claims.
+    ///
+    /// `None` when there is no contract to deliver.
+    pub codex_developer_instructions: Option<String>,
     /// Extra pre-approved tool patterns from the persona's `allow:`. Widens
     /// only *within* the capability class: deny rules beat allow rules on both
     /// CLIs, so this can never re-grant what the block's `kind` denies.
@@ -14739,6 +15259,17 @@ pub struct OrchRegistry {
     /// (`~/.copilot/agents`) — the generated per-block contract file (#416)
     /// writes here. `None` in production. Mirrors `claude_projects_dir`.
     copilot_agents_dir_override: TrackedMutex<Option<PathBuf>>,
+    /// Test-only override of codex's own home (`$CODEX_HOME`, else
+    /// `~/.codex`) — the generated per-agent profile file (#2515 C1) writes
+    /// here. `None` in production. Mirrors `copilot_agents_dir_override`.
+    ///
+    /// A whole HOME rather than a subdirectory, unlike its two neighbours,
+    /// because that is the shape codex's own knob has: the profile file sits
+    /// directly under `CODEX_HOME` beside `config.toml`, which is also the
+    /// file `codex_user_mcp_exposure` reads. One override moves both, so a
+    /// test cannot end up writing a fixture profile into a temp dir while
+    /// measuring the developer's real config for exposure.
+    codex_home_override: TrackedMutex<Option<PathBuf>>,
     /// Test-only override of the #417 compact-hook script directory
     /// (`compact_hook_dir`, normally a sibling of `shim_dir()` under the real
     /// per-machine loomux data dir). Without this, `compact_hook_dir`
@@ -15606,6 +16137,11 @@ pub fn session_cwd_in_store(
 struct StoreIndex {
     claude: Option<HashSet<String>>,
     copilot: Option<HashSet<String>>,
+    /// #2515 C1. A third field rather than a merged set, for the reason the
+    /// first two are separate: a root holding only claude groups must not pay
+    /// for a walk of the human's whole codex history, which is three directory
+    /// levels deep and the most expensive of the three enumerations.
+    codex: Option<HashSet<String>>,
 }
 
 impl StoreIndex {
@@ -15632,18 +16168,38 @@ impl StoreIndex {
         // set lookup, so the two agree by construction and not by the accident
         // that no real file is named `../x`.
         let Ok(seg) = PathSegment::parse(session_id) else { return false };
-        let set = if cli == "copilot" {
-            self.copilot.get_or_insert_with(|| {
+        // A `match` with explicit arms, not an `if`/`else` (#2515 C1). The
+        // `else` used to read CLAUDE's projects directory for every CLI that
+        // was not copilot, which was right only while claude was the only
+        // OTHER non-group-local store — and it stopped being right the moment
+        // codex arrived with a store of its own. A codex id looked up in
+        // claude's projects root is a MISS, and a miss here renders as
+        // `resumable: false`: the Resume affordance silently is not offered,
+        // and nothing says why. That is the mistype shape #2515's per-CLI
+        // sweep classifies this site under, and the fix is to stop having a
+        // default that names a store.
+        //
+        // The `_` arm is still claude, deliberately: `find_session_cwd` routes
+        // an unknown CLI to claude's store too (its own default arm), and this
+        // function's doc promises the same answer that function gives. What
+        // changed is that claude is now the answer for the CLIs that have no
+        // store of their own, rather than for everything that is not copilot.
+        let set = match cli {
+            "copilot" => self.copilot.get_or_insert_with(|| {
                 crate::sessions::copilot_session_state_root()
                     .map(|root| crate::sessions::copilot_session_ids(&root))
                     .unwrap_or_default()
-            })
-        } else {
-            self.claude.get_or_insert_with(|| {
+            }),
+            "codex" => self.codex.get_or_insert_with(|| {
+                crate::sessions::codex_sessions_root()
+                    .map(|root| crate::sessions::codex_session_ids(&root))
+                    .unwrap_or_default()
+            }),
+            _ => self.claude.get_or_insert_with(|| {
                 crate::sessions::claude_projects_root()
                     .map(|root| crate::sessions::claude_session_ids(&root))
                     .unwrap_or_default()
-            })
+            }),
         };
         set.contains(seg.as_str())
     }
@@ -28164,6 +28720,7 @@ impl OrchRegistry {
             claude_projects_dir: TrackedMutex::new("claude_projects_dir", None),
             claude_agents_dir_override: TrackedMutex::new("claude_agents_dir_override", None),
             copilot_agents_dir_override: TrackedMutex::new("copilot_agents_dir_override", None),
+            codex_home_override: TrackedMutex::new("codex_home_override", None),
             compact_hook_dir_override: TrackedMutex::new("compact_hook_dir_override", None),
             copilot_hooks_dir_override: TrackedMutex::new("copilot_hooks_dir_override", None),
             low_disk_notified: TrackedMutex::new("low_disk_notified", false),
@@ -28377,6 +28934,13 @@ impl OrchRegistry {
         *self.copilot_agents_dir_override.lock_safe() = Some(dir);
     }
 
+    /// Point codex's home at a specific directory, instead of `$CODEX_HOME` /
+    /// `~/.codex`. Test-only seam (see `codex_home_override`).
+    #[doc(hidden)]
+    pub fn set_codex_home_override(&self, dir: PathBuf) {
+        *self.codex_home_override.lock_safe() = Some(dir);
+    }
+
     /// Take (and clear) the notices a spawn produced for `agent_id` (#802).
     ///
     /// Empty for the overwhelming majority of spawns. Read once, by the
@@ -28493,6 +29057,113 @@ impl OrchRegistry {
             }
         }
         dirs::home_dir().map(|h| h.join(".copilot"))
+    }
+
+    /// codex's user-level home (`$CODEX_HOME`, else `~/.codex`) — or, for a
+    /// registry that is not the user's live one, a contained stand-in inside
+    /// its own root (#2515 C1).
+    ///
+    /// Same three rules as [`Self::copilot_home_dir`], and here for the same
+    /// #502 reason: this is the third directory in the user's home loomux
+    /// WRITES into, and a throwaway registry that reached the real one would
+    /// leave profile files in a human's `~/.codex` that nothing ever sweeps.
+    /// The test override is checked first so a test never depends on the
+    /// developer's own environment; `CODEX_HOME` is checked only for the live
+    /// registry, because that variable names the user's REAL codex home, which
+    /// is precisely what a throwaway registry must not touch.
+    ///
+    /// **`is_empty()`, not `trim()`, and that is a deliberate disagreement with
+    /// the neighbour above.** codex's own `find_codex_home` filters on
+    /// `!val.is_empty()`, so a `CODEX_HOME` of one space is a real (and
+    /// hopeless) path to codex itself. Reading it as unset here would put the
+    /// profile in `~/.codex` while the pane's codex looked in `" "` — the two
+    /// would disagree about which store this pane is configured from, which is
+    /// worse than agreeing on a path that does not exist. `sessions.rs`'s
+    /// `codex_sessions_root_from` mirrors the vendor for the same reason.
+    fn codex_home_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = self.codex_home_override.lock_safe().clone() {
+            return Some(dir);
+        }
+        if !self.is_live_registry() {
+            return Some(self.root.join("codex-home"));
+        }
+        if let Ok(home) = std::env::var("CODEX_HOME") {
+            if !home.is_empty() {
+                return Some(PathBuf::from(home));
+            }
+        }
+        dirs::home_dir().map(|h| h.join(".codex"))
+    }
+
+    /// Write one codex pane's profile file and return its path plus the pane
+    /// environment that pane needs — `write_mcp_config`'s codex branch, split
+    /// out because it is the only branch whose file lands OUTSIDE loomux's own
+    /// state root.
+    ///
+    /// That is the one genuinely new cross-layer fact in #2515 and it is why
+    /// three things travel with it: the name is loomux-branded so a sweep can
+    /// recognise it, the file is removed with the agent that owns it
+    /// ([`Self::remove_codex_profile`]), and anything the removal misses is
+    /// reclaimed at startup ([`Self::sweep_orphaned_agent_files`]). A file in a
+    /// vendor's user directory that nothing cleans up is #502 by another route.
+    ///
+    /// `Err` rather than best-effort, and for the same reason
+    /// `write_gemini_policy` is: this file is not a convenience the pane can do
+    /// without. Without it the pane has no MCP server (no report channel), no
+    /// recorded trust (it boots into the trust dialog and eats its kickoff),
+    /// and no contract. A codex pane that cannot have its profile is not a
+    /// degraded agent, it is a pane sitting on a dialog.
+    fn write_codex_profile(
+        &self,
+        group: &GroupId,
+        agent: &PathSegment,
+        auth: CodexMcpAuth<'_>,
+        workdir: &Path,
+        unattended: bool,
+        effort: &str,
+        developer_instructions: Option<&str>,
+    ) -> Result<(PathBuf, String), String> {
+        let home = self
+            .codex_home_dir()
+            .ok_or_else(|| "cannot resolve codex's home directory (no CODEX_HOME and no user home)".to_string())?;
+        let name = codex_profile_name(agent)?;
+        // codex itself requires `CODEX_HOME` to EXIST — it errors out with
+        // "CODEX_HOME points to {val:?}, but that path is not a directory" —
+        // so creating it is not loomux overstepping: a pane whose home is
+        // missing does not boot at all.
+        fs::create_dir_all(&home).map_err(|e| format!("{}: {e}", home.display()))?;
+        let path = home.join(format!("{name}{CODEX_PROFILE_FILE_EXT}"));
+        let port = self.port();
+        let body =
+            codex_profile_toml(port, auth, workdir, unattended, effort, developer_instructions);
+        fs::write(&path, body).map_err(|e| format!("{}: {e}", path.display()))?;
+        // Measure-and-warn, once per spawn, and NEVER a refusal — see
+        // `codex_user_mcp_exposure`. `None` for the human who declares no MCP
+        // servers of their own, which is the ordinary case and writes no row.
+        if let Some(exposure) = codex_user_mcp_exposure(&home, MCP_SERVER) {
+            let mut row = exposure;
+            row["agent"] = json!(agent.as_str());
+            self.audit(group, brand::AUDIT_ACTOR, "codex-user-mcp-merged", row);
+        }
+        Ok((path, name))
+    }
+
+    /// Remove one agent's codex profile file. Best-effort and idempotent: the
+    /// agent may have been on another CLI, the file may already be gone, or
+    /// `CODEX_HOME` may have moved since it was written — none of which is
+    /// worth failing a kill or a group teardown over, and all of which the
+    /// startup sweep catches later.
+    fn remove_codex_profile(&self, agent_id: &str) {
+        let Ok(seg) = PathSegment::parse(agent_id) else { return };
+        let Ok(name) = codex_profile_name(&seg) else { return };
+        let Some(home) = self.codex_home_dir() else { return };
+        let path = home.join(format!("{name}{CODEX_PROFILE_FILE_EXT}"));
+        if fs::remove_file(&path).is_ok() {
+            crate::obs::breadcrumb(
+                "codex-profile",
+                &format!("removed {} with its agent", path.display()),
+            );
+        }
     }
 
     /// Pre-trust an agent's workspace in copilot's config so its pane doesn't
@@ -28667,7 +29338,96 @@ impl OrchRegistry {
                 }
             }
         }
+        // #2515 C1: codex's profile files, which are keyed on the AGENT rather
+        // than on the group and live in a directory the two loops above never
+        // look at. Same #464 B1 rule, applied to a different roster: if the
+        // set of live agents cannot be established, delete NOTHING — reading
+        // "I could not find out" as "nothing is live" is exactly backwards and
+        // would strip a running pane of its trust, its MCP server and its
+        // contract on the next respawn.
+        let (live_agents, roster_complete) = self.live_agent_ids();
+        if roster_complete {
+            if let Some(home) = self.codex_home_dir() {
+                if let Ok(entries) = fs::read_dir(&home) {
+                    let prefix = format!("{}-", brand::NAME);
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if !path.is_file() {
+                            continue;
+                        }
+                        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+                        // Both halves are required, and the SUFFIX half is what
+                        // keeps a human's own `orrerix-notes.md` out of
+                        // consideration: `write_codex_profile` only ever writes
+                        // `<brand>-<agent>.config.toml`, so anything else in
+                        // this directory is not loomux's to delete.
+                        let Some(stem) = name.strip_suffix(CODEX_PROFILE_FILE_EXT) else { continue };
+                        let Some(agent) = stem.strip_prefix(&prefix) else { continue };
+                        if live_agents.contains(agent) {
+                            continue;
+                        }
+                        match fs::remove_file(&path) {
+                            Ok(()) => {
+                                crate::obs::breadcrumb(
+                                    "fixture-sweep",
+                                    &format!("reclaimed orphaned codex profile {}", path.display()),
+                                );
+                                reclaimed.push(path.to_string_lossy().into_owned());
+                            }
+                            Err(e) => errors.push(
+                                json!({ "path": path.to_string_lossy(), "error": e.to_string() }),
+                            ),
+                        }
+                    }
+                }
+            }
+        } else {
+            let msg = "codex profile sweep skipped: at least one group's roster could not be \
+                       read, so which agents are live is unknown — refusing to guess";
+            crate::obs::breadcrumb("fixture-sweep", msg);
+            errors.push(json!({ "path": "agents.json", "error": msg }));
+        }
         json!({ "reclaimed": reclaimed, "errors": errors })
+    }
+
+    /// Every agent id any group's durable roster records, and whether that
+    /// answer is COMPLETE (#2515 C1).
+    ///
+    /// The second half is the whole point, and it is #464 B1's rule one level
+    /// down. `sweep_orphaned_agent_files` already refuses to sweep when it
+    /// cannot enumerate GROUPS; a group whose `agents.json` is individually
+    /// unreadable is the same ignorance in a smaller scope, and treating it as
+    /// "that group has no agents" would make every one of its panes' profiles
+    /// look orphaned. So a single unreadable roster turns the whole answer
+    /// incomplete and the caller deletes nothing.
+    ///
+    /// A group directory with no `agents.json` at ALL is not that case: it is a
+    /// group that has never spawned an agent, which is a real and common state
+    /// (a freshly created group), and it genuinely contributes no ids.
+    /// `NotFound` is therefore complete and everything else is not — the same
+    /// distinction `capture_session_baseline` draws between a missing store and
+    /// an unreadable one.
+    fn live_agent_ids(&self) -> (HashSet<String>, bool) {
+        let mut ids = HashSet::new();
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return (ids, false);
+        };
+        let mut complete = true;
+        for e in entries.flatten().filter(|e| e.path().is_dir()) {
+            let path = e.path().join("agents.json");
+            match fs::read_to_string(&path) {
+                Ok(text) => match serde_json::from_str::<Vec<AgentRecord>>(&text) {
+                    Ok(list) => ids.extend(list.into_iter().map(|r| r.id)),
+                    // A roster that is present and unparseable is the
+                    // dangerous one: its agents exist and this cannot see
+                    // them.
+                    Err(_) => complete = false,
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => complete = false,
+            }
+        }
+        (ids, complete)
     }
 
     /// Record the `Arc` the registry is stored behind so `&self` methods can
@@ -31931,6 +32691,27 @@ impl OrchRegistry {
                 let ids = crate::sessions::copilot_session_ids(&root);
                 SessionBaseline::Copilot { ids, root }
             }),
+            // codex (#2515 C1): copilot's shape — a store that is the HUMAN's,
+            // not this group's, so an absent root is "codex has never run
+            // here" and is a real (empty) baseline, while an unresolvable one
+            // is a degrade that refuses to watch. `codex_sessions_root()`
+            // answers `None` only for the second: it resolves a path without
+            // touching the disk, so `None` means there is no home to resolve
+            // AT ALL, which is not the same fact as an empty store.
+            "codex" => match crate::sessions::codex_sessions_root() {
+                Some(root) => {
+                    let ids = crate::sessions::codex_session_ids(&root);
+                    Some(SessionBaseline::Codex { ids, root })
+                }
+                None => {
+                    self.audit(group, brand::AUDIT_ACTOR, "session-untracked", json!({
+                        "cli": "codex",
+                        "reason": "could not resolve codex's session store before spawning, so a \
+                                   new session cannot be told from an existing one",
+                    }));
+                    None
+                }
+            },
             "opencode" => match crate::opencodedb::session_ids(&self.opencode_db_path(group)) {
                 Ok(ids) => Some(SessionBaseline::OpenCode { ids }),
                 Err(crate::opencodedb::Unavailable::Absent) => {
@@ -32028,6 +32809,22 @@ impl OrchRegistry {
                 match crate::sessions::newest_new_copilot_session(root, ids, cwd) {
                     Some(sid) => SessionSearch::Found(sid),
                     None => SessionSearch::Waiting,
+                }
+            }
+            SessionBaseline::Codex { ids, root } => {
+                // Same claim exclusion as opencode's below, and for a reason
+                // that is stronger here rather than weaker: codex's store is
+                // the HUMAN's, shared by every group AND by their own
+                // terminal sessions, so "a new rollout under this directory"
+                // separates far less than it does in a group-local store.
+                // Directory plus baseline plus claims is the whole of what
+                // distinguishes two panes in one worktree, and when that is
+                // not enough the answer is `Contested`, never a guess.
+                let claimed = self.claimed_sessions(group_id, agent_id);
+                match crate::sessions::newest_new_codex_session(root, ids, cwd, &claimed) {
+                    crate::sessions::CodexIdentified::One(sid) => SessionSearch::Found(sid),
+                    crate::sessions::CodexIdentified::None => SessionSearch::Waiting,
+                    crate::sessions::CodexIdentified::Contested(n) => SessionSearch::Contested(n),
                 }
             }
             SessionBaseline::OpenCode { ids } => {
@@ -36355,7 +37152,44 @@ impl OrchRegistry {
         // spawns itself. Asking the old question here would have run gemini
         // into the `unreachable!` below. See `CliCaps::mcp_argv_seam`.
         let has_seam = cli_caps(cli).is_some_and(|c| c.mcp_argv_seam);
-        let (token, mcp_args) = if has_seam {
+        let (token, mcp_args) = if cli == "codex" {
+            // codex (#2515 C1) is the one seam CLI whose SOLO profile is not
+            // the same document as its group profile, so it is written here
+            // rather than through `write_mcp_config` below.
+            //
+            // The difference is one field and it is forced: a solo launch only
+            // ever appends a flag string to a command line the human owns — it
+            // sets no pane environment at all (the pi arm below says so) — so
+            // a profile naming `env_http_headers` would name a variable
+            // nothing sets. The pane would connect with no auth header and
+            // still be advertised `delivery_only: false`, which is exactly the
+            // disagreement the `other =>` arm below exists to prevent. So a
+            // solo profile carries the token itself; see `CodexMcpAuth`.
+            //
+            // Everything else is a group pane's document with its group-only
+            // parts absent: `Role::Solo` is `Containment::None` and has no
+            // block, so there is no persona to compile and no effort knob to
+            // deliver, and the posture is `attended` because a solo pane HAS a
+            // human in it — the same reading `write_mcp_config`'s
+            // `unattended: false` gives on every other CLI here.
+            let token = new_token();
+            let seg = PathSegment::parse(&agent_id)
+                .map_err(|e| format!("invalid agent id {agent_id:?}: {e}"))?;
+            let (_path, profile) = self.write_codex_profile(
+                solo_group_id(),
+                &seg,
+                CodexMcpAuth::Literal(&token),
+                Path::new(cwd),
+                /*unattended*/ false,
+                /*effort*/ "",
+                /*developer_instructions*/ None,
+            )?;
+            // The NAME, not the path: `-p` takes a profile name and resolves
+            // it against `CODEX_HOME` itself. Unquoted, and safe unquoted,
+            // because `codex_profile_name` refuses anything outside codex's
+            // own `[A-Za-z0-9_-]` alphabet rather than sanitizing it.
+            (token, format!("-p {profile}"))
+        } else if has_seam {
             let token = new_token();
             // A solo pane is `Role::Solo` — `Containment::None`, nothing to
             // deny, no block, and therefore no persona to compile. No
@@ -36373,6 +37207,10 @@ impl OrchRegistry {
                     Path::new(cwd),
                     Containment::None,
                     false,
+                    // No block, so no knobs — and no argv-seam CLI reached
+                    // from here reads them anyway: codex, the one that would,
+                    // is handled above.
+                    workflow::ModelKnobs::default(),
                     &PersonaInject::default(),
                 )?
                 .path;
@@ -45147,6 +45985,14 @@ impl OrchRegistry {
         workdir: &Path,
         containment: Containment,
         unattended: bool,
+        // #2515 C1: read by the codex branch alone. codex has no effort FLAG —
+        // `model_reasoning_effort` is a key in the profile file this function
+        // writes — so a knob that is argv-borne on claude and pi is
+        // config-borne here, and the two builders emit nothing for it. Passed
+        // as the whole `ModelKnobs` rather than a bare `&str` so this parameter
+        // means the same thing as the builders' does; `context` is unread,
+        // because codex has no context-variant key (`CliCaps` says so).
+        knobs: workflow::ModelKnobs<'_>,
         persona: &PersonaInject,
     ) -> Result<AgentCliConfig, String> {
         let port = self.port();
@@ -45169,7 +46015,7 @@ impl OrchRegistry {
             let policy = self.write_gemini_policy(&dir, &agent_seg, containment)?;
             let cfg = gemini_settings_json(port, token, containment, policy.as_deref());
             fs::write(&path, cfg).map_err(|e| e.to_string())?;
-            let env = cli_extra_env(cli, &path);
+            let env = cli_extra_env(cli, &path, token);
             return Ok(AgentCliConfig { path, env });
         }
         // OpenCode (#722): the config document is delivered by environment
@@ -45191,6 +46037,34 @@ impl OrchRegistry {
             let db_dir = db.parent().expect("opencode_db_path always has a parent").to_path_buf();
             fs::create_dir_all(&db_dir).map_err(|e| e.to_string())?;
             let env = opencode_pane_env(&cfg, containment, unattended, &db);
+            return Ok(AgentCliConfig { path, env });
+        }
+        // codex (#2515 C1): the only branch whose file lands OUTSIDE loomux's
+        // own state root, because codex's `-p` names a profile in `CODEX_HOME`
+        // rather than a path anywhere. `path` below is therefore that file, not
+        // one under `configs/` — the `path` computed above is unused on this
+        // branch, and `AgentCliConfig.path` documents itself as "the generated
+        // file", which this is.
+        //
+        // It carries far more than MCP: trust, approval posture, sandbox mode,
+        // network access, the effort knob and the role contract all ride it.
+        // That is why the function's name undersells this branch, and why
+        // `write_codex_profile` is where the argument for each key lives.
+        if cli == "codex" {
+            let (path, _name) = self.write_codex_profile(
+                group,
+                &agent_seg,
+                // A GROUP pane, so the token rides the pane environment and
+                // the file names the variable — plan D2. `solo_prepare` is the
+                // caller that cannot do this, and it passes `Literal`; see
+                // `CodexMcpAuth`.
+                CodexMcpAuth::EnvVar(CODEX_TOKEN_ENV),
+                workdir,
+                unattended,
+                knobs.effort,
+                persona.codex_developer_instructions.as_deref(),
+            )?;
+            let env = cli_extra_env(cli, &path, token);
             return Ok(AgentCliConfig { path, env });
         }
         // pi (#2126): the file written here IS the file named on
@@ -45227,7 +46101,7 @@ impl OrchRegistry {
                 row["agent"] = json!(agent_id);
                 self.audit(group, brand::AUDIT_ACTOR, "pi-repo-mcp-merged", row);
             }
-            let env = cli_extra_env(cli, &path);
+            let env = cli_extra_env(cli, &path, token);
             return Ok(AgentCliConfig { path, env });
         }
         let mut server = json!({
@@ -45240,7 +46114,7 @@ impl OrchRegistry {
         }
         let cfg = json!({ "mcpServers": one_server_map(server) });
         fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).map_err(|e| e.to_string())?;
-        let env = cli_extra_env(cli, &path);
+        let env = cli_extra_env(cli, &path, token);
         Ok(AgentCliConfig { path, env })
     }
 
@@ -46355,6 +47229,34 @@ impl OrchRegistry {
             return out;
         }
 
+        // codex (#2515 C1): the same whole-`contract` delivery as claude,
+        // opencode and pi, and the only one of the five that needs no file of
+        // loomux's own — the contract IS a key in the profile
+        // `write_mcp_config` is about to write, so there is no second artifact
+        // to create, no handle that could resolve to the wrong definition, and
+        // no write that could fail independently.
+        //
+        // That last point is why this branch has no fallback arm while its
+        // three predecessors all do. Their failure mode is "the contract file
+        // could not be written, so emit no flag and fall back to the kickoff";
+        // here the contract and the MCP server and the trust level are one
+        // file, and a codex pane that cannot have it is not a degraded agent —
+        // it is a pane sitting on the trust dialog with no report channel. So
+        // the failure belongs to `write_codex_profile`, which returns `Err` and
+        // fails the spawn visibly, rather than to a silent degrade here.
+        //
+        // A `copilot_native` persona is as irrelevant here as in the two
+        // branches above: that flag records what COPILOT's `--agent` can
+        // resolve, and codex resolves neither the file nor its frontmatter.
+        // The text is already folded into `contract` by `block_contract_text`.
+        if cli == "codex" {
+            if !contract.trim().is_empty() {
+                out.codex_developer_instructions = Some(contract.to_string());
+                out.contract_carrier = ContractCarrier::SystemLayerFull;
+            }
+            return out;
+        }
+
         // Claude (and the fallback adapter): the durable contract ALWAYS
         // rides the system-prompt layer now — every block, persona or not
         // — but as of round #417 correction 6, by FILE, never argv. The
@@ -46795,6 +47697,77 @@ impl OrchRegistry {
             // contract and its containment — which is what makes this the
             // longest of the non-claude arms and what makes its assertions
             // land here rather than on a generated document.
+            "codex" => {
+                // The whole line is four things, and three of them are one
+                // thing: `-C` (where), `-p` (everything loomux configured),
+                // an optional `-m`, and — on a resume — the `resume`
+                // SUBCOMMAND. No `-s`, no `-a`, no `--full-auto` (which does
+                // not exist at the pin; its only occurrence in the vendor is a
+                // test, and the docs call it "a deprecated compatibility
+                // alias"), and never the bypass flag. Posture rides the
+                // profile, which is what `codex_launch_flags_per_posture`
+                // pins: the attended and unattended LINES are byte-identical
+                // and the two PROFILES are not.
+                //
+                // `-C` on BOTH directions, and on the resume it is doing real
+                // work rather than being symmetric for its own sake. Resuming
+                // a thread whose recorded cwd differs from the launch dir
+                // makes the TUI PROMPT ("resume here or there?") when
+                // `tui.resume_cwd` is unset, and a prompt on a pane loomux is
+                // about to type into is a lost kickoff.
+                //
+                // Root options are inherited by the subcommand
+                // (`SharedCliOptions::inherit_exec_root_options`), so writing
+                // them before `resume` is correct and is the only order that
+                // works — codex's usage is `codex [OPTIONS] <COMMAND> [ARGS]`.
+                let mut cmd = String::from("codex");
+                cmd.push_str(&format!(" -C \"{}\"", workdir.display()));
+                // Unquoted: `codex_profile_name` refuses anything outside
+                // codex's `[A-Za-z0-9_-]` alphabet rather than sanitizing it,
+                // so there is nothing here a shell could split. `cfg` is the
+                // profile FILE; `-p` wants its name, which is the file stem
+                // minus `.config.toml`.
+                if let Some(profile) = codex_profile_name_of_path(cfg) {
+                    cmd.push_str(&format!(" -p {profile}"));
+                }
+                // Omitted entirely when empty, for the reason opencode's and
+                // pi's arms give: `default_model("codex", …)` is empty on
+                // purpose so the human's own `config.toml` model wins, and a
+                // blank `-m` would be an argument, not a silence.
+                if !model.is_empty() {
+                    cmd.push_str(&format!(" -m {model}"));
+                }
+                // #687: codex has no effort FLAG — `model_reasoning_effort` is
+                // a profile key, written by `write_codex_profile` from the
+                // SAME `knobs` this function is handed. Read here and
+                // deliberately not emitted, so the omission is a statement
+                // rather than a gap; `a_codex_effort_knob_rides_the_profile_
+                // and_never_the_line` pins both halves at once.
+                let _ = knobs.effort;
+                // Last, and a SUBCOMMAND rather than a flag — the only session
+                // identity among loomux's adapters that is not a flag. `resume`
+                // is read here, unlike pi's arm: codex has no
+                // opens-or-creates flag, so a fresh spawn names nothing at all
+                // and learns its id from the store afterwards
+                // (`SessionBaseline::Codex`).
+                if let (Some(s), true) = (session, resume) {
+                    cmd.push_str(&format!(" resume {s}"));
+                }
+                // `persona.extra_allow` holds claude/copilot tool-pattern
+                // strings; codex has no allow mechanism a launch line can
+                // reach (its rules engine loads only from `CODEX_HOME/rules`
+                // and the project's `.codex/rules`, neither per-agent), so
+                // there is nothing to translate them into and a codex block
+                // widens nothing — the same decision as gemini's, opencode's
+                // and pi's arms.
+                //
+                // `containment` is likewise unread, and that is `cli_can_host`
+                // holding rather than an omission: codex tops out at
+                // `Containment::None`, so the only classes that reach here are
+                // the ones with nothing to deny.
+                debug_assert!(!containment.denies_edits());
+                cmd
+            }
             "pi" => {
                 // ONE flag for both directions, and that is the whole reason
                 // pi needs no session watcher, no baseline and no contest
@@ -47243,6 +48216,31 @@ impl OrchRegistry {
             // literal argv element (no shell here, so no quotes), and
             // `build_agent_argv_matches_command_line` tokenizes the string
             // form and asserts it equals this vector across the matrix.
+            "codex" => {
+                push(&mut a, "codex");
+                push(&mut a, "-C");
+                a.push(workdir.display().to_string());
+                if let Some(profile) = codex_profile_name_of_path(cfg) {
+                    push(&mut a, "-p");
+                    push(&mut a, profile);
+                }
+                if !model.is_empty() {
+                    push(&mut a, "-m");
+                    push(&mut a, model);
+                }
+                // == the string form's silence: the effort knob is a profile
+                // key on codex, not a flag. Stated so the two forms make the
+                // same claim about it rather than one simply omitting it.
+                let _ = knobs.effort;
+                // The subcommand goes LAST, after every root option, because
+                // codex's usage is `codex [OPTIONS] <COMMAND> [ARGS]` and the
+                // subcommand inherits what precedes it.
+                if let (Some(s), true) = (session, resume) {
+                    push(&mut a, "resume");
+                    push(&mut a, s);
+                }
+                debug_assert!(!containment.denies_edits());
+            }
             "pi" => {
                 push(&mut a, "pi");
                 // `resume` unread on purpose — `--session-id` opens-or-creates.
@@ -47777,6 +48775,11 @@ impl OrchRegistry {
             Path::new(&cwd),
             role.containment(),
             unattended,
+            // #2515 C1: already clamped to what this CLI can honor, the same
+            // value the builders below are handed — one expression, so a codex
+            // pane's profile cannot name an effort its launch line disagrees
+            // with.
+            block.knobs(),
             &inject,
         )?;
         // #417, split from `cfg` per rev-4 review N2 — Claude's hook config
@@ -53649,6 +54652,20 @@ impl OrchRegistry {
                 self.group_dir(&snapshot.group).join("configs").join(format!("{agent_seg}.json")),
             );
         }
+        // #2515 C1: codex's generated file is the one that does NOT live under
+        // the group dir — it is a profile in the human's `CODEX_HOME` — so the
+        // line above cannot reach it and it needs its own removal.
+        //
+        // Unconditional rather than gated on this agent's CLI, and that is the
+        // safer direction on both sides: the removal is a `remove_file` of a
+        // path derived entirely from this agent's own id, so for a non-codex
+        // agent it removes a file that was never written and costs one failed
+        // syscall — while gating on `cli_for_agent` would leave a real profile
+        // behind for any agent whose recorded CLI has drifted from what it was
+        // spawned on. A file in a vendor's user directory that nothing cleans
+        // up is #502 by another route; the startup sweep is the backstop, not
+        // the plan.
+        self.remove_codex_profile(agent_id);
         self.audit(&snapshot.group, brand::AUDIT_ACTOR, "agent-exit",
             json!({ "agent": agent_id, "exit_code": exit_code }));
         crate::obs::breadcrumb(
@@ -56785,6 +57802,9 @@ fn register_orchestrator_pane(
         Path::new(&group.repo),
         containment,
         group.guardrails.auto_ops || containment.forces_unattended(),
+        // #2515 C1 — the same `block.knobs()` the builders below take, for the
+        // same reason `containment` above is derived rather than hand-passed.
+        block.knobs(),
         &inject,
     )?;
     // #417, split from `cfg` per rev-4 review N2 — Claude's hook config rides
