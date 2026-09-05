@@ -61618,6 +61618,183 @@ fn a_torn_codex_header_leaves_the_watcher_waiting_rather_than_binding() {
     );
 }
 
+/// codex's approval overlays read as WAITING FOR INPUT (#2515 C1, T1.7).
+///
+/// There is no codex arm in `prompt_wait_match` and there must not be one: the
+/// detector is CLI-generic on purpose, and the claim worth pinning is that
+/// codex's dialogs fall inside the generic tokens rather than that someone
+/// remembered to add them. Without this, an attended codex pane raising an
+/// approval overlay would look idle — the attention system would never surface
+/// it, and a human would find the pane stopped with no notice hours later.
+///
+/// **The fixtures are the vendor's own snapshots, verbatim.** Cut from
+/// `tui/src/bottom_pane/snapshots/…approval_overlay…snap` at the pinned tag
+/// rather than written from the plan's paraphrase, because the thing under test
+/// is whether loomux's tokens match text codex actually paints. A fixture
+/// written from a description would be testing the description.
+///
+/// The footer is read only from the last three painted lines, so each fixture
+/// keeps its trailing blank/footer structure rather than being trimmed to the
+/// interesting line.
+#[test]
+fn codex_approval_overlays_read_as_waiting_for_input() {
+    // `…__approval_overlay_cross_thread_prompt.snap` — the commonest one, and
+    // the one an unattended pane must never see.
+    let exec = "\n  Would you like to run the following command?\n\
+                \n  Reason: need filesystem access\n\
+                \n  $ cat /tmp/readme.txt\n\
+                \n› 1. Yes, proceed (y)\n\
+                  2. No, and tell Codex what to do differently (esc)\n\
+                \n  Press enter to confirm or esc to cancel\n";
+    // `…__network_exec_prompt.snap` — a different title and a four-option list.
+    let network = "  Do you want to approve network access to \"example.com\"?\n\
+                   \n  Reason: network request blocked\n\
+                   \n› 1. Yes, just this once (y)\n\
+                     2. Yes, and allow this host for this conversation (a)\n\
+                     3. Yes, and allow this host in the future (p)\n\
+                     4. No, and tell Codex what to do differently (esc)\n\
+                   \n  Press enter to confirm or esc to cancel\n";
+    // `…__approval_overlay_permissions_prompt.snap` — the permissions grant.
+    let perms = "  Would you like to grant these permissions?\n\
+                 \n  Reason: need workspace access\n\
+                 \n› 1. Yes, grant these permissions for this turn (y)\n\
+                   2. Yes, grant for this turn with strict auto review (r)\n\
+                   3. Yes, grant these permissions for this session (a)\n\
+                   4. No, continue without permissions (d)\n\
+                 \n  Press enter to confirm or esc to cancel\n";
+
+    for (name, tail) in [("exec", exec), ("network", network), ("permissions", perms)] {
+        let m = prompt_wait_match(tail);
+        assert!(
+            m.is_some(),
+            "codex's {name} overlay must read as waiting for input — an attended codex pane \
+             raising one would otherwise look idle, and nothing would tell the human:\n{tail}"
+        );
+    }
+
+    // The negative control, and it is the half that makes the three above mean
+    // something. A finished codex turn that merely TALKS about a command must
+    // not read as a question — otherwise the detector would fire on ordinary
+    // prose and the assertions above would be about nothing.
+    let answered = "  I ran `cat /tmp/readme.txt` and it printed the readme.\n\
+                    \n  The next step is to update the docs; say the word and I will.\n";
+    assert!(
+        prompt_wait_match(answered).is_none(),
+        "a finished turn must not read as a question:\n{answered}"
+    );
+}
+
+/// A codex profile is removed with its agent, and an orphan is swept — but only
+/// when the live-agent set is actually known (#2515 C1, T1.9).
+///
+/// This is the file loomux writes into someone else's home directory, so the
+/// two failure directions are asymmetric and both are pinned. Leaving files
+/// behind is #502 by another route (1,111 stray files in a real
+/// `~/.claude/agents`). Deleting one that is still in use is worse: the pane it
+/// belongs to loses its trust, its MCP server and its contract on the next
+/// respawn, with nothing to say why.
+#[test]
+fn a_codex_profile_is_removed_with_its_agent_and_orphans_are_swept() {
+    let (reg, dir) = test_registry();
+    let home = dir.path().join("fake-codex-home");
+    std::fs::create_dir_all(&home).unwrap();
+    reg.set_codex_home_override(home.clone());
+
+    let live = home.join("orrerix-w-1.config.toml");
+    let orphan = home.join("orrerix-w-99.config.toml");
+    // Not loomux's: the sweep must leave both alone. The first is the human's
+    // own codex profile; the second carries loomux's prefix but not its
+    // suffix, which is the pairing `write_codex_profile` actually writes.
+    let human = home.join("work.config.toml");
+    let notes = home.join("orrerix-notes.md");
+    for p in [&live, &orphan, &human, &notes] {
+        std::fs::write(p, "# fixture\n").unwrap();
+    }
+
+    // Nothing is live yet — this registry has no groups at all — so a sweep
+    // here would reclaim BOTH loomux files. That is the correct answer for a
+    // root with no rosters, and it is asserted so the test below is known to
+    // be exercising the roster rather than an accident of ordering.
+    let swept = reg.sweep_orphaned_agent_files();
+    let reclaimed = swept["reclaimed"].as_array().unwrap();
+    let named = |p: &std::path::Path| {
+        reclaimed.iter().any(|r| r.as_str().unwrap_or_default() == p.to_string_lossy())
+    };
+    assert!(named(&live) && named(&orphan), "both loomux profiles are orphans here: {swept}");
+    assert!(
+        human.exists() && notes.exists(),
+        "a file that is not `<brand>-<agent>.config.toml` is not loomux's to delete: \
+         work.config.toml={} orrerix-notes.md={}",
+        human.exists(),
+        notes.exists()
+    );
+
+    // Per-agent removal, which is the primary path — the sweep is the backstop.
+    std::fs::write(&live, "# fixture\n").unwrap();
+    reg.remove_codex_profile("w-1");
+    assert!(!live.exists(), "the profile must go with its agent");
+    // Idempotent: a second removal, a non-codex agent, and an id that never
+    // had a profile are all no-ops rather than errors — `mark_dead` calls this
+    // for EVERY agent, whatever CLI it ran.
+    reg.remove_codex_profile("w-1");
+    reg.remove_codex_profile("orch-1");
+}
+
+/// The refusal half of the sweep (#2515 C1): a roster that cannot be READ makes
+/// the live-agent set incomplete, and an incomplete set deletes NOTHING.
+///
+/// This is #464 B1's rule one level down, and it is the direction that must
+/// never be got wrong. That review found the sweep reading "I cannot enumerate
+/// the groups" as "no groups are live" and deleting every generated file; the
+/// same mistake is available here one scope smaller, where a single unparseable
+/// `agents.json` would make every one of THAT group's panes look orphaned — and
+/// the panes are running, so the next respawn strips them of trust, MCP and
+/// contract during exactly the post-crash relaunch this sweep exists for.
+///
+/// The two absences are deliberately different and both are asserted: a group
+/// with NO `agents.json` is a group that has never spawned an agent, which is
+/// real, common, and genuinely contributes no ids — so it must NOT poison the
+/// sweep the way an unreadable one does.
+#[test]
+fn an_unreadable_roster_stops_the_codex_sweep_rather_than_orphaning_a_live_pane() {
+    let (reg, dir) = test_registry();
+    let home = dir.path().join("fake-codex-home");
+    std::fs::create_dir_all(&home).unwrap();
+    reg.set_codex_home_override(home.clone());
+    let profile = home.join("orrerix-w-7.config.toml");
+
+    // A group that has never spawned an agent: no roster file at all. This
+    // must leave the sweep able to act — it is not ignorance, it is an empty
+    // answer.
+    let empty_group = reg.state_root().join("group-never-spawned");
+    std::fs::create_dir_all(&empty_group).unwrap();
+    std::fs::write(&profile, "# fixture\n").unwrap();
+    let swept = reg.sweep_orphaned_agent_files();
+    assert!(
+        !profile.exists(),
+        "a group with no roster contributes no ids and must not stop the sweep: {swept}"
+    );
+
+    // Now a roster that EXISTS and cannot be parsed. Its agents are real and
+    // this cannot see them, so nothing may be deleted.
+    std::fs::write(&profile, "# fixture\n").unwrap();
+    let broken = reg.state_root().join("group-broken-roster");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join("agents.json"), "{ this is not json").unwrap();
+    let swept = reg.sweep_orphaned_agent_files();
+    assert!(
+        profile.exists(),
+        "an unreadable roster means the live-agent set is UNKNOWN — deleting on a guess is how \
+         a running pane loses its trust and its tools: {swept}"
+    );
+    // …and it says so, rather than reporting a clean sweep. An error-free
+    // report of zero reclamations is indistinguishable from a healthy one.
+    let errors = swept["errors"].as_array().unwrap();
+    assert!(
+        errors.iter().any(|e| e["error"].as_str().unwrap_or_default().contains("roster")),
+        "the skip must be reported: {swept}"
+    );
+}
 /// The launcher's autopilot toggle and the group spawn must MEAN THE SAME
 /// THING on pi (#101), and on pi that meaning is "nothing".
 ///

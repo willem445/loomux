@@ -29179,7 +29179,8 @@ impl OrchRegistry {
     /// `CODEX_HOME` may have moved since it was written — none of which is
     /// worth failing a kill or a group teardown over, and all of which the
     /// startup sweep catches later.
-    fn remove_codex_profile(&self, agent_id: &str) {
+    #[doc(hidden)] // pub for integration tests
+    pub fn remove_codex_profile(&self, agent_id: &str) {
         let Ok(seg) = PathSegment::parse(agent_id) else { return };
         let Ok(name) = codex_profile_name(&seg) else { return };
         let Some(home) = self.codex_home_dir() else { return };
