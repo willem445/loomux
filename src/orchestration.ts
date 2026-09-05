@@ -2030,6 +2030,12 @@ export interface WorkflowSwitchPreview {
   from: string;
   /** The repo-relative file `name` resolves to. */
   path: string;
+  /** A digest of the file this preview was resolved from. Hand it straight to
+   *  `applyWorkflow` — it is what binds the human's confirmation to the bytes
+   *  they read, so a file edited between the two is refused rather than
+   *  silently applied. `null` when the digest could not be taken, which the
+   *  caller must read as "cannot confirm", never as "unchanged". */
+  digest: string | null;
   /** The file's own `name:` field — display prose, never an identifier. */
   display_name: string;
   /** Nothing would change. The modal says so rather than offering an empty
@@ -2071,10 +2077,20 @@ export const workflowSwitchPreview = (groupId: string, name: string): Promise<Wo
  *  group dir's instruction files and re-arms the merge gate. Agents already
  *  live keep the block they were spawned under; a bare resume of a session
  *  whose block the new roster dropped is refused. Rejects on the same
- *  conditions the preview does, plus the preview's own `refusal`. Resolves to
- *  the same shape a following `workflowStatus` read would return. */
-export const applyWorkflow = (groupId: string, name: string): Promise<WorkflowStatus> =>
-  invoke<WorkflowStatus>("orch_apply_workflow", { groupId, name });
+ *  conditions the preview does, plus the preview's own `refusal` — and it also
+ *  rejects when `expectDigest` does not match the file as it stands now, which
+ *  is the file having been edited between the preview and the confirmation.
+ *  Resolves to the same shape a following `workflowStatus` read would return.
+ *
+ *  Always pass the `digest` the preview returned. Passing `null` is a caller
+ *  saying it has no confirmation to honour, and the audit row records that
+ *  rather than pretending the two agreed. */
+export const applyWorkflow = (
+  groupId: string,
+  name: string,
+  expectDigest: string | null
+): Promise<WorkflowStatus> =>
+  invoke<WorkflowStatus>("orch_apply_workflow", { groupId, name, expectDigest });
 
 // ---------- merge queue (#581 slice F): READ-ONLY visibility ----------
 //

@@ -2866,6 +2866,65 @@ positive would not be cosmetic, it would be a refused apply.
 to the schema is a compile error there rather than a key the diff silently stops
 reporting — the same field-inventory idiom the intake schema uses.
 
+### The confirmation is bound to the bytes it was given for
+
+`workflow_switch_preview` returns a `digest` of the file it resolved, and
+`apply_workflow` takes it back as `expect_digest`. If the file has moved since,
+the apply **refuses** and says to re-open the diff.
+
+Without it the apply re-plans under `group_file_io` and installs whatever the
+file says at *click* time — which need not be the diff the human read. Nothing
+was wrong with the roster that landed; what was wrong is that the
+`workflow-switched` row recorded a diff nobody had approved, and the
+disagreement could not be reconstructed from the trail afterwards. The row now
+carries both `digest` (what landed) and `confirmed_digest` (what was shown), and
+a `null` `confirmed_digest` is a caller that passed no confirmation — a script, a
+test — which is a different statement from the two agreeing.
+
+The digest is [`workflow::body_digest`] over the file's text, so it is
+canonicalised the way every other stored digest here is: a checkout differing
+only in line endings is the same document. This tree is CRLF on disk and LF in
+the blob, and a digest that moved with that would refuse every apply on one of
+the two.
+
+### The no-op re-apply is the retry path
+
+Re-applying the ACTIVE name with a file nobody has edited returns early — no
+audit row, no notice, no rewrite of `group.json`. It does **not** skip the
+group dir: `reconcile_instruction_files` runs first.
+
+That is not tidiness. `write_instruction_files` is audited rather than
+propagated (below), so an apply whose write failed leaves the switch live with a
+stale or missing `<id>.md` — and the obvious human response, applying the same
+unedited file again, was exactly the call that used to answer without touching
+the disk. Nothing else self-heals it: the per-spawn render writes a *new* block's
+file and never removes a departed one. The write is idempotent and an apply is a
+human-gated action rather than a poll, so paying it on that arm costs nothing
+worth saving.
+
+### The live toggle adopts the file's intake, and gives it back
+
+`set_advanced_orchestrator` takes `blocks` **and** `intake` from the file on the
+way ON, and restores the built-in roster **and** the built-in vocabulary on the
+way OFF.
+
+It did not always. Taking `blocks` alone left a group that arrived in workflow
+mode by *toggle* rather than by launch running a declared roster beside the
+built-in label vocabulary — which `roster_drift` reads, correctly, as drift
+against a file nobody had edited. That was invisible until #1689 slice B
+published drift as a field, which is why the fix landed with it (#2659 review
+round 1). Two claims went with it: `persist_roster`'s doc said the toggle's
+`intake` round-trips "because the toggle re-reads the group's ACTIVE file", which
+was a true sentence about `blocks` offered as the reason for `intake`; and
+`roster_drift`'s comment said blocks and intake are "ALWAYS resolved together",
+which the toggle path had never done. Both are corrected where they sit.
+
+The OFF half is the same rule pointing the other way. Restoring the built-in
+roster while keeping the file's labels would leave the intake poller and the
+human's `hold` veto (#778) answering to a spelling only the repo file ever named,
+on a group that is no longer obeying that file. Off means the file is not obeyed,
+and that has to include the half of it that is not blocks.
+
 ### The gate, the instruction files, and the trail
 
 The gate is re-armed through `sync_merge_gate_locked`, inside `group_file_io`
@@ -2929,6 +2988,13 @@ a finding and an entry error — a workflow file may never block a launch, #225)
 and `list_workflow_names` answers the status payload's question without opening
 anything. Both walk one `scan_workflows`, so the picker and the status cannot
 come to disagree about what a repo declares.
+
+`WORKFLOWS_MAX` bounds the **listing**, not the directory loop. The plain file is
+inserted after that loop and wins, so capping only the loop let a repo that had
+filled the ceiling from `workflows/` list one row over a finding that promised
+otherwise (#2659 review round 1). The trim never drops the plain file — the
+layout rule says that is what the name `default` means — so the row that goes is
+the last directory row by name.
 
 ### What slice B deliberately did not do
 

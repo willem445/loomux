@@ -426,8 +426,8 @@ fn scan_workflows(repo: &str) -> (BTreeMap<String, ScannedWorkflow>, Vec<String>
                 // has buried it.
                 if !findings.iter().any(|f| f.contains("more than")) {
                     findings.push(format!(
-                        "{dir_rel} declares more than {WORKFLOWS_MAX} workflow files — only the \
-                         first {WORKFLOWS_MAX} by name are offered"
+                        "{dir_rel} declares more than {WORKFLOWS_MAX} workflow files — the \
+                         listing is capped at {WORKFLOWS_MAX} names"
                     ));
                 }
                 break;
@@ -466,6 +466,21 @@ fn scan_workflows(repo: &str) -> (BTreeMap<String, ScannedWorkflow>, Vec<String>
         );
     }
 
+    // The plain file is inserted AFTER the loop and WINS, so on a repo that
+    // already filled the ceiling from `workflows/` it would push the listing one
+    // over — 65 rows under a finding promising 64 (#2659 review round 1,
+    // rev-std 2). The ceiling bounds the LISTING, so trim here; and never trim
+    // the plain file, which the layout rule says is what the name `default`
+    // means. Sorted, so the row dropped is the last by name.
+    while seen.len() > WORKFLOWS_MAX {
+        let Some(victim) =
+            seen.keys().rev().find(|k| k.as_str() != DEFAULT_WORKFLOW_NAME).cloned()
+        else {
+            break;
+        };
+        seen.remove(&victim);
+    }
+
     (seen, findings)
 }
 
@@ -485,6 +500,24 @@ pub fn list_workflows(repo: &str) -> WorkflowListing {
         workflows: seen.into_values().map(|s| read_entry(&s.abs, s.name, s.rel)).collect(),
         findings,
     }
+}
+
+/// A content digest of the file `name` resolves to (#1689 slice B, review
+/// round 1 premortem 1) — what binds a confirmation to the bytes the human
+/// was actually shown.
+///
+/// `None` when the file is absent or unreadable, which a caller must treat as
+/// "cannot confirm" rather than "unchanged". Canonicalised by [`body_digest`],
+/// so a checkout that differs only in line endings is the same document —
+/// this tree is CRLF on disk and LF in the blob, and a digest that moved with
+/// that would refuse every apply on one of the two.
+///
+/// It reads the file a second time, after the parse. That is deliberate and
+/// cheap where it is used: a preview and an apply are human-gated actions, not
+/// a poll, and threading the raw text out of `load_workflow_named` would widen
+/// a signature every group-scoped reader shares to serve two callers.
+pub fn workflow_digest(repo: &str, name: &WorkflowName) -> Option<String> {
+    std::fs::read_to_string(workflow_file_named(repo, name)).ok().map(|t| body_digest(&t))
 }
 
 /// The names alone, sorted — no file is opened (#1689 slice B).
@@ -5631,6 +5664,39 @@ mod tests {
             listing.findings
         );
         assert_eq!(list_workflow_names(repo).len(), WORKFLOWS_MAX, "the names-only walk is bounded too");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_ceiling_counts_the_plain_file_too() {
+        // #2659 review round 1, rev-std 2: the cap guarded only the `workflows/`
+        // loop, and the plain file is inserted AFTER it and WINS — so a repo that
+        // filled the ceiling from the directory listed 65 rows under a finding
+        // promising 64. The ceiling bounds the LISTING.
+        let root = temp_repo("ceiling-plus-plain");
+        for i in 0..WORKFLOWS_MAX {
+            write_at(&root, &format!(".orrerix/workflows/w{i:03}.yml"), &wf_doc("W"));
+        }
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("Plain"));
+        let repo = root.to_str().unwrap();
+
+        let listing = list_workflows(repo);
+        assert_eq!(listing.workflows.len(), WORKFLOWS_MAX, "the listing is capped, not the loop");
+        assert_eq!(list_workflow_names(repo).len(), WORKFLOWS_MAX, "and the names-only walk with it");
+        // The plain file is never the row dropped: the layout rule says it is what
+        // the name `default` means, so trimming it would answer the wrong question.
+        assert!(
+            names(&listing).contains(&"default"),
+            "the plain file survives the trim: {:?}",
+            names(&listing)
+        );
+        // The row that goes is the last by name — the directory rows are `w000`…,
+        // which sort after `default`, so `w063` is the one that loses.
+        assert!(
+            !names(&listing).contains(&format!("w{:03}", WORKFLOWS_MAX - 1).as_str()),
+            "{:?}",
+            names(&listing)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

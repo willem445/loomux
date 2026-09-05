@@ -5,16 +5,16 @@
 //! without an explicit grant silently unreachable for every window,
 //! including `main`. These tests turn that silent failure into a red test:
 //!
-//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_157`:
+//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_<N>`:
 //!     `src/lib.rs`'s `generate_handler!` and `command_manifest::APP_COMMANDS`
 //!     are the two hand-maintained lists this migration depends on staying
 //!     identical; this diffs them directly out of the `lib.rs` source rather
 //!     than trusting a hand count.
-//!   - `main_has_all_157_and_zero_permission_denies_dangerous_spread`: builds
+//!   - `main_has_all_<N>_and_zero_permission_denies_dangerous_spread`: builds
 //!     a real (headless) `tauri::test` mock app using the app's *actual*
 //!     `capabilities/`/`permissions/` on disk (via the same `generate_context!`
 //!     `build.rs` already feeds — not a reimplementation of ACL resolution),
-//!     invokes all 157 commands against the `main` window label, and invokes
+//!     invokes all `<N>` commands against the `main` window label, and invokes
 //!     a representative dangerous spread + a benign control against the
 //!     `plugin-zero-template` window label (see
 //!     `capabilities/plugin-zero-template.json`). This is both the coherence
@@ -23,7 +23,7 @@
 //!
 //! Red-before-green (cited in the PR): dropping `orch_grant_merge` from
 //! `permissions/sets/orch-control.toml` makes
-//! `main_has_all_157_and_zero_permission_denies_dangerous_spread` fail with
+//! `main_has_all_<N>_and_zero_permission_denies_dangerous_spread` fail with
 //! `main is missing a grant for: ["orch_grant_merge"]`.
 
 // Stub commands: same bare identifiers as the real commands in
