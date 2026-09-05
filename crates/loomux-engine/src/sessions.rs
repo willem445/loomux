@@ -1189,9 +1189,7 @@ pub fn walk_codex_session_files<T>(
                     // without a second `ends_with`: `plain` is a subslice of
                     // `name`, shorter exactly when a suffix was stripped.
                     let compressed = plain.len() != name.len();
-                    if compressed && path.with_file_name(plain).exists() {
-                        continue;
-                    }
+                    let _ = compressed;
                     if let Some(found) = visit(&path) {
                         return Some(found);
                     }
