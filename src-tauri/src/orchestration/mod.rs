@@ -48381,9 +48381,6 @@ impl OrchRegistry {
                 // so there is nothing here a shell could split. `cfg` is the
                 // profile FILE; `-p` wants its name, which is the file stem
                 // minus `.config.toml`.
-                if let Some(profile) = codex_profile_name_of_path(cfg) {
-                    cmd.push_str(&format!(" -p {profile}"));
-                }
                 // Omitted entirely when empty, for the reason opencode's and
                 // pi's arms give: `default_model("codex", …)` is empty on
                 // purpose so the human's own `config.toml` model wins, and a
@@ -48880,10 +48877,6 @@ impl OrchRegistry {
                 push(&mut a, "codex");
                 push(&mut a, "-C");
                 a.push(workdir.display().to_string());
-                if let Some(profile) = codex_profile_name_of_path(cfg) {
-                    push(&mut a, "-p");
-                    push(&mut a, profile);
-                }
                 if !model.is_empty() {
                     push(&mut a, "-m");
                     push(&mut a, model);
