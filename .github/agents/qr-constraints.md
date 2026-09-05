@@ -170,7 +170,7 @@ exercises the real pattern, and it has a guaranteed match: the doc comment in
 ### 5. A role-template edit re-blesses the pre222 fixtures in the same PR
 
 ```
-grep -nE 'src-tauri/src/orchestration/templates/(orchestrator|worker|reviewer|planner|manager)\.md' .scratch/files.txt
+grep -nE 'src-tauri/src/orchestration/templates/(orchestrator|worker|reviewer|planner|manager|lead)\.md' .scratch/files.txt
 grep -n 'src-tauri/tests/fixtures/pre222/' .scratch/files.txt
 ```
 

@@ -5879,7 +5879,7 @@ const PRE222: [(&str, &str); 5] = [
 ///   against `LIVE` below. That question is about the TEMPLATE and is asked of
 ///   all five equally, which is why `manager.md` gets the same re-bless gate as
 ///   the other four rather than a weaker one.
-const GOLDENS: [(&str, &str); 6] = [
+const GOLDENS: [(&str, &str); 7] = [
     PRE222[0],
     PRE222[1],
     PRE222[2],
@@ -5890,6 +5890,15 @@ const GOLDENS: [(&str, &str); 6] = [
     // manager.md is: default groups DO read it, which is why it sits in
     // `PRE222` above and in both default-group pins.
     PRE222[4],
+    // #2519 slice B. Golden-pinned in the slice that DELIVERS it, which is
+    // what `doc/design/lead-pane.md` said slice A was deferring: the pin
+    // exists to make an accidental edit to bytes a shipped pane already reads
+    // fail loudly, and until the launch path existed no pane read this file.
+    // Not in `PRE222`, for `manager.md`'s reason exactly: a default group has
+    // no lead block, so `write_instruction_files` writes no `lead.md` into its
+    // dir and the two default-group pins would be looking for something
+    // correctly absent.
+    ("lead.md", include_str!("fixtures/pre222/lead.md")),
 ];
 
 /// The live templates, with the placeholder(s) each must carry. Each element of the
@@ -5902,7 +5911,7 @@ const GOLDENS: [(&str, &str); 6] = [
 /// `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}`), they stay a single contiguous-string key
 /// — same reasoning `block.md`'s `{{PERSONA_NOTE}}{{LANE_NOTE}}{{GATE_NOTE}}` already
 /// relies on.
-const LIVE: [(&str, &str, &[&str]); 6] = [
+const LIVE: [(&str, &str, &[&str]); 7] = [
     // #1683: the merge-gate and re-sync sections moved to the playbook, and
     // their two workflow-conditional fragments with them — the orchestrator
     // core's key list shrinks to `{{WORKFLOW}}` and `{{LOCKS_ORCH}}`.
@@ -5949,6 +5958,13 @@ const LIVE: [(&str, &str, &[&str]); 6] = [
         // `{{REVIEW_DRIVER}}` are in this file and nowhere else.
         &["{{MERGE_QUEUE}}{{REVIEW_DRIVER}}", "{{POST_MERGE_WORKFLOW_HOOK}}"],
     ),
+    // #2519 slice B. An EMPTY key list, and that is a statement rather than a
+    // gap: `lead.md` carries no workflow-conditional prose at all, so nothing
+    // is stripped and its golden is the live template byte for byte. The
+    // `{{GROUP_ID}}`/`{{REPO}}` it does carry are per-group VALUE variables —
+    // `HOLD_LABEL`'s class, not this list's — so the golden keeps them literal
+    // and the pin bites on the prose around them.
+    ("lead.md", loomux_lib::orchestration::LEAD_TPL, &[]),
 ];
 
 /// Render a template with the plain per-group VALUE variables `render_template`
