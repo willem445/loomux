@@ -240,10 +240,12 @@ export const ORCH_CLIS: OrchCli[] = [
     // disagree with it — which is exactly why the wrong sentence above survived
     // to review: no code depended on it.
     //
-    // Membership here is spawnability. codex hosts a worker or an
-    // orchestrator; a reviewer, planner or manager on it is refused by
-    // `cli_can_host`,
-    // because its only containment axis is an all-or-nothing `sandbox_mode`.
+    // Membership here is spawnability. codex hosts a worker, an orchestrator or
+    // a lead; a reviewer, planner or manager on it is refused by
+    // `cli_can_host`, because its only containment axis is an all-or-nothing
+    // `sandbox_mode`. `lead` is on the hosted side by the same one comparison —
+    // `Role::Lead` is `Containment::None` — rather than by anyone adding it
+    // here.
     id: "codex",
     models: [INHERIT_MODEL],
     defaults: {
@@ -252,6 +254,12 @@ export const ORCH_CLIS: OrchCli[] = [
       reviewer: INHERIT_MODEL,
       planner: INHERIT_MODEL,
       manager: INHERIT_MODEL,
+      // #2519 arrived while this branch was open, and the `Record<OrchRole, …>`
+      // above did exactly what its doc promises: a missing key was a compile
+      // error rather than a silent hole. `INHERIT_MODEL` is this row's
+      // orchestrator default, which is the rule that doc states for `lead` —
+      // and on codex every role inherits anyway.
+      lead: INHERIT_MODEL,
     },
   },
 ];
