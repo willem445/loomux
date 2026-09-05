@@ -10659,15 +10659,26 @@ fn the_workflow_path_a_delegate_is_told_about_is_the_groups_own_file() {
     assert!(named > 0, "and at least one names b's file");
 }
 
-/// The residual, pinned rather than promised: exactly ONE call site in
-/// `src-tauri/src` still reads the repo's `default` workflow without asking
-/// which one a GROUP runs, and it is repo-scoped rather than group-scoped.
+/// **No call site in `src-tauri/src` reads the repo's `default` workflow
+/// without asking which one a GROUP runs** — the residual is closed (#2663),
+/// and this scan is what keeps it closed.
 ///
-/// The plan predicted two. `orch_workflow_preview_sync` was the second, and it
-/// stopped being one when it gained its optional `name` — its no-name arm now
-/// goes through `load_workflow_named` at `default` like everything else. This
-/// scan is what noticed: the stale-row assertion below refused to carry a row
-/// that matched nothing, rather than letting the count go quietly wrong.
+/// The one `RESIDUALS` row left is not a residual at all: it is the NAMED
+/// sibling `workflow_file_named(`, which the `workflow::workflow_file` prefix
+/// necessarily catches, and it is listed rather than excluded by a narrower
+/// pattern because a pattern tuned to miss it would also miss
+/// `workflow_file_exists(`, the function this is guarding against.
+///
+/// The plan predicted two residuals and both are gone.
+/// `orch_workflow_preview_sync` was the second, and it stopped being one when
+/// it gained its optional `name` — its no-name arm goes through
+/// `load_workflow_named` at `default` like everything else. `gh.rs::hold_label`
+/// was the first, and #2663 closed it the same way: it takes an
+/// `Option<&Guardrails>` now, and its no-group arm reads
+/// `load_active_workflow(repo, &Guardrails::default())` rather than
+/// `workflow::load_workflow(repo)`. Both times this scan is what noticed the
+/// row had gone stale: the assertion below refuses to carry a row that matches
+/// nothing, rather than letting the count go quietly wrong.
 ///
 /// **Three spellings, not one**, and the counts below are measured at both ends
 /// rather than recalled — the first version of this paragraph guessed them and
@@ -10685,12 +10696,13 @@ fn the_workflow_path_a_delegate_is_told_about_is_the_groups_own_file() {
 ///
 /// So **26 sites moved, and 14 of them — every `workflow_path` and every
 /// `workflow_file_exists` — were invisible to a trigger watching
-/// `load_workflow` alone.** All three functions are still `pub` and still answer
-/// only for `default`. Adding an audit line or a template var as
-/// `workflow::workflow_path(&g.repo)` type-checks, reads naturally, and is
-/// exactly what twelve lines in `mod.rs` said one commit ago; a group running
-/// `b.yml` would then be told in its own audit trail that it runs
-/// `.orrerix/workflow.yml`.
+/// `load_workflow` alone.** #2663 then moved the 27th: the `head` 1 in the
+/// first row was `gh.rs::hold_label`, and it is 0 now. All three functions are
+/// still `pub` and still answer only for `default`. Adding an audit line or a
+/// template var as `workflow::workflow_path(&g.repo)` type-checks, reads
+/// naturally, and is exactly what twelve lines in `mod.rs` said one commit ago;
+/// a group running `b.yml` would then be told in its own audit trail that it
+/// runs `.orrerix/workflow.yml`.
 ///
 /// A textual scan, with the limits that implies — it reads call TEXT, so a
 /// caller that bound the function to a local first would be invisible. **So
@@ -10722,22 +10734,6 @@ fn only_the_argued_residuals_still_read_the_default_workflow_directly() {
 
     /// `(file, call text, why it is not group-scoped)`.
     const RESIDUALS: &[(&str, &str, &str)] = &[
-        (
-            "gh.rs",
-            "loomux_engine::workflow::load_workflow(repo)",
-            "hold_label takes a REPO, not a group — the gh shim resolves its writable label \
-             allow-list before any group is in hand. REPO-SCOPED BY CONSTRUCTION, AND WRONG \
-             THE MOMENT A GROUP CAN RUN A WORKFLOW WITH A DIFFERENT `intake.labels.hold`: \
-             `hold_label_of(group)` reads the group's own profile while `allowed_labels`, \
-             `label_spec_for` and `gh_label_vocabulary_sync` all resolve `default`'s, so the \
-             human's one-click veto would stop working for exactly the group that renamed it. \
-             REACHABLE as of #1689 slice B: apply_workflow pins a name AND rewrites \
-             guardrails.intake from the named file, so this is live for any group that \
-             applies a workflow renaming `hold`. Not reachable by a human GESTURE until \
-             slice D2 wires Review & apply. Closing it means giving gh.rs's three \
-             default-resolving sites a group, which is #2663 and a blocking \
-             prerequisite for slice D2",
-        ),
         (
             "mod.rs",
             "workflow::workflow_file_named(&repo, n).is_file()",

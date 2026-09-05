@@ -4046,6 +4046,7 @@ export class Pane implements VoiceTargetPane {
     if (this.issuesView) return;
     this.issuesView = new IssuesView({
       getCwd: () => this.cwdRaw,
+      getGroupId: () => this.orchGroup,
       onClose: () => this.toggleIssuesView(),
       onEmbedMenu: (anchor) => this.showEmbedMenu("issues", anchor),
     });

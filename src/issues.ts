@@ -102,24 +102,39 @@ export interface GhLabelVocabulary {
   hold: string;
 }
 
-/** Resolve this repo's writable label vocabulary. Reads the repo's workflow
- *  config; spawns no `gh`, so it is cheap enough to call on every repo change. */
-export const ghLabelVocabulary = (repo: string): Promise<GhLabelVocabulary> =>
-  invoke("gh_label_vocabulary", { repo });
+/** Resolve the writable label vocabulary for `repo`, scoped to `group` when
+ *  the calling pane has one (#2663). Spawns no `gh`, so it is cheap enough to
+ *  call on every repo change.
+ *
+ *  `group` is the pane's own orchestration group id, or null for a plain pane.
+ *  A group's veto spelling is the one IT is running (`guardrails.intake.hold`,
+ *  what its poller watches), which can differ from what the repo's default
+ *  workflow file declares once the group has applied a named workflow. Null is
+ *  the repo resolution, unchanged. */
+export const ghLabelVocabulary = (
+  repo: string,
+  group: string | null
+): Promise<GhLabelVocabulary> => invoke("gh_label_vocabulary", { repo, group });
 
 /** Add and/or remove labels on issue `number`. The backend validates every
- *  label against the allow-list it resolves for this repo — the three fixed
- *  signals (agent-ready / agent-investigation / agent-managed) plus the repo's
- *  own `hold` spelling — and rejects anything else, so a malformed call fails
- *  loudly rather than attaching an arbitrary label. The veto (#778) is writable
- *  from here because applying it IS the veto gesture; pass the spelling
- *  `ghLabelVocabulary` returned, not a literal. */
+ *  label against the allow-list it resolves for this repo and `group` — the
+ *  three fixed signals (agent-ready / agent-investigation / agent-managed) plus
+ *  the resolved `hold` spelling — and rejects anything else, so a malformed
+ *  call fails loudly rather than attaching an arbitrary label. The veto (#778)
+ *  is writable from here because applying it IS the veto gesture; pass the
+ *  spelling `ghLabelVocabulary` returned, not a literal.
+ *
+ *  `group` must be the SAME value the `ghLabelVocabulary` call used (#2663):
+ *  the button and the allow-list are one resolution only while both are asked
+ *  the same question. */
 export const ghIssueSetLabels = (
   repo: string,
+  group: string | null,
   number: number,
   add: string[],
   remove: string[]
-): Promise<void> => invoke("gh_issue_set_labels", { repo, number, add, remove });
+): Promise<void> =>
+  invoke("gh_issue_set_labels", { repo, group, number, add, remove });
 
 /** Full detail (description + comments) for one issue — backs the detail pane. */
 export const ghIssueView = (repo: string, number: number): Promise<GhDetail> =>

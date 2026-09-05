@@ -10,13 +10,26 @@
 //! can be written are gated by a fixed allow-list, so a create/label call can
 //! never attach an arbitrary label even though the webview is trusted.
 //!
+//! **The label vocabulary is scoped to a GROUP where the caller has one**
+//! (#2663). Two commands here take an optional `group`, and the pane that owns
+//! the issues view supplies its own (`orchGroupId`) when it is an orchestration
+//! pane. The id is a `GroupId` before it is used — it never becomes a path here,
+//! but the type is what makes `guardrails_of` unable to take a raw string. A
+//! group's spelling comes from `guardrails.intake.hold`, the field the lifecycle
+//! panel, the intake poller and the contract prose already read, and it is
+//! re-checked against `workflow::usable_intake_label` before it can reach an
+//! argv — see [`hold_label`].
+//!
 //! Like `git.rs`, spawns are arg-vectors (shell injection is impossible) and
 //! `gh` output is decoded lossily. The `--json` field set is pinned rather than
 //! parsing human output, so `gh` cosmetic changes don't break parsing.
 
+use crate::orchestration::{GroupId, Guardrails, OrchRegistry};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::Arc;
+use tauri::Manager;
 
 /// Run a `gh`-backed computation off the webview main thread (issue #716).
 /// Tauri dispatches a *synchronous* `#[tauri::command]` by calling it directly
@@ -55,6 +68,33 @@ where
     }
 }
 
+/// The guardrails the named group is RUNNING, or `None` when this registry no
+/// longer holds it (#2663).
+///
+/// Takes a `GroupId`, never a raw string, so the parse cannot be skipped on the
+/// way here: each command below spells `GroupId::parse` in its OWN body
+/// (CLAUDE.md constraint 6, and `tests/groupid.rs`'s boundary scan reads bodies,
+/// so a helper that swallowed the parse would read as unparsed — correctly, the
+/// point of the rule being that a raw string stops being one where it arrives).
+/// The parse is cheap enough to sit before the `run_blocking` hand-off: a
+/// bounded character scan over a short string, no I/O and no lock, while the
+/// registry read below stays off the GUI thread with the rest of the body.
+///
+/// **Three inputs collapse to `None`, deliberately**: no `group` argument at all
+/// (a plain pane's issues view — the pre-#2663 path, byte for byte), an id that
+/// does not parse, and an id this registry no longer holds (the group ended).
+/// All three mean *there is no group whose vocabulary I could answer for*, and
+/// collapsing them is what keeps the two commands in agreement: the read-only
+/// vocabulary command has no `Result` to refuse into (its payload is a frozen
+/// wire contract), so refusing a malformed id on the WRITE path alone would put
+/// the button and the allow-list back into disagreement — the defect class this
+/// file's #778 work exists to close. Being lenient is safe because nothing here
+/// builds a path from the id: it is a map key, and the leniency decides which
+/// VOCABULARY answers, never who may touch what.
+fn group_rails(app: &tauri::AppHandle, group: Option<GroupId>) -> Option<Guardrails> {
+    app.state::<Arc<OrchRegistry>>().guardrails_of(&group?)
+}
+
 /// Labels the issues view is permitted to add/remove **whatever the repo's
 /// workflow says**. These are the durable signals the orchestrator's intake poll
 /// watches for (see `orchestration/templates/orchestrator.md`): `agent-ready` /
@@ -74,33 +114,59 @@ where
 /// the write succeeds and the orchestrator's substring match still picks it up.
 const FIXED_LABELS: [&str; 3] = ["agent-ready", "agent-investigation", "agent-managed"];
 
-/// This repo's spelling of the hold veto (#778) — `intake.labels.hold` from its
-/// `.loomux/workflow.yml`, or the built-in `agent-hold` when the file declares
-/// none, is absent, or does not parse.
+/// The spelling of the hold veto (#778) that THIS CALL answers for: a group's
+/// own when the caller has one, and otherwise the repo's.
 ///
-/// **Resolved through the engine, never re-implemented here.** `load_workflow`
-/// is the same function `create_group` and `orch_workflow_preview` run, and
-/// `Workflow::intake` is always fully resolved (built-in defaults filled in), so
-/// the spelling this returns is by construction the spelling the intake poller
-/// will honor for a group launched on this repo. A second parser here is exactly
-/// how the UI and the poller would drift apart again.
+/// **With a group — `guardrails.intake.hold`, the field the group is RUNNING**
+/// (#2663). That is the same field `OrchRegistry::hold_label_of` reads for the
+/// lifecycle panel, the intake poller and the contract's `{{HOLD_LABEL}}`, so
+/// the panel, the issues view, the writable allow-list and the create spec are
+/// one value by construction rather than four resolutions that happen to agree.
+///
+/// **And deliberately NOT `load_active_workflow(repo, rails)`**, which would read
+/// the group's file as it stands right now. The two differ exactly under drift:
+/// a group runs the vocabulary pinned at launch (or at an `apply_workflow`), and
+/// an edit to the file since then is audited as `workflow-changed-since-launch`
+/// and NOT adopted. Resolving the veto from the file's current content would
+/// hand the human a button writing a label that group's own poller is not
+/// watching — the #778 failure, reintroduced one layer along. It also means this
+/// arm opens no file at all, so there is no second loader here to drift.
+///
+/// **Without a group — the repo's `default` workflow**, through the #1689 pair
+/// at `Guardrails::default()` (whose `workflow` name IS `default`), which is the
+/// file `workflow::load_workflow` would have opened. Byte for byte the pre-#2663
+/// answer, and it is what a plain (non-orchestration) pane's issues view gets.
+///
+/// **Every spelling is re-checked at this boundary**, whichever arm produced it.
+/// A value off the parser is already clean; one off a hand-edited `group.json`
+/// is not necessarily, and this is the last thing between it and a
+/// `gh label create <name>` positional. `usable_intake_label` is the workflow
+/// parser's OWN rule (one function, three callers), so this is a re-ask rather
+/// than a third predicate that could drift from it.
 ///
 /// **A broken workflow file falls back to the built-in**, deliberately: a repo
 /// whose file does not parse gets the built-in roster from `create_group` too,
 /// so its poller is watching `agent-hold`, and the UI must write what the poller
 /// watches. Failing closed (refusing every hold write) would take away the veto
-/// gesture over a typo elsewhere in the file.
-fn hold_label(repo: &str) -> String {
-    loomux_engine::workflow::load_workflow(repo)
-        .ok()
-        .flatten()
-        .map(|wf| wf.intake.hold)
-        .filter(|h| !h.trim().is_empty())
+/// gesture over a typo elsewhere in the file. A group whose pinned spelling is
+/// unusable falls back the same way, and to the same value `read_intake` would
+/// itself have produced for that field.
+fn hold_label(repo: &str, group: Option<&Guardrails>) -> String {
+    let raw = match group {
+        Some(rails) => Some(rails.intake.hold.clone()),
+        None => crate::orchestration::load_active_workflow(repo, &Guardrails::default())
+            .ok()
+            .flatten()
+            .map(|wf| wf.intake.hold),
+    };
+    raw.as_deref()
+        .and_then(loomux_engine::workflow::usable_intake_label)
         .unwrap_or_else(|| loomux_engine::workflow::builtin_intake_profile().hold)
 }
 
-/// The full set of labels writable for `repo`: the three fixed signals plus this
-/// repo's resolved hold spelling.
+/// The full set of labels writable for this call's scope: the three fixed
+/// signals plus the hold spelling [`hold_label`] resolves for it — a group's own
+/// when `group` is `Some`, the repo's otherwise (#2663).
 ///
 /// **Still an allow-list, and that is the load-bearing part.** The hold entry is
 /// ONE value resolved from the repo's own committed config — not a wildcard, not
@@ -117,16 +183,20 @@ fn hold_label(repo: &str) -> String {
 /// can be read as an option). Note the two are different claims: the alphabet
 /// alone would have permitted `--force`, because `-` is in it.
 ///
-/// **And the guarantee is about this path specifically.** The value here is
-/// resolved from the repo's `.loomux/workflow.yml` through `parse_workflow`, so
-/// the sanitizer is always in front of it; a file that fails to parse falls back
-/// to the built-in. A hand-edited `group.json` can carry an unsanitized label
-/// into `guardrails.intake.hold`, but that field feeds prose surfaces (the
-/// contract, the notice, the panel) and never an argv — `gh.rs` does not read
-/// group state at all.
-fn allowed_labels(repo: &str) -> Vec<String> {
+/// **And the guarantee is about every path that reaches here** (#2663). A value
+/// out of a workflow file met `parse_workflow`, so the sanitizer was always in
+/// front of it. A group's `guardrails.intake.hold` is the path that did NOT:
+/// `gh.rs` now reads group state, and a hand-edited `group.json` never met the
+/// parser. An earlier version of this paragraph rested on "`gh.rs` does not read
+/// group state at all", which this change makes false — so the guarantee is
+/// carried by [`hold_label`] re-asking `workflow::usable_intake_label` instead,
+/// which is the parser's own rule and refuses a leading `-` on top of the
+/// alphabet. `read_intake` applies that same rule when it loads a `group.json`,
+/// so the two agree; this boundary does not depend on that, which is the point
+/// of asking twice.
+fn allowed_labels(repo: &str, group: Option<&Guardrails>) -> Vec<String> {
     let mut out: Vec<String> = FIXED_LABELS.iter().map(|s| s.to_string()).collect();
-    let hold = hold_label(repo);
+    let hold = hold_label(repo, group);
     if !out.contains(&hold) {
         out.push(hold);
     }
@@ -160,8 +230,8 @@ fn label_spec(name: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// The create spec for a label allowed on `repo`, resolving the one entry whose
-/// NAME is repo-configurable.
+/// The create spec for a label allowed in this call's scope, resolving the one
+/// entry whose NAME is configurable — per repo, and now per group (#2663).
 ///
 /// The hold veto (#778) cannot be matched by literal in [`label_spec`] any more:
 /// a repo that renamed it to `do-not-touch` must still get the label *created*
@@ -174,11 +244,15 @@ fn label_spec(name: &str) -> Option<(&'static str, &'static str)> {
 /// stays legible on GitHub to someone who has never read the orchestrator
 /// contract — including the human deciding whether to apply it — under whatever
 /// name the repo chose.
-fn label_spec_for(repo: &str, name: &str) -> Option<(&'static str, &'static str)> {
+fn label_spec_for(
+    repo: &str,
+    group: Option<&Guardrails>,
+    name: &str,
+) -> Option<(&'static str, &'static str)> {
     if let Some(spec) = label_spec(name) {
         return Some(spec);
     }
-    (name == hold_label(repo)).then_some((
+    (name == hold_label(repo, group)).then_some((
         "b60205",
         "Held by the human — full-autonomy agents must not start this",
     ))
@@ -576,29 +650,50 @@ fn gh_issue_create_sync(repo: String, title: String, body: String) -> Result<GhI
 }
 
 /// Add and/or remove labels on an issue. Every label — add or remove — is
-/// validated against [`allowed_labels`] for this repo before any spawn, so this
-/// can never attach or strip a label outside the agent go-signal set plus the
-/// repo's own resolved hold spelling (#778).
+/// validated against [`allowed_labels`] for this call's scope before any spawn,
+/// so this can never attach or strip a label outside the agent go-signal set
+/// plus the resolved hold spelling (#778).
+///
+/// `group` is the calling pane's own orchestration group when it has one
+/// (#2663): a veto clicked in an orchestrator pane writes the spelling THAT
+/// group's poller watches, not the one its repo's `default` file happens to
+/// declare. Absent — a plain pane — is the repo resolution, unchanged.
+///
+/// The registry read happens on the blocking pool with the rest of the body: an
+/// `AppHandle` is one `Arc` clone to resolve and carries no lifetime, which is
+/// what an `async` command needs (the `tauri::State` reasoning in
+/// `orchestration::mod`'s `run_blocking` doc).
 #[tauri::command]
 pub async fn gh_issue_set_labels(
+    app: tauri::AppHandle,
     repo: String,
+    group: Option<String>,
     number: u64,
     add: Vec<String>,
     remove: Vec<String>,
 ) -> Result<(), String> {
-    run_blocking(move || gh_issue_set_labels_sync(repo, number, add, remove)).await
+    // Parsed at the boundary, in this command's own body (CLAUDE.md constraint
+    // 6): an unusable id is `None`, which is the no-group arm — see
+    // [`group_rails`] for why all three no-group cases are one arm.
+    let gid = group.as_deref().and_then(|g| GroupId::parse(g).ok());
+    run_blocking(move || {
+        let rails = group_rails(&app, gid);
+        gh_issue_set_labels_sync(repo, rails.as_ref(), number, add, remove)
+    })
+    .await
 }
 
 fn gh_issue_set_labels_sync(
     repo: String,
+    group: Option<&Guardrails>,
     number: u64,
     add: Vec<String>,
     remove: Vec<String>,
 ) -> Result<(), String> {
-    // Resolved once, from the repo's own committed workflow config, and used for
-    // both directions: a repo that renamed the veto must be able to APPLY its
-    // spelling and to LIFT it again.
-    let allowed = allowed_labels(&repo);
+    // Resolved once, for this call's scope, and used for both directions: a
+    // caller that renamed the veto must be able to APPLY its spelling and to
+    // LIFT it again.
+    let allowed = allowed_labels(&repo, group);
     validate_labels(&allowed, &add)?;
     validate_labels(&allowed, &remove)?;
     // Nothing to do — don't spawn gh just to no-op (gh issue edit with neither
@@ -610,7 +705,7 @@ fn gh_issue_set_labels_sync(
     // so create any allow-listed label we're about to add that's missing. Only
     // adds need this; removing a label the repo lacks is already a no-op at gh.
     if !add.is_empty() {
-        ensure_labels_exist(&repo, &add)?;
+        ensure_labels_exist(&repo, group, &add)?;
     }
     let args = issue_edit_args(number, &add, &remove);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -650,22 +745,33 @@ pub struct GhLabelVocabulary {
 }
 
 #[tauri::command]
-pub async fn gh_label_vocabulary(repo: String) -> GhLabelVocabulary {
-    run_blocking(move || Ok(gh_label_vocabulary_sync(&repo)))
-        .await
-        // A panicking blocking pool must not leave the issues view with no
-        // vocabulary at all: fall back to the built-ins, which is exactly what a
-        // repo with no workflow file resolves to anyway.
-        .unwrap_or_else(|_| gh_label_vocabulary_sync(""))
+pub async fn gh_label_vocabulary(
+    app: tauri::AppHandle,
+    repo: String,
+    group: Option<String>,
+) -> GhLabelVocabulary {
+    // Parsed at the boundary, in this command's own body (CLAUDE.md constraint
+    // 6): an unusable id is `None`, which is the no-group arm — see
+    // [`group_rails`] for why all three no-group cases are one arm.
+    let gid = group.as_deref().and_then(|g| GroupId::parse(g).ok());
+    run_blocking(move || {
+        let rails = group_rails(&app, gid);
+        Ok(gh_label_vocabulary_sync(&repo, rails.as_ref()))
+    })
+    .await
+    // A panicking blocking pool must not leave the issues view with no
+    // vocabulary at all: fall back to the built-ins, which is exactly what a
+    // repo with no workflow file resolves to anyway.
+    .unwrap_or_else(|_| gh_label_vocabulary_sync("", None))
 }
 
-#[doc(hidden)] // pub for integration tests: resolve a repo's vocabulary without a Tauri runtime
-pub fn gh_label_vocabulary_sync(repo: &str) -> GhLabelVocabulary {
+#[doc(hidden)] // pub for integration tests: resolve a vocabulary without a Tauri runtime
+pub fn gh_label_vocabulary_sync(repo: &str, group: Option<&Guardrails>) -> GhLabelVocabulary {
     let builtin = loomux_engine::workflow::builtin_intake_profile();
     GhLabelVocabulary {
         ready: builtin.ready,
         investigate: builtin.investigate,
-        hold: hold_label(repo),
+        hold: hold_label(repo, group),
     }
 }
 
@@ -810,11 +916,19 @@ fn gh_activity_sync(repo: String) -> Result<GhActivity, String> {
 /// Create any allow-listed label in `labels` that the repo doesn't already
 /// define, so a following `gh issue edit --add-label` can attach it. Callers
 /// must have validated `labels` against the allow-list first. Thin wrapper over
-/// [`ensure_labels_with`] that binds the `gh` runner AND the spec lookup to this
-/// repo — the latter because the hold label's NAME is repo-configurable (#778),
-/// so "what colour/description do I create this with" is a per-repo question now.
-fn ensure_labels_exist(repo: &str, labels: &[String]) -> Result<(), String> {
-    ensure_labels_with(labels, |name| label_spec_for(repo, name), |args| {
+/// [`ensure_labels_with`] that binds the `gh` runner to this repo AND the spec
+/// lookup to the same scope the allow-list was resolved for — the latter because
+/// the hold label's NAME is configurable (#778, per group since #2663), so "what
+/// colour/description do I create this with" follows whichever spelling the
+/// validation just admitted. Handing this a different scope from
+/// [`allowed_labels`] would produce a label that validates and then cannot be
+/// created.
+fn ensure_labels_exist(
+    repo: &str,
+    group: Option<&Guardrails>,
+    labels: &[String],
+) -> Result<(), String> {
+    ensure_labels_with(labels, |name| label_spec_for(repo, group, name), |args| {
         run_gh(Some(repo), args)
     })
 }
@@ -885,7 +999,7 @@ where
 
 // ---------- pure helpers (unit-tested) ----------
 
-/// Reject any label not in `allowed` — the repo's resolved set from
+/// Reject any label not in `allowed` — the resolved set from
 /// [`allowed_labels`]. Takes the set rather than reading the const so the
 /// resolution happens once per call at the command boundary, and so this stays a
 /// pure function a unit test can drive with any vocabulary.
@@ -1407,7 +1521,21 @@ mod tests {
     /// The default vocabulary — what `allowed_labels` resolves to for a repo
     /// with no workflow file, and what every pre-#778 caller effectively used.
     fn default_allowed() -> Vec<String> {
-        allowed_labels("C:/nonexistent-repo-with-no-workflow")
+        allowed_labels("C:/nonexistent-repo-with-no-workflow", None)
+    }
+
+    /// A group running `hold`, and nothing else declared — the shape #2663's
+    /// three sites now take. Built through `Guardrails`/`IntakeProfile` rather
+    /// than a bare string so the tests exercise the same field
+    /// `OrchRegistry::hold_label_of` reads.
+    fn group_running_hold(hold: &str) -> Guardrails {
+        Guardrails {
+            intake: loomux_engine::workflow::IntakeProfile {
+                hold: hold.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1471,7 +1599,7 @@ mod tests {
     /// here would remove the veto gesture over an unrelated typo in the file.
     #[test]
     fn a_repo_without_a_workflow_file_gets_the_builtin_hold_label() {
-        assert_eq!(hold_label("C:/nonexistent-repo-with-no-workflow"), "agent-hold");
+        assert_eq!(hold_label("C:/nonexistent-repo-with-no-workflow", None), "agent-hold");
         assert_eq!(
             default_allowed(),
             vec!["agent-ready", "agent-investigation", "agent-managed", "agent-hold"]
@@ -1502,23 +1630,23 @@ mod tests {
         );
         let repo = dir.path().to_string_lossy().to_string();
 
-        assert_eq!(hold_label(&repo), "do-not-touch");
-        assert_eq!(gh_label_vocabulary_sync(&repo).hold, "do-not-touch");
+        assert_eq!(hold_label(&repo, None), "do-not-touch");
+        assert_eq!(gh_label_vocabulary_sync(&repo, None).hold, "do-not-touch");
         // The write path agrees with what the view was told — one resolution,
         // so the button and the allow-list cannot disagree.
-        let allowed = allowed_labels(&repo);
+        let allowed = allowed_labels(&repo, None);
         assert!(validate_labels(&allowed, &["do-not-touch".to_string()]).is_ok());
         assert!(
             validate_labels(&allowed, &["agent-hold".to_string()]).is_err(),
             "the built-in means nothing to this repo's poller, so writing it would be a no-op veto"
         );
         // ...and the label can be CREATED under its own name on a fresh repo.
-        assert!(label_spec_for(&repo, "do-not-touch").is_some());
+        assert!(label_spec_for(&repo, None, "do-not-touch").is_some());
 
         // The go-signals are reported as built-ins, not as anything the file
         // says: #382 P2 has not landed, and claiming otherwise here would be the
         // same overclaim this whole change is fixing, pointed the other way.
-        let vocab = gh_label_vocabulary_sync(&repo);
+        let vocab = gh_label_vocabulary_sync(&repo, None);
         assert_eq!(vocab.ready, "agent-ready");
         assert_eq!(vocab.investigate, "agent-investigation");
     }
@@ -1531,21 +1659,125 @@ mod tests {
     fn a_broken_workflow_file_falls_back_to_the_builtin_veto() {
         let dir = repo_with_workflow("this: is not: a valid workflow\n  - at all\n");
         let repo = dir.path().to_string_lossy().to_string();
-        assert_eq!(hold_label(&repo), "agent-hold");
-        assert!(validate_labels(&allowed_labels(&repo), &["agent-hold".to_string()]).is_ok());
+        assert_eq!(hold_label(&repo, None), "agent-hold");
+        assert!(
+            validate_labels(&allowed_labels(&repo, None), &["agent-hold".to_string()]).is_ok()
+        );
     }
 
     /// A file that declares an `intake:` block but no `hold:` key inherits the
     /// built-in — the migration case every other label field already has, and
     /// the one where an empty-string fallback would produce a veto that matches
     /// nothing at all.
+    /// **#2663, the whole point.** A group whose pinned `intake.hold` differs
+    /// from its repo's `default` workflow file gets its OWN spelling from all
+    /// three sites, and the repo's file — the decoy — is never read.
+    ///
+    /// The decoy declares a THIRD value (`repo-veto`), not the built-in, so a
+    /// site that had silently stayed repo-scoped fails here rather than passing
+    /// because two of the three answers happened to coincide.
+    #[test]
+    fn a_groups_own_hold_spelling_beats_the_repos_default_workflow_file() {
+        let dir = repo_with_workflow(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             intake:\n  labels:\n    hold: repo-veto\n",
+        );
+        let repo = dir.path().to_string_lossy().to_string();
+        let rails = group_running_hold("do-not-touch");
+        let group = Some(&rails);
+
+        // 1. the spelling itself, and 2. what the view is TOLD.
+        assert_eq!(hold_label(&repo, group), "do-not-touch");
+        assert_eq!(gh_label_vocabulary_sync(&repo, group).hold, "do-not-touch");
+        // 3. what the write path ACCEPTS.
+        let allowed = allowed_labels(&repo, group);
+        assert!(validate_labels(&allowed, &["do-not-touch".to_string()]).is_ok());
+        assert!(
+            validate_labels(&allowed, &["repo-veto".to_string()]).is_err(),
+            "the repo file's spelling means nothing to THIS group's poller"
+        );
+        assert!(
+            validate_labels(&allowed, &["agent-hold".to_string()]).is_err(),
+            "and neither does the built-in"
+        );
+        // 4. what can be CREATED on a fresh repo.
+        assert!(label_spec_for(&repo, group, "do-not-touch").is_some());
+        assert!(label_spec_for(&repo, group, "repo-veto").is_none());
+
+        // The negative control, on the SAME repo: no group in hand is the
+        // pre-#2663 answer, the file's own spelling, unchanged.
+        assert_eq!(hold_label(&repo, None), "repo-veto");
+        assert_eq!(gh_label_vocabulary_sync(&repo, None).hold, "repo-veto");
+        assert!(label_spec_for(&repo, None, "repo-veto").is_some());
+        assert!(label_spec_for(&repo, None, "do-not-touch").is_none());
+    }
+
+    /// A group on the built-in vocabulary is byte for byte the pre-#2663
+    /// four-label set — the migration control for every group that existed
+    /// before named workflows, which is nearly all of them.
+    #[test]
+    fn a_group_running_the_builtin_vocabulary_is_unchanged() {
+        let repo = "C:/nonexistent-repo-with-no-workflow";
+        let rails = Guardrails::default();
+        assert_eq!(allowed_labels(repo, Some(&rails)), default_allowed());
+        assert_eq!(hold_label(repo, Some(&rails)), "agent-hold");
+    }
+
+    /// **The argv boundary (#2663).** `guardrails.intake.hold` is the one input
+    /// to this file that never met `parse_workflow`: a hand-edited `group.json`
+    /// writes it directly. `gh label create <name>` takes it as a POSITIONAL, so
+    /// a `-`-leading value would be read by cobra as a flag.
+    ///
+    /// `hold_label` re-asks `workflow::usable_intake_label` — the parser's own
+    /// rule — and falls back to the BUILT-IN rather than to the repo's file: the
+    /// group's own answer is authoritative-but-unusable, and quietly substituting
+    /// a different group's-file spelling would be a second wrong answer.
+    #[test]
+    fn a_flag_shaped_hold_from_a_hand_edited_group_json_never_reaches_an_argv() {
+        let dir = repo_with_workflow(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             intake:\n  labels:\n    hold: repo-veto\n",
+        );
+        let repo = dir.path().to_string_lossy().to_string();
+
+        for evil in ["--force", "-x", "--"] {
+            let rails = group_running_hold(evil);
+            let group = Some(&rails);
+            assert_eq!(
+                hold_label(&repo, group),
+                "agent-hold",
+                "{evil:?} must fall back to the built-in, not to the repo file"
+            );
+            let allowed = allowed_labels(&repo, group);
+            assert!(
+                !allowed.iter().any(|l| l.starts_with('-')),
+                "nothing flag-shaped may enter the allow-list: {allowed:?}"
+            );
+            assert!(
+                validate_labels(&allowed, &[evil.to_string()]).is_err(),
+                "{evil:?} must not validate"
+            );
+            assert!(
+                label_spec_for(&repo, group, evil).is_none(),
+                "{evil:?} must have no create spec"
+            );
+        }
+
+        // Positive control on the loop above: the SAME construction with a
+        // legitimate value does land, so the four assertions are refusing this
+        // value class rather than refusing everything a group can pin.
+        let ok = group_running_hold("do-not-touch");
+        assert_eq!(hold_label(&repo, Some(&ok)), "do-not-touch");
+        assert!(label_spec_for(&repo, Some(&ok), "do-not-touch").is_some());
+    }
+
     #[test]
     fn an_intake_block_without_a_hold_key_inherits_the_builtin_veto() {
         let dir = repo_with_workflow(
             "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
              intake:\n  labels:\n    ready: go-build-it\n",
         );
-        assert_eq!(hold_label(&dir.path().to_string_lossy()), "agent-hold");
+        assert_eq!(hold_label(&dir.path().to_string_lossy(), None), "agent-hold");
     }
 
     #[test]
@@ -1578,7 +1810,7 @@ mod tests {
         // repo-resolved and `label_spec` alone can no longer answer for it.
         let repo = "C:/nonexistent-repo-with-no-workflow";
         for l in default_allowed() {
-            let spec = label_spec_for(repo, &l);
+            let spec = label_spec_for(repo, None, &l);
             assert!(spec.is_some(), "{l} has no create spec");
             let (color, desc) = spec.unwrap();
             assert_eq!(color.len(), 6, "{l} color must be 6 hex digits: {color:?}");
@@ -1598,13 +1830,13 @@ mod tests {
         // enforces: a repo that has never seen the label gets one whose meaning is
         // legible on GitHub without reading the orchestrator contract.
         let red = Some(("b60205", "Held by the human — full-autonomy agents must not start this"));
-        assert_eq!(label_spec_for(repo, "agent-hold"), red);
+        assert_eq!(label_spec_for(repo, None, "agent-hold"), red);
         // Non-allow-listed names have no spec (defense in depth vs. arbitrary
         // label creation) — including a would-be hold spelling this repo did not
         // declare, which is what stops `label_spec_for` from being a create
         // permit for any label at all.
-        assert!(label_spec_for(repo, "bug").is_none());
-        assert!(label_spec_for(repo, "do-not-touch").is_none());
+        assert!(label_spec_for(repo, None, "bug").is_none());
+        assert!(label_spec_for(repo, None, "do-not-touch").is_none());
         assert!(label_spec("agent-hold").is_none(), "the literal is no longer a fixed spec");
     }
 
@@ -1682,7 +1914,7 @@ mod tests {
     /// workflow file. Keeps the flow tests about the FLOW (list, create, error
     /// handling) rather than about label resolution, which its own tests cover.
     fn builtin_spec(name: &str) -> Option<(&'static str, &'static str)> {
-        label_spec_for("C:/nonexistent-repo-with-no-workflow", name)
+        label_spec_for("C:/nonexistent-repo-with-no-workflow", None, name)
     }
 
     /// argv (joined with spaces for easy matching) and returns Ok(stdout)/Err(stderr).

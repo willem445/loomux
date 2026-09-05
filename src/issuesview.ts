@@ -51,6 +51,13 @@ function ghErrText(err: unknown): string {
 export interface IssuesViewHost {
   /** The pane's live working directory (from shell integration). */
   getCwd(): string | null;
+  /** The orchestration group this pane belongs to, or null for a plain pane
+   *  (#2663). The veto spelling is a property of the GROUP once one is in
+   *  hand — `guardrails.intake.hold` is what its poller watches, and a group
+   *  that applied a named workflow can be running a different spelling from
+   *  the one its repo's default workflow file declares. Null is the repo
+   *  resolution, which is what every pane got before #2663. */
+  getGroupId(): string | null;
   /** Close the issues view and return to the terminal. */
   onClose(): void;
   /** The view's own header embed button was clicked (#361) — `anchor` (the
@@ -128,10 +135,11 @@ export class IssuesView {
   readonly el: HTMLElement;
 
   private repoRoot: string | null = null;
-  /** This repo's veto spelling (#778), resolved by the backend from its workflow
-   *  config. Starts at the built-in and is replaced when the repo resolves —
+  /** The veto spelling (#778) for this pane's repo AND group, resolved by the
+   *  backend. Starts at the built-in and is replaced when the repo resolves —
    *  never guessed from a label the list happened to contain. Re-resolved on
-   *  every repo change, because it is a property of the repo, not of the pane. */
+   *  every repo change; the group half needs no re-resolution because a pane's
+   *  group is fixed for the life of the pane (#2663). */
   private holdLabel: string = DEFAULT_HOLD;
   private issues: GhIssue[] = [];
   private prs: GhPr[] = [];
@@ -352,7 +360,8 @@ export class IssuesView {
         // built-in rather than blanking the view, which is what the backend's
         // allow-list would accept for a repo whose file it also could not read.
         try {
-          this.holdLabel = (await ghLabelVocabulary(root)).hold || DEFAULT_HOLD;
+          this.holdLabel =
+            (await ghLabelVocabulary(root, this.host.getGroupId())).hold || DEFAULT_HOLD;
         } catch {
           this.holdLabel = DEFAULT_HOLD;
         }
@@ -602,7 +611,15 @@ export class IssuesView {
     this.busy.add(issue.number);
     this.renderList();
     try {
-      await ghIssueSetLabels(this.repoRoot, issue.number, delta.add, delta.remove);
+      // The same `group` the vocabulary was resolved with, so the button and the
+      // backend allow-list cannot disagree (#2663).
+      await ghIssueSetLabels(
+        this.repoRoot,
+        this.host.getGroupId(),
+        issue.number,
+        delta.add,
+        delta.remove
+      );
       // Reflect the change locally so the row updates without a full refetch;
       // the next refresh reconciles with GitHub's truth.
       issue.labels = issue.labels
