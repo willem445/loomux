@@ -467,11 +467,39 @@ persisted `kind` through `workflow::kind_from_str`, which has no `lead` arm by
 design — that absence is what stops a repo file declaring one and stops a lead
 opening a lead. So an unknown kind is *dropped* on reload, and a roster read back
 off disk would answer "not a lead group" for every lead group there has ever
-been. `lead_prepare` writes a `lead` marker into the group dir (the `paused`
-marker's precedent) and `is_lead_group` asks that.
+been. `lead_prepare` writes a `lead` marker into the group dir and
+`is_lead_group` asks that.
 `a_reloaded_lead_group_loses_its_lead_block_but_keeps_its_marker` pins both
 halves, so the day `kind_from_str` grows a `lead` arm that test goes red rather
 than the marker quietly becoming redundant.
+
+**The marker has a LIFETIME, and both ends of it are code.** This is the
+`paused` marker's precedent taken whole rather than half, and taking half of it
+was a real defect (rev-final B1). A group id is repo-derived and handed out
+again — `next_group_id` returns the first candidate with no LIVE agent, and the
+group directory is never removed — so a lead group whose pane has died leaves
+its id, and a write-only marker, free for an ordinary orchestration to reattach
+to. That group would then answer `is_lead_group()` for the rest of its life,
+and every session in it would be refused as unresumable, citing a toggle nobody
+flipped, with no start-fresh affordance to escape through (`lead-group` is
+deliberately not one of the two kinds that offer it).
+
+So the marker is **cleared in `create_group_ex`**, which is the one place a
+group id is claimed, and re-written by `lead_prepare` after its own mint. Not
+at teardown, and that is the load-bearing difference from `end_group`'s `paused`
+remove: a lead that simply dies never runs `end_group` at all — its helpers go
+through `end_lead_children`, which is not the same path. Clearing at the claim
+covers the death, the crash and the deliberate close identically, and it covers
+`Launch::Promote` too, which reattaches a dormant group by exactly the same id
+selection. `an_ordinary_group_reusing_a_dead_leads_id_is_not_a_lead_group` is
+the pin, and it is written so the two operands COLLIDE — same registry, same
+repo, same id — because the first version of the resume test built its control
+in a second registry on a second repo and could not have failed on this.
+
+The write also moved BELOW every step of the prepare that can fail. It used to
+sit above `write_mcp_config` and the empty-flags refusal, so either error return
+left a `lead` marker on a group that never became a lead group — the same false
+refusal, reached from the other side.
 
 ### A correction slice A's note could not make
 

@@ -1514,6 +1514,131 @@ fn a_group_never_ends_up_with_two_roots() {
     );
 }
 
+/// **An ordinary orchestration that reuses a dead lead's group id is NOT a lead
+/// group** — the marker has a lifetime, and this is its far end (rev-final B1).
+///
+/// A group id is repo-derived and handed out again: `next_group_id` returns the
+/// first candidate with no LIVE agent, and the group directory is never removed.
+/// A marker that is only ever written therefore outlives the group that wrote it,
+/// and the ordinary orchestration that reattaches to that id inherits it — every
+/// session in it refused as unresumable, citing a toggle nobody flipped, with no
+/// start-fresh affordance to escape through. Recovery would mean deleting a file
+/// by hand.
+///
+/// **The two operands COLLIDE here, and that is the whole design of the test.**
+/// `a_lead_group_cannot_be_resumed`'s control builds its ordinary group in a
+/// second registry, on a second repo, so it asks `is_lead_group` about a
+/// directory the lead mint never touched — it could not fail on this however
+/// broken the marker's lifetime was (CLAUDE.md: a non-interference pin is
+/// fail-able only when its two operands meet). Here it is one registry, one repo,
+/// and the SAME id, asserted rather than assumed.
+///
+/// The resume half is the one that matters to a human: the ordinary group's own
+/// helper must not come back with `resume-lead-group:`.
+#[test]
+fn an_ordinary_group_reusing_a_dead_leads_id_is_not_a_lead_group() {
+    let (reg, _d, repo, gid, agent_id, _out) = prepared_lead("claude", 4);
+    reg.lead_bind(&agent_id, 9801).unwrap();
+    assert!(reg.is_lead_group(&gid), "precondition: the mint marked it");
+
+    // The lead dies. Nothing runs `end_group` on this path — that is
+    // `end_lead_children` — which is exactly why clearing at teardown would not
+    // have been enough.
+    reg.on_pty_exit(9801, Some(0), "", 0, true);
+
+    // …and an ORDINARY orchestration launches on the same repo, in the same
+    // registry. `create_group` is the launcher's own path.
+    let ordinary = reg
+        .create_group(
+            &repo.path(),
+            Guardrails {
+                max_agents: 4,
+                agent_cli: "claude".into(),
+                blocks: workflow::default_roster(&[
+                    (Role::Orchestrator, "claude", ""),
+                    (Role::Worker, "claude", ""),
+                ]),
+                ..Guardrails::default()
+            },
+        )
+        .expect("an ordinary group on a repo whose lead has died");
+    assert_eq!(
+        ordinary.id, gid,
+        "THE COLLISION, asserted rather than assumed: a dead group's id really is handed out \
+         again, so this test is about the id the lead mint marked"
+    );
+    assert!(
+        !reg.is_lead_group(&ordinary.id),
+        "the claim on a reused id is cleared where the id is claimed — an ordinary group that \
+         inherited it would refuse every session in it for the rest of its life"
+    );
+
+    // The consequence, driven through the path a human would meet it on.
+    let w = reg.spawn_agent(&ordinary.id, Role::Worker, "w", "t", false, None).unwrap();
+    let sid = "cccc0000-1111-4222-8333-444455556666";
+    reg.set_session_for_test(&w.id, sid);
+    reg.mark_dead(&w.id, Some(0));
+    let err = resume_recorded_session(&reg, sid, None, false).err().unwrap_or_default();
+    assert!(
+        !err.starts_with("resume-lead-group:"),
+        "an ordinary group's helper must not be refused as a lead group's: {err}"
+    );
+
+    // …and the control, so the assertion above is not passing because NOTHING is
+    // ever refused: a fresh lead group on another repo still is.
+    let (reg2, _d2, _repo2, gid2, lead2, _o2) = prepared_lead("claude", 4);
+    assert!(reg2.is_lead_group(&gid2), "the control group must be a lead group");
+    reg2.lead_bind(&lead2, 9802).unwrap();
+    let w2 = reg2.spawn_agent(&gid2, Role::Worker, "w", "t", false, None).unwrap();
+    let sid2 = "dddd0000-1111-4222-8333-444455556666";
+    reg2.set_session_for_test(&w2.id, sid2);
+    reg2.mark_dead(&w2.id, Some(0));
+    let refused = resume_recorded_session(&reg2, sid2, None, false)
+        .expect_err("a real lead group's helper is still refused");
+    assert!(refused.starts_with("resume-lead-group:"), "{refused}");
+}
+
+/// **A prepare that fails leaves no marker behind** — B1's second trigger.
+///
+/// The marker used to be written above `write_mcp_config`'s `?` and above the
+/// empty-flags refusal, so either error return left a `lead` marker on a group
+/// that never became a lead group: the same false-refusal state, reached from the
+/// other side. It is now written below every step that can fail.
+///
+/// Driven through the reachable failure: `write_mcp_config` refuses when the MCP
+/// server has no port, which is the state a registry is in before `set_port`.
+/// The control is the same call on a registry that HAS a port — without it this
+/// would pass against a build where `lead_prepare` never marks anything.
+#[test]
+fn a_failed_lead_prepare_leaves_no_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = Arc::new(relaunch_registry(dir.path()));
+    // Deliberately NO `set_port`: `write_mcp_config` refuses, which is the first
+    // `?` below where the marker used to be written.
+    let repo = real_repo();
+    let err = reg
+        .lead_prepare("claude", &repo.path(), "l", 4, false, 5, 0, 5)
+        .expect_err("a prepare that cannot write an MCP config must fail");
+    assert!(err.contains("MCP server is not running"), "the expected failure, not another: {err}");
+
+    let marked: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|g| GroupId::parse(g).map(|id| reg.is_lead_group(&id)).unwrap_or(false))
+        .collect();
+    assert!(
+        marked.is_empty(),
+        "a failed prepare marked a group as a lead group: {marked:?} — every later launch that \
+         reattaches to it would refuse every session in it"
+    );
+
+    // THE CONTROL. The same call on a registry with a port marks its group — so
+    // the emptiness above is the failure path, not a build that marks nothing.
+    let (reg2, _d2, _repo2, gid2, _lead2, _o2) = prepared_lead("claude", 4);
+    assert!(reg2.is_lead_group(&gid2), "a prepare that SUCCEEDS does mark its group");
+}
+
 /// **A lead group cannot be resumed.**
 ///
 /// The lead's own pane is a human-launched CLI orrerix never opened and cannot

@@ -4742,9 +4742,26 @@ pub fn solo_group_id() -> &'static GroupId {
 /// `group.json` is DROPPED on reload rather than restored. Every reader that
 /// needs the fact after a restart asks this file instead.
 ///
-/// Same shape and same directory as the `paused` marker, and best-effort in the
-/// same way: a group whose marker could not be written still runs, and what is
-/// lost is a refusal rather than a permission.
+/// **It has a LIFETIME, and both ends of it are code** (rev-final B1). A group
+/// id is repo-derived and handed out again: `next_group_id` returns the first
+/// candidate with no LIVE agent, and the group directory is never removed. So a
+/// marker that is only ever written outlives the group that wrote it, and the
+/// next ordinary orchestration to reattach to that id answers `is_lead_group()`
+/// forever — every session in it refused as unresumable, citing a toggle nobody
+/// flipped, with `offersStartFresh` false for that kind so the UI offers no way
+/// out. It is written by `lead_prepare` (last, below every step that can fail)
+/// and CLEARED by `create_group_ex`, which is the one place an id is claimed.
+///
+/// That pairing is the `paused` marker's precedent taken WHOLE: `end_group`
+/// removes that one so "a future relaunch on this repo starts clean rather than
+/// silently paused", and `invalidate_usage_memo` beside it states the general
+/// form — "a group id is chosen by liveness and can be handed out again".
+/// Clearing at the CLAIM rather than at teardown is the one difference, and it
+/// is required: a lead that simply dies never runs `end_group` at all.
+///
+/// Best-effort at both ends, and each failure leaves the pre-existing answer
+/// standing rather than inventing one: a write that fails loses the resume
+/// refusal, and a remove that fails leaves a refusal that was already there.
 pub const LEAD_MARKER: &str = "lead";
 
 /// The `AgentEntry` for a pane the HUMAN's own launcher opens — a solo pane or
@@ -33429,6 +33446,35 @@ impl OrchRegistry {
         fs::create_dir_all(dir.join("configs")).map_err(|e| e.to_string())?;
         let resumed = dir.join("group.json").is_file();
 
+        // #2519 B1 (rev-final). A group id is claimed HERE and nowhere else, and
+        // this is the one line that makes the lead marker mean "the group at this
+        // id, AS IT EXISTS NOW, was minted by the toggle".
+        //
+        // The hazard is the one `end_group` clears the `paused` marker for, and
+        // its neighbour states the general form: "a group id is chosen by
+        // liveness and can be handed out again". `next_group_id` returns the
+        // first candidate with no LIVE agent, and the group DIRECTORY is never
+        // removed — so a lead group whose pane has died leaves its id, and its
+        // marker, free for an ordinary orchestration to reattach to. Without
+        // this line that ordinary group answers `is_lead_group()` for the rest of
+        // its life and `resume_recorded_session` refuses every session in it,
+        // citing a toggle nobody flipped — and `offersStartFresh` is false for
+        // that kind, so the UI offers no way out either.
+        //
+        // **Unconditional rather than `Launch::Fresh`-only**, and the extra
+        // coverage is the argument: a `Launch::Promote` reattaches a dormant
+        // group by exactly the same id selection, so a promote onto a dead
+        // lead's id inherits the same stale marker. A `Launch::Resume` cannot
+        // reach a lead group at all — `resume_recorded_session` refuses one
+        // before anything is created — so there is no case where clearing here
+        // erases a fact that is still true. `lead_prepare` re-writes it after
+        // its own mint succeeds, which is what keeps the marker one group wide.
+        //
+        // Best-effort like the `paused` remove it mirrors: a marker that could
+        // not be deleted leaves the pre-existing refusal standing, which is the
+        // direction this fails in either way.
+        let _ = fs::remove_file(dir.join(LEAD_MARKER));
+
         // #407: a PROMOTE reattaching a dormant group brings the promote
         // modal's defaults with it — a right-click is not the launcher, and
         // there is no roster preview in it — so the ROSTER (and the toggle and
@@ -37315,24 +37361,72 @@ impl OrchRegistry {
             ));
         }
 
-        // The durable "this is a lead group" fact, and it is a MARKER FILE
-        // rather than the roster, which is the part worth reading twice.
-        // `group.json` does carry the lead block, but `read_blocks` resolves
-        // every persisted `kind` through `workflow::kind_from_str` — which has
-        // no `lead` arm, deliberately and structurally (that absence is what
-        // stops a repo file declaring one and stops a lead opening a lead) — so
-        // an unknown kind is DROPPED on reload. A reattach or a resume
-        // therefore sees a roster with no lead block at all, and anything that
-        // asked the roster "is this a lead group?" would answer no for every
-        // group that has been through a restart. The marker is asked instead;
-        // it follows the `paused` marker's precedent, in the same directory.
+        // N2 (rev-final): the identity half, split at the seam the review named
+        // — everything above this line decides WHICH GROUP, everything below it
+        // decides WHO THE PANE IS. It is also every remaining step that can
+        // FAIL, which is what lets the marker below be written knowing no error
+        // return can strand one (B1, second trigger).
+        let (agent_id, mcp_args) = self.mint_lead_identity(&group, cli, cwd, name, auto_ops)?;
+
+        // THE MARKER, written LAST. It used to sit above `write_mcp_config`'s `?`
+        // and the empty-flags refusal, so either error return left a `lead`
+        // marker on a group that never became a lead group — the same
+        // false-refusal state B1's main chain produces, reached from the other
+        // side. Nothing below this line can fail.
         //
-        // Best-effort, like that marker: a lead group whose marker could not be
-        // written still runs. What is lost is the resume refusal below, which
-        // then falls through to the ordinary "no recorded orchestration"
-        // failures rather than to a permissive path.
+        // A MARKER FILE rather than the roster, which is the part worth reading
+        // twice. `group.json` does carry the lead block, but `read_blocks`
+        // resolves every persisted `kind` through `workflow::kind_from_str` —
+        // which has no `lead` arm, deliberately and structurally (that absence is
+        // what stops a repo file declaring one and stops a lead opening a lead) —
+        // so an unknown kind is DROPPED on reload. A reattach or a resume
+        // therefore sees a roster with no lead block at all, and anything that
+        // asked the roster "is this a lead group?" would answer no for every lead
+        // group that has been through a restart.
+        //
+        // Best-effort, like the `paused` marker it mirrors — and the pairing with
+        // `create_group_ex`'s remove is what makes that safe. A failed write
+        // loses the resume refusal, which falls through to the ordinary "no
+        // recorded orchestration" failures; a marker left behind by a group that
+        // has ended is cleared by the next claim of its id, rather than by hoping
+        // nothing reuses it.
         let _ = fs::write(self.group_dir(&group.id).join(LEAD_MARKER), b"1");
 
+        self.audit(&group.id, "human", "lead-prepare", json!({
+            "agent": agent_id, "cli": cli, "max_agents": max_agents,
+        }));
+        crate::obs::breadcrumb(
+            "lead-prepare",
+            &format!("group={} agent={agent_id} cli={cli}", group.id),
+        );
+        Ok(json!({
+            "group_id": group.id,
+            "agent_id": agent_id,
+            "mcp_args": mcp_args,
+        }))
+    }
+
+    /// The lead pane's own identity: its id, its token, its MCP config, and the
+    /// flag string the launcher appends (#2519, split out per rev-final N2).
+    ///
+    /// The seam is a statement rather than a line-count trim.
+    /// [`lead_prepare`](Self::lead_prepare) decides WHICH GROUP — the argument
+    /// checks, the mint, the one-root invariant — and this decides WHO THE PANE
+    /// IS, given that group. It is also every step of the prepare that can still
+    /// fail, which is what lets its caller write the `lead` marker below the call
+    /// and know no error return can strand one.
+    ///
+    /// Runs under the caller's `creation` guard, and takes `&GroupInfo` rather
+    /// than a `&GroupId` so it cannot re-resolve a group its caller has already
+    /// pinned.
+    fn mint_lead_identity(
+        &self,
+        group: &GroupInfo,
+        cli: &str,
+        cwd: &str,
+        name: &str,
+        auto_ops: bool,
+    ) -> Result<(String, String), String> {
         let seq = self.mint_agent_seq(&group.id);
         let agent_id = format!("lead-{seq}");
         let display = sanitize_agent_name(name);
@@ -37344,8 +37438,8 @@ impl OrchRegistry {
         let containment = Role::Lead.containment();
         // `PersonaInject::default()`, like `solo_prepare`: a lead group has no
         // workflow file, so no block in it can carry a persona, and every CLI
-        // that reads `persona` out of this config is one whose seam this
-        // function has already refused.
+        // that reads `persona` out of this config is one whose seam
+        // `lead_prepare` has already refused, above the call to this function.
         let cfg = self.write_mcp_config(
             &group.id,
             &agent_id,
@@ -37389,8 +37483,9 @@ impl OrchRegistry {
             cwd,
             // `None`, unlike a solo pane, and it is the same statement
             // `solo_cli`'s own doc makes: a non-solo agent's CLI comes from its
-            // BLOCK, and this one's block carries `cli` because the roster above
-            // pinned it. A `Some` here would be a second source for one fact.
+            // BLOCK, and this one's block carries `cli` because the roster
+            // `lead_prepare` built pinned it. A `Some` here would be a second
+            // source for one fact.
             None,
         );
         self.agents.lock_safe().insert(agent_id.clone(), entry.clone());
@@ -37400,18 +37495,7 @@ impl OrchRegistry {
         // `"role": "lead"` row `doc/design/lead-pane.md` lists as a
         // public-contract change.
         self.persist_agent_record(&entry, "running");
-        self.audit(&group.id, "human", "lead-prepare", json!({
-            "agent": agent_id, "cli": cli, "max_agents": max_agents,
-        }));
-        crate::obs::breadcrumb(
-            "lead-prepare",
-            &format!("group={} agent={agent_id} cli={cli}", group.id),
-        );
-        Ok(json!({
-            "group_id": group.id,
-            "agent_id": agent_id,
-            "mcp_args": mcp_args,
-        }))
+        Ok((agent_id, mcp_args))
     }
 
     /// Human-only: bind the pty the launcher just opened for a lead pane, then

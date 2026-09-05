@@ -24,6 +24,7 @@ export type ResumeFailureKind =
    *  `group-mismatch`: nothing contradicted the caller, there was simply
    *  nothing to check it against. Not `offersStartFresh` for the same reason —
    *  a fresh session would join that unverified group. */
+  | "group-unknown"
   /** The session belongs to a group opened by the orrerix-subagents toggle
    *  (#2519). Its root is a human's own agent pane that orrerix never
    *  launched and cannot relaunch, so there is no group left to rejoin into —
@@ -31,7 +32,6 @@ export type ResumeFailureKind =
    *  `offersStartFresh`: a fresh session would join the same rootless group.
    *  The way back is a new lead pane, not a resume. */
   | "lead-group"
-  | "group-unknown"
   | null;
 
 const TAG_KIND: Record<string, ResumeFailureKind> = {
