@@ -325,6 +325,12 @@ function scorePr(ctx, pr) {
   const driver = {
     drives: 0, lane_spawns: 0, hand_backs: 0, refused: 0, held: 0,
     cancelled: 0, consumed: 0, satisfied: 0, ci_green: 0, resumed: 0, pruned: 0,
+    // #2501: panes the driver released itself, per side. Named counters rather
+    // than the catch-all below, because these two are the measurement the
+    // feature exists to move  the whole point is that the next round of this
+    // scorecard can put them beside  and  without a reader
+    // having to know which rd-* actions are new.
+    lanes_released: 0, workers_released: 0,
   };
   const refusedByReason = {};
   const heldByReason = {};
@@ -391,6 +397,8 @@ function scorePr(ctx, pr) {
         case 'rd-ci-green': driver.ci_green += 1; break;
         case 'rd-resumed': driver.resumed += 1; break;
         case 'rd-pruned': driver.pruned += 1; break;
+        case 'rd-lane-released': driver.lanes_released += 1; break;
+        case 'rd-worker-released': driver.workers_released += 1; break;
         default: driver[row.action] = (driver[row.action] || 0) + 1; break;
       }
       continue;

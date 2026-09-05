@@ -2618,13 +2618,26 @@ from `cap-refused` above even though the remedy is the same, because the two say
 about how long: one is a single refusal on the spot, this is a run of them, and telling a drive
 that has just hit the cap from one that has been stuck all afternoon is the whole point.
 
-**The driver still never kills a pane, including to make room for itself.** Freeing a slot is
-yours or the orchestrator's — or the idle reaper's, where you have set one. What the driver owes
-instead is the sentence, and that is what `cap-full` is; its line also lists the panes that drive
-still owns, so you can see at a glance whether the pressure is even its own. A drive now costs one
-pane per reviewer for its whole life — its lanes are resumed round to round rather than respawned,
-and a reviewer that is still writing is never given a second pane alongside it — so a drive is no
-longer competing with itself for the slots it is waiting on.
+**The driver releases the two kinds of pane it is finished with, and nothing else.** A reviewer
+whose verdict is recorded at the commit the PR is on now has answered the only question the drive
+asks it, and a worker that reported done has had that report read and acted on. In both cases the
+pane is idle, what it produced is already on disk, and the conversation is kept — so the driver
+closes the pane, the slot frees immediately, and the next round reopens that same session in a
+fresh pane. Nothing is lost but the pane: a reviewer asked again comes back to a PR it has already
+read, exactly as it did before.
+
+It kills nothing else. A reviewer that has not answered, one whose verdict belongs to an older
+commit, a worker that is still working or that reported blocked, a drive that is parking or
+ending — all keep their panes, and so does every pane in the group that is not this drive's.
+The driver never goes looking for a pane to free because it is short of slots: it releases on
+facts about the pane, never on how full the group is. Killing anything else is still yours or the
+orchestrator's — or the idle reaper's, where you have set one — and `cap-full` is still the
+sentence a drive owes when it is starved, with its line listing the panes that drive still holds
+so you can see whether the pressure is even its own. What changed is how often that happens: a
+drive between rounds now holds no reviewer slot at all.
+
+Each release is on the audit log as `rd-lane-released` or `rd-worker-released`, naming the pane,
+the session kept and why — so it costs you no line in your pane and is still there to count.
 
 **A drive is bounded by where it is stuck, not by how long it has existed.** Each of the four
 working states has its own bound, and it starts again from zero every time the drive moves:
@@ -2709,7 +2722,9 @@ reopened simply starts fresh, as it always did.
 by the idle reaper, or because the CLI exited — the driver sees it on the next tick and reopens
 that reviewer's session in a fresh pane, rather than sitting there waiting for a verdict that can
 no longer arrive. The audit log records it as `rd-lane-reopened`, naming the pane that went — and who
-ended it, where orrerix knows (a pane that exited on its own says nothing about who). This matters most right after a `cap-refused` notice, which asks you to free a slot by
+ended it, where orrerix knows (a pane that exited on its own says nothing about who). A pane the
+driver released itself is never logged this way: that is `rd-lane-released`, and the difference is
+whether the drive lost a reviewer or was finished with one. This matters most right after a `cap-refused` notice, which asks you to free a slot by
 killing an idle delegate: a lane that has finished its turn looks idle, and before this killing one
 cost the drive a full hour of silence. A lane whose panes keep dying still parks on
 `held(lane-stalled)` at the usual timeout, measured from when the lane was first asked — replacing

@@ -684,8 +684,16 @@ red-evidence PR, a release bump, a PR the human said they would read themselves.
 
 **What the driver may never do**, so you never have to wonder: merge, or use any landing verb;
 write a merge grant; relabel or edit an issue or a PR, bodies included; widen or author a brief
-(every variable in one is a fact orrerix READ); kill a pane; decide a disposition; or open the gate
-— only a reviewer's own `review_verdict` does that. It is strictly **additive** to the merge gate:
+(every variable in one is a fact orrerix READ); decide a disposition; or open the gate
+— only a reviewer's own `review_verdict` does that.
+
+**It kills a pane in exactly two cases**, and it is worth knowing which so you do not go looking
+for them: a reviewer lane whose verdict is recorded at the head it is driving, and a worker that
+has reported and gone idle once the drive has read that report. Both are *released* — the pane
+closes, the delegate slot frees at once, and the session is kept, so the next round comes back to
+the same conversation in a fresh pane. It never kills anything else, and never kills a pane
+because slots are short; each release is on the audit log as `rd-lane-released` or
+`rd-worker-released`, and costs you no line in this pane. It is strictly **additive** to the merge gate:
 it never grants what the gate would not, and a completed drive is never a substitute for a
 reviewer's `pass`.
 
@@ -7350,7 +7358,13 @@ fn live_cap_refusal(live: u32, max: u32, roster: &str) -> String {
 
 /// Whether a spawn refusal is the live-delegate cap's — see
 /// [`live_cap_refusal`], whose literal this reads.
-pub(crate) fn is_live_cap_refusal(err: &str) -> bool {
+///
+/// `pub` for the integration tests: #2501's cap-accounting test needs a CONTROL
+/// that the spawn it expects to be refused is refused by the cap and not by the
+/// spawn-rate backstop or a bad block, and a test that re-spelled the marker
+/// would be a second copy of the literal this function exists to keep single.
+#[doc(hidden)] // pub for integration tests
+pub fn is_live_cap_refusal(err: &str) -> bool {
     err.contains(LIVE_CAP_MARKER)
 }
 
@@ -17397,6 +17411,12 @@ pub enum ExitInitiator {
     /// no task in flight, nothing to lose — which is what makes it safe to
     /// demote alongside an orchestrator-initiated kill.
     IdleTimeout,
+    /// The review driver releasing a pane it no longer needs (#2501) — a
+    /// reviewer lane whose verdict is recorded at the drive's current head, or a
+    /// worker that reported and went idle once the drive had consumed the
+    /// report. `reviewdrive::releasable` is the closed rule and
+    /// `OrchRegistry::release_driven_pane` is the only thing that stamps this.
+    DriverRelease,
 }
 
 impl ExitInitiator {
@@ -17404,6 +17424,7 @@ impl ExitInitiator {
         match self {
             ExitInitiator::Orchestrator => "orchestrator",
             ExitInitiator::IdleTimeout => "idle-timeout",
+            ExitInitiator::DriverRelease => "driver-release",
         }
     }
 }
@@ -17430,13 +17451,35 @@ pub enum ExitNoticeRoute {
 /// work, that mode must PROMPT.** `IdleTimeout` is demoted here only
 /// because `reap_idle_agents` is, by construction, restricted to agents
 /// that are idle — no task, nothing lost. A future "kill the stalled
-/// worker" or "kill to reclaim a slot" reaper is a materially different
-/// event the orchestrator did not ask for and cannot reconstruct from the
-/// roster: give it its own `ExitInitiator` variant and route it to
-/// `Prompt`, rather than reusing this one.
+/// worker" reaper is a materially different event the orchestrator did not
+/// ask for and cannot reconstruct from the roster: give it its own
+/// `ExitInitiator` variant and route it to `Prompt`, rather than reusing
+/// this one.
+///
+/// **`DriverRelease` is demoted, and it is worth saying why it is not the
+/// "kill to reclaim a slot" case that sentence turns away** (#2501). That
+/// case is a reaper choosing a victim to make room; this is a drive
+/// disposing of a pane whose work it has already taken delivery of, in one
+/// of two states `reviewdrive::releasable` closes over: a lane whose
+/// verdict is recorded at the drive's current head, or a worker whose
+/// `report` the drive has consumed. Both carry `IdleTimeout`'s own
+/// property — the pane is idle, so nothing is in flight — and add the one
+/// it does not: the output is already durable (a verdict file, a consumed
+/// report) and the conversation is resumable by session, so nothing is
+/// lost rather than merely nothing in progress.
+///
+/// The orchestrator can reconstruct it, which is the actual test this
+/// function applies: `rd-lane-released` / `rd-worker-released` name the
+/// pane, the session and the reason on the audit log, the roster reflects
+/// the liveness, and the drive's own exit notice lists the panes that are
+/// still there. And prompting would be self-defeating — an orchestrator
+/// turn per released pane is precisely the cost #2501 measured and exists
+/// to remove, so a `Prompt` here would spend the saving on announcing it.
 pub fn exit_notice_route(initiator: Option<ExitInitiator>) -> ExitNoticeRoute {
     match initiator {
-        Some(ExitInitiator::Orchestrator) | Some(ExitInitiator::IdleTimeout) => ExitNoticeRoute::AuditOnly,
+        Some(ExitInitiator::Orchestrator)
+        | Some(ExitInitiator::IdleTimeout)
+        | Some(ExitInitiator::DriverRelease) => ExitNoticeRoute::AuditOnly,
         // Crash, watchdog-driven death, an agent quitting unexpectedly, a
         // human closing the pane — nobody in this process asked for it.
         None => ExitNoticeRoute::Prompt,
@@ -53110,6 +53153,94 @@ impl OrchRegistry {
         app.state::<crate::pty::PtyManager>().kill(pty);
         self.audit(&a.group, brand::AUDIT_ACTOR, "agent-kill",
             json!({ "agent": agent_id, "initiator": initiator.as_str() }));
+        Ok(())
+    }
+
+    /// **Release one pane the review driver no longer needs** (#2501) — the
+    /// registry half of `reviewdrive::releasable`, and the ONLY route by which
+    /// the driver may end a pane's life.
+    ///
+    /// # Why this exists rather than the driver calling `kill_agent`
+    ///
+    /// `review-driver.md` §3.1 item 5 was a closed guarantee — the driver may
+    /// never kill a pane — enforced by a default-deny source scan over the
+    /// driver's three files that denies `kill_agent` and the reaper entry
+    /// points. #2501 narrows the guarantee to two states, and the honest way to
+    /// narrow it is to give the driver exactly one named capability rather than
+    /// to let it reach a kill primitive by some other name: the scan keeps
+    /// denying `kill_agent`, `kill_agent_as`, `mark_dead` and
+    /// `reap_idle_agents` inside those files, and permits this one call, whose
+    /// site count it pins. A kill the driver reached any other way still fails
+    /// the scan, which is what makes "only these two states" reviewable instead
+    /// of merely intended.
+    ///
+    /// This function lives here, beside `kill_agent_as` and `mark_dead`, for the
+    /// same reason: it is a lifecycle capability, and a barrier a caller must
+    /// pass is not one the caller gets to define.
+    ///
+    /// # The barrier, and which way each condition fails
+    ///
+    /// Four refusals, all of them on facts orrerix already holds — never on a
+    /// judgment about what is on the pane's screen, which §3 keeps out of the
+    /// driver:
+    ///
+    /// - **unknown, or already `Dead`** — there is nothing to release, and a
+    ///   second release would restamp an initiator over whoever really ended it
+    ///   (`record_exit_initiator` is first-writer-wins, so it would not, but the
+    ///   caller would be told a release happened that did not);
+    /// - **an orchestrator or manager pane** — never the driver's, defensively
+    ///   refused here as well as being unreachable through
+    ///   `reviewdrive::releasable`, which only ever names this drive's own
+    ///   worker and lanes;
+    /// - **busy** (`idle_since_ms.is_none()`) — the same signal the idle reaper
+    ///   and `idle_pane_on_session` read, and the whole of what makes this safe
+    ///   to demote in `exit_notice_route`: a pane with work in flight has
+    ///   something to lose;
+    /// - **no pty** — an agent in the spawn-to-bind window, which `kill_agent_as`
+    ///   refuses for rev-13 F1's reason: stamping an initiator for a kill that
+    ///   could not happen poisons every later exit of that pane.
+    ///
+    /// # Ordering, and the cap
+    ///
+    /// The stamp goes on before anything is touched (`kill_agent_as`'s reason:
+    /// the pty waiter can be in `on_pty_exit` before this returns), then
+    /// `mark_dead`, then the pty. `mark_dead` is what frees the slot — the
+    /// live-delegate cap counts agents whose status is not `Dead`, so a released
+    /// pane stops counting at that instant rather than whenever its process
+    /// finishes exiting, which is what "a released pane frees a slot
+    /// immediately" means. It also drops the `by_pty` mapping, so the real exit
+    /// lands as a no-op instead of a duplicate notice, and it is the atomic
+    /// claim: only the caller that wins the live→dead transition gets `Some`,
+    /// so a release racing a human's kill produces one of each, not two. The
+    /// pty kill itself is best-effort, exactly as `close_completed_planner`'s
+    /// is: unit tests run with no app handle.
+    pub(crate) fn release_driven_pane(&self, agent_id: &str) -> Result<(), String> {
+        let a = self.agent(agent_id).ok_or("unknown agent")?;
+        if a.status == AgentStatus::Dead {
+            return Err(format!("agent {agent_id} is already gone"));
+        }
+        if matches!(a.role, Role::Orchestrator | Role::Manager) {
+            return Err(format!("refusing to release {agent_id}: it is not a driven delegate"));
+        }
+        if a.idle_since_ms.is_none() {
+            return Err(format!("agent {agent_id} is still working"));
+        }
+        let Some(pty) = a.pty_id else {
+            return Err(format!("agent {agent_id} has no terminal yet (still binding)"));
+        };
+        self.record_exit_initiator(agent_id, ExitInitiator::DriverRelease);
+        // The atomic claim. `None` means something else won the live→dead race —
+        // a human's kill, a crash — and this release did not happen.
+        let Some(snapshot) = self.mark_dead(agent_id, Some(0)) else {
+            return Err(format!("agent {agent_id} was ended by something else first"));
+        };
+        self.audit(&snapshot.group, brand::AUDIT_ACTOR, "agent-kill", json!({
+            "agent": agent_id,
+            "initiator": ExitInitiator::DriverRelease.as_str(),
+        }));
+        if let Some(app) = self.app.lock_safe().clone() {
+            app.state::<crate::pty::PtyManager>().kill(pty);
+        }
         Ok(())
     }
 

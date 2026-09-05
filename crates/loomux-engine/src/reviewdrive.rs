@@ -361,9 +361,12 @@ pub enum HeldReason {
     /// `cap-refused` there would have learned that the cap refused *a* spawn,
     /// which had been true and harmless thirty-seven ticks earlier.
     ///
-    /// **The driver still never kills a pane** (§3.1 item 5), and this hold is
-    /// what makes that survivable rather than silent: the notice names who can
-    /// free a slot. What actually releases the cap is a human or the
+    /// **The driver still never kills a pane to make room** (§3.1 item 5, as
+    /// #2501 narrowed it: it releases a lane whose verdict is recorded at this
+    /// head and a worker whose report it consumed, on facts about those panes
+    /// and never on how full the group is), and this hold is what makes the
+    /// remaining starvation survivable rather than silent: the notice names who
+    /// can free a slot. What actually releases the cap is a human or the
     /// orchestrator killing an idle delegate, the idle reaper where one is
     /// configured, or another drive ending — and #2109's other two fixes are
     /// what make waiting terminate at all, because a drive now costs ONE pane
@@ -2479,6 +2482,68 @@ impl DriveEntry {
         true
     }
 
+    /// **Un-record the pane [`releasable`] named, keeping the conversation**
+    /// (#2501) — the record half of a release. Answers the pane id it dropped,
+    /// or `None` when there was nothing to drop.
+    ///
+    /// # Why the pane slot is CLEARED rather than marked
+    ///
+    /// A released pane is dead, and [`forget_dead_panes`](DriveEntry::forget_dead_panes)
+    /// already argues at length why a dead pane is safe to forget: `resolve_token`
+    /// refuses a caller whose agent is `Dead` and has no entry for one that is
+    /// gone, so such a pane cannot reach the MCP seam at all and there is no
+    /// traffic left for this drive to fail to own. §7's interception key is
+    /// therefore not weakened by dropping it, and three readers get the right
+    /// answer for free instead of needing a second field threaded into each:
+    /// `owned_panes` stops naming a pane an exit notice would say is "still
+    /// running"; `rd_live_lane_pane`'s duplicate refusal stops guarding a pane
+    /// that is not there; and `rd_dead_lane_pane` stops reporting a deliberate
+    /// release as a lane this drive LOST, which is what `rd-lane-reopened` means
+    /// and would have been a false claim on the row a reader chases after
+    /// killing an idle delegate.
+    ///
+    /// It is not pushed onto `prior_agents` either, for the same reason and one
+    /// more: that list is bounded by liveness, so the very next
+    /// `forget_dead_panes` would drop it — recording it would be a write whose
+    /// only effect is to be undone.
+    ///
+    /// # The conversation, and the one thing that makes this fail closed
+    ///
+    /// `session` is what [`LaneRecord::session`] should carry afterwards, and it
+    /// is passed IN rather than read off the record for #2109's reason (see
+    /// [`LaneRecord::reseeded`]): the recorded field is what a SPAWN returned,
+    /// which is a session id only on a CLI that pre-assigns one, so a copilot or
+    /// opencode lane carries `""` and its conversation lives on the pane and the
+    /// roster row instead. The caller resolves all three sources and hands the
+    /// answer here, and this **refuses the release outright** when the answer is
+    /// empty: dropping the pane of a lane whose session cannot be named would
+    /// destroy the conversation this whole mechanism promises to keep. The
+    /// worker's session is the entry's own and is refused the same way.
+    pub fn release_pane(&mut self, role: &DrivenRole, session: &str) -> Option<String> {
+        let session = session.trim();
+        match role {
+            DrivenRole::Worker => {
+                if self.worker_session.trim().is_empty() || self.worker_agent.is_empty() {
+                    return None;
+                }
+                Some(std::mem::take(&mut self.worker_agent))
+            }
+            DrivenRole::Lane(block) => {
+                let rec = self.lanes.iter_mut().find(|l| l.block == *block)?;
+                if rec.agent.trim().is_empty() {
+                    return None;
+                }
+                if rec.session.trim().is_empty() {
+                    if session.is_empty() {
+                        return None;
+                    }
+                    rec.session = session.to_string();
+                }
+                Some(std::mem::take(&mut rec.agent))
+            }
+        }
+    }
+
     /// Which side of this drive `agent_id` is, if any — §7's interception key.
     ///
     /// **The key is the agent, never text a delegate typed**, and this method is
@@ -3655,6 +3720,179 @@ fn decide_gate_check(facts: &DriveFacts) -> DriveStep {
         // known, so nothing moves — and in particular this is not `satisfied`.
         GateOutcome::NotEvaluated => DriveStep::Wait,
     }
+}
+
+/// Why a driven pane is no longer needed — the **closed set** of two, and the
+/// whole of what #2501 narrowed §3.1 item 5 to.
+///
+/// The note's item 5 was a closed sentence ("the driver may never kill a pane")
+/// and it named its own reopening condition: *"a later measurement shows drives
+/// starving on panes nothing frees"*. #2501 is that measurement — 12 driven PRs,
+/// 20 `rd-refused` rows on one of them, five `held(cap-refused)` exits, and about
+/// 25 orchestrator wakes spent doing by hand exactly what these two variants do.
+/// So the item is narrowed rather than deleted, and the narrowing is this enum:
+/// anything not spelled here is still a pane the driver may not touch.
+///
+/// **What makes exactly these two safe is not that they are idle.** The idle
+/// reaper's demotion argument ("no task in flight, nothing to lose") is half of
+/// it; the other half is that in both states the pane's OUTPUT is already on
+/// durable record — a verdict file the gate re-reads, or a `report` the drive has
+/// consumed and acted on — and the CONVERSATION survives, because the driver
+/// resumes lanes and workers by session and has done since #2109. A release
+/// therefore destroys nothing: not work, not a decision, not a reviewer's memory
+/// of the PR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseReason {
+    /// A reviewer lane whose verdict is recorded **at the revision now on the
+    /// PR**. The lane has answered the only question this drive asks it, so
+    /// there is nothing left in that pane for the drive to wait for; the next
+    /// round resumes its session (§5.2's `session`, resolved through the record,
+    /// the roster or the merged records).
+    ///
+    /// Word-blind, on [`lane_verdict_is_current`]'s own argument: a verdict is
+    /// bound to the revision it reviewed, and what makes the pane finished is
+    /// that it ANSWERED about this revision, not which word it chose.
+    VerdictRecorded,
+    /// The worker pane whose `report` this tick consumed. §7 intercepts it, arc
+    /// 8 acts on it, and the hand-back that follows resumes
+    /// [`DriveEntry::worker_session`] rather than the pane — so the pane's only
+    /// remaining function was to hold a slot.
+    ReportConsumed,
+}
+
+impl ReleaseReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReleaseReason::VerdictRecorded => "verdict-recorded",
+            ReleaseReason::ReportConsumed => "report-consumed",
+        }
+    }
+}
+
+/// One pane [`releasable`] says this drive no longer needs.
+///
+/// The pane id is deliberately NOT here. This crate is Tauri-free and cannot ask
+/// whether a pane is alive, idle or typeable — those are the registry's facts,
+/// injected the way [`DriveEntry::forget_dead_panes`] injects liveness — so what
+/// this carries is the DRIVE's half of the decision (which side, and why) and
+/// the caller reads the pane off the entry and applies its own half.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseCandidate {
+    pub role: DrivenRole,
+    pub reason: ReleaseReason,
+}
+
+/// **The panes this drive no longer needs, at this tick's facts and this tick's
+/// step** (#2501) — the drive-side half of §3.1 item 5's narrowing.
+///
+/// Pure, and separate from [`decide`] rather than folded into it, because a
+/// release is **not an arc**: it moves no state, spends no counter and appears
+/// in no row of §2.1's table. It is the same shape as [`DriveStep::OpenLane`]
+/// being "not a transition" — a side effect the tick performs beside the step,
+/// not instead of one.
+///
+/// # The three conditions, and what each excludes
+///
+/// **1. The step must leave the drive LIVE.** An `Advance` into `held`,
+/// `satisfied` or `cancelled` releases nothing, and that is not caution — it is
+/// what keeps §6's exit notices true. A parked drive's notice says its panes are
+/// "still running" and that a `drive_review` resume speaks to them again
+/// ([`PaneStanding::Owned`](crate::rddrive::PaneStanding::Owned)); a terminal
+/// one hands them to the orchestrator to dispose of. Releasing on the tick that
+/// writes one of those lines would make the line false in the same breath. A
+/// lane released on an EARLIER tick is simply not in
+/// [`DriveEntry::owned_panes`] any more, so the notice keeps naming exactly the
+/// panes that are still there.
+///
+/// **2. A lane's verdict must be CURRENT.** Asked with
+/// [`lane_verdict_is_current`] — the same function `review-wait` decides with,
+/// never a second implementation of it — over the lane facts this tick READ, so
+/// a verdict recorded three commits ago releases nothing. A head that could not
+/// be read is empty, `lane_verdict_is_current` is false for it, and the tick
+/// releases nothing at all: "we could not check" is not "it has answered".
+///
+/// **3. The worker must have REPORTED, into a drive that is in `fix-wait`.**
+/// `WorkerSignal::Done` and no other word: `Blocked` is INVARIANT 3 territory
+/// and parks the drive for the orchestrator, which is a pane a human is about to
+/// talk to. `Silent` has reported nothing at all. And the state condition is
+/// what makes "the driver has consumed the report" a fact rather than a
+/// description — the signal is one-shot, cleared when the arc it fed is durable,
+/// so the tick that sees `Done` in `fix-wait` is the tick that consumed it.
+///
+/// # What this deliberately does NOT release
+///
+/// A lane that has been briefed and has not answered; a lane whose verdict binds
+/// to an older revision; a worker that reported `blocked` or has said nothing; a
+/// pane belonging to a drive that is parking or ending this tick; and every pane
+/// in the group that is not this drive's. The orchestrator's kill authority is
+/// untouched by all of it — this narrows what the DRIVER may do, and adds
+/// nothing anywhere else.
+///
+/// # The residual, stated because a narrowing must state one
+///
+/// The worker rule fires on ONE tick — the arc out of `fix-wait` — and the
+/// caller's own half of the decision can refuse it there: a pane still finishing
+/// its turn is not idle, and an idle check that says "no" is not retried,
+/// because the next tick is no longer in `fix-wait` and the fact has expired.
+/// That case costs exactly what it cost before #2501 (the pane holds its slot
+/// until the next hand-back reuses it, per #1960), so the failure direction is
+/// the old behaviour rather than anything new.
+///
+/// The lane rule retries instead of expiring — it is a standing property of the
+/// tick's facts — but it is **bounded by which states read those facts**, and
+/// that bound is worth naming rather than leaving to be discovered. `facts.
+/// required_lanes` is fetched only in `review-wait` and `gate-check`; §2.4 pays
+/// for the routed-file list in exactly the states that consult it and nowhere
+/// else. So a lane whose pane was still writing when its verdict landed is
+/// released on the next tick the drive spends in one of those two states —
+/// immediately, while another required lane is outstanding, and otherwise on the
+/// drive's next review round. A one-lane gate whose only lane was busy on the
+/// tick that read its pass therefore keeps that pane to the exit, where §6's
+/// notice names it for the orchestrator exactly as it always did.
+pub fn releasable(
+    entry: &DriveEntry,
+    facts: &DriveFacts,
+    step: &DriveStep,
+) -> Vec<ReleaseCandidate> {
+    // Condition 1. A step that parks or ends the drive releases nothing.
+    if let DriveStep::Advance { to, .. } = step {
+        if to.is_parked() || to.is_terminal() {
+            return Vec::new();
+        }
+    }
+    let mut out: Vec<ReleaseCandidate> = Vec::new();
+    // Condition 3, first, so the list reads worker-first exactly as
+    // `owned_panes` does.
+    if entry.state() == DriveState::FixWait
+        && facts.worker == WorkerSignal::Done
+        && !entry.worker_agent.is_empty()
+    {
+        out.push(ReleaseCandidate {
+            role: DrivenRole::Worker,
+            reason: ReleaseReason::ReportConsumed,
+        });
+    }
+    // Condition 2. `required_lanes` is `None` in the states that do not read it
+    // and when the routing could not be computed at all; both are "we do not
+    // know which lanes are required", and neither is a licence to release one.
+    let digest = facts.body_digest.as_deref();
+    for l in facts.required_lanes.iter().flatten() {
+        if !lane_verdict_is_current(l.verdict.as_ref(), &facts.head, digest) {
+            continue;
+        }
+        // A lane with no record, or one whose record carries no pane, has
+        // nothing to release — including one released on an earlier tick, whose
+        // pane slot is empty precisely so this stays true.
+        match entry.lane(&l.block) {
+            Some(rec) if !rec.agent.trim().is_empty() => {}
+            _ => continue,
+        }
+        out.push(ReleaseCandidate {
+            role: DrivenRole::Lane(l.block.clone()),
+            reason: ReleaseReason::VerdictRecorded,
+        });
+    }
+    out
 }
 
 fn minutes_ms(minutes: u64) -> u64 {
@@ -7007,6 +7245,245 @@ mod tests {
             "…and at nine the floor has overtaken the twelve-hour backstop, so `decide`'s \
              age check — which runs first — is what such a drive parks on. Disclosed at \
              `state_bound_ms`; this is where it starts"
+        );
+    }
+
+    // ── #2501: what the driver may release ──────────────────────────────────
+
+    /// A `review-wait` entry with one lane, briefed at `head`, running in pane
+    /// `rev-1` on session `sess-lane`.
+    fn lane_open_at(head: &str) -> DriveEntry {
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = head.to_string();
+        e.open_lane("rev-std", "sess-lane", "rev-1", head, Some("d1"), 1_000, false);
+        e
+    }
+
+    /// The step a live `review-wait` tick takes when it is simply waiting — the
+    /// neutral one, so a release these tests observe is the LANE rule firing and
+    /// not the step type.
+    const LIVE: DriveStep = DriveStep::Wait;
+
+    /// **The lane rule, both directions, on one fixture whose only moving part
+    /// is the verdict's binding.**
+    ///
+    /// The two rows differ in the head the verdict is bound to and in nothing
+    /// else — same entry, same pane, same live head — so a `releasable` that
+    /// ignored currency and a `releasable` that released nothing are both red
+    /// here. That is the discrimination CLAUDE.md's non-discriminating-fixture
+    /// rule asks for: the candidate outputs must DIVERGE.
+    #[test]
+    fn a_lane_is_released_when_its_verdict_binds_to_the_live_revision_and_not_before() {
+        for (label, at_head, digest, owed) in [
+            ("answered about this revision", "h1", "d1", true),
+            ("answered about an older head", "h0", "d1", false),
+            ("answered before the body moved", "h1", "d0", false),
+        ] {
+            let e = lane_open_at("h1");
+            let mut f = facts_at("h1");
+            f.required_lanes =
+                Some(vec![lane_fact("rev-std", Some(Verdict::Pass), at_head, digest)]);
+            let got = releasable(&e, &f, &LIVE);
+            assert_eq!(
+                got.len(),
+                usize::from(owed),
+                "{label}: releasable said {got:?}"
+            );
+            if owed {
+                assert_eq!(got[0].role, DrivenRole::Lane("rev-std".into()), "{label}");
+                assert_eq!(got[0].reason, ReleaseReason::VerdictRecorded, "{label}");
+            }
+        }
+    }
+
+    /// **Word-blind, exactly as [`lane_verdict_is_current`] is.** A lane that
+    /// said `fail` or `escalate` about this revision has answered, and what makes
+    /// its pane finished is that it answered — not which word it chose.
+    ///
+    /// The negative control is in the row above and is the one that makes this
+    /// mean something: currency, not the word, is what decides.
+    #[test]
+    fn the_lane_rule_reads_the_binding_and_never_the_word() {
+        for word in [Verdict::Pass, Verdict::Fail, Verdict::Escalate] {
+            let e = lane_open_at("h1");
+            let mut f = facts_at("h1");
+            f.required_lanes = Some(vec![lane_fact("rev-std", Some(word), "h1", "d1")]);
+            assert_eq!(
+                releasable(&e, &f, &LIVE).len(),
+                1,
+                "a lane that answered {:?} at this revision is finished with this round",
+                word
+            );
+        }
+    }
+
+    /// **A lane with no pane on record releases nothing** — which is what makes
+    /// the release idempotent rather than a loop that kills once and then keeps
+    /// naming a candidate nothing can act on. Same facts as the positive row
+    /// above; the only difference is that the pane slot is already empty.
+    #[test]
+    fn a_lane_whose_pane_is_already_released_is_not_a_candidate_again() {
+        let mut e = lane_open_at("h1");
+        let mut f = facts_at("h1");
+        f.required_lanes = Some(vec![lane_fact("rev-std", Some(Verdict::Pass), "h1", "d1")]);
+        assert_eq!(releasable(&e, &f, &LIVE).len(), 1, "the control: it is a candidate first");
+
+        let freed = e.release_pane(&DrivenRole::Lane("rev-std".into()), "sess-lane");
+        assert_eq!(freed.as_deref(), Some("rev-1"), "the pane it un-recorded");
+        assert_eq!(
+            e.lane("rev-std").map(|l| l.session.as_str()),
+            Some("sess-lane"),
+            "…and the conversation, which is the whole promise"
+        );
+        assert!(releasable(&e, &f, &LIVE).is_empty(), "not a candidate a second time");
+    }
+
+    /// **A step that parks or ends the drive releases nothing**, which is what
+    /// keeps §6's exit notices true: they say the panes they name are still
+    /// running and are the orchestrator's to resume or dispose of.
+    ///
+    /// Driven over every terminal and parked target, and over a live one as the
+    /// positive control — otherwise "released nothing" is indistinguishable from
+    /// a fixture that was never releasable at all.
+    #[test]
+    fn a_parking_or_terminal_step_releases_nothing() {
+        let mut f = facts_at("h1");
+        f.required_lanes = Some(vec![lane_fact("rev-std", Some(Verdict::Pass), "h1", "d1")]);
+        assert_eq!(
+            releasable(&lane_open_at("h1"), &f, &LIVE).len(),
+            1,
+            "the positive control: these facts DO release under a live step"
+        );
+        for (to, reason) in [
+            (DriveState::Held, Some(HeldReason::Escalate)),
+            (DriveState::Satisfied, None),
+            (DriveState::Cancelled, None),
+        ] {
+            let step = DriveStep::Advance { to, held_reason: reason, bump: None };
+            assert!(
+                releasable(&lane_open_at("h1"), &f, &step).is_empty(),
+                "a step into {} must release nothing",
+                to.as_str()
+            );
+        }
+        let live = DriveStep::Advance {
+            to: DriveState::GateCheck,
+            held_reason: None,
+            bump: None,
+        };
+        assert_eq!(
+            releasable(&lane_open_at("h1"), &f, &live).len(),
+            1,
+            "…while an arc that leaves the drive live still does"
+        );
+    }
+
+    /// **The worker rule: `fix-wait` plus `Done`, and nothing else.**
+    ///
+    /// Every other worker signal is a row here, because each is a different
+    /// reason to keep the pane: `Blocked` parks the drive for the orchestrator,
+    /// which is about to talk to that pane; `Silent` has said nothing;
+    /// `Unresumable` has already gone. And the state condition is a row too —
+    /// the same `Done` in `ci-wait` is a report about a hand-back this drive has
+    /// already consumed, so it may not release a second time.
+    #[test]
+    fn the_worker_is_released_only_on_the_tick_that_consumes_its_done_report() {
+        for (state, signal, owed) in [
+            (DriveState::FixWait, WorkerSignal::Done, true),
+            (DriveState::FixWait, WorkerSignal::Blocked, false),
+            (DriveState::FixWait, WorkerSignal::Silent, false),
+            (DriveState::FixWait, WorkerSignal::Unresumable, false),
+            (DriveState::CiWait, WorkerSignal::Done, false),
+            (DriveState::ReviewWait, WorkerSignal::Done, false),
+        ] {
+            let mut e = entry_at(state);
+            e.head = "h1".to_string();
+            e.record_worker_pane("w-1");
+            let mut f = facts_at("h1");
+            f.worker = signal;
+            let got = releasable(&e, &f, &LIVE);
+            assert_eq!(
+                got.len(),
+                usize::from(owed),
+                "{}/{signal:?} released {got:?}",
+                state.as_str()
+            );
+            if owed {
+                assert_eq!(got[0].role, DrivenRole::Worker);
+                assert_eq!(got[0].reason, ReleaseReason::ReportConsumed);
+            }
+        }
+    }
+
+    /// **A release refuses when the conversation cannot be named.** Killing the
+    /// pane of a lane whose session nothing can resolve would end the reviewer's
+    /// memory of the PR, which is the one thing this mechanism promises to keep.
+    ///
+    /// The positive control is the second half: the same lane, with a session,
+    /// releases — so the refusal is the empty session and not the fixture.
+    #[test]
+    fn a_release_refuses_a_lane_whose_session_cannot_be_named() {
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.open_lane("rev-std", "", "rev-1", "h1", Some("d1"), 1_000, false);
+        assert_eq!(
+            e.release_pane(&DrivenRole::Lane("rev-std".into()), ""),
+            None,
+            "no session on the record and none resolved: the pane stays"
+        );
+        assert_eq!(
+            e.lane("rev-std").map(|l| l.agent.as_str()),
+            Some("rev-1"),
+            "…and the record still names it, so the next tick can try again"
+        );
+        assert_eq!(
+            e.release_pane(&DrivenRole::Lane("rev-std".into()), "sess-resolved"),
+            Some("rev-1".to_string()),
+            "the control: a resolved session releases"
+        );
+        assert_eq!(
+            e.lane("rev-std").map(|l| l.session.as_str()),
+            Some("sess-resolved"),
+            "…and the resolved id is written onto the record, so the resume no longer \
+             depends on the dead pane's own row"
+        );
+    }
+
+    /// The worker's half of the same refusal, and the pane list that follows
+    /// from it: a released pane is not in [`DriveEntry::owned_panes`], which is
+    /// what keeps every exit notice's "still running" true.
+    #[test]
+    fn a_released_worker_leaves_the_owned_pane_list() {
+        let mut e = entry_at(DriveState::FixWait);
+        e.record_worker_pane("w-1");
+        assert!(
+            e.owned_panes().iter().any(|(a, r)| a == "w-1" && *r == DrivenRole::Worker),
+            "the control: it is owned first"
+        );
+        assert_eq!(e.release_pane(&DrivenRole::Worker, ""), Some("w-1".to_string()));
+        assert!(
+            !e.owned_panes().iter().any(|(a, _)| a == "w-1"),
+            "a released pane must not be named by a notice that says its panes are still running"
+        );
+        assert_eq!(
+            e.release_pane(&DrivenRole::Worker, ""),
+            None,
+            "…and there is nothing left to release twice"
+        );
+    }
+
+    /// `DriveEntry::new` records the worker SESSION, so the worker arm's
+    /// fail-closed branch needs an entry that has none — the shape a drive
+    /// started without one would have. Pinned because the branch is otherwise
+    /// unreachable from the fixtures above and would read as dead code.
+    #[test]
+    fn a_worker_with_no_recorded_session_is_never_released() {
+        let mut e = entry_at(DriveState::FixWait);
+        e.worker_session = String::new();
+        e.record_worker_pane("w-1");
+        assert_eq!(
+            e.release_pane(&DrivenRole::Worker, "sess-ignored"),
+            None,
+            "the worker's session is the entry's own; a caller may not supply one for it"
         );
     }
 }
