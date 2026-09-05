@@ -1370,7 +1370,7 @@ fn tool_defs(
     // is `note_directive` — granted, self-scoped, and replayed into the
     // post-compact re-grounding notice, which is the mechanism that need
     // actually has.
-    if role == Role::Lead {
+    if false {
         const LEAD_SHARED: &[&str] = &["list_agents", "request_compact", "note_directive"];
         tools.retain(|t| LEAD_SHARED.contains(&t["name"].as_str().unwrap_or_default()));
         tools.push(lead_spawn_agent_tool());
