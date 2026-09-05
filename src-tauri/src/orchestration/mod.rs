@@ -6171,9 +6171,7 @@ pub fn cli_extra_env(cli: &str, cfg: &Path, token: &str) -> Vec<(String, String)
         // no-seam path). Exporting an empty variable would leave the pane
         // presenting a blank auth header, which the MCP server refuses in a way
         // that reads like a bug rather than like an absence — so emit nothing.
-        "codex" if !token.is_empty() => {
-            vec![(CODEX_TOKEN_ENV.to_string(), token.to_string())]
-        }
+        "codex" if !token.is_empty() => Vec::new(),
         // pi (#2126): `cfg` is named on ARGV (`--mcp-config`), so none of this
         // pane's MCP identity rides the environment — the one variable here is
         // the boot-time version check, and it is unrelated to `cfg`.
