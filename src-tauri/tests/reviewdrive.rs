@@ -8939,3 +8939,259 @@ fn a_fail_route_hand_back_at_the_cap_is_fed_by_the_lane_it_releases() {
          about to free"
     );
 }
+
+// ── §2.3 #2509's one-shot grace, through the real tick ──────────────────────
+
+/// [`driven`], with the drive seeded one round short of the bound.
+///
+/// `rounds_already_spent` is §2.3's own parameter and means exactly this — the
+/// budget is the drive's, not the driver's — so the fixture reaches the bound in
+/// ONE real round instead of three, without any test writing a counter by hand.
+fn driven_one_short(
+    reg: &OrchRegistry,
+    repo: &Repo,
+    gh: &FakeGh,
+) -> (GroupId, String) {
+    let group = reg.create_group(&repo.path(), rails()).unwrap().id;
+    let w = reg
+        .spawn_agent(&group, Role::Worker, "w", "", false, None)
+        .expect("a worker to hand back to");
+    let session = w.session_id.clone().expect("claude mints a session id at spawn");
+    let seed = DriveLimits::default().max_review_rounds - 1;
+    let out = reg.drive_review_with(&group, gh, 1758, &session, false, seed, "orch-1", 0);
+    assert_eq!(out["driving"], serde_json::json!(true), "drive_review refused: {out}");
+    (group, session)
+}
+
+/// A lane's blocking `fail`, through the real MCP arm — which is what writes the
+/// verdict file the next tick reads.
+fn record_fail_for(reg: &OrchRegistry, group: &GroupId, agent: &str, summary: &str) {
+    let caller = Caller {
+        agent_id: agent.to_string(),
+        group: group.clone(),
+        role: Role::Reviewer,
+        role_hint: None,
+    };
+    dispatch(
+        reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "fail", "summary": summary } }),
+    )
+    .expect("the lane records its verdict");
+}
+
+/// The worker's `report(done)`, which is what takes arc 8 out of `fix-wait`.
+fn worker_done(reg: &OrchRegistry, group: &GroupId, worker: &str) {
+    dispatch(
+        reg,
+        &Caller {
+            agent_id: worker.to_string(),
+            group: group.clone(),
+            role: Role::Worker,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "done", "note": "fixed", "ref": "#1758" } }),
+    )
+    .expect("a driven worker reports");
+}
+
+fn status_grace(reg: &OrchRegistry, group: &GroupId) -> bool {
+    reg.review_drive_status(group)["drives"][0]["grace_used"]
+        .as_bool()
+        .unwrap_or(false)
+}
+
+fn status_rounds(reg: &OrchRegistry, group: &GroupId) -> u64 {
+    reg.review_drive_status(group)["drives"][0]["counters"]["review_rounds"]
+        .as_u64()
+        .unwrap_or_default()
+}
+
+/// **The acceptance test, and it is one fixture read twice.**
+///
+/// The drive reaches the bound on a real `fail`; the worker then makes the fix
+/// #2509 is about — the PR **body** moves and the head does not — and the lane
+/// fails again. That second fail is the one the bound would have parked on, and
+/// the grace hands the worker back instead. Then a THIRD body-only fail parks,
+/// because the grace is one per drive.
+///
+/// Every step is the real tick: `decide` chooses, `rd_drive_group_with` performs,
+/// and the verdict files are written by `review_verdict` through the MCP arm.
+/// What the engine unit tests pin as a rule, this pins as a sequence — including
+/// the two things only the seam can carry, the `rd-round-grace` row and
+/// `review_drive_status`'s `grace_used`.
+#[test]
+fn a_body_only_fail_at_the_bound_buys_one_more_round_then_the_next_one_parks() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven_one_short(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    gh.set_body("b1");
+    reg.set_pr_body_override(Some("b1".to_string()));
+
+    // Round one: the lane opens and fails on the CODE. This is the round that
+    // reaches the bound, and it must NOT be graced — nothing has been briefed
+    // about a body yet.
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, _b, lane) = first.lanes_opened.first().cloned().expect("lane 0 opens");
+    record_fail_for(&reg, &group, &lane, "fail - the retry loop is unbounded");
+    let handed = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, worker) = handed.handbacks.first().cloned().expect("arc 5 hands the PR back");
+    assert_eq!(status_state(&reg, &group), "fix-wait");
+    assert_eq!(
+        status_rounds(&reg, &group),
+        DriveLimits::default().max_review_rounds as u64,
+        "the fixture's premise: that round put the drive AT the bound"
+    );
+    assert!(!status_grace(&reg, &group), "and it spent no grace getting there");
+
+    // The fix is BODY-ONLY: the body moves, the head does not.
+    gh.set_body("b2");
+    reg.set_pr_body_override(Some("b2".to_string()));
+    worker_done(&reg, &group, &worker);
+    reg.rd_drive_group_with(&group, &gh, 40_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "review-wait",
+        "arc 8 returns at an UNCHANGED head, which is the only shape this feature has"
+    );
+
+    // The lane is re-briefed about the body, and fails on it.
+    let reopened = reg.rd_drive_group_with(&group, &gh, 50_000);
+    let (_pr, _b, lane2) = reopened
+        .lanes_opened
+        .first()
+        .cloned()
+        .expect("a moved digest at an unchanged head re-briefs the lane");
+    record_fail_for(&reg, &group, &lane2, "fail - the receipt still cites the old run");
+
+    // **THE assertion.** Under the old rule this tick parks `held(review-limit)`.
+    let graced = reg.rd_drive_group_with(&group, &gh, 60_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "fix-wait",
+        "a body-only fail at the bound buys one more round instead of parking; \
+         held rows: {:?}",
+        rows_for(&reg, &group, "rd-held")
+    );
+    let (_pr, worker2) = graced
+        .handbacks
+        .first()
+        .cloned()
+        .expect("and the grace really does reach the worker");
+    let rows = rows_for(&reg, &group, "rd-round-grace");
+    assert_eq!(rows.len(), 1, "exactly one grace row: {rows:?}");
+    assert_eq!(rows[0]["pr"], json!(1758), "{rows:?}");
+    assert_eq!(rows[0]["block"], json!("rev-std"), "…naming the lane whose fail earned it");
+    assert_eq!(rows[0]["reason"], json!("body-only"), "{rows:?}");
+    assert_eq!(rows[0]["head"], json!(HEAD_A), "{rows:?}");
+    assert!(status_grace(&reg, &group), "review_drive_status shows it spent");
+    assert_eq!(
+        status_rounds(&reg, &group),
+        DriveLimits::default().max_review_rounds as u64,
+        "and the review-round counter has NOT moved — MAX_ROUNDS_CEILING bounds \
+         exactly what it bounded before"
+    );
+
+    // A second body-only round: same shape, and this time it parks. The grace is
+    // one per drive, not one per body-only fail.
+    gh.set_body("b3");
+    reg.set_pr_body_override(Some("b3".to_string()));
+    worker_done(&reg, &group, &worker2);
+    reg.rd_drive_group_with(&group, &gh, 70_000);
+    let again = reg.rd_drive_group_with(&group, &gh, 80_000);
+    let (_pr, _b, lane3) = again.lanes_opened.first().cloned().expect("re-briefed once more");
+    record_fail_for(&reg, &group, &lane3, "fail - and now the diffstat is stale too");
+    reg.rd_drive_group_with(&group, &gh, 90_000);
+    assert_eq!(status_state(&reg, &group), "held");
+    let held = rows_for(&reg, &group, "rd-held");
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["reason"], json!("review-limit"), "{held:?}");
+    assert_eq!(
+        rows_for(&reg, &group, "rd-round-grace").len(),
+        1,
+        "and no second grace was written"
+    );
+}
+
+/// **The negative control, and the only difference is what the worker moved.**
+///
+/// Same drive, same bound, same reviewer, same word — but the fix moves the
+/// HEAD. The lane is then re-briefed about a revision nobody has reviewed, so no
+/// body-only mark is stamped and the bound parks the drive on the next fail
+/// exactly as it always did.
+///
+/// Without this, the acceptance test above is equally green under a rule that
+/// graced every fail at the bound — which would be #2509 defeating INVARIANT 9
+/// rather than narrowing it.
+#[test]
+fn a_code_fail_at_the_bound_still_parks_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven_one_short(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    gh.set_body("b1");
+    reg.set_pr_body_override(Some("b1".to_string()));
+
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, _b, lane) = first.lanes_opened.first().cloned().expect("lane 0 opens");
+    record_fail_for(&reg, &group, &lane, "fail - the retry loop is unbounded");
+    let handed = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, worker) = handed.handbacks.first().cloned().expect("arc 5 hands the PR back");
+    assert_eq!(
+        status_rounds(&reg, &group),
+        DriveLimits::default().max_review_rounds as u64,
+        "the same premise as the acceptance test: AT the bound"
+    );
+
+    // The fix moves the CODE. The body moves too — a worker fixing code
+    // re-writes its receipts — so the difference between the two tests is the
+    // head alone, not "one of them edited the body".
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    gh.set_body("b2");
+    reg.set_pr_body_override(Some("b2".to_string()));
+    // Arc 7 FIRST, then the report. `decide_fix_receipts`' own residual is that
+    // a worker which pushes and reports inside one tick window has its report
+    // spent on the arc; the real sequence is push, checks settle, read the
+    // matrix, THEN report, and the fixture follows it.
+    reg.rd_drive_group_with(&group, &gh, 40_000); // fix-wait -> ci-wait (arc 7)
+    worker_done(&reg, &group, &worker);
+    reg.rd_drive_group_with(&group, &gh, 50_000); // ci-wait -> review-wait (arc 2)
+    assert_eq!(status_head(&reg, &group), HEAD_B, "the fixture's premise: the code moved");
+    assert_eq!(status_state(&reg, &group), "review-wait");
+
+    let reopened = reg.rd_drive_group_with(&group, &gh, 60_000);
+    let (_pr, _b, lane2) = reopened
+        .lanes_opened
+        .first()
+        .cloned()
+        .expect("a moved head re-briefs the lane");
+    record_fail_for(&reg, &group, &lane2, "fail - the new guard is inverted");
+    reg.rd_drive_group_with(&group, &gh, 70_000);
+
+    assert_eq!(status_state(&reg, &group), "held", "a code fail at the bound parks");
+    let held = rows_for(&reg, &group, "rd-held");
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["reason"], json!("review-limit"), "{held:?}");
+    assert!(
+        rows_for(&reg, &group, "rd-round-grace").is_empty(),
+        "and no grace was granted: {:?}",
+        rows_for(&reg, &group, "rd-round-grace")
+    );
+    assert!(!status_grace(&reg, &group), "…so it is still there for a body-only round");
+}

@@ -7697,4 +7697,262 @@ mod tests {
             "the worker's session is the entry's own; a caller may not supply one for it"
         );
     }
+
+    // ── §2.3 #2509's one-shot grace for a body-only fail ─────────────────────
+
+    /// A drive sitting AT the review bound, with `rev-std`'s brief carrying (or
+    /// not carrying) #2509's mark.
+    ///
+    /// `body_only` is the axis every test below varies, and it is the only one:
+    /// the counters, the live revision, the lane's pane and the reviewer's word
+    /// are identical on both sides, so a rule that decided on the bound alone —
+    /// or on nothing — is red rather than green-by-luck.
+    fn at_the_bound(body_only: bool) -> DriveEntry {
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-a".into();
+        e.counters.review_rounds = DriveLimits::default().max_review_rounds;
+        e.open_lane(
+            "rev-std", "sess-lane", "rev-1", "head-a", Some("d1"), 1_000, false, body_only,
+        );
+        e
+    }
+
+    /// The facts a lane's blocking `fail`, recorded about the live revision,
+    /// puts in front of `review-wait`.
+    fn failing_at_the_bound() -> DriveFacts {
+        DriveFacts {
+            required_lanes: Some(vec![lane_fact("rev-std", Some(Verdict::Fail), "head-a", "d1")]),
+            ..facts_at("head-a")
+        }
+    }
+
+    /// **THE test.** Two rows differing in the BRIEF the driver sent and in
+    /// nothing else.
+    #[test]
+    fn a_body_only_fail_at_the_bound_buys_one_more_round_and_a_code_fail_does_not() {
+        let limits = DriveLimits::default();
+        let facts = failing_at_the_bound();
+        assert_eq!(
+            decide(&at_the_bound(true), &facts, &limits),
+            DriveStep::spend(DriveState::FixWait, Counter::BodyOnlyGrace),
+            "a fail on a lane re-briefed about the body alone buys the one grace round"
+        );
+        assert_eq!(
+            decide(&at_the_bound(false), &facts, &limits),
+            DriveStep::held(HeldReason::ReviewLimit),
+            "a fail on a lane briefed about the code parks the drive exactly as it always did"
+        );
+    }
+
+    /// §2.3's "never stacking", performed rather than asserted: the arc is
+    /// taken, the drive goes round again on the same body-only brief, and the
+    /// second fail parks.
+    #[test]
+    fn the_grace_is_spent_once_and_the_next_body_only_fail_parks() {
+        let limits = DriveLimits::default();
+        let facts = failing_at_the_bound();
+        let mut e = at_the_bound(true);
+        let step = decide(&e, &facts, &limits);
+        assert_eq!(step, DriveStep::spend(DriveState::FixWait, Counter::BodyOnlyGrace));
+        e.take(&step, 3_000).unwrap();
+        assert!(e.counters.body_only_grace, "the arc is what spends it");
+
+        // Arc 7 then arc 2: the worker pushes, CI settles, and the drive is back
+        // in `review-wait` with the same body-only brief out and the same fail.
+        e.advance(DriveState::CiWait, None, None, 4_000).unwrap();
+        e.advance(DriveState::ReviewWait, None, None, 5_000).unwrap();
+        e.open_lane(
+            "rev-std", "sess-lane", "rev-1", "head-a", Some("d1"), 6_000, false, true,
+        );
+        assert_eq!(
+            decide(&e, &facts, &limits),
+            DriveStep::held(HeldReason::ReviewLimit),
+            "the grace is one per drive, not one per body-only fail"
+        );
+    }
+
+    /// **"`MAX_ROUNDS_CEILING` is untouched" is a claim about a NUMBER**, so it
+    /// is pinned as one: the grace round leaves `review_rounds` exactly where
+    /// the bound left it, and is funded from the bool beside it.
+    #[test]
+    fn the_grace_round_never_moves_the_review_round_counter() {
+        let limits = DriveLimits::default();
+        let mut e = at_the_bound(true);
+        let spent = e.counters.review_rounds;
+        assert_eq!(spent, limits.max_review_rounds, "the fixture really is at the bound");
+        let step = decide(&e, &failing_at_the_bound(), &limits);
+        e.take(&step, 3_000).unwrap();
+        assert_eq!(e.counters.review_rounds, spent, "a grace round is not a review round");
+        assert!(
+            e.counters.review_rounds <= MAX_ROUNDS_CEILING,
+            "and INVARIANT 9's ceiling bounds exactly what it bounded before"
+        );
+        assert!(e.counters.body_only_grace, "it is funded from its own one-shot budget");
+        assert_eq!(e.state(), DriveState::FixWait, "and it really does hand the worker back");
+    }
+
+    /// The grace is asked **only at the bound**. Below it the ordinary round is
+    /// spent and the grace is untouched — otherwise it is a discount, and a
+    /// drive would arrive at the bound with it already gone.
+    #[test]
+    fn below_the_bound_a_body_only_fail_spends_an_ordinary_round() {
+        let limits = DriveLimits::default();
+        let mut e = at_the_bound(true);
+        e.counters.review_rounds = limits.max_review_rounds - 1;
+        let step = decide(&e, &failing_at_the_bound(), &limits);
+        assert_eq!(step, DriveStep::spend(DriveState::FixWait, Counter::ReviewRounds));
+        e.take(&step, 3_000).unwrap();
+        assert!(!e.counters.body_only_grace, "an ordinary round leaves the grace unspent");
+        assert_eq!(e.counters.review_rounds, limits.max_review_rounds);
+    }
+
+    /// All four crossings of {this lane was already briefed at the live head} x
+    /// {every required lane has ANSWERED at it}, because the mark reads two
+    /// signals and a mark that read either one alone is green on two of them.
+    #[test]
+    fn the_body_only_mark_needs_a_re_brief_at_an_unchanged_head_and_a_fully_answered_one() {
+        let limits = DriveLimits::default();
+        // `briefed`: the head this lane's record was last briefed at, or "" for
+        // a lane with no record at all. `other`: the SECOND required lane's
+        // verdict, which is what decides "has everyone answered".
+        let step = |briefed: &str, other: Option<Verdict>| {
+            let mut e = entry_at(DriveState::ReviewWait);
+            e.head = "head-a".into();
+            if !briefed.is_empty() {
+                e.open_lane("rev-std", "s1", "rev-1", briefed, Some("OLD"), 1_000, false, false);
+            }
+            let facts = DriveFacts {
+                required_lanes: Some(vec![
+                    lane_fact("rev-std", Some(Verdict::Fail), "head-a", "OLD"),
+                    lane_fact("rev-final", other, "head-a", "OLD"),
+                ]),
+                body_digest: Some("NEW".into()),
+                ..facts_at("head-a")
+            };
+            decide(&e, &facts, &limits)
+        };
+        let marked = |s: &DriveStep| match s {
+            DriveStep::OpenLane { body_only, .. } => *body_only,
+            other => panic!("expected a lane brief, got {other:?}"),
+        };
+        // The one row that is #2509's case: re-briefed at this head, everyone
+        // has spoken about it, and only the body moved.
+        assert!(marked(&step("head-a", Some(Verdict::Pass))));
+        // A lane nobody has answered at this head: the CODE here is not
+        // reviewed to completion, so a later fail is a first opinion, not a
+        // body finding.
+        assert!(!marked(&step("head-a", None)));
+        // A brief that predates this head is not a re-brief AT it.
+        assert!(!marked(&step("head-b", Some(Verdict::Pass))));
+        // And a lane with no record at all has never been briefed here.
+        assert!(!marked(&step("", Some(Verdict::Pass))));
+    }
+
+    /// The grant's posture, which is [`LaneRecord::briefed_verify`]'s one grant
+    /// over: an **exact** `(briefed_head, briefed_digest)` match, never
+    /// [`lane_open_for`]'s unknown-tolerant comparison. A brief whose revision
+    /// cannot be pinned grants nothing.
+    #[test]
+    fn the_grace_refuses_a_brief_whose_revision_it_cannot_pin() {
+        let e = at_the_bound(true);
+        assert!(
+            body_only_grace_applies(&e, "rev-std", "head-a", Some("d1")),
+            "the positive control: this fixture DOES earn the grace"
+        );
+        assert!(!body_only_grace_applies(&e, "rev-std", "head-b", Some("d1")), "the head moved");
+        assert!(!body_only_grace_applies(&e, "rev-std", "head-a", Some("d2")), "the body moved");
+        assert!(
+            !body_only_grace_applies(&e, "rev-std", "head-a", None),
+            "the body could not be read: unknown is never 'unbound, therefore fine'"
+        );
+        assert!(
+            !body_only_grace_applies(&e, "rev-std", "head-a", Some("")),
+            "and an empty digest is not a digest"
+        );
+        assert!(
+            !body_only_grace_applies(&e, "rev-final", "head-a", Some("d1")),
+            "another lane's brief grants this one nothing"
+        );
+        assert!(
+            !body_only_grace_applies(&at_the_bound(false), "rev-std", "head-a", Some("d1")),
+            "a brief that was never marked body-only"
+        );
+        let mut spent = at_the_bound(true);
+        spent.counters.body_only_grace = true;
+        assert!(!body_only_grace_applies(&spent, "rev-std", "head-a", Some("d1")), "already spent");
+    }
+
+    /// A repo file cannot buy a SECOND grace any more than it can buy a fourth
+    /// round — the sibling of
+    /// `a_repo_cannot_raise_invariant_9_by_handing_decide_a_wider_bound`, on the
+    /// axis that slice could not vary because the field did not exist.
+    #[test]
+    fn a_repo_that_widens_its_bound_still_gets_exactly_one_grace() {
+        let wide = DriveLimits { max_review_rounds: 9, ..DriveLimits::default() };
+        assert_eq!(wide.max_review_rounds, 9, "the fixture really is over-bound");
+        let facts = failing_at_the_bound();
+        let mut e = at_the_bound(true);
+        e.counters.review_rounds = MAX_ROUNDS_CEILING;
+        assert_eq!(
+            decide(&e, &facts, &wide),
+            DriveStep::spend(DriveState::FixWait, Counter::BodyOnlyGrace),
+            "the clamp puts a wide repo at the same bound, and the grace answers there"
+        );
+        e.counters.body_only_grace = true;
+        assert_eq!(
+            decide(&e, &facts, &wide),
+            DriveStep::held(HeldReason::ReviewLimit),
+            "and nine rounds in a repo file still buys no second grace"
+        );
+    }
+
+    /// An `escalate` at the bound is still §3's judgment call, not a grace: the
+    /// currency ladder answers `escalate` above the `fail` arm, and #2509 must
+    /// not have quietly moved a JUDGMENT hold onto the driver's own budget.
+    #[test]
+    fn an_escalate_at_the_bound_is_still_a_judgment_hold_and_never_a_grace() {
+        let limits = DriveLimits::default();
+        let facts = DriveFacts {
+            required_lanes: Some(vec![lane_fact(
+                "rev-std",
+                Some(Verdict::Escalate),
+                "head-a",
+                "d1",
+            )]),
+            ..facts_at("head-a")
+        };
+        let e = at_the_bound(true);
+        assert_eq!(decide(&e, &facts, &limits), DriveStep::held(HeldReason::Escalate));
+        assert!(
+            !e.counters.body_only_grace,
+            "and it costs the grace nothing, so a disposition can still spend it"
+        );
+    }
+
+    /// §5.2's graceful-degradation posture, and the asymmetry with the three
+    /// COUNTS beside it: a missing count is REFUSED because a defaulted zero
+    /// re-grants a whole budget, while a missing bool grants one round once and
+    /// is the true reading of a file no build with this field ever wrote.
+    #[test]
+    fn a_counters_block_written_before_the_grace_existed_parses_with_it_unspent() {
+        let old = NOTE_EXAMPLE;
+        assert!(
+            !old.contains("body_only_grace"),
+            "the fixture really predates the field"
+        );
+        let st = parse_state(old).expect("a pre-#2509 counters block still parses");
+        assert!(
+            st.entries.iter().all(|d| !d.counters.body_only_grace),
+            "and reads as a grace nobody has spent"
+        );
+        // The negative control: the field is not merely being ignored on the way
+        // in. A file that says the grace IS spent round-trips as spent.
+        let spent = old.replace(
+            r#""rebase_attempts": 0 },"#,
+            r#""rebase_attempts": 0, "body_only_grace": true },"#,
+        );
+        assert_ne!(spent, old, "the mutation must actually land");
+        let st = parse_state(&spent).expect("and the new field parses");
+        assert!(st.entries.iter().all(|d| d.counters.body_only_grace));
+    }
 }
