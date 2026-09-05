@@ -1624,9 +1624,8 @@ pub fn newest_new_codex_session(
             return None;
         }
         let recorded = header.pointer("/payload/cwd").and_then(Value::as_str).unwrap_or_default();
-        if norm_path(recorded) == want {
-            hits.push(id.to_string());
-        }
+        let _ = recorded;
+        hits.push(id.to_string());
         None
     });
     match hits.len() {
