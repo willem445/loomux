@@ -159,7 +159,6 @@ fn lead_tool_surface_is_exactly_the_enumerated_set() {
             // the shared read tier, filtered to what a group-less-board pane
             // can honestly answer
             "list_agents",
-            "get_state",
             "request_compact",
             "note_directive",
             // the capability the toggle exists to grant
@@ -196,9 +195,54 @@ fn lead_tool_surface_is_exactly_the_enumerated_set() {
         ("review_verdict", "a lead group has no review gate"),
         ("queue_merge", "a lead group has no merge queue"),
         ("notify_when", "a fired watch is an injection the human did not ask for"),
+        ("get_state", "nothing can write a lead group's state blob — see the pair test below"),
+        ("set_state", "the write half of that same pair"),
     ] {
         assert!(!names.contains(&withheld.to_string()), "{withheld} must not be listed — {why}");
     }
+}
+
+/// **The group-state pair is granted together or not at all** (rev-final B1).
+///
+/// `get_state` was on the lead's surface in this PR's first draft, justified as
+/// a durable scratchpad. It is not one, and the reason is structural rather
+/// than a matter of taste: `state.json` has exactly ONE writer in the tree —
+/// `OrchRegistry::set_state`, reached only from the `set_state` MCP arm, which
+/// is `require_orchestrator` — and a lead group has no orchestrator by design.
+/// A lead holding the read alone would call it forever and get `"{}"` every
+/// time, which is the "advertise a route with nothing behind it" failure the
+/// withheld column exists to prevent, in its silent form.
+///
+/// So the invariant is the PAIR, not either tool: whoever wants a lead to hold
+/// durable state has to argue for the WRITE, and the read follows it. Asserted
+/// as an equality of the two memberships rather than as two `!contains`
+/// checks, because the shape this must fail on is one of them being added back
+/// alone — which two independent negative assertions would let through in the
+/// direction that matters (grant the read, forget the write).
+#[test]
+fn the_group_state_pair_is_granted_together_or_not_at_all() {
+    let (reg, _d, _td, _gid, lead) = lead_group();
+    let c = caller_for(&reg, &lead);
+    let names = listed_tools(&reg, &c);
+
+    let has_read = names.contains(&"get_state".to_string());
+    let has_write = names.contains(&"set_state".to_string());
+    assert_eq!(
+        has_read, has_write,
+        "the lead's surface lists get_state={has_read} and set_state={has_write}. A read \
+         without the write is a call that returns \"{{}}\" forever — nothing in a lead group \
+         can write that blob. Grant both with an argument for the write, or neither."
+    );
+    assert!(!has_read, "today it is neither — see doc/design/lead-pane.md's Withheld table");
+
+    // The non-vacuity control: the equality above also holds when the surface
+    // is empty or broken, so pin that this pane really does have a surface and
+    // that a tool of the same shared read tier IS on it.
+    assert!(
+        names.contains(&"list_agents".to_string()),
+        "the shared read tier must still reach this class, or the assertion above is about \
+         a pane with no tools at all: {names:?}"
+    );
 }
 
 /// **Every tool loomux has, minus the lead's own surface, is refused to a
@@ -276,7 +320,6 @@ fn the_gate_and_the_listing_agree_for_a_lead() {
     let probes: Vec<(&str, Value)> = vec![
         // on the surface
         ("list_agents", json!({})),
-        ("get_state", json!({})),
         ("group_usage", json!({})),
         ("note_directive", json!({ "text": "the human asked for X" })),
         ("channel_status", json!({})),
@@ -295,6 +338,10 @@ fn the_gate_and_the_listing_agree_for_a_lead() {
         ("get_task", json!({ "id": "t-1" })),
         ("upsert_task", json!({ "title": "t" })),
         ("remove_task", json!({ "id": "t-1" })),
+        // Both halves of the group-state pair, deliberately adjacent: the read
+        // was granted in this PR's first draft and is now withheld, and the
+        // gate must refuse it exactly as it refuses the write (rev-final B1).
+        ("get_state", json!({})),
         ("set_state", json!({ "state": "{}" })),
         ("list_questions", json!({})),
         ("list_needs_you", json!({})),
@@ -324,7 +371,7 @@ fn the_gate_and_the_listing_agree_for_a_lead() {
     }
     // Non-vacuity: the loop above would also pass if the gate refused nothing
     // and the listing offered everything.
-    assert_eq!(denied_by_gate, 18, "every off-surface probe must be refused BY THE GATE");
+    assert_eq!(denied_by_gate, 19, "every off-surface probe must be refused BY THE GATE");
 }
 
 /// **A lead may open a worker, and nothing else** — each refusal named, with

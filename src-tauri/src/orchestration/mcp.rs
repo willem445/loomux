@@ -1337,8 +1337,7 @@ fn tool_defs(
     // WHY EACH ONE, and why the withheld ones are withheld, is
     // `doc/design/lead-pane.md`'s table. In one line each: the fleet-control
     // five plus `spawn_agent` are the capability the toggle exists to grant;
-    // `list_agents` is how the pane knows what it opened; `get_state` is a
-    // durable scratchpad that survives its own compact; `group_usage` answers
+    // `list_agents` is how the pane knows what it opened; `group_usage` answers
     // "what is this costing" in the pane the human is already asking in
     // (the liaison's argument, inherited by construction: a read of an
     // aggregate scoped to the caller's own group); `note_directive` and
@@ -1350,8 +1349,29 @@ fn tool_defs(
     // group has no orchestrator; the human is right here), and the whole
     // board/question/verdict/merge surface (no board, no gate, no queue —
     // listing any of them would advertise a route that has nothing behind it).
+    //
+    // **`get_state` is WITHHELD, and it is the one grant this slice took back**
+    // (rev-final B1). The plan's enumerated surface listed it, and it survived
+    // into the first draft justified as "a durable scratchpad that survives the
+    // pane's own compact" — a capability this class does not have. The group's
+    // `state.json` has exactly ONE writer in the tree
+    // (`OrchRegistry::set_state`, reached only from the `set_state` arm below,
+    // which is `require_orchestrator`), and a lead group has no orchestrator BY
+    // DESIGN. So nothing can ever write that blob in a lead group, and
+    // `get_state` would return `"{}"` on every call, forever. Listing it is
+    // exactly the "advertise a route with nothing behind it" the board tools
+    // are withheld for — worse, in fact, since a dead READ fails silently while
+    // a dead write at least errors.
+    //
+    // The pair is granted together or not at all, which
+    // `the_group_state_pair_is_granted_together_or_not_at_all` pins: a later
+    // slice that wants a lead to hold durable state has to argue for the WRITE,
+    // and the read follows it. What serves the compact-survival need meanwhile
+    // is `note_directive` — granted, self-scoped, and replayed into the
+    // post-compact re-grounding notice, which is the mechanism that need
+    // actually has.
     if role == Role::Lead {
-        const LEAD_SHARED: &[&str] = &["list_agents", "get_state", "request_compact", "note_directive"];
+        const LEAD_SHARED: &[&str] = &["list_agents", "request_compact", "note_directive"];
         tools.retain(|t| LEAD_SHARED.contains(&t["name"].as_str().unwrap_or_default()));
         tools.push(lead_spawn_agent_tool());
         tools.extend(fleet_control_tool_defs());
@@ -2265,7 +2285,6 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         && !matches!(
             name,
             "list_agents"
-                | "get_state"
                 | "request_compact"
                 | "note_directive"
                 | "spawn_agent"

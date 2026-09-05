@@ -2022,7 +2022,14 @@ pub fn kind_from_str(s: &str) -> Option<Role> {
         //    edit could drop;
         //  - a `resume_session` carrying a recorded `role: "lead"` and no block
         //    id is refused rather than re-roled, by the same #544 "never guess a
-        //    capability class" path every unrecognized role takes.
+        //    capability class" path every unrecognized role takes — the
+        //    `owner_rec.block.trim().is_empty()` branch runs this function on
+        //    the recorded role and errors on `None`. (A recorded row that DOES
+        //    carry a block id takes the other branch and is refused a step
+        //    later, by the lead caller's own effective-class check, whose
+        //    `declared.or(kind)` is then `None`. Both routes refuse; only the
+        //    first is this function's doing, and naming which is which is the
+        //    point of spelling it out — rev-final R1 on #2519.)
         //
         // Adding an arm here would silently undo all three at once. `Role::Solo`
         // is absent for the identical reason and is the precedent.

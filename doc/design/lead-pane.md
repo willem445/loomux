@@ -80,7 +80,6 @@ are equal, in both directions.
 | `get_output` | Read a helper's tail. This is the cost argument: a helper's output stays out of the lead's context until it asks. |
 | `kill_agent`, `focus_agent`, `rename_agent` | Manage the panes it opened. Shared wording. |
 | `list_agents` | Know what it has open. |
-| `get_state` | A durable scratchpad that survives the pane's own compact. |
 | `group_usage` | "What is this costing", answered in the pane the human is already asking in — the liaison's argument (#891 S2) inherited by construction: a read of an aggregate scoped to the caller's own group, settling nothing and writing nothing. Opted in at the arm, NOT by widening `require_orchestrator_or_liaison`, which also gates `ask_human`. |
 | `channel_send`, `channel_status` | The cross-workspace channel. A human connects one by hand, on this pane; see the `notify_when` row for why that distinction decides it. |
 | `note_directive`, `request_compact` | Self-scoped; neither reaches another pane. |
@@ -91,11 +90,11 @@ are equal, in both directions.
 | --- | --- |
 | `report` | A lead is the **root**: there is nothing above it. `deliver_relayed_to_root` would resolve the lead itself as the recipient — a pane relaying its own status into its own transcript. Refused at the gate AND in its own arm, so the arm can say what to do instead (the human is in this pane). |
 | `message_orchestrator` | A lead group has no orchestrator. |
-| `upsert_task`, `remove_task`, `list_tasks`, `get_task` | No task board exists in a lead group. Listing them would advertise routes with nothing behind them. (`get_state` IS granted: it is a durable blob, not a board.) |
+| `upsert_task`, `remove_task`, `list_tasks`, `get_task` | No task board exists in a lead group. Listing them would advertise routes with nothing behind them. |
 | `ask_human`, `request_attention`, `withdraw_*`, `list_questions`, `list_needs_you` | The human is **in** this pane. Every one of these exists to move a decision to a human who is somewhere else. |
 | `review_verdict`, `list_verdicts` | No review gate. A verdict here would open nothing. |
 | the merge queue, `drive_review*`, `read_playbook` | No merge queue, no driver, no orchestrator playbook. |
-| `set_state` is granted; the board writes above are not | See the two rows above — the split is board versus blob, not read versus write. |
+| `get_state` **and** `set_state` | Withheld as a PAIR, and the read is the one this slice took back (rev-final B1). `state.json` has exactly one writer in the tree — `OrchRegistry::set_state`, reached only from an MCP arm that is `require_orchestrator` — and a lead group has no orchestrator by design, so nothing in one can ever write that blob. A lead holding the read alone would get `"{}"` back on every call, forever: the same "advertise a route with nothing behind it" as the board rows above, in its silent form. Whoever wants a lead to hold durable state argues for the WRITE and the read follows it; `the_group_state_pair_is_granted_together_or_not_at_all` pins the pair rather than either tool. The compact-survival need this was first justified by is served by `note_directive`, which IS granted. |
 | `notify_when`, `list_notifications`, `cancel_notification` | **v1 decision, revisit.** A fired watch is text typed into the pane at a moment the human did not choose, requested by the agent rather than by them. That is the line this table draws, and it is the line `channel_send` sits on the other side of: a channel is opened by a human's own gesture on this pane, a watch is registered by the agent itself. |
 | `acquire_lock`, `release_lock`, `list_locks` | A lead group declares no resources — there is no workflow file to declare them in (see *Consent* below). |
 | `message_manager`, `check_mail` | The manager's mailbox belongs to a class this group does not have. |
@@ -159,7 +158,13 @@ not any check — is what makes three refusals structural:
    `kind_from_str` fails that test rather than quietly enabling recursion.
 3. A `resume_session` carrying a recorded `role: "lead"` and no block id is
    refused rather than re-roled, by the same #544 "never guess a capability
-   class" path every unrecognized role takes.
+   class" path every unrecognized role takes: the `block.trim().is_empty()`
+   branch runs `kind_from_str` on the recorded role and errors on `None`. A
+   recorded row that *does* carry a block id takes the other branch and is
+   refused a step later instead, by the lead caller's own effective-class check
+   (`declared.or(kind)` is then `None`). Both routes refuse; only the first is
+   the vocabulary's doing, and which is which is worth spelling out — a review
+   round turned on exactly that distinction (rev-final R1).
 
 `Role::Solo` is absent from that vocabulary for the identical reason and is the
 precedent.
