@@ -1372,7 +1372,7 @@ fn codex_content_text(content: &Value) -> Option<String> {
         return None;
     };
     blocks.iter().find_map(|b| {
-        (b.get("type")?.as_str()? == "input_text")
+        (b.get("type")?.as_str()? == "text")
             .then(|| b.get("text")?.as_str().map(str::to_string))
             .flatten()
     })
