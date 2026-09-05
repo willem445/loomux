@@ -331,7 +331,7 @@ pub fn classify_agent_probe(code: Option<i32>, stderr: &str) -> AgentProbe {
         return AgentProbe::Absent;
     }
     match code {
-        Some(0) | Some(1) => AgentProbe::Present,
+        Some(0) => AgentProbe::Present,
         _ => AgentProbe::Absent,
     }
 }
