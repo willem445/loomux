@@ -1718,7 +1718,6 @@ two remaining ways a fresh pane can appear.
   nine panes from six was to count them by hand across three PRs. It records
   what HAPPENED — a resume that was attempted and fell through is `false` —
   which is why the failure is its own row rather than a flag here. Since #2508
-  which is why the failure is its own row rather than a flag here. Since #2508
   it also carries `scope`, the round's scope line **verbatim, `scope: ` prefix
   included** — the value is `scope: whole-diff` | `scope: delta since <sha>` |
   `scope: body-only` (§5.5), never the bare mode, so a counter filtering the
