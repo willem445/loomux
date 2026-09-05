@@ -44,7 +44,15 @@ src-tauri/src/
     `CLI_CAPS` rather than as `if cli == …` at a call site — that table, the capability
     class (`Role`) and the deny tier it selects (`Containment`) now live in
     crates/loomux-engine (#888 slice A2 batch 4) and are re-exported here, so every
-    `orchestration::` spelling of them resolves unchanged; opencode's whole seam — an
+    `orchestration::` spelling of them resolves unchanged. `Role` carries two shared
+    predicates (#2519): `is_fixture` — a pane opened FOR the human rather than a delegate
+    an orchestrator opened, which is the one exemption rule seven guardrails read (the
+    dock, the cap, the reaper, the watchdog, the review driver's release, `spawn_agent`'s
+    refusals and persona ownership) — and the narrower `is_root`, the one agent a
+    delegate's `report` is typed into, which `deliver_relayed_to_root` looks a group up by.
+    They differ by exactly `Role::Manager`, and that gap is load-bearing: doc/design/manager.md.
+    `Role::Lead`, a human-driven pane that opens helper panes instead of harness subagents,
+    is doc/design/lead-pane.md; opencode's whole seam — an
     env-delivered config document, its permission-key containment and its per-group session
     store — is `doc/design/opencode.md`. Compact-survival is
     layered (#329, #416, #417): a durable role CONTRACT riding the CLI's own system-prompt layer
