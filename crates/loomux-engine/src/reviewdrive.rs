@@ -3883,6 +3883,11 @@ pub fn releasable(
     facts: &DriveFacts,
     step: &DriveStep,
 ) -> Vec<ReleaseCandidate> {
+    // [scratch] #2501 round 2: the pure RULE is neutered: the driver is finished
+    // with nothing, ever, which is the pre-#2501 behaviour.
+    if true {
+        return Vec::new();
+    }
     // Condition 1. A STEP that parks or ends the drive releases nothing — which
     // is not the same as "a drive that parks": the arm can refuse and park after
     // this has answered. See the doc above (rev-final W1).
