@@ -318,7 +318,7 @@ impl Role {
     /// Pinned as a SET (`the_fixture_classes_are_exactly_these_three`) so a
     /// later class is a deliberate addition rather than a default.
     pub fn is_fixture(self) -> bool {
-        matches!(self, Role::Orchestrator | Role::Manager | Role::Lead)
+        matches!(self, Role::Orchestrator | Role::Manager)
     }
 
     /// **Whether this class is the ROOT of its group** — the one agent a
