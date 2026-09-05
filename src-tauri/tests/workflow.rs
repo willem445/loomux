@@ -8633,19 +8633,26 @@ fn a_renamed_veto_reaches_the_contract_the_poller_and_the_allow_list_alike() {
          to apply a label that holds nothing: {state}"
     );
 
-    // 3. The seam the write side stands on. `gh.rs` has no group — the issues
-    //    view is repo-scoped — so it resolves the spelling from the repo's own
-    //    workflow file via `load_workflow`, and its allow-list is only correct
-    //    if that resolution equals the group's. Pinned here because it is the
-    //    one link the two sides' own tests cannot see between them: gh.rs's
-    //    unit tests prove it reads the file, this proves the file is what the
-    //    poller and contract were built from. (The allow-list's own closed-ness
-    //    is `a_resolved_hold_spelling_widens_the_allow_list_by_exactly_one_value`.)
+    // 3. The seam the write side stands on, and #2663 narrowed WHICH side it
+    //    holds up. `gh.rs` takes an `Option<&Guardrails>` now: a pane inside a
+    //    group hands it one and the spelling comes from `guardrails.intake.hold`
+    //    directly, so for THAT caller the two resolutions are one value and
+    //    cannot disagree. A plain pane still passes `None`, and its arm still
+    //    resolves the repo's `default` file — so this agreement is what the
+    //    allow-list's correctness rests on for the no-group caller, which is the
+    //    half a live group cannot cover. Pinned here because it is the one link
+    //    the two sides' own tests cannot see between them. (The allow-list's own
+    //    closed-ness is
+    //    `a_resolved_hold_spelling_widens_the_allow_list_by_exactly_one_value`;
+    //    the group-scoped half is
+    //    `an_applied_workflow_renaming_the_hold_veto_moves_every_label_surface`
+    //    in `tests/orchestration.rs`.)
     let from_file = workflow::load_workflow(&repo.path()).unwrap().unwrap().intake.hold;
     assert_eq!(
         from_file, g.guardrails.intake.hold,
-        "the repo-file resolution gh.rs uses must equal the group's — if these can differ, the \
-         UI writes one spelling while the poller honors another, which is the defect one layer over"
+        "the repo-file resolution a NO-GROUP gh.rs caller uses must equal the group's for a \
+         group launched on that file — if these can differ, a plain pane's issues view writes \
+         one spelling while this group's poller honors another"
     );
 }
 

@@ -1621,10 +1621,13 @@ mod tests {
         dir
     }
 
-    /// **The write side of the rename, read from a real file.** This is what
-    /// makes the issues view's one-click veto land on the label the repo's own
-    /// poller honors: `gh.rs` has no group to ask, so it resolves the spelling
-    /// from the same `.loomux/workflow.yml` `create_group` parses.
+    /// **The write side of the rename, read from a real file** — the NO-GROUP
+    /// arm, which is what a plain (non-orchestration) pane's issues view gets.
+    /// This is what makes its one-click veto land on the label the repo's own
+    /// poller honors: with no group to ask, the spelling comes from the same
+    /// `.loomux/workflow.yml` `create_group` parses. The group arm is
+    /// `a_groups_own_hold_spelling_beats_the_repos_default_workflow_file`, which
+    /// uses this same fixture as its decoy (#2663).
     #[test]
     fn a_declared_hold_spelling_is_resolved_from_the_repos_workflow_file() {
         let dir = repo_with_workflow(

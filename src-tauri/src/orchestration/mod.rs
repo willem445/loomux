@@ -5321,11 +5321,13 @@ pub struct Guardrails {
     /// from its own `gh issue list` sweep, so a contract still naming
     /// `agent-hold` put a held issue into the plan the human then approved.
     /// The spelling now also reaches the contract (the `{{HOLD_LABEL}}`
-    /// template variable, rendered from this field), and — resolved from the
-    /// repo's workflow file, since the issues view has no group — the
-    /// issues-view toggle and `gh.rs`'s label allow-list. See
-    /// `doc/design/orchestration.md`'s full-autonomy section for why the two
-    /// resolution paths agree.
+    /// template variable, rendered from this field) and the issues-view toggle
+    /// with `gh.rs`'s label allow-list — which read **this field** whenever the
+    /// calling pane has a group, and the repo's `default` workflow file only
+    /// when it does not (#2663; the issues view can be open on a plain pane).
+    /// So for a pane inside a group there is one resolution rather than two.
+    /// See `doc/design/orchestration.md`'s full-autonomy section for the
+    /// no-group arm and for which way the drift case points.
     ///
     /// Available regardless of the toggle: autonomous mode can run with the
     /// built-in roster, so a consumer must always have a profile to read, not

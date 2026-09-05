@@ -12956,15 +12956,25 @@ Five public-contract changes, all additive:
    button writes a label the poller ignores, so the issue keeps arriving as eligible — but it
    is the same defect, and the same fix.
 
-   **Two resolution paths, and why they agree.** The poller and the contract read
-   `guardrails.intake.hold` (the group's resolved profile); `gh.rs` has no group — the issues
-   view is repo-scoped and can be open with no group at all — so it resolves from the repo's
-   own `.loomux/workflow.yml` through the same `workflow::load_workflow` `create_group` runs.
-   Guardrails are re-resolved from that file on every launch/resume, so the two can only
-   differ while a group is live and the file has been edited under it; the UI then writes the
-   *newly typed* spelling, which is the safe direction (the human's latest word), and the next
-   relaunch converges. An integration test pins that the two resolutions agree for a given
-   repo, because that agreement is what the allow-list's correctness rests on.
+   **Two resolution paths, and #2663 collapsed the one that mattered.** The poller and the
+   contract read `guardrails.intake.hold` — the group's resolved profile. `gh.rs` now reads
+   that same field whenever the calling pane has a group (`IssuesViewHost.getGroupId()`, from
+   the pane's `orchGroupId`), so for a pane inside a group there is ONE resolution and the
+   button cannot disagree with the poller.
+
+   The issues view can still be open with no group at all — a plain pane — and that caller
+   resolves the repo's `default` workflow file, which is what it has always done. An
+   integration test pins that the two agree for a group launched on that file, because that
+   agreement is what the no-group caller's allow-list rests on.
+
+   **The direction under drift, stated because it inverted.** This paragraph used to say a
+   live group whose file had been edited under it would have the UI write the *newly typed*
+   spelling, "the safe direction (the human's latest word)". That was true only while `gh.rs`
+   read the file. It now reads what the group is RUNNING, and the newly typed spelling is the
+   unsafe one: an edit since launch is audited as `workflow-changed-since-launch` and is
+   deliberately not adopted, so the poller is still watching the pinned label and a button
+   writing the file's new one would hold nothing. The relaunch (or an `apply_workflow`) is
+   still what converges them.
 
    The allow-list stays an allow-list: exactly one resolved value joins the three fixed
    signals. A repo that declares no `hold:` gets the identical four-label set it had before.
