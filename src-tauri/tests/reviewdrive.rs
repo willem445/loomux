@@ -9005,12 +9005,6 @@ fn status_grace(reg: &OrchRegistry, group: &GroupId) -> bool {
         .unwrap_or(false)
 }
 
-fn status_rounds(reg: &OrchRegistry, group: &GroupId) -> u64 {
-    reg.review_drive_status(group)["drives"][0]["counters"]["review_rounds"]
-        .as_u64()
-        .unwrap_or_default()
-}
-
 /// **The acceptance test, and it is one fixture read twice.**
 ///
 /// The drive reaches the bound on a real `fail`; the worker then makes the fix
@@ -9048,7 +9042,7 @@ fn a_body_only_fail_at_the_bound_buys_one_more_round_then_the_next_one_parks() {
     let (_pr, worker) = handed.handbacks.first().cloned().expect("arc 5 hands the PR back");
     assert_eq!(status_state(&reg, &group), "fix-wait");
     assert_eq!(
-        status_rounds(&reg, &group),
+        review_rounds(&reg, &group),
         DriveLimits::default().max_review_rounds as u64,
         "the fixture's premise: that round put the drive AT the bound"
     );
@@ -9096,7 +9090,7 @@ fn a_body_only_fail_at_the_bound_buys_one_more_round_then_the_next_one_parks() {
     assert_eq!(rows[0]["head"], json!(HEAD_A), "{rows:?}");
     assert!(status_grace(&reg, &group), "review_drive_status shows it spent");
     assert_eq!(
-        status_rounds(&reg, &group),
+        review_rounds(&reg, &group),
         DriveLimits::default().max_review_rounds as u64,
         "and the review-round counter has NOT moved — MAX_ROUNDS_CEILING bounds \
          exactly what it bounded before"
@@ -9153,7 +9147,7 @@ fn a_code_fail_at_the_bound_still_parks_immediately() {
     let handed = reg.rd_drive_group_with(&group, &gh, 30_000);
     let (_pr, worker) = handed.handbacks.first().cloned().expect("arc 5 hands the PR back");
     assert_eq!(
-        status_rounds(&reg, &group),
+        review_rounds(&reg, &group),
         DriveLimits::default().max_review_rounds as u64,
         "the same premise as the acceptance test: AT the bound"
     );
