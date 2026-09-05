@@ -3001,11 +3001,18 @@ delivery. The durable read-back is the orchestrator-only MCP tool `list_blocks`:
   the pinned template.** `templates/workflow.md` — rendered by
   `workflow_section`, which is already where workflow-conditional prose lives
   (the #891 S3 rule) — gains one paragraph naming the switch notice and the
-  read-back. It sits behind `roster_is_custom`, so a built-in group never reads
-  a word about either (the
+  read-back. The paragraph sits behind `roster_is_custom`, so a built-in
+  group's KICKOFF never reads a word about either (the
   `advisor_and_process_prose_stays_silent_unless_a_block_declares_the_hint`
   rule) and the pre222 fixtures stay byte-identical: `workflow.md` is
-  deliberately not fixture-pinned, `orchestrator.md` is.
+  deliberately not fixture-pinned, `orchestrator.md` is. The TOOL is the other
+  half of that sentence and is deliberately NOT gated: `tool_defs` is never
+  handed the roster (its arguments are role, hint, locks, manager_declared), so
+  `list_blocks` is listed for every orchestrator, a built-in group's included —
+  and its answer there is honest, `{workflow: "default", advanced: false,
+  blocks: <built-in roster>}`. Gating the listing would mean threading roster
+  state into every listing call to refuse a read whose true answer is harmless;
+  the honest-answer cost is zero and the docs pin the distinction.
 
 ### `list_workflows` got its bound here (#2658)
 

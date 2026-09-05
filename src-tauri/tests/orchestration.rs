@@ -46987,6 +46987,29 @@ fn the_workflow_kickoff_teaches_the_notice_and_the_read_back_only_when_a_roster_
         fs::read_to_string(reg2.state_root().join(g2.id.as_str()).join("orchestrator.md")).unwrap();
     assert!(!builtin.contains("list_blocks"), "{builtin}");
     assert!(!builtin.contains("workflow switched"), "{builtin}");
+
+    // The TOOL is the other half of the docs sentence, and it is deliberately
+    // NOT gated: `tool_defs` is never handed the roster, so a built-in group's
+    // orchestrator IS offered `list_blocks` (rev-final round 3 — the first cut
+    // of the docs claimed otherwise, which the listing structurally cannot do).
+    // Pin the listing half so a future attempt to gate it reddens rather than
+    // silently making the sentence true again…
+    let orch2 = reg2.spawn_agent(&g2.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co2 = reg2.resolve_token(&orch2.token).unwrap();
+    let listed = dispatch(&reg2, &co2, "tools/list", &json!({})).unwrap();
+    let names: Vec<&str> =
+        listed["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"list_blocks"), "{names:?}");
+    // …and the answer half, because the docs sentence now promises the built-in
+    // group gets the truth rather than a refusal: `workflow: "default"` with
+    // the built-in four-block roster, the group not in workflow mode.
+    let honest = list_blocks_call(&reg2, &co2);
+    assert_eq!(honest["isError"], json!(false), "{honest}");
+    let answer: Value =
+        serde_json::from_str(honest["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(answer["workflow"], json!("default"), "{answer}");
+    assert_eq!(answer["advanced"], json!(false), "{answer}");
+    assert_eq!(answer["blocks"].as_array().unwrap().len(), 4, "{answer}");
 }
 
 // ───────── #385: merge-gate hot-reload ─────────
