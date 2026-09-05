@@ -568,7 +568,7 @@ pub fn drive_ssh_add_with_transcript(
         // prompting fixtures answered correctly, exited, and were still reported
         // `Timeout` (#2368). `spawn_pty_blocking` does not need it because a
         // pane's death is reported by its own `child.wait()` waiter thread.
-        if status.is_none() {
+        if false {
             if let Ok(Some(st)) = child.try_wait() {
                 status = Some(st);
                 // ConPTY renders a SCREEN, so the last frame before a fast exit
