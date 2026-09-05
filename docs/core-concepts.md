@@ -107,8 +107,8 @@ browser shows what you called it.
 
 **One thing worth knowing.** Some agent CLIs get their session id the moment
 they start, because orrerix puts it on the command line — Claude Code and pi do
-this. Others mint their own a little later, on their first turn; Copilot CLI
-and OpenCode are the ones that do that today. A note you write on one of the
+this. Others mint their own a little later, on their first turn; Copilot CLI,
+OpenCode and Codex are the ones that do that today. A note you write on one of the
 latter *before* its first prompt is held in memory and attached as soon as
 orrerix learns the id — but if you restart the app in that window, that note is
 lost. The overlay says so while it applies.
@@ -374,8 +374,8 @@ be rearranged in place:
   Hermes mauve, Ante citron, pi cyan); anything else keeps the violet that just
   means "an agent". The same colours mark the CLI chips in the session list.
   Agents with a recognisable mark show it; everything else shows a
-  lettered badge with the program's initial (`C` for Claude, `O` for opencode,
-  `P` for pi),
+  lettered badge with the program's initial (`C` for Claude and for Codex, `O`
+  for opencode, `P` for pi),
   and `?` if orrerix couldn't make out what was launched. Hover it for the program
   name. A plain shell pane has no agent, so it carries no mark at all. An **SSH
   pane** shows the CLI its saved connection runs on the far end — not `ssh`,

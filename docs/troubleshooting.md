@@ -87,6 +87,24 @@ installed. Make sure the CLI is on your `PATH` (open a fresh terminal and run
 An agent pane that dies with an error **stays open** so you can read what
 happened — it isn't closed out from under you.
 
+### Codex specifically, on Windows
+
+Codex ships two ways, and they put the binary in different places:
+
+- the **desktop app** installs it at
+  `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`;
+- `npm i -g @openai/codex` leaves a `codex.cmd` shim in `%APPDATA%\npm`.
+
+Either is fine — orrerix resolves an agent program through the Windows command
+interpreter, which finds a `.cmd` shim as readily as an `.exe`. What matters is
+that whichever one you have is on your `PATH`. If `codex --version` works in
+one shell but orrerix says it can't find it, the usual cause is a `PATH` set
+per-shell (a PowerShell profile, say) rather than for your user account, so
+orrerix's own environment never sees it.
+
+A `PATH` change made after orrerix started does not reach panes that are
+already open — restart orrerix once you have fixed it.
+
 ## A Copilot agent can't use its orrerix tools
 
 If a Copilot pane lists the `orrerix` MCP server but the agent says it has no
