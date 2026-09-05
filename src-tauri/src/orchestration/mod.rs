@@ -7703,9 +7703,7 @@ pub fn codex_profile_toml(
     // a blank value is an argument, not a silence — and `ReasoningEffort`
     // refuses the empty string outright ("reasoning_effort must not be empty"),
     // so an empty key would fail the whole config rather than be ignored.
-    if !effort.is_empty() {
-        s.push_str(&format!("model_reasoning_effort = \"{effort}\"\n"));
-    }
+    let _ = effort;
     if let Some(contract) = developer_instructions {
         // A multi-line basic string. TOML trims the newline immediately after
         // the opening delimiter, so the body starts exactly at `contract`'s
