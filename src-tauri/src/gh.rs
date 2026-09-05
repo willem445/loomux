@@ -2082,6 +2082,21 @@ mod tests {
         // no gh / no repo present — proving the allow-list is the gate.
         let err = gh_issue_set_labels_sync(
             "C:/nonexistent".to_string(),
+            None,
+            1,
+            vec!["definitely-not-allowed".to_string()],
+            vec![],
+        )
+        .unwrap_err();
+        assert!(err.contains("label not allowed"), "got: {err}");
+
+        // …and with a GROUP in hand too (#2663): scoping the vocabulary must not
+        // widen it. The group runs its own `hold`, which is admitted; a name
+        // outside the resolved set is refused on that path exactly as on this one.
+        let rails = group_running_hold("do-not-touch");
+        let err = gh_issue_set_labels_sync(
+            "C:/nonexistent".to_string(),
+            Some(&rails),
             1,
             vec!["definitely-not-allowed".to_string()],
             vec![],
@@ -2094,7 +2109,10 @@ mod tests {
     fn set_labels_noop_when_no_deltas() {
         // Empty add+remove is a success no-op (must not spawn an interactive
         // editor), regardless of repo validity.
-        assert!(gh_issue_set_labels_sync("C:/nonexistent".to_string(), 1, vec![], vec![]).is_ok());
+        assert!(
+            gh_issue_set_labels_sync("C:/nonexistent".to_string(), None, 1, vec![], vec![])
+                .is_ok()
+        );
     }
 
     #[test]
