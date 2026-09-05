@@ -3905,8 +3905,8 @@ fn changed_fields(agent_cli: &str, a: &Block, b: &Block) -> Vec<String> {
     };
     push(a_name != b_name, "name");
     push(a_kind != b_kind, "kind");
-    push(cli_of(a, agent_cli) != cli_of(b, agent_cli), "cli");
-    push(model_of(a, agent_cli) != model_of(b, agent_cli), "model");
+    push(a.cli != b.cli, "cli");
+    push(a.model != b.model, "model");
     push(a_prompt != b_prompt, "prompt");
     push(a_profile != b_profile, "profile");
     push(a_allow != b_allow, "allow");
