@@ -1,0 +1,58 @@
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:06:18.8212703Z # tests 2799
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:06:18.8213344Z # pass 2791
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:06:18.8213680Z # fail 0
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:06:18.8214450Z # skipped 8
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:23.6650068Z ^[[1m^[[92m     Running^[[0m unittests src/lib.rs (target/debug/deps/loomux_engine-dd81e6e3a7797d60)
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:23.6760074Z running 594 tests
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2857408Z failures:
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2857579Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2858205Z ---- harness::claude::tests::a_compact_boundary_carries_its_trigger_and_its_pre_token_count stdout ----
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2858982Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2860386Z thread 'harness::claude::tests::a_compact_boundary_carries_its_trigger_and_its_pre_token_count' (6699) panicked at crates/loomux-engine/src/harness/claude.rs:1078:9:
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2861481Z assertion `left == right` failed
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2862308Z   left: Event(Text { turn: TurnId(0), delta: "before" })
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2862880Z  right: Event(TurnStarted { turn: TurnId(0) })
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2863196Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2863904Z ---- harness::claude::tests::a_stream_event_delta_is_text_and_a_non_text_delta_is_not stdout ----
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2864477Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2865458Z thread 'harness::claude::tests::a_stream_event_delta_is_text_and_a_non_text_delta_is_not' (6703) panicked at crates/loomux-engine/src/harness/claude.rs:1142:9:
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2866519Z assertion `left == right` failed
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2866927Z   left: [Event(Text { turn: TurnId(0), delta: "par" })]
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2867490Z  right: [Event(TurnStarted { turn: TurnId(0) }), Event(Text { turn: TurnId(0), delta: "par" })]
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2867859Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2868298Z ---- harness::claude::tests::an_unknown_message_type_is_ignored_as_an_event_and_kept_as_evidence stdout ----
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2868726Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2869471Z thread 'harness::claude::tests::an_unknown_message_type_is_ignored_as_an_event_and_kept_as_evidence' (6705) panicked at crates/loomux-engine/src/harness/claude.rs:1027:9:
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2870535Z assertion `left == right` failed
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2870894Z   left: Event(Text { turn: TurnId(0), delta: "hi" })
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2871287Z  right: Event(TurnStarted { turn: TurnId(0) })
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2871510Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2871914Z ---- harness::claude::tests::an_unrecognized_terminal_reason_is_carried_not_collapsed stdout ----
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2872304Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2872985Z thread 'harness::claude::tests::an_unrecognized_terminal_reason_is_carried_not_collapsed' (6706) panicked at crates/loomux-engine/src/harness/claude.rs:1195:22:
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2873947Z [Event(TurnEnded { turn: TurnId(0), usage: None, cost: None, stop: Other("a_new_reason") })]
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2874304Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2874666Z ---- harness::claude::tests::init_booted_result_is_the_decoder_walking_one_turn stdout ----
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2875044Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2875685Z thread 'harness::claude::tests::init_booted_result_is_the_decoder_walking_one_turn' (6709) panicked at crates/loomux-engine/src/harness/claude.rs:952:9:
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2876416Z assertion `left == right` failed
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2877215Z   left: [Event(Text { turn: TurnId(0), delta: "on it" }), Event(ToolCall { turn: TurnId(0), id: ToolUseId("toolu_1"), name: "Bash", input: Object {"command": String("git status")} })]
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2878572Z  right: [Event(TurnStarted { turn: TurnId(0) }), Event(Text { turn: TurnId(0), delta: "on it" }), Event(ToolCall { turn: TurnId(0), id: ToolUseId("toolu_1"), name: "Bash", input: Object {"command": String("git status")} })]
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2879305Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2879934Z ---- harness::claude::tests::pump_publishes_events_and_logs_the_lines_it_could_not_decode stdout ----
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2880351Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2881037Z thread 'harness::claude::tests::pump_publishes_events_and_logs_the_lines_it_could_not_decode' (6710) panicked at crates/loomux-engine/src/harness/claude.rs:1240:9:
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2887667Z assertion `left == right` failed: Booted, TurnStarted, Text — the unknown line publishes nothing: [Booted { session: Some("s-9"), model: None, capabilities: [] }, Text { turn: TurnId(0), delta: "hi" }]
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2888485Z   left: 2
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2888693Z  right: 3
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2888809Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2888815Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2888906Z failures:
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2889333Z     harness::claude::tests::a_compact_boundary_carries_its_trigger_and_its_pre_token_count
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2890246Z     harness::claude::tests::a_stream_event_delta_is_text_and_a_non_text_delta_is_not
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2890903Z     harness::claude::tests::an_unknown_message_type_is_ignored_as_an_event_and_kept_as_evidence
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2891540Z     harness::claude::tests::an_unrecognized_terminal_reason_is_carried_not_collapsed
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2892319Z     harness::claude::tests::init_booted_result_is_the_decoder_walking_one_turn
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2892920Z     harness::claude::tests::pump_publishes_events_and_logs_the_lines_it_could_not_decode
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2893270Z 
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-04T23:08:24.2893785Z test result: FAILED. 588 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s

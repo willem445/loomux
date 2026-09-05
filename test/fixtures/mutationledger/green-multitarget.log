@@ -1,0 +1,32 @@
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:21:21.8450230Z # tests 2818
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:21:21.8450350Z # pass 2810
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:21:21.8450410Z # fail 0
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:21:21.8450520Z # skipped 8
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:23:08.2781780Z ^[[1m^[[92m     Running^[[0m unittests src/lib.rs (target/debug/deps/loomux_engine-776d879a1b83916c)
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:23:09.3232390Z test result: ok. 594 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.03s
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:23:09.3237670Z ^[[1m^[[92m     Running^[[0m unittests src/lib.rs (target/debug/deps/loomux_server-a2d609552867cb4e)
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:23:09.3628610Z ^[[1m^[[92m     Running^[[0m unittests src/main.rs (target/debug/deps/loomux_server-c390dfc440253b7e)
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:23:09.3629230Z test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:23:09.3679420Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:23:09.3681720Z ^[[1m^[[92m     Running^[[0m unittests src/lib.rs (target/debug/deps/loomux_lib-2246372b62fad29e)
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:23:20.0880810Z test result: ok. 280 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.69s
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:23:20.0883710Z ^[[1m^[[92m     Running^[[0m unittests src/main.rs (target/debug/deps/orrerix-ddd44d33ba935f8f)
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:23:20.1015020Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:23:20.1018020Z ^[[1m^[[92m     Running^[[0m tests/acl_manifest.rs (target/debug/deps/acl_manifest-b8591e093e9b2987)
+build (macos-latest)	UNKNOWN STEP	2026-09-05T00:23:20.1160310Z test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:21:41.6288708Z # tests 2818
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:21:41.6289371Z # pass 2810
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:21:41.6289686Z # fail 0
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:21:41.6290328Z # skipped 8
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:23:48.1473449Z ^[[1m^[[92m     Running^[[0m unittests src/lib.rs (target/debug/deps/loomux_engine-dd81e6e3a7797d60)
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:23:48.7590248Z test result: ok. 594 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:23:48.7619985Z ^[[1m^[[92m     Running^[[0m unittests src/lib.rs (target/debug/deps/loomux_server-5ec6e81004f5cbd2)
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:23:48.7697291Z test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:23:48.7698208Z ^[[1m^[[92m     Running^[[0m unittests src/main.rs (target/debug/deps/loomux_server-5ca5ec575132d5d8)
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:23:48.7723847Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:23:48.7727038Z ^[[1m^[[92m     Running^[[0m unittests src/lib.rs (target/debug/deps/loomux_lib-dca13802011e4e3e)
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:23:59.9512154Z test result: ok. 280 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.17s
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:23:59.9524060Z ^[[1m^[[92m     Running^[[0m unittests src/main.rs (target/debug/deps/orrerix-b6cae8117b9bcc76)
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:23:59.9545906Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:23:59.9547642Z ^[[1m^[[92m     Running^[[0m tests/acl_manifest.rs (target/debug/deps/acl_manifest-ed79dc31654a76df)
+build (ubuntu-22.04)	UNKNOWN STEP	2026-09-05T00:24:00.1598507Z test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s

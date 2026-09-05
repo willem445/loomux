@@ -6,6 +6,12 @@ dist/
 target/
 src-tauri/gen/schemas/
 *.log
+
+# ...except the CI-log fixtures the mutation-ledger reader is pinned over (#2507). They are
+# excerpts of real runs, and the suite that reads them is only evidence while they are in
+# the tree: without this line `*.log` above silently drops all five, `git status` stays
+# clean, and CI reddens on a file nobody can see is missing.
+!test/fixtures/mutationledger/*.log
 test-results/
 playwright-report/
 .claude/worktrees/

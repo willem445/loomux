@@ -737,10 +737,11 @@ citing it is how a stale row enters the body in the first place.
 produced a false evidence table in this repo, and each was caught by looking
 rather than by routine -- which is exactly what makes it a checklist item:
 
-1. **Re-derive the bank at the current head, from the runs' own logs.** Never
-   adjust a previous total by arithmetic: correcting a stale number by hand is
-   how the next stale number is born, and it is the defect class you are
-   checking for.
+1. **Re-derive the bank at the current head, from the runs' own logs** --
+   `node scripts/mutation-ledger.cjs --rows rows.json`, whose output is what you
+   paste. Never adjust a previous total by arithmetic: correcting a stale number
+   by hand is how the next stale number is born, and it is the defect class you
+   are checking for.
 2. **`MSYS_NO_PATHCONV=1 git rev-parse <round-commit>:<file>`, against the same
    at `<head>`, for every file any round mutates.** A red dated to a moved blob
    is evidence about code that no longer exists. This is the check with no
@@ -946,6 +947,49 @@ a readability one) and give each its own round. Signature: a complete, reconcili
 table in which no row names a decision the diff plainly makes (#1501 — a coverage regression
 shipped under TWELVE green rounds, `record_contributions_for` then extracted pure, round 13
 and `j16` following).
+
+### Generate the table, do not type it: `scripts/mutation-ledger.cjs`
+
+The wave's table is a list of figures GitHub already printed. Write a rows file
+naming the banked-green run and, per round, its run id and the behaviour it set
+aside; the script reads the rest out of the runs' logs and prints the markdown
+table plus the `Round N -- k tests (P/F)` bullets, each row dated to the head SHA
+its own run reports.
+
+```sh
+cat > .scratch/rows.json <<'JSON'
+{ "target": "loomux_engine", "job": "build (ubuntu-22.04)",
+  "base": { "run": 33932644347 },
+  "rows": [ { "n": 1, "behaviour": "session-id compare is canonicalized", "run": 33928049423,
+              "cutFrom": "7b36ae86" } ] }
+JSON
+node scripts/mutation-ledger.cjs --rows .scratch/rows.json     # paste this into the agent layer
+node scripts/mutation-ledger.cjs --check <pr>                  # re-read a POSTED body's rows
+```
+
+`--target`/`--job`/`--what` name which suite a row is about. They are not
+optional decoration: a run carries one `test result:` line per test binary per
+platform leg, and a crate's lib and bin unittests share a target stem. The script
+refuses an ambiguous selector and names the candidates rather than picking one.
+
+Run `--check <pr>` again after **every** push, a body-only fix included, beside
+`node scripts/pr-body-check.cjs --pr <n>`. The two answer different questions and
+neither substitutes for the other: `pr-body-check` re-measures the body against
+HEAD and never opens a log, so it cannot see a wrong pass/fail split; this opens
+the log and never looks at head. MISMATCH must be zero in both before
+`report(done)`.
+
+What it cannot see -- an expired or truncated log, a runner that printed no
+totals, whether a round was cut from the right base -- is in
+`doc/design/mutation-ledger.md`. A parse that finds no totals is an error rather
+than an empty row, so the failure you get is loud rather than a blank cell.
+
+**Checking a body against a run that is still going gets you provisional figures,
+and the script says so on stderr rather than caching them.** Only a completed run's
+log is banked; an in-flight one is read fresh every time. So a `--check` run while
+CI is mid-flight is a look, not a receipt -- re-run it once the run completes, which
+is the same rule as everywhere else here.
+
 
 ### The frontend half runs its base red locally — build the isolated tree right
 
