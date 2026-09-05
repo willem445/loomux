@@ -695,9 +695,16 @@ fn a_lead_is_a_fixture_for_the_cap_the_reaper_and_the_dock() {
     let (reg, _d, _td, gid, lead) = lead_group();
     let worker = reg.spawn_agent(&gid, Role::Worker, "w", "", false, None).unwrap();
 
-    // Both panes are idle and the group's timeout is 5 minutes, so a reap run
-    // far in the future must name the worker and must not name the lead.
-    let far_future = 1_000_000_000_000u64;
+    // Both panes are idle (both were spawned with an empty task, which is what
+    // stamps `idle_since_ms`), and the group's timeout is 5 minutes — so a reap
+    // run far in the future must name the worker and must not name the lead.
+    //
+    // `u64::MAX / 2`, not a hand-written "big" number: `idle_should_kill`
+    // measures `now - idle_since` against a wall-clock epoch stamp, so a
+    // literal that merely LOOKS large (1e12 ms is the year 2001) is in the
+    // PAST and saturates the subtraction to zero. The control below caught
+    // exactly that, which is what it is for.
+    let far_future = u64::MAX / 2;
     let reaped = reg.idle_reap_candidates(far_future);
     assert!(
         reaped.contains(&worker.id),
