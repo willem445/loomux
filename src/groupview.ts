@@ -1294,8 +1294,14 @@ export class GroupView {
     // is invisible — the #47 planner bug, which is why `manager` (#1161) is here
     // from the start. The orchestrator leads; the manager follows it, because it
     // is the other pane the human deals with directly rather than a delegate.
+    //
+    // #2519 puts `lead` beside them, on the same argument and not merely for
+    // completeness: a lead group's root IS the lead, so `roles.orchestrator` is
+    // 0 there, and a breakdown without this key would render "1 agent live"
+    // with no entry at all beside it.
     const roleBits = [
       s.roles.orchestrator ? `${s.roles.orchestrator} orch` : "",
+      s.roles.lead ? `${s.roles.lead} lead${s.roles.lead > 1 ? "s" : ""}` : "",
       s.roles.manager ? `${s.roles.manager} manager${s.roles.manager > 1 ? "s" : ""}` : "",
       s.roles.worker ? `${s.roles.worker} worker${s.roles.worker > 1 ? "s" : ""}` : "",
       s.roles.reviewer ? `${s.roles.reviewer} reviewer${s.roles.reviewer > 1 ? "s" : ""}` : "",
