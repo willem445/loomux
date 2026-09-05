@@ -182,6 +182,32 @@ test("a secret attached to a profile OBJECT is never serialized either", () => {
   assert.equal(written.includes("password"), false);
 });
 
+test("a passphrase attached to a profile OBJECT is never serialized either", () => {
+  // #2368 slice A gives the launcher a Key-passphrase field for the first time,
+  // so "a caller hangs a passphrase on a profile" stops being hypothetical: the
+  // value now exists in the same form, one field above, and the shortest wrong
+  // way to plumb it is to put it on the profile. The schema is deliberately
+  // UNCHANGED by that slice — the passphrase is used once, in `submit`, and
+  // never persisted — and this is what makes that a property rather than an
+  // intention.
+  //
+  // Three spellings, because the encode side is an allowlist and a reviewer
+  // should not have to trust that it is: whichever name a future caller reaches
+  // for, `profileToWire` writes only the fields it declares.
+  for (const key of ["passphrase", "keyPassphrase", "sshPassphrase"]) {
+    const smuggled = { ...fullProfile(), [key]: "correct horse battery staple" } as unknown as SshProfile;
+    const written = encodeSshProfiles(store(smuggled));
+    assert.equal(written.includes("correct horse"), false, `encode must not write a ${key} value`);
+    assert.equal(written.includes(key), false, `encode must not write a ${key} key`);
+  }
+  // Positive control for the three assertions above: an assertion that a string
+  // does NOT contain something passes just as well over an empty encode. The
+  // fields that ARE declared must still be there.
+  const ok = encodeSshProfiles(store(fullProfile()));
+  assert.equal(ok.includes("id_ed25519"), true, "the declared identityFile still round-trips");
+  assert.equal(ok.includes("build.example.net"), true, "the declared destination still round-trips");
+});
+
 test("identityFile carrying key MATERIAL is refused; the profile survives without it", () => {
   // The one field key material can enter through the front door: paste a PEM
   // blob into something labelled "identity file" and a naive store writes the

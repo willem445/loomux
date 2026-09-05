@@ -156,6 +156,207 @@ loomux did not spawn for a human at the keyboard. Then `extraArgs` becomes remot
 code execution on the local box, and the answer is a capability boundary, not a
 filter.
 
+## Passphrases: the agent holds the key, orrerix holds nothing (#2368 slice A)
+
+A passphrase-protected key makes the section above expensive rather than wrong:
+every pane asks again, because every pane is a fresh `ssh`. The fix that keeps
+"orrerix holds none" **literally** true is to use the passphrase **once**, to run
+the user's own `ssh-add`, and let OpenSSH's own agent hold the decrypted key —
+exactly the state the machine would be in after a hand-run `ssh-add`. The key
+material never enters orrerix at all, and `sshprofiles.json`'s schema is
+unchanged: the allow-lists above still drop a `passphrase` key at both ends, and
+slice A extends the *tests* that prove it rather than the schema.
+
+### Vendor facts the choice rests on
+
+Checked in Win32-OpenSSH's own sources and issue tracker, because each one is the
+reason an obvious alternative does not work on this project's baseline:
+
+| Fact | Source | Consequence |
+| --- | --- | --- |
+| Windows askpass runs only when `SSH_ASKPASS` is set; `SSH_ASKPASS_REQUIRE=force` postdates the in-box 8.1p1 client | `readpass.c`; [Win32-OpenSSH #2115](https://github.com/PowerShell/Win32-OpenSSH/issues/2115) (honoured on 8.1p1, ignored on 8.6p1) | askpass is version roulette on the baseline |
+| `read_passphrase` takes `RP_ALLOW_STDIN`, but a **non-tty** stdin routes back to askpass | `readpass.c` | a pipe is not a way in either |
+| The agent pipe is hardcoded `\\.\pipe\openssh-ssh-agent`; `ssh-agent -d` serves one connection then exits | `ssh-agent/agent.c`, `agent-main.c` | a private per-app agent is not constructible from the shipped binary |
+| The Windows agent persists loaded keys across reboots and ignores `-t` | `HKCU\OpenSSH\Agent\Keys` (DPAPI); [Win32-OpenSSH #1056](https://github.com/PowerShell/Win32-OpenSSH/issues/1056) | "session memory" is really *until forgotten* — a docs fact, not something to imply away |
+| `ssh-agent.exe` with no args asks the SCM to start the service and `fatal`s when it cannot; the service ships **Disabled** | `agent-main.c` | the refusal has to carry a one-time **admin** step |
+| `SSH_AUTH_SOCK` on Windows accepts only a named-pipe path; the client defaults to the hardcoded pipe when unset | [Win32-OpenSSH #1761](https://github.com/PowerShell/Win32-OpenSSH/issues/1761) | nothing needs threading into the pane env on Windows; off Windows the pane child inherits the app's own `SSH_AUTH_SOCK` through `CommandBuilder` |
+
+### The options, and why 1a
+
+| Option | What orrerix would hold | Windows mechanism | Verdict |
+| --- | --- | --- | --- |
+| **1a. Agent-held via the OS agent** | nothing — the passphrase lives for one `ssh-add` call; the **agent** holds the decrypted key | the OpenSSH Authentication Agent service; orrerix runs `ssh-add <key>` in a hidden ConPTY it owns and answers the prompt | **built** — zero new crates, and the base of option 3 |
+| 1b. A private `ssh-agent` per app run, `SSH_AUTH_SOCK` into the pane env | nothing | not constructible: hardcoded pipe, single-shot `-d`; an in-process agent needs key parsing and signing crates, which means `getrandom` (constraint 2) | rejected on Windows; the natural macOS/Linux follow-up |
+| 1c. `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force` at connect time | the passphrase in memory, re-fed per connect | needs an askpass **executable** orrerix does not ship, and 8.1p1 has no `REQUIRE` while 8.6p1 is reported to ignore `SSH_ASKPASS` | rejected — version roulette, and a stale env var breaks prompting for every pane |
+| 1d. Type the passphrase into the pane when its prompt appears | the passphrase in memory | prompt-text matching on the byte stream; the echo-off race can land the passphrase in scrollback | rejected — exactly the hazard the never-in-the-pane rule exists for |
+| 2. OS keychain plus a *remember* toggle | the **passphrase itself**, persisted | Credential Manager through the `windows` crate already depended on | only on the human's say-so (slice B); it flips the rule from "holds none" to "holds one, opt-in, in the OS store" |
+
+### The hidden ConPTY is the seam, and that is the one boundary crossed
+
+The feature's original shape (§ *The shape*) is **zero backend spawn code**. This
+adds one backend command, and the argument for it is narrow: a console can only
+be opened backend-side, and giving `ssh-add` a real console is the only mechanism
+that behaves the same on 8.1p1 and 8.6p1. It is the same
+`native_pty_system().openpty` call `spawn_pty_blocking` already makes — no new
+dependency, no new mechanism — and the pty is **hidden**: never registered with
+`PtyManager`, never streamed, dropped when the call returns.
+
+What it does **not** do is move key handling into orrerix; the argument against an
+SSH library (§ *The shape*, point 2) is untouched. orrerix drives OpenSSH's own
+`ssh-add` exactly as a human would, and `ssh-add` is resolved **beside** the
+`ssh` that `discover_ssh` picked, so the pair is always one OpenSSH — a PATH-found
+`ssh-add` can be Git for Windows' MSYS build, whose agent is not the one the inbox
+`ssh.exe` talks to.
+
+### The wire shape, as a public contract
+
+One new `#[tauri::command]`:
+`ssh_add_identity(sshPath, identityFile, passphrase) -> SshAddOutcome`, `async`
+through `run_blocking` and never sync (constraint 10 — it spawns processes, which
+INV-2 refuses on the webview thread outright).
+
+| `kind` | Payload | Means |
+| --- | --- | --- |
+| `added` | — | the agent now holds the key |
+| `badPassphrase` | `detail` | `ssh-add` rejected it; `detail` is its own last line, scrubbed |
+| `noAgent` | `hint` | nothing to add the key to; `hint` is the platform's one-time fix |
+| `timeout` | — | the conversation outran its 15 s bound and the child was killed (the human waits up to **27 s** end to end — see below) |
+| `failed` | `detail` | `ssh-add` missing, a spawn failure, or an unrecognised refusal |
+
+The conversation itself answers **at most one** prompt with the passphrase and
+**at most one** retry ask with an *empty* line, which is `ssh-add`'s own
+documented give-up: it re-asks until handed an empty passphrase, so re-sending
+the same wrong value is a spin that ends at the deadline. Both asks carry **no
+trailing newline** — they are asks, not lines — which is why the driver
+classifies the whole transcript rather than complete lines.
+
+#### The bytes decide the conversation; the exit status decides the verdict
+
+Two ConPTY properties make the transcript an unreliable *verdict*, and both were
+measured rather than anticipated — on CI, where all three prompting fixtures
+answered correctly, exited, and were still reported `Timeout`:
+
+- **A ConPTY master read never returns EOF when the child dies**, because the
+  read side stays open as long as the caller holds the master. So a driver that
+  waits for the stream to end waits until its deadline, every time.
+  `spawn_pty_blocking` never hit this because a pane's death is reported by its
+  own `child.wait()` waiter thread — a mechanism this one-shot call does not
+  have and therefore has to supply.
+- **ConPTY renders a screen, not a stream.** A process that prints one line and
+  exits immediately can have that frame dropped: the success fixture's
+  `Identity added` line never arrived at all.
+
+The driver therefore polls `try_wait` between reads, drains for a moment after
+the exit, and — when no line decided the outcome — falls back to `ssh-add`'s own
+exit code, where **0 means the identity was added**. The transcript remains the
+only thing that can decide *what to answer and when to give up*; it is simply not
+the last word on whether the key went in.
+
+#### The answer is one write, and it is re-sent once
+
+A third measured fact, from the same logs: the answer and its Enter sent as
+**two** writes lost the Enter on roughly one run in three. The console had
+echoed the passphrase back — so the read was live and cooked-mode echo had
+run — and the lone `\r` that followed simply never took effect, leaving
+`ssh-add` blocked on a read nobody would finish. The line and its Enter now go
+in one buffer, and the write result is **returned rather than dropped**: `let _
+= write_all(…)` is what made this invisible in the first place, and a refusal
+naming the failed write is a bug report where a fifteen-second `Timeout` is not.
+
+What is left of the race is bounded by exactly one re-send of the Enter. The
+cost of being wrong is asymmetric: a duplicate Enter can only supply an *empty*
+line, and the only reader that can still be waiting is the retry ask — where an
+empty line is the give-up this driver sends anyway. A lost one costs the user
+the whole bound and refuses a launch that would have worked.
+
+#### Two things this widens, named rather than left implicit
+
+**The bound a human experiences is 27 s, and it is enforced rather than summed.**
+The launcher awaits the whole sequence behind one modal "Connecting…", so the
+15 s conversation bound is not the number anyone waits.
+
+The first attempt at stating that got it wrong, and the way it was wrong is the
+reason the shape changed. Per-step ceilings — probe 5 s, start-attempt 10 s,
+re-probe 5 s, conversation 15 s — **compose**, and `run_ssh_add`'s agent check
+does not return on success: it falls through to the conversation. So there was a
+fourth-step path, probe + start + probe + drive = **35 s**, against a constant
+claiming 20 and a test that pinned only the two compositions someone had listed.
+The constant had been picked to satisfy that list, so the test certified the
+false number instead of exposing it.
+
+A second review round then found the same claim falsified one layer down: the
+conversation ends by killing its child and then waiting for it, and
+`portable-pty` 0.9.0's `Child::wait` is `WaitForSingleObject(INFINITE)` behind a
+`kill` whose result is **inverted** — `Err` when `TerminateProcess` succeeded,
+`Ok` when it failed — so a child that survives the kill is indistinguishable from
+one that died, and the wait never returns. `CHILD_REAP_BUDGET` bounds it: the
+child is polled for at most 2 s and then **abandoned**, the same trade
+`subproc::abandon_child_and_readers` makes, because a leaked process is far
+better than a wedged app. That budget is the third term of the total.
+
+The fix is structural, because a corrected sum would have had the same defect one
+step later. Everything before the conversation now shares **one** deadline
+(`AGENT_SETUP_BUDGET`, 10 s, enforced in `ensure_agent`), and the conversation
+always gets its own full `SSH_ADD_TIMEOUT` whatever the setup spent. Every path
+is therefore setup-then-conversation — there is no path *set* to enumerate — and
+`WORST_CASE_TOTAL` is their sum by construction. A step added to the setup phase
+tomorrow costs budget rather than inventing a path the pin misses.
+
+An exhausted budget fails **closed**: a step with no time left is killed at once
+and `probe_agent` reads a capture it could not make as `Absent`, so the run ends
+in the refusal that carries the platform's fix rather than in a launch with no
+agent behind it.
+
+**The set of binaries this feature will execute goes from one to three.** An SSH
+pane used to run exactly the `ssh` the human named. This adds `ssh-add` and, on
+the no-agent path, `ssh-agent.exe` — both taken from that `ssh`'s own directory,
+neither named by the human. Accepted on the same footing as the `ssh` itself:
+anyone who can write that directory has already replaced the `ssh`, and the
+beside-rule is what keeps the agent the client's own rather than whichever
+OpenSSH leads PATH. Stated here because it is a widening, and a reader
+comparing this note against the "no backend, no dependency" shape above should
+not have to infer it.
+
+### Persistence honesty
+
+On Windows the agent keeps the key **until it is forgotten** (`ssh-add -D`, or
+`ssh-add -d <key>`), across reboots, and `-t` is ignored — so this feature really
+does buy "remember" semantics there, and the docs say so rather than implying a
+session lifetime nobody delivers. That is also why option 2 buys little on
+Windows: the agent already persists, and storing the *passphrase* as well would
+add a secret where none is stored today.
+
+### The refusal spawns no pane, and never dead-ends
+
+A non-`added` outcome ends the launch: the message is shown, the passphrase field
+is focused, and **nothing is spawned**. That is the point rather than a
+limitation — a wrong passphrase can never hang a pane because it never reaches
+one. Every refusal names the same escape (blank the field and let ssh ask inside
+the pane, which is the pre-#2368 path), because a refusal that leaves someone
+stuck is worse than the prompt it replaced.
+
+### Residuals, stated rather than claimed away
+
+- **The passphrase's transient copies.** It reaches the backend as a `String`
+  through Tauri's IPC deserialization, and the webview holds it in an `<input>`
+  before that. `zero_secret` overwrites only the buffer `sshagent.rs` owns;
+  neither of the other two is under this module's control, and no crate would
+  change that. orrerix does not *store* the passphrase — it does not claim to
+  have scrubbed every copy out of two runtimes it does not own.
+- **A fake `ssh-add` that echoes.** The real one reads with echo off and never
+  prints a passphrase back, so `scrub_secret` is a belt against the case where the
+  program on the other end of the pty is a shim or a wrapper. `detail` is the one
+  field carrying foreign text, so it is the one place a leak could ride out;
+  `src-tauri/tests/sshagent.rs` drives exactly that program.
+- **Service-start ACL.** Whether a non-elevated `ssh-agent.exe` can start a
+  *Manual*-start service is unverified here (constraint 3 keeps a live agent off
+  CI). The code handles both answers: one start attempt, one re-probe, then the
+  refusal carrying the admin step.
+- **The breadcrumb.** Exactly one is written, `ssh-add outcome=<variant>`, and
+  `SshAddOutcome::variant` returns `&'static str` — so `detail` (foreign text) and
+  the identity path (the human's filesystem) are not reachable from it by
+  construction, not by care.
+
 ## Who owns `RemoteShell`
 
 **`sshprofile.ts` (S1) owns the value set.** It declares the canonical triple —

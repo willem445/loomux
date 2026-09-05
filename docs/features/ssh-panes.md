@@ -67,6 +67,7 @@ ssh client**, then fill in the section that appears:
 | **Destination** | `user@host`, a bare `host`, or a `Host` alias from your own `ssh_config`. Required. One field rather than separate user/host boxes, because an alias has neither — and an alias is how your `ProxyJump`, `IdentityFile` and `User` come along for free. |
 | **Port** | `-p`. Blank means orrerix passes nothing and your ssh config decides. |
 | **Identity file** | `-i`. A **path** to a private key — never the key itself (see [below](#credentials-orrerix-holds-none)). Blank means your ssh config decides. |
+| **Key passphrase** | Shown once you have named an **Identity file**. If that key is passphrase-protected, type it here and orrerix runs `ssh-add` **once** before the pane opens, so your own ssh-agent holds the key and nothing asks again. Never saved (see [below](#credentials-orrerix-holds-none)); leave it blank and ssh asks you inside the pane instead. |
 | **Remote shell** | **POSIX (sh/bash/zsh)** or **cmd.exe** — which shell's quoting rules the remote command is built for. A declaration, not a guess; see [Remote shell](#remote-shell-a-declaration-not-a-detection). |
 | **Keepalive (s)** | `ServerAliveInterval`. Blank emits *nothing at all*, so your own ssh config's keepalive settings win untouched. |
 | **Extra ssh flags** | Space-separated argv words passed to `ssh` verbatim and in order (`-J jump.example.net`). The escape hatch for anything the fields above don't model. |
@@ -113,15 +114,55 @@ and interactive prompts in the pane. orrerix passes no `BatchMode`, so a prompt 
 free to appear and you answer it in the pane. This mirrors how orrerix treats
 GitHub: it stores no token and shells out to your authenticated `gh`.
 
+### The one thing you can type that is a secret — and where it goes
+
+**Key passphrase** is the exception that proves the rule, and it is worth being
+precise about. When you fill it in, orrerix uses it **once**, immediately, to run
+your own `ssh-add` on the identity file you named. The passphrase is not saved, not
+written to any file, and not handed to the pane; the thing that ends up holding
+your decrypted key is **your own ssh-agent**, exactly as if you had run `ssh-add`
+in a terminal yourself. Leave the field blank and nothing happens at all — ssh
+asks you inside the pane, which is what it always did.
+
+Three things about this are worth knowing before you use it.
+
+**On Windows the agent has to be running, and turning it on is a one-time
+administrator step.** Windows ships the OpenSSH Authentication Agent service
+**disabled**. If it is off, orrerix tells you so and opens no pane. In an
+Administrator PowerShell:
+
+```powershell
+Set-Service ssh-agent -StartupType Automatic
+Start-Service ssh-agent
+```
+
+**On Windows the agent keeps your key until you tell it to forget.** It is not a
+session cache: keys survive a reboot (they live encrypted under
+`HKCU\OpenSSH\Agent\Keys`), and the `-t` lifetime option is ignored by the Windows
+agent, so orrerix cannot ask for a shorter one. Forget one key with
+`ssh-add -d <path-to-key>`, or all of them with `ssh-add -D`. That is a real
+trade: you are asked once instead of once per pane, and in exchange the agent
+holds the key until you clear it.
+
+**If it doesn't work you are never stuck.** A wrong passphrase, a missing agent
+or a timeout ends the launch with the reason and **opens no pane** — so a bad
+passphrase can never leave a pane hanging, because it never reaches one. Every one
+of those messages also names the way through: blank the **Key passphrase** field
+and let ssh ask you inside the pane.
+
+### The connections file
+
 Saved connections live in **`%APPDATA%\loomux\sshprofiles.json`**, a plain,
 hand-editable JSON file next to `tabs.json` and `settings.json`. It holds
 hostnames, ports, the *path* of an identity file, a remote folder, a CLI name and
-your extra flags. **orrerix never writes a password or a passphrase into it**, and
-two structural guards keep that true rather than merely stated:
+your extra flags. **orrerix never writes a password or a passphrase into it** —
+including the one you type into **Key passphrase**, which is used and dropped
+without the file being touched. Two structural guards keep that true rather than
+merely stated:
 
 1. **Read and write are both allowlists.** Only the declared fields are read in,
-   and only those fields are written out — so a `password` key hand-added to the
-   file cannot survive one load/save cycle.
+   and only those fields are written out — so a `password` or `passphrase` key
+   hand-added to the file cannot survive one load/save cycle.
 2. **The identity file is checked to be a path.** Paste a PEM blob into that field
    and it is refused, rather than written into the JSON.
 

@@ -53,6 +53,7 @@ macro_rules! stub_commands {
 stub_commands!(
     spawn_pty, pty_backend_info, write_pty, resize_pty, kill_pty, dir_info, change_dir,
     discover_git_bash, discover_ssh,
+    ssh_add_identity,
     list_sessions, record_copilot_launch_posture, record_claude_launch_posture,
     git_repo_root, git_log, git_status, git_diff, git_commit_files, git_stage, git_unstage, git_commit,
     git_checkout, git_discard, git_worktree_add, git_worktree_list, git_fetch, git_push, git_pull, git_tag,
@@ -166,11 +167,11 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_163() {
+fn app_commands_len_is_164() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        163,
-        "APP_COMMANDS drifted from the expected count of 163 (120 per the #363 plan's audited \
+        164,
+        "APP_COMMANDS drifted from the expected count of 164 (120 per the #363 plan's audited \
          count, +1 for orch_confirm_solo_copilot_autopilot added in #364, +2 for \
          orch_set_advanced_orchestrator/orch_workflow_status added in #316/#355, +3 for \
          orch_set_compact_nudge_minutes/orch_set_compact_nudge_roles/ \
@@ -212,13 +213,16 @@ fn app_commands_len_is_163() {
          +2 for orch_question_dismiss/orch_needs_you_dismiss — the human's \
          no-longer-relevant close-out on each registry, added in #2137, \
          +2 for load_session_log/save_session_log — orrerix's own sessions log (the pane name \
-         and the human's notes, per harness session) added in #2116) — \
+         and the human's notes, per harness session) added in #2116, \
+         +1 for ssh_add_identity — loading a passphrase-protected key into the user's own \
+         ssh-agent once, through a hidden ConPTY driving the user's own ssh-add, so an SSH \
+         pane connects without a per-pane passphrase prompt, added in #2368 slice A) — \
          if this is an intentional addition/removal, update this tripwire's count too"
     );
 }
 
 #[test]
-fn main_has_all_163_and_zero_permission_denies_dangerous_spread() {
+fn main_has_all_164_and_zero_permission_denies_dangerous_spread() {
     // Catches drift in *this test file* before it can mask a real gap: the
     // stub list above must match APP_COMMANDS exactly.
     let mut stub_names: Vec<&str> = STUB_COMMAND_NAMES.to_vec();

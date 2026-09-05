@@ -17,6 +17,7 @@ import type { CliKnobs } from "./selectorknobs";
 import type { CliProbe } from "./modelcatalog";
 import type { CliModelReply } from "./modelwire";
 import type { SessionSource } from "./sessionsource.ts";
+import type { SshAddOutcome } from "./sshagent";
 import { PtyRouter, type RouteOwner } from "./ptyroute.ts";
 
 export interface SpawnOptions {
@@ -123,6 +124,28 @@ export const discoverGitBash = (): Promise<string | null> =>
  *  Returns the ABSOLUTE path, and that path is what the spawned argv carries:
  *  resolving once means the binary that was probed is the binary that runs. */
 export const discoverSsh = (): Promise<string | null> => invoke<string | null>("discover_ssh");
+
+/** Load one passphrase-protected identity into the user's OWN ssh-agent, once
+ *  (#2368 slice A) — the single invoke site for `ssh_add_identity`, per
+ *  CLAUDE.md constraint 5.
+ *
+ *  `program` is the ssh client `discoverSsh` resolved: the backend looks for
+ *  `ssh-add` beside it, so the key is loaded into the agent that client will
+ *  actually ask rather than into whichever OpenSSH happens to lead PATH.
+ *
+ *  The passphrase crosses this boundary once and is not stored on either side —
+ *  `sshprofiles.json`'s schema is unchanged, and the backend zeroes its own
+ *  copy. It never reaches a pane: nothing on the spawn path has a field for it.
+ *
+ *  Rejects only when the command itself could not run; every ssh-add outcome,
+ *  refusals included, comes back as a resolved `SshAddOutcome` for
+ *  `sshAddRefusal` to turn into one paragraph. */
+export const sshAddIdentity = (
+  program: string,
+  identityFile: string,
+  passphrase: string
+): Promise<SshAddOutcome> =>
+  invoke<SshAddOutcome>("ssh_add_identity", { sshPath: program, identityFile, passphrase });
 
 /** The model knobs loomux can actually set on an agent CLI (#687) — the CLI's
  *  `CLI_CAPS` row, reported verbatim by the backend so the launcher, the workflow

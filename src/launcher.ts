@@ -71,10 +71,12 @@ import {
   type RemoteShell,
   type SshProfile,
 } from "./sshprofile";
+import { sshAddRefusal, sshPassphraseGate } from "./sshagent";
 import {
   agentCliKnobs,
   discoverGitBash,
   discoverSsh,
+  sshAddIdentity,
   loadSshProfiles,
   saveSshProfiles,
 } from "./pty";
@@ -298,6 +300,14 @@ export class WelcomeForm {
   private sshDestInput: HTMLInputElement;
   private sshPortInput: HTMLInputElement;
   private sshIdentityInput: HTMLInputElement;
+  /** **Key passphrase** (#2368 slice A). Used ONCE, to run `ssh-add` on the
+   *  identity above so the user's own agent holds the key — never saved, never
+   *  put on a profile, never handed to a pane. Read into a local in `submit`
+   *  and cleared in the same statement; see the ssh arm below. */
+  private sshPassphraseInput: HTMLInputElement;
+  /** The row `sshPassphraseInput` lives in, hidden while there is no identity
+   *  file to load: a passphrase with no key path names nothing. */
+  private sshPassphraseField: HTMLElement;
   private sshRemoteShellSel: HTMLSelectElement;
   private sshKeepaliveInput: HTMLInputElement;
   private sshExtraInput: HTMLInputElement;
@@ -550,6 +560,14 @@ export class WelcomeForm {
     this.sshPortInput.max = String(MAX_SSH_PORT);
     this.sshPortInput.className = "dlg-input dlg-num";
     this.sshIdentityInput = textInput("path to a private key — optional");
+    this.sshIdentityInput.addEventListener("input", () => this.updateSshPassphraseField());
+    this.sshPassphraseInput = textInput("only if that key is passphrase-protected");
+    // `password` so it is never rendered, and `autocomplete="off"` /
+    // `name=""` so no browser credential store is invited to remember a value
+    // orrerix has promised not to keep either.
+    this.sshPassphraseInput.type = "password";
+    this.sshPassphraseInput.autocomplete = "off";
+    this.sshPassphraseInput.name = "";
     this.sshRemoteShellSel = select(
       REMOTE_SHELLS.map((s) => [s, s === "posix" ? "POSIX (sh/bash/zsh)" : "cmd.exe"] as [string, string]),
       DEFAULT_REMOTE_SHELL
@@ -577,6 +595,17 @@ export class WelcomeForm {
     this.sshRemoteCwdInput.addEventListener("input", () => this.updateSshWarning());
     this.sshWarn = document.createElement("div");
     this.sshWarn.className = "dlg-error";
+    this.sshPassphraseField = field(
+      "Key passphrase",
+      this.sshPassphraseInput,
+      "used once to load that key into your ssh-agent — never saved"
+    );
+    // Hidden until something names a key. `field()` leaves `hidden` at the
+    // HTMLElement default of `false`, so without this the row paints in the
+    // window before the profile read resolves — and forever when that read
+    // returns null or an empty list (#2397 review W1). The kind switch below
+    // is what re-decides it; this is the state it starts from.
+    this.sshPassphraseField.hidden = true;
     const sshRow = (...fields: HTMLElement[]): HTMLElement => {
       const row = document.createElement("div");
       row.className = "dlg-row";
@@ -592,6 +621,7 @@ export class WelcomeForm {
         field("Port", this.sshPortInput, "blank = your ssh config"),
         field("Identity file", this.sshIdentityInput, "a path, never a key")
       ),
+      this.sshPassphraseField,
       sshRow(
         field("Remote shell", this.sshRemoteShellSel, "how the remote command is quoted"),
         field("Keepalive (s)", this.sshKeepaliveInput, "blank = your ssh config")
@@ -959,6 +989,15 @@ export class WelcomeForm {
       // picked rather than at submit, where their latency would be a stall.
       void this.loadSshProfilesOnce();
       void this.resolveSshProgram();
+      // Both ssh-section visibility rules run here, on ONE schedule. Driving
+      // the warning from the kind switch and the passphrase row only from the
+      // identity listener + `applySshProfile` is the asymmetry CLAUDE.md names:
+      // `applySshProfile` runs from the picker's `change` and from the profile
+      // read's `if (store.profiles.length)` arm, so a human with NO saved
+      // connections — the first-run case — reached the form with the row
+      // painted and Identity file empty, where a typed passphrase is a silent
+      // no-op (#2397 review W1).
+      this.updateSshPassphraseField();
       this.updateSshWarning();
     }
     // Same control, honest caption per kind: a folder to browse or edit, a repository
@@ -1656,6 +1695,10 @@ export class WelcomeForm {
     this.sshDestInput.value = picked?.destination ?? "";
     this.sshPortInput.value = picked?.port !== undefined && picked?.port !== null ? String(picked.port) : "";
     this.sshIdentityInput.value = picked?.identityFile ?? "";
+    // Nothing about a passphrase is persisted, so there is nothing to seed —
+    // and carrying the one typed for the PREVIOUS connection across a switch
+    // would send it to a different host's key. Clear it with the rest.
+    this.sshPassphraseInput.value = "";
     this.sshRemoteShellSel.value = picked?.remoteShell ?? DEFAULT_REMOTE_SHELL;
     this.sshKeepaliveInput.value =
       picked?.keepaliveSeconds !== undefined && picked?.keepaliveSeconds !== null
@@ -1664,6 +1707,7 @@ export class WelcomeForm {
     this.sshExtraInput.value = picked?.extraArgs.join(" ") ?? "";
     this.sshRemoteCwdInput.value = picked?.remoteCwd ?? "";
     this.setSshCli(picked?.defaultCli ?? null);
+    this.updateSshPassphraseField();
     this.updateSshWarning();
     this.updateName();
     // `setSshCli` assigns the select's value, and an assignment fires no `change` — so the
@@ -1686,6 +1730,18 @@ export class WelcomeForm {
       this.sshCliSel.appendChild(o);
     }
     this.sshCliSel.value = cli ?? "";
+  }
+
+  /** Show **Key passphrase** only while there is an identity file to load.
+   *
+   *  A passphrase with no key path names nothing — `sshPassphraseGate` skips it
+   *  for exactly that reason — so offering the box would be offering a control
+   *  that cannot act. Hiding it also CLEARS it: a value left behind in a hidden
+   *  password box is a secret the human can no longer see they are carrying. */
+  private updateSshPassphraseField(): void {
+    const hasIdentity = this.sshIdentityInput.value.trim() !== "";
+    this.sshPassphraseField.hidden = !hasIdentity;
+    if (!hasIdentity) this.sshPassphraseInput.value = "";
   }
 
   /** The SSH section's inline warnings. No ssh client at all replaces the rest —
@@ -1866,7 +1922,9 @@ export class WelcomeForm {
       //  3. compose the argv, catching the one class of refusal the builder
       //     raises (a remote-command token cmd.exe cannot be handed safely,
       //     which is a fixable data problem, not a bug);
-      //  4. save the connection, best-effort, and fire.
+      //  4. save the connection, best-effort;
+      //  5. load the key into the user's own ssh-agent when a Key passphrase
+      //     was typed (#2368 slice A) — a refusal there ends the launch.
       this.setBusy(true, "Connecting…");
       const program = await this.resolveSshProgram();
       if (!program) {
@@ -1889,6 +1947,44 @@ export class WelcomeForm {
         return;
       }
       await this.persistSshProfile(plan.profile);
+      // 5. #2368 slice A — load the key into the user's OWN ssh-agent, once,
+      //    before anything spawns. Read and CLEARED in one statement: from here
+      //    on the only copy orrerix holds is this local, which dies with the
+      //    call. It is deliberately not on `plan`, on `PaneSetupInput`, or on
+      //    the `fire()` payload — those types have no field for it, which is
+      //    what makes "the passphrase cannot reach a pane" structural rather
+      //    than a habit.
+      //
+      //    A refusal ends the launch: no pane is spawned. That is the point —
+      //    a wrong passphrase can never hang a pane because it never reaches
+      //    one, and the message says how to get in anyway (blank the field and
+      //    let ssh ask inside the pane, which is the pre-#2368 path).
+      const passphrase = this.sshPassphraseInput.value;
+      this.sshPassphraseInput.value = "";
+      if (
+        sshPassphraseGate({ identityFile: plan.profile.identityFile, passphrase }) === "add"
+      ) {
+        let refusal: string | null;
+        try {
+          refusal = sshAddRefusal(
+            await sshAddIdentity(program, plan.profile.identityFile ?? "", passphrase)
+          );
+        } catch (err) {
+          // The command itself could not run. Same shape as a refusal: say so,
+          // spawn nothing, and leave the blank-field escape open.
+          refusal = sshAddRefusal({
+            kind: "failed",
+            detail: String(err instanceof Error ? err.message : err),
+          });
+        }
+        if (refusal) {
+          this.showError(refusal);
+          this.sshPassphraseInput.focus();
+          this.setBusy(false);
+          this.latch.release();
+          return;
+        }
+      }
       this.fire({
         kind: "ssh",
         name: plan.name,

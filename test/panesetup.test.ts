@@ -434,6 +434,37 @@ test("a login-shell connection composes an argv with no -t, no -- and no command
   assert.deepEqual(argv, ["ssh.exe", "dev@build.example.net"]);
 });
 
+test("a passphrase smuggled onto a profile cannot reach the spawned argv (#2368)", () => {
+  // #2368 slice A introduces a Key-passphrase field, and the rule it rests on is
+  // that the value NEVER reaches a pane: it is read into a local in `submit`,
+  // handed to `ssh_add_identity`, and dropped. This is the argv half of that,
+  // pinned against the shortest wrong way to plumb it — hanging it on the
+  // profile object the argv builder reads.
+  //
+  // The other half is a TYPE fact rather than a runtime one, and the two
+  // instruments see different things (CLAUDE.md's mutation-table rule): there is
+  // no passphrase field on `PaneSetupInput`, `SshProfile`, or the argv, so
+  // adding one to a caller is a `tsc --noEmit` error — which `npm test` alone
+  // would never report, because `node --test` strips types without checking
+  // them. The cast below is what makes the runtime half reachable at all.
+  const smuggled = {
+    ...sshProfile({ defaultCli: "claude", port: 2222, remoteCwd: "/srv/app" }),
+    passphrase: "correct horse battery staple",
+    keyPassphrase: "correct horse battery staple",
+  } as unknown as SshProfile;
+
+  const argv = sshLaunchArgv("ssh.exe", smuggled, "sess-1");
+
+  for (const word of argv) {
+    assert.ok(!word.includes("correct horse"), `no argv word may carry a passphrase: ${word}`);
+    assert.ok(!word.includes("passphrase"), `no argv word may name a passphrase: ${word}`);
+  }
+  // Positive control: an assertion that nothing contains a needle passes just as
+  // well over an empty argv. The declared fields must still be composed.
+  assert.ok(argv.includes("dev@build.example.net"), "the destination is still composed");
+  assert.ok(argv.includes("2222"), "the declared port is still composed");
+});
+
 test("an unknown remote CLI warns rather than refusing — it is a remote program, not ours", () => {
   // S1's stated contract: a profile naming a CLI this build doesn't know "is a
   // profile to warn about, not a profile to silently delete". What loomux's

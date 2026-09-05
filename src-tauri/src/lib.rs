@@ -35,6 +35,7 @@ pub mod orchestration; // pub: integration smoke test links through it
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 pub mod ptyout; // pub: the #712 output-coalescing integration test drives `pty_output_pump`
 pub mod rootreg; // pub: the #1042 declared-root integration tests link its admit helpers
+pub mod sshagent; // pub: the #2368 integration test drives `drive_ssh_add` against a fake ssh-add
 pub mod sessions; // pub: the #412 resume-hardening integration tests fixture its store-lookup test seams
 mod uistate; // durable UI state (project tabs, #63) — atomic tabs.json store
 pub mod usage; // pub: exercised by orchestration integration tests
@@ -198,6 +199,7 @@ pub fn run() {
             pty::change_dir,
             pty::discover_git_bash,
             pty::discover_ssh,
+            sshagent::ssh_add_identity,
             sessions::list_sessions,
             sessions::record_copilot_launch_posture,
             sessions::record_claude_launch_posture,
