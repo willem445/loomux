@@ -37504,7 +37504,8 @@ impl OrchRegistry {
             // it against `CODEX_HOME` itself. Unquoted, and safe unquoted,
             // because `codex_profile_name` refuses anything outside codex's
             // own `[A-Za-z0-9_-]` alphabet rather than sanitizing it.
-            (token, format!("-p {profile}"))
+            let _ = profile;
+            (token, String::new())
         } else if has_seam {
             let token = new_token();
             // A solo pane is `Role::Solo` — `Containment::None`, nothing to
