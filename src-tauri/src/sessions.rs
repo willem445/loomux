@@ -1541,8 +1541,10 @@ mod launch_intent_tests {
         claude_posture_in, copilot_launch_posture, load_launch_intent, posture_key_for,
         record_claude_launch_posture_impl, record_copilot_launch_posture_impl, scan_sessions,
         set_claude_projects_root_for_test, set_copilot_session_state_root_for_test,
-        set_launch_intent_path_for_test, set_legacy_copilot_posture_path_for_test,
-        set_session_index_path_for_test, IntentKey, Posture, SessionInfo,
+        set_codex_sessions_root_for_test, set_launch_intent_path_for_test,
+        set_legacy_copilot_posture_path_for_test, set_opencode_store_for_test,
+        set_pi_sessions_root_for_test, set_session_index_path_for_test, IntentKey, Posture,
+        SessionInfo,
     };
     use std::fs;
 
@@ -1568,6 +1570,28 @@ mod launch_intent_tests {
         // too, so a scan test neither reads another run's cached rows nor writes
         // its fixtures over the developer's real `session-index.json`.
         set_session_index_path_for_test(Some(d.path().join("session-index.json")));
+        // EVERY file-backed source, not just the two these tests assert about
+        // (#2515 C2). `scan_rows` below is `scan_sessions()`, which is ONE pass
+        // over all of them, so a root left unbound here is the developer's real
+        // history walked by a unit test — slow, non-deterministic, and able to
+        // push the test's own fixtures past `LIST_LIMIT`. claude and copilot are
+        // bound per-test below; these three were not bound anywhere, and the
+        // `scan_rows` doc claimed otherwise.
+        //
+        // codex is the one that made this urgent — `~/.codex` is where the
+        // OpenAI desktop app writes, so it exists on a machine that has never
+        // run `codex` from a terminal — but pi (#2126) and opencode (#722) had
+        // the same hole and are fixed with it rather than left two-thirds true.
+        //
+        // The two directory roots are CREATED; opencode's is a database PATH
+        // that nothing creates, so "no store" is its deterministic empty.
+        let codex = d.path().join("codex-sessions");
+        let pi = d.path().join("pi-sessions");
+        fs::create_dir_all(&codex).unwrap();
+        fs::create_dir_all(&pi).unwrap();
+        set_codex_sessions_root_for_test(Some(codex));
+        set_pi_sessions_root_for_test(Some(pi));
+        set_opencode_store_for_test(Some(d.path().join("opencode").join("opencode.db")));
         d
     }
 
@@ -1575,14 +1599,21 @@ mod launch_intent_tests {
         set_launch_intent_path_for_test(None);
         set_legacy_copilot_posture_path_for_test(None);
         set_session_index_path_for_test(None);
+        set_codex_sessions_root_for_test(None);
+        set_pi_sessions_root_for_test(None);
+        set_opencode_store_for_test(None);
     }
 
     /// The rows the real `list_sessions` would return, for the scan tests
     /// below. #493 merged the per-CLI scans into one pass, so each of these
-    /// tests must also fixture the OTHER CLI's root to an empty tempdir (they
-    /// do) — otherwise the scan would walk the developer's real
-    /// `~/.claude`/`~/.copilot` history, which is slow, non-deterministic, and
-    /// big enough to push the test's own fixtures past the row limit.
+    /// tests must also fixture EVERY OTHER source's root to an empty tempdir —
+    /// otherwise the scan walks the developer's real history, which is slow,
+    /// non-deterministic, and big enough to push the test's own fixtures past
+    /// the row limit.
+    ///
+    /// claude and copilot are bound per-test; codex, pi and opencode are bound
+    /// once in `posture_seam` (#2515 C2 — see the comment there for why all
+    /// three, and why this sentence used to name only two).
     fn scan_rows() -> Vec<SessionInfo> {
         scan_sessions().0
     }
