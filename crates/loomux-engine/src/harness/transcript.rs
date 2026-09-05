@@ -307,9 +307,17 @@ fn preview_input(input: &serde_json::Value) -> String {
             other => other.to_string(),
         },
     };
-    // One line, always: a newline inside a preview would break the "one
-    // collapsed line each" property that keeps a busy pane readable.
-    let raw = raw.replace(['\n', '\r'], " ");
+    // The "one collapsed line each" property is held by [`Renderer::wrapped`],
+    // which turns every control character — `LF` and `CR` included — into a
+    // space at the one point all pass-through text crosses.
+    //
+    // This function used to carry its own `replace(['\n', '\r'], " ")`. It is
+    // gone rather than kept as belt-and-braces, and that is the point of the
+    // finding that put the filter in `wrapped`: a second, weaker copy of one
+    // rule is how the two drift, and this copy WAS the weaker one — it stripped
+    // `CR`/`LF` from a tool's arguments while letting `ESC` through, and model
+    // text got neither. A round that removed it stopped reddening once `wrapped`
+    // covered the same ground, which is what a subsumed rule looks like.
     let (cut, truncated) = super::truncate_on_char_boundary(&raw, TOOL_PREVIEW_BYTES);
     if truncated {
         format!("{cut}…")
@@ -545,7 +553,9 @@ mod tests {
         assert!(drawn[0].starts_with("> Bash("), "{drawn:?}");
         assert!(
             drawn[0].contains("echo one echo two"),
-            "the newlines must become spaces, not line breaks: {drawn:?}"
+            "the newlines must become spaces, not line breaks — held by \
+             `wrapped`'s control filter, which is why this test reddens with \
+             that filter removed rather than with a preview-local strip: {drawn:?}"
         );
     }
 
