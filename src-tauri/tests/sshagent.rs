@@ -120,6 +120,46 @@ fn a_wrong_passphrase_gives_up_the_way_ssh_add_documents() {
     );
 }
 
+/// The same conversation, with the vendor's own retry wording sitting inside the
+/// **identity path** — which `ssh-add` interpolates into its first ask.
+const ACCEPTS_WITH_LOADED_PATH: &str = concat!(
+    "@echo off\n",
+    "echo fake-ssh-add-running\n",
+    "set /p p=Enter passphrase for C:\\keys\\Bad passphrase, try again for\\id_ed25519: \n",
+    "if not \"%p%\"==\"hunter2\" goto bad\n",
+    "echo Identity added: C:\\keys\\id_ed25519 test-key\n",
+    "exit /b 0\n",
+    ":bad\n",
+    "set /p q=Bad passphrase, try again for C:\\keys\\id_ed25519: \n",
+    "exit /b 1\n",
+);
+
+#[test]
+fn an_identity_path_carrying_the_retry_wording_is_still_answered() {
+    // #2397 review W3, end to end rather than at the classifier. The path is the
+    // human's own text and the vendor binary interpolates it into
+    // `Enter passphrase for %s%s: `, so before the fix the FIRST ask classified
+    // as the retry: the driver sent its empty give-up instead of the passphrase
+    // and the launch was refused with the key never offered.
+    //
+    // This fixture is deliberately worse than the reachable case — it puts the
+    // WHOLE retry template in the path, so it fails against a fix that merely
+    // lengthened the match string and passes only when the first ask is tested
+    // first.
+    let dir = tempfile::tempdir().unwrap();
+    let argv = fake_ssh_add(dir.path(), "loaded-path.bat", ACCEPTS_WITH_LOADED_PATH);
+
+    let (outcome, seen) = drive_ssh_add_with_transcript(&argv, b"hunter2", Duration::from_secs(20));
+
+    assert_eq!(
+        outcome,
+        SshAddOutcome::Added,
+        "a path carrying the retry wording must not turn the first ask into a refusal\n\
+         transcript: {}",
+        show(&seen)
+    );
+}
+
 /// A fake that asks, reads, and exits with `%1` **without printing a verdict**.
 ///
 /// The transcript cannot decide these runs, which is the point: it is exactly

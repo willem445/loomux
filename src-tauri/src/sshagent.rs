@@ -51,6 +51,18 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// The worst case a human waits, end to end — **20 s**, not [`SSH_ADD_TIMEOUT`].
+///
+/// `run_ssh_add` sequences probe → start-attempt → probe → drive, so the two
+/// paths that can run longest are `AGENT_PROBE_TIMEOUT` + `AGENT_START_TIMEOUT`
+/// + `AGENT_PROBE_TIMEOUT` = 20 s to a `NoAgent` refusal, and
+/// `AGENT_PROBE_TIMEOUT` + `SSH_ADD_TIMEOUT` = 20 s to a `Timeout`. The launcher
+/// awaits the whole sequence behind one "Connecting…", so this — not the 15 s
+/// below — is the number a human experiences. Named here so a reader who edits
+/// any one of the three constants can see what they are really changing (#2397
+/// review premortem).
+pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(20);
+
 /// How long the whole `ssh-add` conversation may take before it is abandoned.
 ///
 /// A bound rather than a wait, for the reason `GH_CAPTURE_TIMEOUT` exists: this
@@ -172,11 +184,20 @@ pub enum SshAddEvent {
 /// for …`) must be recognised before the first ask, or a mistyped passphrase
 /// would be answered with the same wrong passphrase forever.
 pub fn classify_ssh_add_line(line: &str) -> SshAddEvent {
-    if line.contains("Bad passphrase") {
-        return SshAddEvent::BadPassphrase;
-    }
+    // The FIRST ask is tested first, and the retry is matched on the vendor's
+    // whole template rather than on `Bad passphrase` alone. Both halves of that
+    // are load-bearing, and the reason is that the identity PATH is interpolated
+    // into these strings by `ssh-add` itself (`Enter passphrase for %s%s: `):
+    // a path containing `Bad passphrase` made the first ask classify as the
+    // retry, so the driver sent its give-up instead of the passphrase and
+    // refused a launch with the key never offered (#2397 review W3). The two
+    // templates are disjoint — the retry says `try again for`, not `Enter
+    // passphrase for` — so testing the ask first is total, not a tie-break.
     if line.contains("Enter passphrase for") {
         return SshAddEvent::Prompt;
+    }
+    if line.contains("Bad passphrase, try again for") {
+        return SshAddEvent::BadPassphrase;
     }
     if line.contains("Identity added") {
         return SshAddEvent::Added;
@@ -213,6 +234,17 @@ pub fn ssh_add_beside(ssh_path: &Path) -> Option<PathBuf> {
 
 /// Resolve the `ssh-add` to drive: beside the resolved `ssh` when that exists,
 /// otherwise the first `ssh-add` on PATH.
+///
+/// **What this feature is willing to execute, stated because it widened.** Before
+/// #2368 an SSH pane ran exactly one binary the human had named — the `ssh`
+/// `discover_ssh` resolved. This module adds two more from that same directory:
+/// `ssh-add` (here) and `ssh-agent.exe` (`try_start_agent`), neither named by the
+/// human and the second on a refusal path they did not ask for. That is accepted
+/// on the same footing as the `ssh` itself — someone who can write the directory
+/// a user's `ssh` lives in has already replaced the `ssh`, and the beside-rule is
+/// what keeps the agent the client's own. It is not a *narrower* surface than
+/// before, and the design note says so rather than leaving the widening implicit
+/// (#2397 review premortem).
 ///
 /// The impure half of [`ssh_add_beside`] — one `is_file` and a PATH scan. The
 /// fallback exists for a layout the beside-rule cannot serve (an `ssh` shim
@@ -516,6 +548,10 @@ pub fn drive_ssh_add_with_transcript(
     // been used. See the re-arm below.
     let mut last_write = Instant::now();
     let mut rearmed = false;
+    // How much of `seen` this driver has already acted on. See the classify
+    // call below for why the tail, and not the whole transcript, is what is
+    // classified.
+    let mut consumed = 0usize;
 
     while terminal.is_none() {
         let now = Instant::now();
@@ -545,23 +581,31 @@ pub fn drive_ssh_add_with_transcript(
         if drain_until.is_some_and(|until| now >= until) {
             break;
         }
-        // One re-send of the Enter, and only one.
+        // One re-send of the answer, and only one.
         //
-        // A lost Enter is indistinguishable from a slow one, and the cost of
-        // being wrong is asymmetric: a duplicate Enter can only supply an EMPTY
-        // line, and the only reader that can still be waiting is `ssh-add`'s
-        // retry ask — where an empty line is exactly the give-up this driver
-        // sends anyway. A lost one costs the user the whole bound and refuses a
-        // launch that would have worked. `send_answer` above removes the cause
-        // this was written for; this bounds what is left of it, because a
-        // fifteen-second hang is not a failure mode to leave to a race.
+        // It re-sends **what the reader is still waiting for**, which is not
+        // always an empty line. When the answer was two writes, only the
+        // trailing `\r` could go missing and the parked reader was always the
+        // retry ask — so a bare Enter was the right thing to repeat. Since
+        // `send_answer` made it ONE buffer the surviving residual is the
+        // opposite shape: the whole write is lost, and the reader still parked
+        // is then the FIRST ask, where a bare Enter is an *empty passphrase*
+        // and `ssh-add` answers `Bad passphrase, try again for …` — reporting a
+        // CORRECT passphrase as rejected (#2397 review W2). So repeat the
+        // passphrase while the first ask is what is outstanding, and the empty
+        // give-up once it is not.
+        //
+        // A lost write is indistinguishable from a slow one, and the cost of
+        // being wrong stays asymmetric: a duplicate answer is read by nobody if
+        // the first one landed, while a lost one costs the user the whole bound
+        // and refuses a launch that would have worked.
         if (answered || gave_up)
             && !rearmed
             && status.is_none()
             && now.saturating_duration_since(last_write) >= ANSWER_REARM
         {
             rearmed = true;
-            let _ = send_answer(&mut writer, b"");
+            let _ = send_answer(&mut writer, if gave_up { b"" } else { passphrase });
         }
         // Step rather than wait-to-deadline: the exit poll above only runs
         // between receives, so a long block here would defeat it.
@@ -576,15 +620,29 @@ pub fn drive_ssh_add_with_transcript(
         };
         seen.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Classify the whole transcript rather than a line: the two prompts
-        // carry no newline, so a line-oriented read would never see either
-        // until the process that is waiting for an answer had exited.
-        match classify_ssh_add_line(&seen) {
+        // Classify the UNCONSUMED TAIL — everything since the last thing this
+        // driver acted on — rather than a line or the whole transcript.
+        //
+        // Not a line: the two asks carry no trailing newline, so a
+        // line-oriented read would never see either until the process waiting
+        // for an answer had exited. Not the whole transcript either: once the
+        // first ask has been answered its text stays in `seen` forever, so
+        // every later chunk re-classifies as `Prompt` and nothing after it can
+        // ever be recognised (#2397 review W3 / rev-std 1). The tail keeps the
+        // no-newline property — it spans every chunk since the last action, so
+        // an ask split across reads still matches — while making each ask
+        // decidable once.
+        //
+        // `consumed` is only ever set to `seen.len()`, and `seen` is built from
+        // `from_utf8_lossy`, so the slice below is always on a char boundary.
+        let tail = &seen[consumed..];
+        match classify_ssh_add_line(tail) {
             SshAddEvent::Added => terminal = Some(SshAddOutcome::Added),
             SshAddEvent::NoAgent => terminal = Some(SshAddOutcome::NoAgent { hint: agent_hint() }),
             SshAddEvent::BadPassphrase => {
                 if !gave_up {
                     gave_up = true;
+                    consumed = seen.len();
                     last_write = Instant::now();
                     // ssh-add's own exit: an empty passphrase ends the retry
                     // loop. Anything else re-asks forever.
@@ -598,6 +656,7 @@ pub fn drive_ssh_add_with_transcript(
             SshAddEvent::Prompt => {
                 if !answered {
                     answered = true;
+                    consumed = seen.len();
                     last_write = Instant::now();
                     if let Err(e) = send_answer(&mut writer, passphrase) {
                         terminal = Some(SshAddOutcome::Failed {
@@ -729,11 +788,40 @@ mod tests {
 
     #[test]
     fn the_retry_ask_is_a_bad_passphrase_not_a_prompt() {
-        // The ordering this function exists to fix: `Bad passphrase, try again
-        // for %s%s: ` is an ask too, and reading it as one would answer it with
-        // the same wrong passphrase until the timeout.
+        // The retry is an ask too, and reading it as the FIRST ask would answer
+        // it with the same wrong passphrase until the timeout.
         assert_eq!(
             classify_ssh_add_line(r"Bad passphrase, try again for C:\Users\a\.ssh\id_ed25519: "),
+            SshAddEvent::BadPassphrase
+        );
+    }
+
+    #[test]
+    fn an_identity_path_cannot_impersonate_the_retry_ask() {
+        // #2397 review W3. `ssh-add` interpolates the identity PATH into its own
+        // prompt template, and that path is whatever the human typed into
+        // **Identity file**. When the retry arm matched on `Bad passphrase`
+        // alone and was tested first, a path carrying those two words made the
+        // FIRST ask classify as the retry: the driver sent its empty give-up
+        // instead of the passphrase, and the launch was refused with the key
+        // never offered.
+        //
+        // Unlike an echoed passphrase this needs no foreign shim — the vendor
+        // binary builds the string itself.
+        assert_eq!(
+            classify_ssh_add_line(r"Enter passphrase for C:\keys\Bad passphrase\id_ed25519: "),
+            SshAddEvent::Prompt
+        );
+        // The same hazard the other way round, which the arm ORDER already
+        // covered and must keep covering.
+        assert_eq!(
+            classify_ssh_add_line(r"Enter passphrase for C:\keys\Identity added\id_ed25519: "),
+            SshAddEvent::Prompt
+        );
+        // …and the real retry is still recognised over the same path, which is
+        // what stops this being fixed by simply never returning `BadPassphrase`.
+        assert_eq!(
+            classify_ssh_add_line(r"Bad passphrase, try again for C:\keys\Bad passphrase\id: "),
             SshAddEvent::BadPassphrase
         );
     }
@@ -896,6 +984,24 @@ mod tests {
         // find the command; pin both halves of the one-liner.
         assert!(WINDOWS_AGENT_HINT.contains("Set-Service ssh-agent -StartupType Automatic"));
         assert!(WINDOWS_AGENT_HINT.contains("Start-Service ssh-agent"));
+    }
+
+    #[test]
+    fn the_stated_worst_case_is_what_the_constants_actually_compose_to() {
+        // `WORST_CASE_TOTAL` is a claim on a permanent surface — the module doc,
+        // the design note, and the sentence a human reads about how long
+        // "Connecting…" can sit there. Editing any one of the three constants
+        // it composes reddens this rather than silently falsifying all three.
+        assert_eq!(
+            WORST_CASE_TOTAL,
+            AGENT_PROBE_TIMEOUT + AGENT_START_TIMEOUT + AGENT_PROBE_TIMEOUT,
+            "the no-agent path: probe, start-attempt, re-probe"
+        );
+        assert_eq!(
+            WORST_CASE_TOTAL,
+            AGENT_PROBE_TIMEOUT + SSH_ADD_TIMEOUT,
+            "the timeout path: probe, then the conversation"
+        );
     }
 
     #[test]

@@ -220,7 +220,7 @@ INV-2 refuses on the webview thread outright).
 | `added` | — | the agent now holds the key |
 | `badPassphrase` | `detail` | `ssh-add` rejected it; `detail` is its own last line, scrubbed |
 | `noAgent` | `hint` | nothing to add the key to; `hint` is the platform's one-time fix |
-| `timeout` | — | the conversation outran its 15 s bound and the child was killed |
+| `timeout` | — | the conversation outran its 15 s bound and the child was killed (the human waits up to **20 s** — see below) |
 | `failed` | `detail` | `ssh-add` missing, a spawn failure, or an unrecognised refusal |
 
 The conversation itself answers **at most one** prompt with the passphrase and
@@ -268,6 +268,25 @@ cost of being wrong is asymmetric: a duplicate Enter can only supply an *empty*
 line, and the only reader that can still be waiting is the retry ask — where an
 empty line is the give-up this driver sends anyway. A lost one costs the user
 the whole bound and refuses a launch that would have worked.
+
+#### Two things this widens, named rather than left implicit
+
+**The bound a human experiences is 20 s, not 15.** `run_ssh_add` sequences probe
+(5 s) → start-attempt (10 s) → probe (5 s) → drive (15 s), so the worst case to a
+`NoAgent` refusal is 5 + 10 + 5 and the worst case to a `Timeout` is 5 + 15 —
+both 20 s, awaited behind one "Connecting…" with no client-side bound.
+`WORST_CASE_TOTAL` names it beside the three constants that compose it, so
+editing any one of them shows what is really being changed.
+
+**The set of binaries this feature will execute goes from one to three.** An SSH
+pane used to run exactly the `ssh` the human named. This adds `ssh-add` and, on
+the no-agent path, `ssh-agent.exe` — both taken from that `ssh`'s own directory,
+neither named by the human. Accepted on the same footing as the `ssh` itself:
+anyone who can write that directory has already replaced the `ssh`, and the
+beside-rule is what keeps the agent the client's own rather than whichever
+OpenSSH leads PATH. Stated here because it is a widening, and a reader
+comparing this note against the "no backend, no dependency" shape above should
+not have to infer it.
 
 ### Persistence honesty
 
