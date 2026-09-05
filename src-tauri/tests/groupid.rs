@@ -437,6 +437,15 @@ fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
         // sequence counter. Literal or `format!`-built, never a caller's id.
         "Some(self.root.join(format!(\"{}-{sub}\", cli_dir.trim_start_matches('.'))))",
         "return Some(self.root.join(\"copilot-home\"));",
+        // #2515 C1: codex's home, and the same #502 containment rule its
+        // copilot neighbour above is here for — a registry that is not the
+        // user's live one gets a stand-in INSIDE its own root rather than
+        // reaching `$CODEX_HOME`/`~/.codex`, so a throwaway registry (every
+        // `test_registry()` in this suite) cannot leave profile files in a
+        // human's real codex home. A literal segment, never a caller's id: the
+        // agent id becomes a FILE NAME under this directory, and that half is
+        // sanctioned separately in `tests/pathseg.rs`.
+        "return Some(self.root.join(\"codex-home\"));",
         "self.root.join(\"agent-seq.json\")",
         // Siblings of the root, not children of it.
         "self.root.parent().unwrap_or(&self.root).join(\"ghshim\")",

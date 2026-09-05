@@ -208,6 +208,60 @@ export const ORCH_CLIS: OrchCli[] = [
       lead: INHERIT_MODEL,
     },
   },
+  {
+    // #2515 C1. Inherit-only, like opencode's and pi's rows, and here it is not
+    // an absence of a good default but the presence of one loomux did not
+    // choose: `model` in the human's own `~/.codex/config.toml` is where they
+    // already picked, and the profile loomux layers on top deliberately names
+    // no model, so an unpinned block inherits it. Emitting an id would override
+    // that silently. The backend's `default_model("codex", _)` returns the same
+    // nothing — the launcher and the spawn path have to agree, or the form
+    // advertises an inheritance it then overrides.
+    //
+    // The curated list is bare for the #329 reason too: codex's ids track
+    // OpenAI's current lineup, `mergeModelOptions` puts whatever
+    // `codex --help` reports in front of this list, and a hardcoded shortcut
+    // here could only ever be a staler copy of a live answer.
+    //
+    // **Both knobs are real on codex, and only one is orrerix-settable.** Effort
+    // is `model_reasoning_effort` in the generated profile, and codex accepts
+    // EVERY level orrerix has: its `ReasoningEffort::from_str` maps `max`
+    // alongside `none`/`minimal`/`ultra`/`persistent` and a `Custom(String)`
+    // catch-all, so its vocabulary is a strict SUPERSET of orrerix's five and
+    // the backend's row takes `EFFORT_LEVELS` whole. (An earlier version of
+    // this comment said `max` had no codex spelling and was refused on a codex
+    // block. Both halves were false — carried over from #2515's slice plan,
+    // which the PR's own D7 correction retracts — and nothing in the parser
+    // refuses it: `validate_knob` errors only for a value outside the CLI's own
+    // list.) Context is model-determined, with no variant key.
+    //
+    // Neither is a launcher field on this row; both are read from the backend's
+    // `agent_cli_knobs`, which quotes `CliCaps` directly, so nothing here can
+    // disagree with it — which is exactly why the wrong sentence above survived
+    // to review: no code depended on it.
+    //
+    // Membership here is spawnability. codex hosts a worker, an orchestrator or
+    // a lead; a reviewer, planner or manager on it is refused by
+    // `cli_can_host`, because its only containment axis is an all-or-nothing
+    // `sandbox_mode`. `lead` is on the hosted side by the same one comparison —
+    // `Role::Lead` is `Containment::None` — rather than by anyone adding it
+    // here.
+    id: "codex",
+    models: [INHERIT_MODEL],
+    defaults: {
+      orchestrator: INHERIT_MODEL,
+      worker: INHERIT_MODEL,
+      reviewer: INHERIT_MODEL,
+      planner: INHERIT_MODEL,
+      manager: INHERIT_MODEL,
+      // #2519 arrived while this branch was open, and the `Record<OrchRole, …>`
+      // above did exactly what its doc promises: a missing key was a compile
+      // error rather than a silent hole. `INHERIT_MODEL` is this row's
+      // orchestrator default, which is the rule that doc states for `lead` —
+      // and on codex every role inherits anyway.
+      lead: INHERIT_MODEL,
+    },
+  },
 ];
 
 /** The catalog row for a CLI id, falling back to the first row — the launcher's

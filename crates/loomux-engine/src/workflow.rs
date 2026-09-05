@@ -2293,7 +2293,7 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     }
 
     // Closed value sets, from the accessors that already state them for error
-    // messages — so a fifth entry in SUPPORTED_CLIS reddens this rather than
+    // messages — so a sixth entry in SUPPORTED_CLIS reddens this rather than
     // leaving the manifest quietly stale.
     let mut cli_values = vec![String::new()]; // an empty `cli:` inherits the group's
     cli_values.extend(SUPPORTED_CLIS.iter().map(|c| c.to_string()));
@@ -6222,7 +6222,12 @@ mod tests {
         // reader can falsify in one grep is worse than none. So pi is pinned
         // here as a REFUSED cli whose refusal must not claim it cannot carry
         // an id.
-        for cli in ["copilot", "gemini", "opencode", "pi"] {
+        // codex joined with #2515 C1 for the ORDINARY reason — it recognizes a
+        // session by scanning a local store (`SessionBaseline::Codex`), which a
+        // remote CLI's store is not — so it is the plainest member of this loop
+        // and is here to keep the gate total as `SUPPORTED_CLIS` grows, not
+        // because anything about it is special.
+        for cli in ["codex", "copilot", "gemini", "opencode", "pi"] {
             let errs = parse_workflow(&remote_doc(&[
                 ("kind", "worker"),
                 ("cli", cli),

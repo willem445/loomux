@@ -193,7 +193,8 @@ use loomux_lib::orchestration::{
     CLAUDE_QUESTION_DENY_TOOLS, claude_denies_interactive_question,
     // #267 stage 2: gemini as a reviewer-capable CLI, and the capability table
     // that decides which classes any CLI may host.
-    cli_can_host, cli_caps, cli_extra_env, gemini_policy_toml, gemini_settings_json,
+    cli_can_host, cli_caps, cli_extra_env, codex_profile_toml, gemini_policy_toml,
+    gemini_settings_json, CodexMcpAuth,
     CLI_CAPS, GEMINI_EDIT_DENY_TOOLS, GEMINI_READONLY_DENY_GIT, KNOWN_GEMINI_TOOLS,
     // #687: the per-block model knobs — the capability rows that decide which
     // CLI can honor one, and the query the launcher reads them through.
@@ -294,6 +295,39 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
 /// keyed by PANE, so the target needs a `pty_id` or the delivery fails with the
 /// same "agent has no terminal yet" error an unpaused one would get. The text
 /// is still recorded in full; it lands under the ordinary `prompt` action now,
+
+/// One codex rollout under `<root>/<yyyy>/<mm>/<dd>/`, in the shape
+/// `RolloutFileName::render` emits and with the `session_meta` first line
+/// `RolloutRecorder::new` writes (#2515 C1).
+///
+/// The timestamp is a literal 19 characters because that is what the vendor's
+/// own parser requires — it reads the id from offset 20 after checking for a
+/// `-` at 19 — and `thread` is deliberately allowed to be a readable label
+/// rather than a UUID: this repo's rule is looser than the vendor's about the
+/// timestamp on purpose (`codex_rollout_thread_id`'s doc), and a fixture whose
+/// ids read as words makes a contest assertion legible.
+///
+/// **No codex is ever run** (constraint 3): the format is read blob-by-blob out
+/// of `openai/codex` at tag `rust-v0.153.4` and quoted in `doc/design/codex.md`.
+fn write_codex_rollout(root: &Path, date: (&str, &str, &str), thread: &str, cwd: &str) -> PathBuf {
+    let dir = root.join(date.0).join(date.1).join(date.2);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("rollout-2026-09-05T10-00-00-{thread}.jsonl"));
+    // `cwd` is interpolated into JSON, so a Windows path would need its
+    // backslashes escaped. Every caller here passes a forward-slash path, and
+    // that is not laziness: `norm_path` folds both separators, so the fixtures
+    // exercise the comparison rather than the escaping — which is
+    // `codex_profile_toml`'s job and is pinned in `tests/codexharness.rs`.
+    assert!(!cwd.contains('\\'), "fixture cwds use forward slashes: {cwd}");
+    let body = format!(
+        "{{\"timestamp\":\"2026-09-05T10:00:00.000Z\",\"type\":\"session_meta\",\
+         \"payload\":{{\"session_id\":\"{thread}\",\"id\":\"{thread}\",\
+         \"timestamp\":\"2026-09-05T10:00:00.000Z\",\"cwd\":\"{cwd}\",\
+         \"originator\":\"codex_cli_rs\",\"cli_version\":\"0.153.4\"}}}}\n"
+    );
+    std::fs::write(&path, body).unwrap();
+    path
+}
 
 /// #904: the one constructor, in tests as in production — these suites drive
 /// the refusal paths with ids that are deliberately not live groups.
@@ -7234,13 +7268,21 @@ fn single_pane_autopilot_flags_per_cli() {
     );
     assert_eq!(single_pane_autopilot_flags("OpenCode"), opencode);
 
-    // CLIs with no known unattended surface get no flags (the toggle is inert),
-    // rather than inventing flags that may not exist. `opencode` left this
-    // class in #722 — replaced by `custom`, the placeholder this function's own
-    // doc names, so the specimen count and the property both survive.
+    // No flags on the LINE. `opencode` left this class in #722 — replaced by
+    // `custom`, the placeholder this function's own doc names, so the specimen
+    // count and the property both survive.
+    //
+    // **`codex` is in this loop for a different reason from the other three,
+    // and since #2515 C1 the difference matters.** `custom`, `aider` and `""`
+    // are here because nothing is known about their unattended surface, so
+    // inventing flags would be guessing. codex has a real approval policy and
+    // loomux really does set it — as `approval_policy` in the generated
+    // profile — so its empty answer is a statement about WHERE the posture
+    // lives, not about whether it exists. Reaching for `-a/--ask-for-approval`
+    // here would give a pane a posture its own profile disagrees with.
     for other in ["codex", "custom", "aider", ""] {
         assert_eq!(single_pane_autopilot_flags(other), "",
-            "{other:?} has no unattended flag surface — must return empty");
+            "{other:?} puts no unattended flag on the command line — must return empty");
     }
 }
 
@@ -8209,7 +8251,12 @@ fn build_agent_argv_matches_command_line() {
     // Every adapter, not just the two the matrix started with: an arm only one
     // of the two builders emits is precisely the drift this exists to catch,
     // and a CLI absent from the list is an arm nobody is checking.
-    for cli in ["claude", "copilot", "gemini", "opencode", "pi", "totally-unknown-cli"] {
+    // codex joined with #2515 C1. Its arms are the ones this matrix is most
+    // worth running over: they are the only pair where the two forms differ in
+    // SHAPE rather than only in quoting — the string form appends
+    // ` resume <id>` while the argv form pushes two tokens — so a divergence
+    // here is a real possibility rather than a formality.
+    for cli in ["claude", "codex", "copilot", "gemini", "opencode", "pi", "totally-unknown-cli"] {
         for auto_ops in [false, true] {
             // Every tier, not just the two that existed before #462 — a
             // middle tier that only one of the two forms emits is exactly the
@@ -8423,7 +8470,12 @@ fn supported_clis_match_the_capability_table() {
 /// is `sandbox_mode`, whose `read-only` rung also blocks running commands and
 /// network access (no tests, no `gh`) and whose `workspace-write` rung denies
 /// nothing at all. So it tops out at `Containment::None` — fine for a worker or
-/// an orchestrator, structurally disqualified for a reviewer or a planner.
+/// an orchestrator, structurally disqualified for every class orrerix denies
+/// the editing tools to — a reviewer, a planner, and a MANAGER, which sits at
+/// the reviewer's tier for the same purpose (#1161: it reads the codebase to
+/// ground its questioning and must not write it). Three classes, and none of
+/// them had to be remembered: `cli_can_host` is one comparison against an
+/// ordered ladder.
 #[test]
 fn a_cli_may_not_host_a_class_whose_containment_it_cannot_enforce() {
     // The uncontained classes are open to every evaluated CLI.
@@ -8432,8 +8484,9 @@ fn a_cli_may_not_host_a_class_whose_containment_it_cannot_enforce() {
             assert!(cli_can_host(cli, role).is_ok(), "{cli} must be able to host a {role:?}");
         }
     }
-    // The contained ones are not.
-    for role in [Role::Reviewer, Role::Planner] {
+    // The contained ones are not. `Role::Manager` joins them here rather than
+    // by anyone noticing: it is `NoEdits`, so the ladder puts it on this side.
+    for role in [Role::Reviewer, Role::Planner, Role::Manager] {
         for cli in ["claude", "copilot", "gemini"] {
             assert!(
                 cli_can_host(cli, role).is_ok(),
@@ -8579,18 +8632,91 @@ fn a_gemini_agent_reaches_the_same_loomux_mcp_server_every_other_cli_does() {
 fn a_gemini_panes_env_carries_its_settings_path_and_no_other_clis_does() {
     let cfg = Path::new("C:/data/group/configs/rev-1.json");
     assert_eq!(
-        cli_extra_env("gemini", cfg),
+        cli_extra_env("gemini", cfg, "tok-abc"),
         vec![(
             "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
             "C:/data/group/configs/rev-1.json".to_string()
         )]
     );
-    for other in ["claude", "copilot", "codex", ""] {
+    // gemini's env names a PATH and never a token — asserted explicitly,
+    // because the codex arm below put a secret into this function's output and
+    // "no other CLI's env carries one" is now a property worth stating rather
+    // than an obvious one.
+    assert!(
+        !cli_extra_env("gemini", cfg, "tok-abc").iter().any(|(_, v)| v.contains("tok-abc")),
+        "gemini's settings file carries its own token; the pane env must not"
+    );
+    // `codex` was in this list until #2515 C1, as a member of the class
+    // "delivers its MCP config on argv, so it needs no env". It has left that
+    // class: its config is SELECTED on argv (`-p`) and its token rides the
+    // environment. Per CLAUDE.md the specimen is relocated rather than the
+    // assertion relaxed — the loop below keeps the witnesses that are still
+    // inside the class, and codex gets its own assertions.
+    for other in ["claude", "copilot", ""] {
         assert!(
-            cli_extra_env(other, cfg).is_empty(),
-            "{other} delivers its MCP config on argv — it must get no extra env"
+            cli_extra_env(other, cfg, "tok-abc").is_empty(),
+            "{other} names its config on argv and carries nothing in the pane environment"
         );
     }
+    // pi is deliberately NOT in that loop, and was not before #2515 C1
+    // either: it gets exactly one variable, and the point is that the
+    // variable is not IDENTITY. Asserted rather than omitted, so "pi's env
+    // carries no token" is a checked claim rather than an absence.
+    let pi = cli_extra_env("pi", cfg, "tok-abc");
+    assert_eq!(pi.len(), 1, "pi gets the boot-time version-check skip and nothing else: {pi:?}");
+    assert!(
+        !pi.iter().any(|(_, v)| v.contains("tok-abc")),
+        "pi names its config on argv — its one variable must not carry the token: {pi:?}"
+    );
+}
+
+/// A codex GROUP pane's token rides the environment, and the variable is the
+/// one its profile names (#2515 C1).
+///
+/// Two halves, and the second is the one with teeth. The profile written by
+/// `write_codex_profile` says `env_http_headers = { … = "ORRERIX_AGENT_TOKEN" }`
+/// and holds no token; this function is what puts the value there. If the two
+/// spellings drift, nothing fails at spawn — the pane boots, connects with no
+/// auth header, and every tool call is refused, which reads to an agent as the
+/// orchestration tools being broken.
+#[test]
+fn a_codex_panes_env_carries_its_token_under_the_name_its_profile_expects() {
+    let cfg = Path::new("C:/Users/x/.codex/orrerix-w-3.config.toml");
+    assert_eq!(
+        cli_extra_env("codex", cfg, "tok-abc"),
+        vec![("ORRERIX_AGENT_TOKEN".to_string(), "tok-abc".to_string())]
+    );
+    // The name is derived from the brand prefix rather than hard-coded twice —
+    // the pairing `CODEX_TOKEN_ENV`'s doc claims.
+    assert_eq!(
+        cli_extra_env("codex", cfg, "tok-abc")[0].0,
+        format!("{}AGENT_TOKEN", brand::ENV_PREFIX)
+    );
+    // The profile's own spelling of that variable, asserted against the same
+    // expression — this is the drift the test exists for.
+    let profile = codex_profile_toml(
+        7777,
+        CodexMcpAuth::EnvVar("ORRERIX_AGENT_TOKEN"),
+        Path::new("C:/repo"),
+        true,
+        "",
+        None,
+    );
+    assert!(
+        profile.contains(&format!("\"{}AGENT_TOKEN\"", brand::ENV_PREFIX)),
+        "the profile must name the variable this function sets:\n{profile}"
+    );
+    // The path is NOT in the env: codex's config reaches it by `-p <name>` on
+    // argv, so a variable naming the file would be a second, unread channel.
+    assert!(
+        !cli_extra_env("codex", cfg, "tok-abc").iter().any(|(_, v)| v.contains(".config.toml")),
+        "codex's config is selected on argv, not named by an environment variable"
+    );
+    // No token, no variable. `solo_prepare`'s no-seam path mints none, and an
+    // empty variable would leave the pane presenting a blank auth header —
+    // which the server refuses in a way that reads like a bug rather than an
+    // absence.
+    assert!(cli_extra_env("codex", cfg, "").is_empty());
 }
 
 /// The [`GEMINI_EDIT_DENY_TOOLS`] pin, same shape and same limits as
@@ -45047,9 +45173,17 @@ fn solo_prepare_builds_the_exact_per_cli_flag_strings_and_delivery_only_falls_ba
     assert!(cargs.contains("--additional-mcp-config \"@"), "got: {cargs}");
     assert!(cargs.contains("--allow-tool orrerix"), "got: {cargs}");
 
-    // No config seam today (A2): AgentEntry still exists (a valid
-    // deliver_prompt target once connected), but no token is ever minted.
-    for cli in ["codex", "gemini", "opencode", "custom"] {
+    // No config seam (A2): AgentEntry still exists (a valid deliver_prompt
+    // target once connected), but no token is ever minted.
+    //
+    // **codex left this class in #2515 C1** and is asserted below instead.
+    // Its seam is one indirection further out than claude's — `-p <profile>`
+    // SELECTS a config file rather than naming one — but it is still a flag
+    // string appended to a command line the human owns, which is the whole of
+    // what `CliCaps::mcp_argv_seam` asks. Relocated rather than relaxed
+    // (CLAUDE.md): gemini, opencode and custom are still squarely in the
+    // class, so the loop keeps its discriminating power.
+    for cli in ["gemini", "opencode", "custom"] {
         let prepared = reg.solo_prepare(cli, "C:/tmp/solo", "x").unwrap();
         assert_eq!(prepared["delivery_only"], json!(true), "{cli} has no config seam");
         assert_eq!(prepared["mcp_args"], json!(""), "{cli} must get no flags");
@@ -45057,6 +45191,20 @@ fn solo_prepare_builds_the_exact_per_cli_flag_strings_and_delivery_only_falls_ba
         assert!(reg.agent(id).is_some());
         assert!(reg.agent(id).unwrap().token.is_empty());
     }
+
+    // codex's new POSITIVE membership, so the widening is pinned in BOTH
+    // directions — without this, moving codex out of the loop above would be
+    // indistinguishable from forgetting to test it.
+    let codex = reg.solo_prepare("codex", "C:/tmp/solo", "cx").unwrap();
+    assert_eq!(codex["delivery_only"], json!(false), "codex mints a real token since #2515 C1");
+    let xargs = codex["mcp_args"].as_str().unwrap();
+    assert!(xargs.starts_with("-p orrerix-solo-"), "got: {xargs}");
+    // The NAME, never the path: `-p` resolves against CODEX_HOME itself, so a
+    // line carrying the file path would send codex looking for a profile
+    // under a directory it would then join onto.
+    assert!(!xargs.contains(".config.toml"), "got: {xargs}");
+    let cid = codex["agent_id"].as_str().unwrap();
+    assert!(!reg.agent(cid).unwrap().token.is_empty(), "a full member carries a token");
 }
 
 #[test]
@@ -45156,8 +45304,12 @@ fn delivery_only_solo_pane_receives_but_can_never_send_or_become_sender() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let cw = reg.resolve_token(&w.token).unwrap();
 
-    // codex has no MCP-config seam today -> delivery-only, no token minted.
-    let prepared = reg.solo_prepare("codex", "C:/tmp/solo", "solo codex").unwrap();
+    // gemini has no MCP-config seam -> delivery-only, no token minted. This
+    // was codex until #2515 C1 gave it one; gemini is the right replacement
+    // rather than the nearest, because its seam is absent for a REASON that
+    // is not going away — its config is a file named by an environment
+    // variable, and a solo launch sets no environment at all.
+    let prepared = reg.solo_prepare("gemini", "C:/tmp/solo", "solo gemini").unwrap();
     assert_eq!(prepared["delivery_only"], json!(true));
     let solo_id = prepared["agent_id"].as_str().unwrap().to_string();
     reg.solo_bind(&solo_id, 701).unwrap();
@@ -45378,7 +45530,9 @@ fn set_sender_rejects_a_delivery_only_candidate_and_leaves_the_sender_unchanged(
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
-    let prepared = reg.solo_prepare("codex", "C:/tmp/solo", "solo").unwrap();
+    // gemini, not codex: codex mints a real token since #2515 C1, and this
+    // test needs a candidate that genuinely has none.
+    let prepared = reg.solo_prepare("gemini", "C:/tmp/solo", "solo").unwrap();
     let solo_id = prepared["agent_id"].as_str().unwrap().to_string();
     reg.solo_bind(&solo_id, 802).unwrap();
     let ch = reg.connect_agents(&g.id, &w.id, solo_group_id(), &solo_id, &w.id).unwrap();
@@ -51613,15 +51767,25 @@ fn every_cli_row_explains_both_knobs() {
     // loomux's five levels (#2126), so two CLIs can set effort, while claude is
     // still alone on context because the [1m] suffix has no analogue anywhere
     // else.
-    for cli in ["claude", "pi"] {
+    //
+    // codex joins them with #2515 C1, and it is the one whose seam is NOT a
+    // flag: `model_reasoning_effort` is a key in the profile file loomux
+    // generates and selects with `-p`. The set is still all five, because
+    // `ReasoningEffort::from_str` at the pinned tag maps `"max" => Max`
+    // alongside `none`/`minimal`/`ultra`/`persistent` and a `Custom(String)`
+    // catch-all — a strict superset of loomux's vocabulary. #2515's slice plan
+    // claimed the opposite ("loomux's `max` is not deliverable"); the
+    // correction is recorded on the issue, and this is where it is pinned, so
+    // narrowing the row back has to argue with a test rather than with prose.
+    for cli in ["claude", "pi", "codex"] {
         assert_eq!(
             cli_caps(cli).unwrap().effort_levels,
             EFFORT_LEVELS,
-            "{cli} has a session-scoped flag for every level loomux can ask for"
+            "{cli} can be given every level loomux can ask for"
         );
     }
     assert_eq!(cli_caps("claude").unwrap().context_variants, CONTEXT_VARIANTS);
-    for cli in ["copilot", "gemini", "opencode", "pi"] {
+    for cli in ["copilot", "gemini", "opencode", "pi", "codex"] {
         assert!(
             cli_caps(cli).unwrap().context_variants.is_empty(),
             "{cli}'s context window is model-determined, not loomux-settable"
@@ -61783,19 +61947,46 @@ fn every_argv_seam_cli_has_a_solo_mcp_arm() {
     let (reg, dir) = test_registry();
     let cwd = dir.path().to_string_lossy().into_owned();
     let seam: Vec<&str> = CLI_CAPS.iter().filter(|c| c.mcp_argv_seam).map(|c| c.cli).collect();
-    assert!(
-        seam.contains(&"pi"),
-        "this test is vacuous unless the table really has pi as a seam CLI: {seam:?}"
-    );
+    for expect in ["pi", "codex"] {
+        assert!(
+            seam.contains(&expect),
+            "this test is vacuous unless the table really has {expect} as a seam CLI: {seam:?}"
+        );
+    }
     for cli in seam {
         let out = reg
             .solo_prepare(cli, &cwd, &format!("solo-{cli}"))
             .unwrap_or_else(|e| panic!("solo_prepare({cli}) must not fail: {e}"));
         let args = out["mcp_args"].as_str().unwrap_or_default();
+        // The flag string must name the artifact loomux just wrote for this
+        // pane, and WHICH substring says so is per-CLI.
+        //
+        // This used to be `args.contains("mcp")`, which was true of every seam
+        // CLI only while every seam flag was literally `--mcp-config` /
+        // `--additional-mcp-config`. codex (#2515 C1) took the specimen out of
+        // that class: its seam is `-p <profile>`, one indirection further out,
+        // and the word "mcp" appears nowhere on its line. Per CLAUDE.md the
+        // property is relocated onto a witness that still distinguishes rather
+        // than relaxed to fit — so the map below is TOTAL over the seam set,
+        // and a new seam CLI panics here asking for its row instead of
+        // silently passing on a substring that means nothing for it.
+        let want = match cli {
+            "claude" | "copilot" | "pi" => "mcp",
+            // Not "-p": that is two characters and would match almost any
+            // path. The generated profile NAME is the thing only this pane's
+            // own artifact can supply.
+            "codex" => "orrerix-solo-",
+            other => panic!(
+                "{other} is declared argv-seam but this test has no row saying what its solo \
+                 flags must contain — add one beside the `solo_prepare` arm rather than \
+                 weakening the assertion"
+            ),
+        };
         assert!(
-            args.contains("mcp"),
-            "{cli} is declared argv-seam, so solo_prepare must produce its MCP flags — an empty \
-             string here is the arm that used to be `unreachable!()`: {out}"
+            args.contains(want),
+            "{cli} is declared argv-seam, so solo_prepare must produce flags naming this pane's \
+             own generated config (expected to contain {want:?}) — an empty string here is the \
+             arm that used to be `unreachable!()`: {out}"
         );
         assert_eq!(
             out["delivery_only"],
@@ -61961,6 +62152,620 @@ fn pi_launch_flags_per_posture() {
     assert!(
         !attended.contains("--thinking"),
         "no knob set means no flag, never a blank one: {attended}"
+    );
+}
+
+/// codex is a spawnable CLI with no containment ceiling: it hosts the classes
+/// that write, and is refused for every class orrerix denies the editing tools
+/// to (#2515 C1, T1.1).
+///
+/// **THREE refused classes, not the two #2515's plan D1 named.** `Role::Manager`
+/// is `NoEdits` as well (#1161 — a manager must read the codebase to ground its
+/// questioning and must not write it), so it sits above codex's ceiling exactly
+/// as a reviewer does. Nobody had to remember that: `cli_can_host` is one
+/// comparison against an ordered ladder, so the manager is refused by the same
+/// rule. What DID have to be remembered is the PROSE, which said "reviewer or
+/// planner" on four surfaces until this test was written — which is why the
+/// assertion is a partition over EVERY role rather than a list of the ones that
+/// came to mind.
+#[test]
+fn codex_is_a_spawnable_cli_with_no_containment_ceiling() {
+    let caps = cli_caps("codex").expect("codex must have a capability row");
+    assert!(caps.orchestration, "codex is spawnable since #2515 C1");
+    assert!(SUPPORTED_CLIS.contains(&"codex"), "{SUPPORTED_CLIS:?}");
+
+    // The partition, over `Role::ALL` — not a hand-list, and the difference is
+    // not hypothetical: this loop named five classes when it was written, and
+    // `Role::Lead` (#2519 A) landed on main while this branch was open. A list
+    // would have kept passing while silently not covering the new class.
+    //
+    // `ALL` is the right thing to read because it carries its own completeness
+    // proof — `all_index`'s match is exhaustive, so an eighth variant does not
+    // compile until the array grows — which is exactly what its doc says lets a
+    // test "honestly claim to have covered every class".
+    //
+    // Which SIDE each class lands on is derived from `containment()` rather than
+    // asserted per class, so a future one is classified by its own tier instead
+    // of by whoever edits this test.
+    for role in Role::ALL {
+        let allowed = cli_can_host("codex", role);
+        let expect_ok = role.containment().rank() <= caps.max_containment.rank();
+        assert_eq!(
+            allowed.is_ok(),
+            expect_ok,
+            "codex hosting a {role:?} must follow the ladder, not a hand-kept list: {allowed:?}"
+        );
+    }
+    // …and the partition is not degenerate in either direction: something is
+    // hosted and something is refused. Without this the loop above passes
+    // against a `cli_can_host` that answered `Ok` for everything.
+    assert!(cli_can_host("codex", Role::Worker).is_ok());
+    assert!(cli_can_host("codex", Role::Orchestrator).is_ok());
+    for refused in [Role::Reviewer, Role::Planner, Role::Manager] {
+        let err = cli_can_host("codex", refused)
+            .expect_err("codex tops out at Containment::None — this class needs more");
+        // The refusal must QUOTE the measured reason, not say "unsupported":
+        // both surfaces that render it (the parse error and the launcher) read
+        // this string, and a human told only that it is unsupported goes
+        // looking for a setting rather than reading the ceiling.
+        assert!(
+            err.contains(caps.containment_note),
+            "the refusal for {refused:?} must carry the row's own note: {err}"
+        );
+        assert!(err.contains("codex"), "{err}");
+    }
+}
+
+/// The codex launch line, per posture (#2515 C1) — the twin of
+/// `pi_launch_flags_per_posture` above, and it makes the OPPOSITE claim about
+/// the same equality.
+///
+/// On pi the two postures are byte-identical because pi has no posture at all.
+/// On codex they are byte-identical because the posture is real and rides the
+/// PROFILE — so the equality here is only honest beside
+/// `the_codex_approval_policy_flips_with_the_panes_posture` in
+/// `tests/codexharness.rs`, which asserts the two profiles differ. Either
+/// assertion alone would be satisfied by a codex adapter that delivered no
+/// posture anywhere.
+#[test]
+fn codex_launch_flags_per_posture() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/orrerix-w-3.config.toml");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo/worktree");
+    let cmd = |model: &str, auto: bool, session: Option<&str>, resume: bool| {
+        reg.build_agent_command(
+            "codex",
+            model,
+            auto,
+            cfg,
+            None,
+            gdir,
+            wd,
+            session,
+            resume,
+            Containment::None,
+            &PersonaInject::default(),
+        )
+    };
+
+    let attended = cmd("", false, None, false);
+    assert!(
+        attended.starts_with("codex "),
+        "the program must be codex, not the claude fallback — a missing arm here launches the \
+         wrong CLI entirely: {attended}"
+    );
+
+    // Where. `-C` on every line, because codex's working root is otherwise the
+    // process's cwd rather than the pane's.
+    assert!(attended.contains(" -C \"C:/repo/worktree\""), "{attended}");
+
+    // Everything loomux configured, by NAME — `-p` takes a profile name and
+    // resolves it against CODEX_HOME itself, so a line carrying the PATH would
+    // send codex looking for `CODEX_HOME/C:/x/orrerix-w-3.config.toml`.
+    assert!(
+        attended.contains(" -p orrerix-w-3") && !attended.contains(".config.toml"),
+        "the line must name the profile, never its path: {attended}"
+    );
+
+    // **Attended == unattended**, and the reason is the opposite of pi's: the
+    // approval policy is a profile key. A later edit reaching for
+    // `-a/--ask-for-approval` here would give a pane a posture its own profile
+    // disagrees with.
+    let unattended = cmd("", true, None, false);
+    assert_eq!(
+        attended, unattended,
+        "codex's posture rides the profile, so the two postures must produce ONE command line — \
+         see the_codex_approval_policy_flips_with_the_panes_posture for the half that must DIFFER"
+    );
+
+    // The flags loomux must never emit on codex, each for its own reason:
+    // `--full-auto` does not exist at the pin (its only occurrence in the
+    // vendor is a test, and the docs call it a deprecated alias); the bypass
+    // flag turns the sandbox off entirely; `-s`/`-a` would contradict the
+    // profile.
+    for forbidden in ["--full-auto", "--yolo", "--dangerously-bypass", " -s ", " -a "] {
+        assert!(
+            !attended.contains(forbidden),
+            "loomux never emits {forbidden:?} on a codex line: {attended}"
+        );
+    }
+
+    // Session identity: a SUBCOMMAND, not a flag, and only on a resume. codex
+    // has no opens-or-creates flag — `resume_session_id` is `#[clap(skip)]` —
+    // so a fresh spawn names nothing and learns its id from the store.
+    let sid = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+    let fresh = cmd("", false, Some(sid), false);
+    let resumed = cmd("", false, Some(sid), true);
+    assert!(
+        !fresh.contains(sid),
+        "a FRESH codex spawn must not name a session at all — there is no flag that would \
+         create one, so an id here would be a `resume` of a thread that does not exist: {fresh}"
+    );
+    assert_eq!(
+        fresh, attended,
+        "a fresh spawn with an id in hand must produce the same line as one without: {fresh}"
+    );
+    assert!(resumed.ends_with(&format!(" resume {sid}")), "{resumed}");
+    // The ORDER is the property, not just the presence: codex's usage is
+    // `codex [OPTIONS] <COMMAND> [ARGS]` and the subcommand inherits the root
+    // options, so a `-C` after `resume` would be an argument to `resume`.
+    let c_at = resumed.find(" -C ").expect("-C must be present");
+    let resume_at = resumed.find(" resume ").expect("resume must be present");
+    assert!(
+        c_at < resume_at,
+        "root options must precede the subcommand — `-C` after `resume` is not a root option \
+         at all: {resumed}"
+    );
+    // `-C` survives the resume, and that is what keeps the resume-cwd PROMPT
+    // from ever appearing on a pane loomux is about to type into.
+    assert!(resumed.contains(" -C \"C:/repo/worktree\""), "{resumed}");
+
+    // An empty model omits the flag — `default_model("codex", _)` is empty so
+    // the human's own config.toml `model` wins.
+    assert!(
+        !attended.contains(" -m "),
+        "an empty model must omit the flag, not emit a blank one: {attended}"
+    );
+    let modelled = cmd("gpt-5.5-codex", false, None, false);
+    assert!(modelled.contains(" -m gpt-5.5-codex"), "{modelled}");
+
+    // #687: the effort knob is a profile key on codex, so it must reach the
+    // line NOWHERE — the inverse of pi's assertion two tests up, and the half
+    // that would silently double-deliver if someone added a flag here.
+    let knobs = workflow::ModelKnobs { effort: "xhigh", context: "" };
+    let effortful = reg.build_agent_command_ex(
+        "codex",
+        "",
+        knobs,
+        false,
+        cfg,
+        None,
+        gdir,
+        wd,
+        None,
+        false,
+        Containment::None,
+        &PersonaInject::default(),
+        Role::Worker,
+        None,
+    );
+    assert_eq!(
+        effortful, attended,
+        "codex has no effort FLAG — the knob is `model_reasoning_effort` in the profile, so a \
+         block that sets one must not change the command line at all: {effortful}"
+    );
+    assert!(!effortful.contains("xhigh"), "{effortful}");
+}
+
+/// The two builders must agree (#2515 C1). A string command and an argv vector
+/// that disagree is the failure `command_line_length_guard` cannot catch: the
+/// pane is spawned from one and measured from the other.
+#[test]
+fn the_codex_argv_builder_agrees_with_the_command_builder() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/orrerix-w-3.config.toml");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo/worktree");
+    let sid = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+    let knobs = workflow::ModelKnobs { effort: "high", context: "" };
+
+    for (session, resume, model) in
+        [(None, false, ""), (Some(sid), true, ""), (Some(sid), true, "gpt-5.5-codex")]
+    {
+        let argv = reg.build_agent_argv_ex(
+            "codex", model, knobs, true, cfg, None, gdir, wd, session, resume,
+            Containment::None, &PersonaInject::default(), Role::Worker, None,
+        );
+        let cmd = reg.build_agent_command_ex(
+            "codex", model, knobs, true, cfg, None, gdir, wd, session, resume,
+            Containment::None, &PersonaInject::default(), Role::Worker, None,
+        );
+        // The argv form carries no quotes (there is no shell), so the
+        // comparison is on the TOKENS the string form quotes.
+        assert_eq!(argv[0], "codex", "{argv:?}");
+        for tok in ["-C", "C:/repo/worktree", "-p", "orrerix-w-3"] {
+            assert!(argv.iter().any(|a| a == tok), "argv is missing {tok:?}: {argv:?}");
+            assert!(cmd.contains(tok), "the string form is missing {tok:?}: {cmd}");
+        }
+        if resume {
+            let at = argv.iter().position(|a| a == "resume").expect("resume token");
+            assert_eq!(argv.get(at + 1).map(String::as_str), Some(sid), "{argv:?}");
+            assert_eq!(at, argv.len() - 2, "the subcommand and its id come LAST: {argv:?}");
+        } else {
+            assert!(!argv.iter().any(|a| a == "resume"), "{argv:?}");
+        }
+        assert_eq!(
+            argv.iter().any(|a| a == "-m"),
+            !model.is_empty(),
+            "the model flag must appear exactly when a model is set: {argv:?}"
+        );
+        assert!(!argv.iter().any(|a| a == "xhigh" || a == "high"), "{argv:?}");
+    }
+}
+
+/// The store watcher (#2515 C1, T1.6): a codex pane finds its own session by
+/// the directory it runs in, refuses a contest, and never takes a session
+/// another pane in the group has already claimed.
+///
+/// Every property here is one a wrong watcher gets wrong in its own direction,
+/// and the CONTEST one is the reason this is not `Option<String>`: several
+/// panes in a group routinely share a directory, so "two matched" is a
+/// recurring answer rather than an edge case, and resolving it by taking the
+/// newest would hand a pane somebody else's conversation.
+#[test]
+fn a_codex_pane_finds_its_session_by_cwd_after_the_baseline_and_refuses_a_contest() {
+    use loomux_lib::sessions::{codex_session_ids, newest_new_codex_session, CodexIdentified};
+    use std::collections::HashSet;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("sessions");
+    let mine = "C:/repo/worktree-a";
+    let theirs = "C:/repo/worktree-b";
+
+    // Two rollouts that existed BEFORE the spawn, in two different date dirs —
+    // a pane booting across local midnight lands in tomorrow's, so the walk
+    // must not be scoped to one day.
+    write_codex_rollout(&root, ("2026", "09", "04"), "old-a", mine);
+    write_codex_rollout(&root, ("2026", "09", "05"), "old-b", mine);
+    let baseline = codex_session_ids(&root);
+    assert_eq!(baseline.len(), 2, "the baseline must see BOTH date dirs: {baseline:?}");
+
+    let none = HashSet::new();
+    // Nothing new yet: the ordinary answer for a booting pane, and the one
+    // that must not be `Found` — the two files above are in this very
+    // directory, so a watcher that ignored the baseline would bind one.
+    assert_eq!(newest_new_codex_session(&root, &baseline, mine, &none), CodexIdentified::None);
+
+    // A new rollout in ANOTHER directory is not this pane's, however new it is.
+    write_codex_rollout(&root, ("2026", "09", "05"), "new-elsewhere", theirs);
+    assert_eq!(
+        newest_new_codex_session(&root, &baseline, mine, &none),
+        CodexIdentified::None,
+        "a cwd mismatch must never fall back to `the newest fresh session` — that is copilot's \
+         rule, and it is wrong here because codex writes cwd in the FIRST line"
+    );
+
+    // The happy path.
+    write_codex_rollout(&root, ("2026", "09", "05"), "new-mine", mine);
+    assert_eq!(
+        newest_new_codex_session(&root, &baseline, mine, &none),
+        CodexIdentified::One("new-mine".into())
+    );
+
+    // A second pane in the SAME directory: refused, never guessed.
+    write_codex_rollout(&root, ("2026", "09", "05"), "new-sibling", mine);
+    assert_eq!(
+        newest_new_codex_session(&root, &baseline, mine, &none),
+        CodexIdentified::Contested(2)
+    );
+
+    // …unless the sibling's id is already claimed by another pane, which is
+    // exactly what resolves the ordinary two-panes-one-worktree case.
+    let claimed: HashSet<String> = ["new-sibling".to_string()].into_iter().collect();
+    assert_eq!(
+        newest_new_codex_session(&root, &baseline, mine, &claimed),
+        CodexIdentified::One("new-mine".into())
+    );
+
+    // A pane with no recorded directory matches NOTHING rather than everything
+    // — the fail-closed direction, and the one an `is_empty()` slip inverts.
+    assert_eq!(newest_new_codex_session(&root, &baseline, "", &none), CodexIdentified::None);
+}
+
+/// A torn header is `Waiting`, not a wrong binding — the mid-write case a poll
+/// on a five-second tick will hit sooner or later.
+///
+/// Separate from the test above because it is about a file that exists and
+/// cannot be read, which is a different question from a file that names a
+/// different directory. A watcher that treated an unreadable header as "close
+/// enough" would bind whatever appeared next.
+#[test]
+fn a_torn_codex_header_leaves_the_watcher_waiting_rather_than_binding() {
+    use loomux_lib::sessions::{newest_new_codex_session, CodexIdentified};
+    use std::collections::HashSet;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("sessions");
+    let dir = root.join("2026").join("09").join("05");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Half a header line — what a reader sees between codex's write and its
+    // flush.
+    std::fs::write(
+        dir.join("rollout-2026-09-05T10-00-00-torn.jsonl"),
+        "{\"timestamp\":\"2026-09-05T10:00:00.000Z\",\"type\":\"session_me",
+    )
+    .unwrap();
+    let empty = HashSet::new();
+    assert_eq!(
+        newest_new_codex_session(&root, &empty, "C:/repo/worktree-a", &empty),
+        CodexIdentified::None,
+        "an unreadable header must not match — the next poll reads it whole"
+    );
+    // The control: the same file, written whole, DOES match. Without this the
+    // assertion above passes just as well against a walker that finds nothing
+    // at all.
+    write_codex_rollout(&root, ("2026", "09", "05"), "whole", "C:/repo/worktree-a");
+    assert_eq!(
+        newest_new_codex_session(&root, &empty, "C:/repo/worktree-a", &empty),
+        CodexIdentified::One("whole".into())
+    );
+}
+
+/// codex's approval overlays read as WAITING FOR INPUT (#2515 C1, T1.7).
+///
+/// There is no codex arm in `prompt_wait_match` and there must not be one: the
+/// detector is CLI-generic on purpose, and the claim worth pinning is that
+/// codex's dialogs fall inside the generic tokens rather than that someone
+/// remembered to add them. Without this, an attended codex pane raising an
+/// approval overlay would look idle — the attention system would never surface
+/// it, and a human would find the pane stopped with no notice hours later.
+///
+/// **The fixtures are the vendor's own snapshots, verbatim.** Cut from
+/// `tui/src/bottom_pane/snapshots/…approval_overlay…snap` at the pinned tag
+/// rather than written from the plan's paraphrase, because the thing under test
+/// is whether loomux's tokens match text codex actually paints. A fixture
+/// written from a description would be testing the description.
+///
+/// The footer is read only from the last three painted lines, so each fixture
+/// keeps its trailing blank/footer structure rather than being trimmed to the
+/// interesting line.
+#[test]
+fn codex_approval_overlays_read_as_waiting_for_input() {
+    // `…__approval_overlay_cross_thread_prompt.snap` — the commonest one, and
+    // the one an unattended pane must never see.
+    let exec = "\n  Would you like to run the following command?\n\
+                \n  Reason: need filesystem access\n\
+                \n  $ cat /tmp/readme.txt\n\
+                \n› 1. Yes, proceed (y)\n\
+                  2. No, and tell Codex what to do differently (esc)\n\
+                \n  Press enter to confirm or esc to cancel\n";
+    // `…__network_exec_prompt.snap` — a different title and a four-option list.
+    let network = "  Do you want to approve network access to \"example.com\"?\n\
+                   \n  Reason: network request blocked\n\
+                   \n› 1. Yes, just this once (y)\n\
+                     2. Yes, and allow this host for this conversation (a)\n\
+                     3. Yes, and allow this host in the future (p)\n\
+                     4. No, and tell Codex what to do differently (esc)\n\
+                   \n  Press enter to confirm or esc to cancel\n";
+    // `…__approval_overlay_permissions_prompt.snap` — the permissions grant.
+    let perms = "  Would you like to grant these permissions?\n\
+                 \n  Reason: need workspace access\n\
+                 \n› 1. Yes, grant these permissions for this turn (y)\n\
+                   2. Yes, grant for this turn with strict auto review (r)\n\
+                   3. Yes, grant these permissions for this session (a)\n\
+                   4. No, continue without permissions (d)\n\
+                 \n  Press enter to confirm or esc to cancel\n";
+
+    for (name, tail) in [("exec", exec), ("network", network), ("permissions", perms)] {
+        let m = prompt_wait_match(tail);
+        assert!(
+            m.is_some(),
+            "codex's {name} overlay must read as waiting for input — an attended codex pane \
+             raising one would otherwise look idle, and nothing would tell the human:\n{tail}"
+        );
+    }
+
+    // **The two signals, isolated.** The three fixtures above carry BOTH a
+    // numbered menu and the footer, so they cannot tell which one is doing the
+    // work — and a version of this test that only used them stayed green when
+    // `"1. yes"` was removed from `NUMBERED_MENU_TOKENS` (round 16 of this
+    // slice's wave). Detection surviving is the right BEHAVIOUR and the wrong
+    // assertion: it made the test insensitive to losing either signal.
+    //
+    // So each half is fed on its own. That codex paints both is real robustness
+    // — the attention system keeps working if the vendor rewords one — but it is
+    // robustness only while BOTH still match, which is what these two pin.
+    // The numbered menu ALONE: codex's own option rows, with the selection
+    // pointer on none of them (in a real overlay it marks exactly one) and no
+    // footer. This is the fixture that reddens when `"1. yes"` leaves
+    // `NUMBERED_MENU_TOKENS`.
+    let menu_only = "  1. Yes, proceed (y)\n\
+                       2. No, and tell Codex what to do differently (esc)\n";
+    assert!(
+        prompt_wait_match(menu_only).is_some(),
+        "codex's numbered menu must be matched on its own, with neither the pointer nor the \
+         footer to carry it:\n{menu_only}"
+    );
+
+    // The selection pointer ALONE — the signal that made the first version of
+    // this isolation useless, so it is pinned rather than merely avoided.
+    let pointer_only = "  Would you like to run the following command?\n\
+                        \n› Yes, proceed\n";
+    assert!(
+        prompt_wait_match(pointer_only).is_some(),
+        "codex marks its highlighted option with a leading pointer, which is a signal in its \
+         own right:\n{pointer_only}"
+    );
+    // The footer ALONE. The title line is inert — no token list matches
+    // "would you like to run…", which is checkable and worth stating, because a
+    // fixture whose title carried a signal would prove nothing about the footer.
+    let footer_only = "  Would you like to run the following command?\n\
+                       \n  Press enter to confirm or esc to cancel\n";
+    assert!(
+        prompt_wait_match(footer_only).is_some(),
+        "codex's footer must be matched on its own, with no numbered menu to carry it:\n\
+         {footer_only}"
+    );
+
+    // The negative control, and it is the half that makes the three above mean
+    // something. A finished codex turn that merely TALKS about a command must
+    // not read as a question — otherwise the detector would fire on ordinary
+    // prose and the assertions above would be about nothing.
+    let answered = "  I ran `cat /tmp/readme.txt` and it printed the readme.\n\
+                    \n  The next step is to update the docs; say the word and I will.\n";
+    assert!(
+        prompt_wait_match(answered).is_none(),
+        "a finished turn must not read as a question:\n{answered}"
+    );
+}
+
+/// A codex profile is removed with its agent, and an orphan is swept — with the
+/// candidate's id sitting in a roster that PARSES (#2515 C1, T1.9; review round
+/// 3, R2).
+///
+/// This is the file orrerix writes into someone else's home directory, so the
+/// two failure directions are asymmetric and both are pinned. Leaving files
+/// behind is #502 by another route (1,111 stray files in a real
+/// `~/.claude/agents`). Deleting one still in use is worse: the pane loses its
+/// trust, its MCP server and its contract on the next respawn, with nothing to
+/// say why.
+///
+/// **The fixture that was missing, and why its absence hid a defect.** The
+/// earlier version reclaimed its orphan only from a state root with no groups at
+/// all — its own comment said "Nothing is live yet — this registry has no groups"
+/// — so no swept candidate's id ever sat in a readable roster. That is the state
+/// of every real installation after its first spawn, and it is exactly where the
+/// first implementation failed: it keyed on the durable roster, which is never
+/// pruned, so every profile orrerix had ever written was skipped and the sweep
+/// reclaimed nothing in production. The witness sat outside the class it was
+/// meant to witness (CLAUDE.md #1225). `w-90` below is that witness: a readable,
+/// parsing roster row for an agent this process does not hold.
+#[test]
+fn a_codex_profile_is_removed_with_its_agent_and_orphans_are_swept() {
+    let (reg, dir) = test_registry();
+    let home = dir.path().join("fake-codex-home");
+    std::fs::create_dir_all(&home).unwrap();
+    reg.set_codex_home_override(home.clone());
+
+    // A LIVE agent — the pane whose profile must survive a sweep.
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let live_agent = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let live_profile = home.join(format!("orrerix-{}.config.toml", live_agent.id));
+
+    // The orphan, and the fixture that was missing: its id is in a roster that
+    // READS and PARSES, which is what every installation looks like after its
+    // first spawn. `spawn_agent` above has already written a real `agents.json`
+    // for this group; this appends a second row for an agent the process does
+    // not hold, exactly as a crash would leave behind.
+    let roster = reg.state_root().join(g.id.as_str()).join("agents.json");
+    let mut rows: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&roster).unwrap()).unwrap();
+    let crashed = rows[0].clone();
+    let mut crashed = crashed;
+    crashed["id"] = json!("w-90");
+    // `running` on purpose: a `kill -9` leaves the last-written status exactly
+    // here, so a `status != "dead"` filter would not have saved this case
+    // either.
+    crashed["status"] = json!("running");
+    rows.push(crashed);
+    std::fs::write(&roster, serde_json::to_string_pretty(&rows).unwrap()).unwrap();
+    assert!(
+        serde_json::from_str::<Vec<serde_json::Value>>(&std::fs::read_to_string(&roster).unwrap())
+            .is_ok(),
+        "the fixture is only about the defect if this roster PARSES"
+    );
+    let orphan = home.join("orrerix-w-90.config.toml");
+
+    // Not orrerix's: the sweep must leave both alone. The first is a human's own
+    // codex profile; the second carries orrerix's prefix but not the suffix
+    // `write_codex_profile` actually writes.
+    let human = home.join("work.config.toml");
+    let notes = home.join("orrerix-notes.md");
+    for p in [&live_profile, &orphan, &human, &notes] {
+        std::fs::write(p, "# fixture\n").unwrap();
+    }
+
+    let swept = reg.sweep_orphaned_agent_files();
+    let reclaimed = swept["reclaimed"].as_array().unwrap();
+    let named = |p: &std::path::Path| {
+        reclaimed.iter().any(|r| r.as_str().unwrap_or_default() == p.to_string_lossy())
+    };
+
+    assert!(
+        named(&orphan) && !orphan.exists(),
+        "an agent this process does not hold is an orphan even though its roster row reads and \
+         parses — that row is never pruned, so it can never be the oracle: {swept}"
+    );
+    assert!(
+        !named(&live_profile) && live_profile.exists(),
+        "a LIVE pane's profile must survive: deleting it strips a running agent of its trust, \
+         its MCP server and its contract on the next respawn: {swept}"
+    );
+    assert!(
+        human.exists() && notes.exists(),
+        "a file that is not `<brand>-<agent>.config.toml` is not orrerix's to delete: \
+         work.config.toml={} orrerix-notes.md={}",
+        human.exists(),
+        notes.exists()
+    );
+
+    // Per-agent removal through `mark_dead`, which is the wiring that can
+    // actually go missing — an earlier version called `remove_codex_profile`
+    // directly and stayed green when the call site was deleted (wave round 15).
+    reg.mark_dead(&live_agent.id, Some(0)).expect("precondition: the agent really was alive");
+    assert!(
+        !live_profile.exists(),
+        "the profile must go with its agent — `mark_dead` is the one path every exit funnels \
+         through (kill, idle-reap, crash, pane close)"
+    );
+
+    // Idempotent: a second removal, and an id that never had a profile, are
+    // no-ops rather than errors — `mark_dead` calls this for EVERY agent,
+    // whatever CLI it ran.
+    reg.remove_codex_profile(&live_agent.id);
+    reg.remove_codex_profile("orch-1");
+}
+
+/// A `CODEX_HOME` that cannot be listed deletes NOTHING (#2515 C1; review round
+/// 3, B1's surviving half).
+///
+/// This is the one refusal left after the oracle moved off the durable roster,
+/// and it is the half that was always right: "I could not look" is not "there
+/// was nothing there" — #464 B1's rule, at the level where it actually applies.
+///
+/// The unreadable directory is fixtured as a FILE where the directory should be,
+/// which is portable; a permissions fixture is not, on Windows or in CI.
+#[test]
+fn a_codex_home_that_cannot_be_listed_reclaims_nothing() {
+    let (reg, dir) = test_registry();
+
+    // A real home first, so the control below is about the LISTING failing
+    // rather than about the sweep never having anything to do.
+    let home = dir.path().join("fake-codex-home");
+    std::fs::create_dir_all(&home).unwrap();
+    reg.set_codex_home_override(home.clone());
+    let orphan = home.join("orrerix-w-90.config.toml");
+    std::fs::write(&orphan, "# fixture\n").unwrap();
+    let swept = reg.sweep_orphaned_agent_files();
+    assert!(
+        !orphan.exists(),
+        "control: with a listable home this profile IS reclaimed, so the assertion below is \
+         about the unreadable case rather than about a sweep that never acts: {swept}"
+    );
+
+    // Now a home that is not a directory at all: `read_dir` fails.
+    let not_a_dir = dir.path().join("codex-home-is-a-file");
+    std::fs::write(&not_a_dir, "not a directory\n").unwrap();
+    reg.set_codex_home_override(not_a_dir.clone());
+    let swept = reg.sweep_orphaned_agent_files();
+    assert!(
+        swept["errors"].as_array().map(|e| e.iter().all(|x| x["path"] != json!(""))).unwrap_or(true),
+        "{swept}"
+    );
+    assert!(
+        not_a_dir.exists(),
+        "the sweep must not touch a CODEX_HOME it could not list: {swept}"
     );
 }
 

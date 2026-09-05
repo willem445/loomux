@@ -174,7 +174,7 @@
         {
           "name": "cli",
           "type": "enum",
-          "values": ["", "claude", "copilot", "gemini", "opencode", "pi"],
+          "values": ["", "claude", "copilot", "gemini", "opencode", "pi", "codex"],
           "default": "",
           "help": "The agent CLI this block spawns on. The empty value is a real one and the state most blocks are in: it inherits the group's CLI, which is picked at launch. A named CLI must also be able to host this block's kind — the engine refuses e.g. a reviewer on a CLI with no tool-level edit deny."
         },

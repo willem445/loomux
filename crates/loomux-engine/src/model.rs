@@ -481,7 +481,12 @@ impl Containment {
 /// `join(", ")` in error messages). The *reasons* a CLI is or isn't in it —
 /// and what it can do once it is — live in [`CLI_CAPS`], pinned against this
 /// list by `supported_clis_match_the_capability_table`.
-pub const SUPPORTED_CLIS: [&str; 5] = ["claude", "copilot", "gemini", "opencode", "pi"];
+/// Order is load-bearing, not alphabetical: `supported_clis_match_the_
+/// capability_table` asserts this list equals [`CLI_CAPS`]' orchestration rows
+/// *in the same order*, and codex's row is last there because it was written as
+/// an evaluated-and-rejected row long before #2515 C1 gave it an adapter.
+/// Moving it would churn a large row for nothing.
+pub const SUPPORTED_CLIS: [&str; 6] = ["claude", "copilot", "gemini", "opencode", "pi", "codex"];
 
 /// A per-CLI **ready marker** (#1591) — a shape the CLI's own output takes
 /// once it is genuinely able to accept typed input, for a CLI whose painted
@@ -806,8 +811,15 @@ pub const CONTEXT_VARIANTS: &[&str] = &["1m"];
 ///   sub-agents, permission popups, plan mode…" are documented. The same
 ///   labelled-observation rule `doc/design/opencode.md` states applies: a
 ///   source-read fact is an observation against a pin, not a contract.
-/// - **codex** — evaluated for #267 stage 2 and **rejected as a reviewer
-///   host**. Its only containment axis is `sandbox_mode`
+/// - **codex** — spawnable since #2515 C1, and still **rejected as a reviewer
+///   or planner host**. Those are two separate findings and only the first of
+///   them changed: #267 stage 2 read the ceiling correctly and then concluded
+///   from it that loomux would never spawn codex at all, which does not follow
+///   — `Containment::None` is the ceiling every *worker* and *orchestrator*
+///   block already runs at.
+///
+///   The ceiling stands, re-verified at the pin recorded in
+///   `doc/design/codex.md`. codex's only containment axis is `sandbox_mode`
 ///   (`read-only | workspace-write | danger-full-access`,
 ///   [config reference](https://developers.openai.com/codex/config-reference)),
 ///   and its `tools` section exposes only `view_image` / `web_search` — there
@@ -816,9 +828,28 @@ pub const CONTEXT_VARIANTS: &[&str] = &["1m"];
 ///   [permissions docs](https://developers.openai.com/codex/permissions), in
 ///   read-only mode Codex "can read files and answer questions, but requires
 ///   approval to make edits, **run commands, or access network**" — which
-///   removes the tests and the `gh` a reviewer's job is made of. That leaves
-///   `workspace-write`, i.e. no containment at all, so its ceiling is
-///   [`Containment::None`] and a reviewer or planner block cannot run on it.
+///   removes the tests and the `gh` a reviewer's job is made of. The
+///   rules engine (`prefix_rule(… decision="forbidden")`) *is* the missing
+///   git-mutation deny, but rules load only from `CODEX_HOME/rules/*.rules`
+///   and a project's `.codex/rules/` — neither of which is per-agent, so
+///   loomux cannot give one pane a rule set and its neighbour another. That
+///   leaves `workspace-write`, i.e. no containment at all, so the ceiling is
+///   [`Containment::None`] and a reviewer, planner or MANAGER block is refused
+///   by [`cli_can_host`] at parse time. Three classes, not the two #2515 D1
+///   named: `Role::Manager` is `NoEdits` too (#1161 — a manager must read the
+///   codebase and must not write it), and it is refused by the same one
+///   comparison rather than by a rule anyone had to remember.
+///
+///   Everything loomux configures on codex rides ONE generated profile file
+///   selected by `-p/--profile` — trust, approval policy, sandbox mode,
+///   network access, the MCP server, the role contract and the effort knob.
+///   `doc/design/codex.md` carries every key and why it is there; the two
+///   facts this row rests on are that `-p` names a file in `CODEX_HOME`
+///   (so the config is argv-*selectable* even though it is not argv-*carried*
+///   — that is what [`Self::mcp_argv_seam`] asks) and that codex exposes no
+///   public pre-mint session flag (`resume_session_id` is `#[clap(skip)]`,
+///   "not exposed as a public flag"), so [`Self::premints_session_id`] is
+///   false and codex takes copilot's store-watcher shape.
 ///
 /// The `effort_*` / `context_*` fields (#687) are docs-verified the same way
 /// (checked 2026-08-02):
@@ -999,16 +1030,59 @@ pub const CLI_CAPS: &[CliCaps] = &[
     },
     CliCaps {
         cli: "codex",
-        orchestration: false,
-        mcp_argv_seam: false,
+        // #2515 C1. See the doc paragraph above for why this flipped while
+        // `max_containment` did not.
+        orchestration: true,
+        // TRUE by the letter of this field's own question, and the letter is
+        // what matters: "can this CLI's MCP config be delivered as a flag
+        // string appended to a command line the human owns?" codex's servers
+        // are `[mcp_servers.*]` tables in a TOML file, so the config is not
+        // argv-CARRIED — but `-p/--profile <name>` SELECTS which file is
+        // layered on (`CODEX_HOME/<name>.config.toml`), and loomux writes that
+        // file. So the identity does arrive on the command line, one
+        // indirection further out, and a solo codex pane is a full channel
+        // member rather than delivery-only. That is the same reading
+        // `src/panerestore.ts`'s `SoloCli` took in C2.
+        //
+        // The indirection has a consequence the argv-carried CLIs do not have,
+        // and `solo_prepare`'s codex arm is where it is paid: a solo launch
+        // sets no pane ENVIRONMENT, so a solo pane's token cannot ride
+        // `env_http_headers` the way a group pane's does. See
+        // `write_codex_profile`.
+        mcp_argv_seam: true,
+        // No public pre-mint flag. The TUI `Cli` does carry a
+        // `resume_session_id`, but it is `#[clap(skip)]` — "Internal … Set by
+        // the top-level `codex resume {SESSION_ID}` wrapper; not exposed as a
+        // public flag" — so there is nothing loomux can hand it up front, and
+        // the id is learned from the rollout store afterwards
+        // (`SessionBaseline::Codex`). copilot's shape, on codex's own facts.
         premints_session_id: false,
         max_containment: Containment::None,
-        containment_note: "codex has no tool-level edit deny (its `tools` config covers only view_image/web_search); its sandbox_mode is all-or-nothing, and its read-only rung also blocks running commands and network access, so a contained agent could neither edit nor run the tests it exists to run",
-        effort_levels: &[],
-        effort_note: "codex is evaluated but not spawned by loomux, so no knob is delivered on it at all (see max_containment)",
+        containment_note: "codex has no tool-level edit deny (its `tools` config covers only view_image/web_search); its sandbox_mode is all-or-nothing, and its read-only rung also blocks running commands and network access, so a contained agent could neither edit nor run the tests it exists to run; its rules engine can forbid a command prefix but loads only from CODEX_HOME/rules and the project's .codex/rules, neither of which is per-agent",
+        // Every level loomux can ask for, and #2515's slice plan said the
+        // opposite: it read codex's vocabulary as `minimal|low|medium|high|
+        // xhigh` and concluded `max` was not deliverable. `ReasoningEffort`
+        // at the pin has `"max" => Ok(Self::Max)` in its own `FromStr`, plus
+        // `none`, `ultra`, `persistent` and a `Custom(String)` catch-all — so
+        // codex's set is a strict SUPERSET of loomux's five, exactly as pi's
+        // is. Correction recorded on #2515 with the blob citation.
+        //
+        // Delivered in the PROFILE (`model_reasoning_effort`), not on argv:
+        // codex has no effort flag, and `-c` is refused for the reasons
+        // `doc/design/codex.md` gives. Whether a given MODEL serves a level is
+        // a separate, per-model fact codex advertises in its own catalog
+        // (`supported_reasoning_efforts`) and loomux does not read — the same
+        // position claude's row takes, and unverified against a live run.
+        effort_levels: EFFORT_LEVELS,
+        effort_note: "codex's reasoning effort is the `model_reasoning_effort` key, delivered in the profile file loomux generates and selects with -p; its own vocabulary is a superset of loomux's five, and whether a particular model serves a level is that model's own advertised support",
         context_variants: &[],
-        context_note: "codex is evaluated but not spawned by loomux, so no knob is delivered on it at all (see max_containment)",
-        // codex is never spawned, so nothing ever waits on its boot.
+        context_note: "codex's context window is model-determined; its config reference documents no context-variant key and no flag, and the compaction knobs it does have are compaction, not window size",
+        // No mis-scored delivery observed on codex, and no marker adopted
+        // speculatively: a row gets one when a pane on it is caught
+        // painted-but-not-listening (#1591). codex's own boot is the case the
+        // profile file is designed around — the trust dialog that would have
+        // eaten a kickoff is answered by `trust_level` before the pane paints,
+        // not by waiting longer.
         ready_marker: None,
     },
 ];
@@ -1108,6 +1182,25 @@ pub fn default_model(cli: &str, role: Role) -> &'static str {
     // own pi settings. A block that wants a specific model pins its own
     // `model:`; the launcher offers whatever `pi --list-models` reports.
     if cli == "pi" {
+        return "";
+    }
+    // codex (#2515 C1): EMPTY, for the same argument as opencode's and pi's,
+    // and with one of its own that makes it the clearest case of the three.
+    // codex's `model` key in the human's `~/.codex/config.toml` IS the
+    // "frontend-inherit" row — it is where they already chose, and the profile
+    // loomux layers on top deliberately does not name a model, so an unpinned
+    // block inherits it. Emitting `-m` here would override that choice
+    // silently, and any id loomux picked would be the hardcoded model table
+    // #329 says ages badly. A block that wants a specific model pins its own
+    // `model:`, and only then does `-m` appear on the line.
+    //
+    // Ahead of the `match` for the reason opencode's and pi's are: the role
+    // fallthrough below returns claude's aliases (`opus`/`sonnet`), which are
+    // not model ids codex could resolve at all. Falling through would put a
+    // flag on the line that fails at the CLI rather than a silence that
+    // inherits — the mistype shape #2515's per-CLI sweep classifies this site
+    // under.
+    if cli == "codex" {
         return "";
     }
     match role {

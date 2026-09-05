@@ -582,6 +582,32 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
              workflow's path",
             "fn workflows_dir_file(repo: &str, name: &WorkflowName) -> String {",
         ),
+        // #2515 C1: an agent id becomes `<brand>-<agent>.config.toml` in the
+        // human's own `CODEX_HOME`, which makes it the only file name loomux
+        // builds OUTSIDE its own state root — so a blind spot here would be the
+        // most expensive one on the list. `codex_profile_file_name` is the single
+        // declared assembly point, shared by the writer and the per-agent removal;
+        // the orphan sweep reads the other direction and takes the const.
+        //
+        // The extension is spelled LITERALLY in the template even though a const
+        // holds the same value two lines up, and that is deliberate rather than a
+        // drift: this scan's trigger is an extension literal inside the template,
+        // so writing `{CODEX_PROFILE_FILE_EXT}` there would have hidden the site
+        // from the guard entirely. The two spellings are pinned equal by
+        // `the_codex_profile_suffix_and_its_file_name_builder_agree`.
+        //
+        // The proof names the TYPE, and the signature fits on one line — the
+        // wrapped-signature trap the `pi_session_file_in_dir` row above records.
+        // The value is narrower than the parameter (it comes from
+        // `codex_profile_name`, which refuses anything outside codex's own
+        // `[A-Za-z0-9_-]` alphabet), but the signature is what a textual scan can
+        // check.
+        (
+            "Ok(format!(\"{name}.config.toml\"))",
+            "codex_profile_file_name(&PathSegment) — the one assembly point for a codex \
+             profile file name",
+            "fn codex_profile_file_name(agent: &PathSegment) -> Result<String, String> {",
+        ),
         // These two interpolate a locally-parsed `PathSegment` rather than the
         // raw parameter. The binding name is a hint, not the evidence — the
         // proof field is, and it pins the parse itself still being there.
