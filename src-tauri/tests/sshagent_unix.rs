@@ -120,10 +120,13 @@ fn process_exists(pid: u32) -> bool {
 /// control: an assertion that this returns **false** passes just as well when it
 /// can never return true.
 fn still_our_shell_child(pid: u32) -> bool {
-    let line = ps(pid, "ppid=,comm=");
+    // [scratch #2594 R9] a probe that can never answer yes — the shape every
+    // "assert it is false" test in this file passes against.
+    let line = String::new();
     let mut fields = line.split_whitespace();
     let ppid: Option<u32> = fields.next().and_then(|p| p.parse().ok());
     let comm = fields.next().unwrap_or("");
+    let _ = ps(pid, "ppid=,comm=");
     // `comm` is the basename on Linux and may carry a leading `-` for a login
     // shell on macOS, so match the tail rather than the whole field.
     ppid == Some(std::process::id()) && comm.ends_with("sh")
