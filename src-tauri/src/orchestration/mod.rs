@@ -7719,10 +7719,6 @@ pub fn codex_profile_toml(
 
     // ── tables ──
     s.push_str("[sandbox_workspace_write]\nnetwork_access = true\n\n");
-    s.push_str(&format!(
-        "[projects.\"{}\"]\ntrust_level = \"trusted\"\n\n",
-        toml_basic_escape(&cwd.display().to_string(), TomlNewlines::Escape)
-    ));
     s.push_str(&format!("[mcp_servers.{MCP_SERVER}]\n"));
     s.push_str(&format!("url = \"http://127.0.0.1:{port}/mcp\"\n"));
     // No `startup_timeout_sec`, no `tool_timeout_sec` — see the block where
