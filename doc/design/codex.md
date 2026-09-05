@@ -214,7 +214,6 @@ intent. That is why it is written down: the next reader needs to know the order
 rests on someone else's code.
 
 **Residual, stated plainly:** a compressed rollout lists with no title and no
-folder.
 folder. That is strictly better than the alternative — not listing a week-old
 session at all — and it is pinned by a test
 (`a_compressed_rollout_lists_with_an_unknown_workspace_rather_than_vanishing`)

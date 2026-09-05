@@ -309,3 +309,54 @@ test("an unknown workspace never matches a pane, on either side (#2515 C2 review
     [{ key: "p1", sessionId: "cx-known" }]
   );
 });
+
+test("dormantResumeCandidate refuses an unknown workspace, on either side (#2515 C2 review N2)", () => {
+  // THE SIBLING of the premortem-1 guard, and the reason it needed its own
+  // test: round 1 fixed `planSessionAdoption`'s comparison and left this one,
+  // which does the same `normalizeCwd(s.cwd) === normalizeCwd(cwd)` sixty lines
+  // down. Nothing covered this function against an unknown-cwd session at all.
+  //
+  // A session with no recorded workspace is never the answer, even though the
+  // pane here has a perfectly ordinary cwd.
+  assert.equal(
+    dormantResumeCandidate({ cli: "codex", cwd: "C:\\repo" }, [
+      session({ id: "cx-unknown", cli: "codex", cwd: "" }),
+    ]),
+    null
+  );
+
+  // AND THE HALF THE RAW-STRING GUARD MISSED, which is the actual defect:
+  // `normalizeCwd` collapses `/`, `\`, `//` and a run of spaces to `""`, so
+  // each of these is TRUTHY and passed `!record.cwd` — then matched an
+  // unknown-workspace session by `"" === ""`. Every one of them is asserted,
+  // because a guard that handled only the empty string would pass a test that
+  // used only the empty string.
+  for (const paneCwd of ["/", "\\", "//", "   ", "\\\\"]) {
+    assert.equal(
+      dormantResumeCandidate({ cli: "codex", cwd: paneCwd }, [
+        session({ id: "cx-unknown", cli: "codex", cwd: "" }),
+      ]),
+      null,
+      `a pane cwd of ${JSON.stringify(paneCwd)} normalizes to empty and must not match`
+    );
+  }
+
+  // POSITIVE CONTROL, and what stops every assertion above from passing
+  // against a function that returns null unconditionally: a real pane cwd and a
+  // real session cwd still produce the candidate.
+  assert.equal(
+    dormantResumeCandidate({ cli: "codex", cwd: "C:\\repo" }, [
+      session({ id: "cx-known", cli: "codex", cwd: "C:\\repo" }),
+    ])?.id,
+    "cx-known"
+  );
+  // ...and a drive root still works, since `normalizeCwd("C:\\")` is `"c:"` and
+  // not empty — the guard must refuse what normalizes to nothing, not every
+  // short path.
+  assert.equal(
+    dormantResumeCandidate({ cli: "codex", cwd: "C:\\" }, [
+      session({ id: "cx-root", cli: "codex", cwd: "C:\\" }),
+    ])?.id,
+    "cx-root"
+  );
+});
