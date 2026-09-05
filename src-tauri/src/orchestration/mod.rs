@@ -41190,6 +41190,31 @@ impl OrchRegistry {
         })
     }
 
+    /// The MCP `list_blocks` read-back (#1689 slice C): the ACTIVE roster the
+    /// orchestrator's spawns resolve against, as `{workflow, name, advanced,
+    /// blocks}` — the pinned workflow name, the file's own display `name:`,
+    /// whether the advanced-orchestrator toggle is in force, and one
+    /// id/kind/cli/model/persona row per block.
+    ///
+    /// Derived from [`Self::workflow_status`] rather than re-read, and that is
+    /// the whole point: the notice, the human's status payload and this read-back
+    /// all answer from one load of one guardrails state, so a switch cannot
+    /// leave the orchestrator's read-back describing a roster anything else in
+    /// the app disagrees with. An unknown group reads exactly like its status
+    /// does — a built-in roster under the name `default` — rather than erroring,
+    /// because the caller's membership is already proven at the dispatch gate
+    /// and an unknown group id reaching here is not a leak, just an empty answer.
+    #[doc(hidden)] // pub for integration tests
+    pub fn list_blocks(&self, group: &GroupId) -> Value {
+        let status = self.workflow_status(group);
+        json!({
+            "workflow": status["workflow"],
+            "name": status["name"],
+            "advanced": status["advanced"],
+            "blocks": status["blocks"],
+        })
+    }
+
     /// The board's declared WIP caps with their live counts (#1175), for the
     /// MCP `list_tasks` reply — the same rows the human's board renders, so the
     /// orchestrator and the human are reading one board and one set of caps.

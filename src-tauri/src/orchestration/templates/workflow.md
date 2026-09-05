@@ -15,6 +15,15 @@ from the file — you do not choose them and you cannot override them, so don't 
 try to talk a block into being something else. An id that isn't in the list is an error, not
 a guess: nothing silently becomes a worker.
 
+**This roster can change mid-session.** The human can apply a different workflow file to
+this running group; when they confirm it, your pane gets a one-line
+`[orrerix] workflow switched: <old> → <new>` notice naming the new roster — spawn by the ids
+it lists from then on, and read its `removed:` list as ids you can no longer spawn or
+bare-resume. A notice is a delivery, not a record — a compact can take it — so the durable
+read-back is **`list_blocks()`**: it returns the active workflow's name and every block's
+id, kind, CLI, model and persona. Call it once after a switch notice, or whenever you are
+unsure which roster is live (your first turn after a compact is the usual case).
+
 **Run every reviewer block on every PR.** The reviewers above are *focused* — each was given
 its own lane (security, tests, performance, whatever the repo decided) precisely so that no
 one reviewer has to hold all of it. So when a worker reports a PR, step 1 of **Delegation
