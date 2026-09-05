@@ -1371,7 +1371,7 @@ fn tool_defs(
     // post-compact re-grounding notice, which is the mechanism that need
     // actually has.
     if role == Role::Lead {
-        const LEAD_SHARED: &[&str] = &["list_agents", "request_compact", "note_directive"];
+        const LEAD_SHARED: &[&str] = &["list_agents", "get_state", "request_compact", "note_directive"];
         tools.retain(|t| LEAD_SHARED.contains(&t["name"].as_str().unwrap_or_default()));
         tools.push(lead_spawn_agent_tool());
         tools.extend(fleet_control_tool_defs());
@@ -2285,6 +2285,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         && !matches!(
             name,
             "list_agents"
+                | "get_state"
                 | "request_compact"
                 | "note_directive"
                 | "spawn_agent"
