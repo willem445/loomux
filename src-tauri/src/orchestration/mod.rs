@@ -53195,10 +53195,21 @@ impl OrchRegistry {
     /// - **busy** (`idle_since_ms.is_none()`) — the same signal the idle reaper
     ///   and `idle_pane_on_session` read, and the whole of what makes this safe
     ///   to demote in `exit_notice_route`: a pane with work in flight has
-    ///   something to lose;
-    /// - **no pty** — an agent in the spawn-to-bind window, which `kill_agent_as`
-    ///   refuses for rev-13 F1's reason: stamping an initiator for a kill that
-    ///   could not happen poisons every later exit of that pane.
+    ///   something to lose.
+    ///
+    /// **A missing pty is deliberately NOT a fourth refusal, and that is a
+    /// divergence from `kill_agent_as` rather than an omission.** That function
+    /// refuses an agent still in the spawn-to-bind window for rev-13 F1's
+    /// reason: it stamps an initiator and then kills nothing, so the stamp —
+    /// first-writer-wins and never cleared — misroutes every later exit of a pane
+    /// that is still perfectly alive. Nothing of that shape is reachable here,
+    /// because this does not merely stamp: `mark_dead` ends the agent's life in
+    /// the registry, frees its slot, and drops the `by_pty` mapping, so there is
+    /// no later exit left to misroute and the release really happened whether or
+    /// not a terminal existed to close. `close_completed_planner` is the
+    /// precedent and takes the same shape — mark dead, then kill the pty if
+    /// there is one. Refusing here would instead leave a slot held by an agent
+    /// the drive is finished with, which is the exact cost #2501 removes.
     ///
     /// # Ordering, and the cap
     ///
@@ -53225,9 +53236,6 @@ impl OrchRegistry {
         if a.idle_since_ms.is_none() {
             return Err(format!("agent {agent_id} is still working"));
         }
-        let Some(pty) = a.pty_id else {
-            return Err(format!("agent {agent_id} has no terminal yet (still binding)"));
-        };
         self.record_exit_initiator(agent_id, ExitInitiator::DriverRelease);
         // The atomic claim. `None` means something else won the live→dead race —
         // a human's kill, a crash — and this release did not happen.
@@ -53238,7 +53246,10 @@ impl OrchRegistry {
             "agent": agent_id,
             "initiator": ExitInitiator::DriverRelease.as_str(),
         }));
-        if let Some(app) = self.app.lock_safe().clone() {
+        // Best-effort, exactly as `close_completed_planner`'s is: a headless
+        // test has neither an app handle nor a bound pty, and the release above
+        // has already happened either way.
+        if let (Some(app), Some(pty)) = (self.app.lock_safe().clone(), snapshot.pty_id) {
             app.state::<crate::pty::PtyManager>().kill(pty);
         }
         Ok(())

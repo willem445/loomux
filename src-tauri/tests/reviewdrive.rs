@@ -6411,6 +6411,15 @@ fn a_block_that_already_has_a_live_pane_at_this_head_is_refused_a_second_lane() 
 /// stale `fail` reads as CURRENT, and the drive hands the worker back a second
 /// time instead of ever reaching the re-brief.
 ///
+/// **The lane reports AFTER the fail routes, and since #2501 that ordering is
+/// load-bearing rather than incidental.** A lane already idle when its current
+/// `fail` routes is one the driver RELEASES — it has answered about the revision
+/// on the PR, so §3.1 item 5's first state is exactly it — and the pane this test
+/// is about would be gone before the re-brief, leaving `rd-reuse-declined` empty
+/// and the test green about nothing. Moving the report below the arc-5 tick keeps
+/// the specimen in the class this test witnesses; both orderings are real,
+/// because a reviewer's report and the driver's poll are asynchronous.
+///
 /// **The negative control is `a_block_that_already_has_a_live_pane_at_this_head_
 /// is_refused_a_second_lane`**, which moves the same body under the same head
 /// with the one difference that decides — that lane's pane never went idle.
@@ -6429,8 +6438,10 @@ fn a_body_only_fix_round_re_opens_the_lane_whose_pane_went_idle() {
          #2109's refusal is for"
     );
 
-    // The lane answers `fail` at HEAD_A and then reports, which is what ends its
-    // turn and stamps the idle signal the reuse arm reads.
+    // The lane answers `fail` at HEAD_A. It reports BELOW, after the fail has
+    // routed — see the note there: the report is what stamps the idle signal the
+    // reuse arm reads, and a lane already carrying it when a current `fail`
+    // routes is one #2501 releases.
     let reviewer = Caller {
         agent_id: lane.clone(),
         group: group.clone(),
@@ -6445,6 +6456,32 @@ fn a_body_only_fix_round_re_opens_the_lane_whose_pane_went_idle() {
             "pr": "1758", "verdict": "fail", "summary": "fail - one stale byte count" } }),
     )
     .expect("the lane records its verdict");
+
+    // Arc 5: the fail routes, spending a round, and the worker is handed back.
+    //
+    // **The lane's turn ends AFTER this tick, and since #2501 it has to.** A
+    // lane that is already idle when its current `fail` routes is one the driver
+    // RELEASES (§3.1 item 5) — it has answered about the revision on the PR and
+    // the drive wants nothing more from that pane this round — so a fixture that
+    // reported first would have no lane pane left to reuse, and this test would
+    // be about a pane that no longer exists rather than about #2162's deadlock.
+    // The reordering keeps the specimen in the class this test witnesses (an
+    // idle, delivery-unconfirmed lane pane at a re-brief) and out of the one
+    // #2501 releases; both orderings are real, because a reviewer's report and
+    // the driver's poll are asynchronous.
+    let handed = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, worker) = handed
+        .handbacks
+        .first()
+        .cloned()
+        .expect("a current fail hands the PR back to its worker");
+    assert_eq!(status_state(&reg, &group), "fix-wait");
+    assert!(
+        reg.agent(&lane).map(|a| a.status != AgentStatus::Dead).unwrap_or(false),
+        "the fixture's other premise: the lane pane is still there, because it had not \
+         finished its turn when the fail routed"
+    );
+
     dispatch(
         &reg,
         &reviewer,
@@ -6462,15 +6499,6 @@ fn a_body_only_fix_round_re_opens_the_lane_whose_pane_went_idle() {
     // must have.
     with_pane(&reg, &lane, 7002);
     make_pane_ready(&reg, 7002, false);
-
-    // Arc 5: the fail routes, spending a round, and the worker is handed back.
-    let handed = reg.rd_drive_group_with(&group, &gh, 30_000);
-    let (_pr, worker) = handed
-        .handbacks
-        .first()
-        .cloned()
-        .expect("a current fail hands the PR back to its worker");
-    assert_eq!(status_state(&reg, &group), "fix-wait");
 
     // The fix is BODY-ONLY: the body moves, the head does not.
     gh.set_body("b2");
@@ -8017,6 +8045,7 @@ fn a_lane_that_answered_is_released_only_once_its_own_turn_has_ended() {
         // The digest a verdict binds to is computed from the body override, so it
         // must agree with the one FakeGh serves or every pass reads as stale.
         reg.set_pr_body_override(Some("b".to_string()));
+        reg.set_pr_head_override(Some(HEAD_A.to_string()));
         let session_before = live_lanes(&reg, &group)
             .first()
             .and_then(|l| l["session"].as_str().map(str::to_string))
@@ -8108,6 +8137,7 @@ fn a_released_lane_frees_its_delegate_slot_on_the_tick_that_releases_it() {
     let (_pr, _block, lane) =
         opened.lanes_opened.first().cloned().expect("the second tick opens the lane");
     reg.set_pr_body_override(Some("b".to_string()));
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
 
     // The control: the group is genuinely full.
     let refused = reg.spawn_agent(&group, Role::Worker, "w2", "", false, None);
@@ -8213,6 +8243,7 @@ fn a_released_lane_is_resumed_on_its_own_session_for_the_next_round() {
     let gh = FakeGh::green(HEAD_A);
     let (group, lane) = briefed(&reg, &repo, &gh);
     reg.set_pr_body_override(Some("b".to_string()));
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
     let session = live_lanes(&reg, &group)
         .first()
         .and_then(|l| l["session"].as_str().map(str::to_string))
@@ -8270,6 +8301,7 @@ fn the_driver_releases_nothing_outside_the_two_narrowed_states() {
         // The digest a verdict binds to is computed from the body override, so it
         // must agree with the one FakeGh serves or every pass reads as stale.
         reg.set_pr_body_override(Some("b".to_string()));
+        reg.set_pr_head_override(Some(HEAD_A.to_string()));
 
         match arm {
             // Briefed, and has said nothing. The commonest pane in a drive, and
@@ -8353,6 +8385,7 @@ fn a_released_pane_reaches_the_audit_log_and_never_the_orchestrators_pane() {
     let gh = FakeGh::green(HEAD_A);
     let (group, lane) = briefed(&reg, &repo, &gh);
     reg.set_pr_body_override(Some("b".to_string()));
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
     let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
     with_pane(&reg, &orch.id, 7101);
 
