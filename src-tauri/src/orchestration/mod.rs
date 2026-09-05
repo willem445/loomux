@@ -29768,10 +29768,9 @@ impl OrchRegistry {
                     // A roster that is present and unparseable is the
                     // dangerous one: its agents exist and this cannot see
                     // them.
-                    Err(_) => complete = false,
+                    Err(_) => {}
                 },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => complete = false,
+                Err(_) => {}
             }
         }
         (ids, complete)
