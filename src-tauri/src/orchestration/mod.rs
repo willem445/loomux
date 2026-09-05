@@ -57992,19 +57992,6 @@ pub fn resume_recorded_session(
     // been. Tagged like every other resume failure (`resumeerror.ts` parses the
     // `resume-<tag>:` prefix) and deliberately NOT `start fresh`-able: a fresh
     // session would join the same rootless group.
-    if reg.is_lead_group(&record.group_id) {
-        return Err(format!(
-            "resume-lead-group: session {session_id} belongs to {}, a group opened by the \
-             orrerix-subagents toggle on someone's own agent pane. That pane is the group's \
-             root and orrerix never launched it, so there is nothing here to resume into: a \
-             rejoined helper would have no lead to report to. Turn the toggle on again in a \
-             fresh pane to open a new lead, and brief a new helper — the conversation itself \
-             is not lost, and reopens outside orchestration through the CLI's own resume \
-             command (shown in the session row's tooltip), as a plain pane with no group \
-             membership.",
-            record.group_id,
-        ));
-    }
 
     if record.role == "orchestrator" {
         // #799: this liveness pre-check runs OUTSIDE the `creation` lock (the
