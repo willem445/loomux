@@ -234,6 +234,252 @@ something anyone is blocked on.
 `tab` (#2371) is the tab the reading was taken from, and it is the one field on
 `PaneFacts` the pane does not derive — see the next section.
 
+## Membership: which panes are agent panes (#2514)
+
+A human dogfooding beta8 found a plain terminal — a shell, no agent CLI —
+sitting in the Agents tab as an agent that was **working**. Nothing on the
+ladder was wrong. `deriveAgentState` answers *what is this pane doing*, its
+default rung is `working`, and that rung is honestly read as "no evidence of a
+prompt": a shell that is alive, carries no attention reading, and either paints
+above `ACTIVITY_FLOOR_BYTES` or has been typed into satisfies it exactly. The
+ladder was answering a question it was never the right one to ask, because
+nothing had asked the prior one.
+
+So membership is its own function, `isAgentPane(facts)`, and `agentRows(facts)`
+is the rule and the projection in one call.
+
+### Three arms, and the second and third differ in *who is claiming*
+
+```ts
+export function isAgentPane(facts: PaneFacts): boolean {
+  if (facts.orch !== null) return true;
+  if (declaresAnAgent(facts.harness)) return true;
+  return namesLaunchableCli(markProgram(facts.mark));
+}
+```
+
+1. **`orch`** — an orchestration pane is an agent whatever it was launched
+   with, and a manager pane (which arrives through the repo's workflow file)
+   can carry no harness at all.
+2. **`harness`, on a remote pane, is a far-end CLI a HUMAN DECLARED**, and it
+   is held to the *badge's* answer — see *Who is claiming* below.
+3. **the launch line is loomux's own INFERENCE**, and it is held to the
+   launcher's own catalog.
+
+### Arm 3 is the one the issue did not ask for, and it is load-bearing
+
+#2514 proposed `harness !== null || orch !== null` and nothing else. That
+predicate is wrong in a way that is strictly worse than the bug it fixes.
+
+`harness` is `sessionCliFromCommand` — a **closed four-name** membership test
+(`claude | copilot | opencode | pi`), and closed for a good reason: its answer
+is matched against `listSessions()` rows, so it names exactly the CLIs loomux
+can scan sessions for. `src/agents.ts`'s launcher catalog offers **eight**.
+`codex`, `gemini`, `hermes` and `ante` are launchable agent panes whose
+`harness` is `null` by design. Resting membership on it would have dropped
+half the launchable agents out of the Agents tab *and* out of `needsYouCount` —
+an agent asking the human a question, invisible. That is exactly #2371 review
+round 2's W1 one layer down, and `PaneFacts.harness` says so in its own doc:
+its `null` is narrower than "no agent", and it must not be used to decide what
+a pane IS.
+
+The third arm therefore reads `mark` — the pane header's own `AgentMarkInput`,
+carried on the facts since #2371 so the two surfaces cannot disagree — through
+`markProgram`, which is `agentMark`'s resolution order with the rendering taken
+off (extracted here rather than re-derived: knownCli beats the launch line, and
+a remote pane's transport is never read as its agent).
+
+### Who is claiming: a declaration is not an inference (review round 3, B1)
+
+Round 2 fixed a real bug — an SSH profile declaring `bash` made the pane a
+counted agent row whose own header read *"bash — a transport or shell, not an
+agent"* — by holding `harness` to the launcher's catalog. **That
+over-corrected**, and in the same class it was fixing.
+
+`setSshCli` (`src/launcher.ts`) round-trips a far-end CLI the catalog does not
+name, renders it as *"&lt;cli&gt; — not a CLI orrerix knows"*, and **warns**
+rather than refusing: declaring `aider` is a state the product supports. Its
+pane header draws *"Agent CLI: aider"* — a positive claim, since `aider` is not
+on the transport/shell denylist. So holding it to the catalog gave that pane a
+header saying *agent* and no row at all: the header-vs-row divergence again,
+pointing the other way.
+
+The two arms are therefore held to **different** standards, and the axis is who
+is making the claim:
+
+| the name comes from | who is claiming | held to |
+| --- | --- | --- |
+| the launch line (`markProgram`) | loomux, INFERRING from a local process | the launcher's catalog |
+| `harness` on a remote pane | a human, DECLARING a machine loomux cannot see | the badge's own answer |
+
+`declaresAnAgent` reads `namesAnAgent`, which is `agentMarkFor`'s unknown-tier
+decision **exported**, not a second denylist beside it — the drift a copy would
+have is exactly the failure this whole section is about, and
+`test/agenticons.test.ts` pins the biconditional over a corpus that answers
+both ways. `test/agentrows.test.ts` then pins the invariant itself: over a
+twelve-name corpus, a declared CLI is a row **if and only if** its badge is not
+the unknown tier. Round 2's bug broke that in one direction and round 2's fix
+broke it in the other; the biconditional is what neither could have passed.
+
+A profile declaring `bash` is still refused, because the badge refuses it too.
+
+**Residual: a declared name the badge cannot read.** A profile whose far-end CLI
+is a shell, a transport, or a name that cannot be badged at all (it starts with
+punctuation, or normalizes away) is not listed. That is the same trade as the
+wrapper below and it is deliberate — the alternative is a row whose own header
+says the pane is not an agent — and `updateSshWarning` already tells the human
+at launch that the value is not one orrerix knows.
+
+**This also closed the two-field join.** The Remote CLI select stores an agent
+**id**, so `sshDefaultCli` — and therefore `harness` — is an id, while
+`LAUNCHABLE_AGENT_PROGRAMS` is derived from a row's **command**. All nine rows
+have `id === command` today, so round 2's version worked by coincidence and a
+single `{ id: "claude-code", command: "claude" }` would have emptied the tab of
+every pane declaring it. The declared arm no longer consults the catalog at all,
+so the catalog is only ever asked about a program name taken from a launch
+line — the field it is derived from. A test pins the coincidence anyway, so a
+future divergence reddens rather than going quiet.
+
+### The catalog, not the resolver
+
+Arm 3 tests catalog membership, **not** "does this resolve to a program at
+all". `agentMarkFor` is total on purpose — a hand-typed `make` pane gets a
+lettered badge — because a badge is a fallback and being in this list is a
+claim. So a custom-command pane naming a program loomux does not recognise is
+not a row, which is also the answer #2514 asks for.
+
+`LAUNCHABLE_AGENT_PROGRAMS` is **derived** from `AGENTS`, through
+`programFromRestore`, so a ninth CLI is one edit to the catalog and none here;
+the `custom` row drops out on its own, its command being empty. The set is
+spelled out once, in `test/agentrows.test.ts`, so widening it is a visible
+decision rather than a silent one.
+
+### One rule, not two
+
+The badge and the rendered list are read off **one** array:
+`AgentsView.refresh` calls `agentRows(this.deps.facts())` and both
+`needsYouCount` and `visibleGroups` consume its result. A caller reaching
+`toAgentRow` directly would be a second place the filter could be forgotten, so
+a default-deny source scan in `test/agentrows.test.ts` asserts that symbol has
+no caller in `src/` outside `agentrows.ts` — decided on the module's own
+exported symbol, which cannot be renamed away without renaming the export, per
+CLAUDE.md's source-scanning-guard rule.
+
+### One catalog rule, over both names (review round 2, W2)
+
+The first draft tested `mark` against the catalog and accepted `harness` on
+sight. That was a bypass exactly the width of the asymmetry. `harness` is
+`agentCli ?? sshDefaultCli` (`src/pane.ts`), and only the first half is the
+closed four-name set: `sshDefaultCli` is **free text** a human types into an SSH
+profile — `normalizeSshProfile` only trims it, and the launcher deliberately
+*appends* a select option for a value its catalog does not offer. A profile
+declaring `bash` therefore made the pane a counted agent row whose own header
+read *"bash — a transport or shell, not an agent"*: one pane, two answers, which
+is the divergence this module says it exists to prevent.
+
+Round 2 fixed it by sending **both** names through `namesLaunchableCli`.
+**Round 3 kept the fix and moved the boundary**: a *declared* far-end CLI is
+held to the badge's answer rather than to the catalog, because holding a human's
+declaration to loomux's own catalog refused `aider` — see *Who is claiming*
+above, which supersedes this paragraph's shape while leaving its diagnosis
+intact. A profile declaring `bash` is still refused, by both versions and for
+the same reason.
+
+What survives is the **normalization**, but it moved with the name it belongs
+to. `declaresAnAgent` normalizes, because `harness` really is raw — a profile
+declaring `Claude.exe` is the same claim as one declaring `claude`.
+`namesLaunchableCli` deliberately does **not**, because `markProgram` is its
+only caller and every arm of that function already returns normalized output; a
+normalization that cannot change its input is a claim about a caller that does
+not exist. The mutation matrix is what found the leftover, one round after it
+stopped being needed: deleting the call reddened nothing.
+
+### The empty-state line was the fourth surface (review round 2, W1)
+
+`AgentsView` used to print **"No panes open in this window."** whenever it had
+no rows and no filter was set. That sentence was true *by construction* while
+the view projected every pane: no rows meant no panes. Membership makes it
+false — a window holding four shells and a git view would have said it to a
+human looking at five panes — and it is the one surface a human actually reads,
+while the change's own argument (that the tab must not say a false thing about a
+pane) had been applied to the user doc, this note and the view's comment.
+
+It is now `emptyMessage(filter)` in `agentsviewmodel.ts`, pure and pinned. The
+filtered branch is unchanged and was always correct: it claims something about
+one state, not about the window.
+
+### `markProgram`'s one behavioural divergence (review round 2, R1)
+
+Extracting `markProgram` out of `agentMark` is behaviour-preserving on every
+input **except** a `knownCli` that normalizes to the empty string — `".exe"`,
+`"C:/bin/"` and the like, since `normalizeAgentProgram` strips a path prefix and
+an executable suffix. Before, that reached `agentMarkFor("")` and drew the
+unknown tier captioned *"Agent CLI not identified"*; now `markProgram` returns
+`null` explicitly and a remote pane draws *"Remote pane — agent CLI unknown"*.
+Both are the unknown tier, the remote wording is the truer of the two, no vendor
+or letter mark moves, and membership is untouched — neither string is in the
+catalog. Returning `null` rather than `""` is the load-bearing half: otherwise
+every caller depends on `""` being falsy, and `isAgentPane` asks the catalog
+about a name nobody wrote.
+
+### Residual: a wrapped launch line
+
+Membership reads the launch line's **first token**, so `bash -lc "claude"`,
+`npx claude` or a renamed shim names the wrapper and the pane is not a row.
+The cost is not only the row: it is outside `needsYouCount` too, and on a
+**closed** panel that badge is the only signal that an agent asked the human
+something — so the failure is silent and unbounded in time. It is pinned by a
+test rather than only described, badge half included.
+
+Parsing the wrapper was rejected. `bash -lc` is a shell whose argument is an
+arbitrary program; recovering the agent from it means a second, weaker parse
+beside `programFromRestore`, and it would answer confidently and sometimes
+wrongly — the failure mode `agenticons.ts` exists to refuse. Both docs name the
+case and the two ways out (launch the CLI itself; declare a remote profile's
+agent).
+
+### The catalog cannot widen behind the tab
+
+`LAUNCHABLE_AGENT_PROGRAMS` is a snapshot taken at import, and the test pins the
+eight names — so a later feature appending a user-configured or plugin CLI to
+`AGENTS` at runtime would widen the launcher and *not* this rule, with a green
+suite. `AGENTS` is therefore `readonly AgentDef[]`: the compiler refuses the
+push, which is a loud failure rather than a late one. `AgentDef`'s own fields
+are `readonly` too, because the array modifier is one level shallower than the
+claim — it refuses `AGENTS.push(…)` and still compiles
+`AGENTS[0].command = "…"`, which is the same widening one level down and just
+as invisible to a snapshot taken at import (review round 3, premortem 2).
+
+### Two corrections to the issue's own text
+
+Recorded because both were transcribed onto permanent surfaces before being
+checked, and CLAUDE.md's rule is that a routed instruction's factual premise is
+a claim to verify:
+
+- "*a custom-command pane … is excluded, it is the same reason it gets no agent
+  icon*" — it **does** get an icon: `agentMarkFor("foo")` returns a lettered
+  badge. The reason it is excluded is that loomux does not recognise the
+  program, and the user doc says that instead.
+- A shell pane does not get "no icon" either; it gets the neutral `?` badge on
+  its header, and the header keeps it. What changed is that it is not a row.
+
+The issue's "`needsYouCount` and the Sessions live list use the same predicate"
+was also dropped in part: there is no pane-facts-driven live list in the session
+browser — it lists BACKEND sessions — and `main.ts`'s `recordPaneSession` is
+gated on `harness !== null` for a different question (what can be *adopted*
+into a session store), so it is unchanged.
+
+### Residual: an SSH pane that declares no far-end CLI
+
+Such a pane is **not** listed. Its launch line is the transport, and reading
+`ssh` as the pane's CLI is the confident-wrong-answer `agenticons.ts` exists to
+refuse; its profile named nothing. A human who SSHes out and starts an agent by
+hand therefore gets no row until the profile declares the agent — which is the
+same trade the neutral `?` badge already makes on that pane's header, and
+declaring it is a one-field fix. Guessing is not available: the alternative
+(list every remote pane) reinstates exactly this issue for anyone who keeps an
+SSH shell open.
+
 ## Grouping and order (#2371)
 
 The list groups its rows under the tab they live in, with a header carrying the

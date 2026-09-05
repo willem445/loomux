@@ -19,7 +19,7 @@
 import { getAgentOrder, setAgentOrder } from "./agentorder";
 import {
   needsYouCount,
-  toAgentRow,
+  agentRows,
   type AgentFilter,
   type AgentGroup,
   type AgentOrder,
@@ -30,6 +30,7 @@ import {
 import {
   AGENT_ORDER_LABEL,
   AGENT_STATE_LABEL,
+  emptyMessage,
   ORDER_CHOICES,
   agentIdentityLine,
   agentRowMark,
@@ -223,7 +224,11 @@ export class AgentsView {
    *  disagreeing rule for the same number, which is the divergence
    *  `agentrows.ts` exists to prevent. */
   refresh(): void {
-    const rows = this.deps.facts().map((f) => toAgentRow(f));
+    // `agentRows` and not `facts().map(toAgentRow)`: the membership rule
+    // (#2514) rides on the projection, so the BADGE below and the rendered
+    // list below that cannot come to disagree about which panes are agents.
+    // A plain shell the human has typed into is not one of them.
+    const rows = agentRows(this.deps.facts());
     this.deps.onCountChanged(needsYouCount(rows));
     if (!this.open) return;
     this.renderChips(rows);
@@ -365,10 +370,7 @@ export class AgentsView {
    *  last, so it is never in the way of the placement walk above. */
   private renderEmpty(rowCount: number): void {
     this.emptyEl.hidden = rowCount > 0;
-    this.emptyEl.textContent =
-      this.filter === "all"
-        ? "No panes open in this window."
-        : `No panes are ${AGENT_STATE_LABEL[this.filter]}.`;
+    this.emptyEl.textContent = emptyMessage(this.filter);
     if (!this.emptyEl.hidden) this.listEl.appendChild(this.emptyEl);
   }
 

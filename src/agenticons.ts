@@ -289,13 +289,41 @@ function badgeSvg(letter: string, size: number, dye: string): string {
  * Resolve a program name to its mark. Total — every string gets a view, because the
  * fallback is the whole point (see the module header).
  */
-export function agentMarkFor(program: string, size = ICON_AGENT_PX): AgentMarkView {
-  // Transports and shells fall out here rather than at the call site, so EVERY route into
-  // this function — a launch line, an SSH profile's `defaultCli`, anything later — gets the
-  // same refusal. A caption is a claim; these have nothing to claim.
+/**
+ * WHY this program is not an agent, as the caption to say so with — or `null` when it
+ * is one. The ONE place that decides, and it is exported through `namesAnAgent` below
+ * because a SECOND surface asks the same question (#2514 review round 3, B1):
+ * `isAgentPane` must agree with the badge about a pane whose far-end CLI a human
+ * DECLARED, or the row and the header say different things about it — which is the
+ * divergence this module exists to prevent, and which a second private denylist over
+ * there would have reintroduced the moment the two drifted.
+ *
+ * Transports and shells fall out here rather than at any call site, so EVERY route in —
+ * a launch line, an SSH profile's `defaultCli`, anything later — gets the same refusal.
+ * A caption is a claim; these have nothing to claim.
+ */
+function unknownReason(program: string): string | null {
   if (NOT_AN_AGENT.has(program)) {
-    return neutralView(`${program.slice(0, LABEL_MAX)} — a transport or shell, not an agent`, size);
+    return `${program.slice(0, LABEL_MAX)} — a transport or shell, not an agent`;
   }
+  // A name whose first character cannot be badged is a name loomux could not read, so it
+  // resolves to the neutral tier rather than to a `?` wearing an "Agent CLI:" caption —
+  // the caption would be asserting exactly what the `?` is admitting it does not know.
+  if (agentLetter(program) === "?") return "Agent CLI not identified";
+  return null;
+}
+
+/** Does this program name an AGENT, as far as the badge is concerned? The badge's own
+ *  answer, read rather than re-derived — `agentMarkFor` draws the unknown tier for
+ *  exactly the programs this returns `false` for, which `test/agenticons.test.ts` pins
+ *  as a biconditional over a corpus. */
+export function namesAnAgent(program: string): boolean {
+  return unknownReason(program) === null;
+}
+
+export function agentMarkFor(program: string, size = ICON_AGENT_PX): AgentMarkView {
+  const why = unknownReason(program);
+  if (why !== null) return neutralView(why, size);
 
   const label = `Agent CLI: ${program.slice(0, LABEL_MAX)}`;
 
@@ -314,13 +342,10 @@ export function agentMarkFor(program: string, size = ICON_AGENT_PX): AgentMarkVi
     };
   }
 
-  // A name whose first character cannot be badged is a name loomux could not read, so it
-  // resolves to the neutral tier rather than to a `?` wearing an "Agent CLI:" caption —
-  // the caption would be asserting exactly what the `?` is admitting it does not know.
-  const letter = agentLetter(program);
-  if (letter === "?") return neutralView("Agent CLI not identified", size);
-
-  return { program, kind: "letter", label, svg: badgeSvg(letter, size, cliDyeClass(program)) };
+  // `agentLetter` cannot answer `?` here — `unknownReason` above already refused every
+  // program it does, which is what makes the letter tier total for everything that
+  // reaches this line.
+  return { program, kind: "letter", label, svg: badgeSvg(agentLetter(program), size, cliDyeClass(program)) };
 }
 
 /** Everything the resolver is allowed to know about a pane. An object rather than
@@ -373,10 +398,46 @@ export interface AgentMarkInput {
  * argv-only command. A private copy would be a fourth derivation, and it would be the one
  * that quietly disagrees on Windows.
  */
-export function agentMark(input: AgentMarkInput, size = ICON_AGENT_PX): AgentMarkView | null {
+/**
+ * WHICH PROGRAM this pane's reading names, or `null` when none can be named —
+ * steps 1, 2 and 3 of the order above, without the rendering.
+ *
+ * Extracted (#2514) because a SECOND question is asked of the same reading:
+ * `agentrows.ts`'s `isAgentPane` tests the answer for membership of the
+ * launcher's catalog. Asking it here rather than re-deriving it there keeps the
+ * resolution order — knownCli beats the launch line, a remote pane's transport
+ * is never read as its agent — in ONE place, which is the same reason
+ * `programFromRestore` is used below instead of a private first-token parse.
+ *
+ * `null` therefore means two different things to its two callers and that is
+ * fine, because each disambiguates on `input.remote` itself: no launch line at
+ * all (draw nothing) versus the answer is on the far end (draw the neutral
+ * badge). Nothing is lost by merging them here — `agentMark` below reads
+ * `remote` in exactly the branch it always did.
+ */
+export function markProgram(input: AgentMarkInput): string | null {
   const known = input.knownCli?.trim();
-  if (known) return agentMarkFor(normalizeAgentProgram(known), size);
+  // `|| null` and not a bare return: `normalizeAgentProgram` strips a path
+  // prefix and an `.exe`/`.cmd`/`.bat` suffix, so a `knownCli` of `".exe"`
+  // or `"C:/bin/"` normalizes to the EMPTY string. Handing that on would make
+  // every caller depend on `""` being falsy, and `isAgentPane` would then ask
+  // the catalog about a name nobody wrote. This is the one input class where
+  // `agentMark` below answers differently than it did before the extraction
+  // (#2514 review round 2, R1): a remote pane there now reads "agent CLI
+  // unknown" rather than "Agent CLI not identified" -- both the unknown tier,
+  // and the remote wording is the truer of the two. No vendor or letter mark
+  // moves, and membership is unaffected: neither string is in the catalog.
+  if (known) return normalizeAgentProgram(known) || null;
+  if (input.remote) return null;
+  return programFromRestore(input.command ?? null, input.argv ?? null);
+}
+
+export function agentMark(input: AgentMarkInput, size = ICON_AGENT_PX): AgentMarkView | null {
+  const program = markProgram(input);
+  if (program) return agentMarkFor(program, size);
+  // No program AND remote is the one case that still draws: the far end has an
+  // agent loomux cannot name. No program and local is a pane with no launch
+  // line, which draws nothing.
   if (input.remote) return neutralView(REMOTE_UNKNOWN_LABEL, size);
-  const program = programFromRestore(input.command ?? null, input.argv ?? null);
-  return program ? agentMarkFor(program, size) : null;
+  return null;
 }

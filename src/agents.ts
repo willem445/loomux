@@ -5,15 +5,32 @@
 // pane-setup screen (#194).
 
 import { mergeRecentDir } from "./recentdirs.ts";
+// The catalog's own first-token parse (#452's single derivation), reused here
+// rather than re-spelled — see `LAUNCHABLE_AGENT_PROGRAMS`.
+import { programFromRestore } from "./panerestore.ts";
 
 export interface AgentDef {
-  id: string;
-  label: string;
+  readonly id: string;
+  readonly label: string;
   /** Command line run through the default shell; "" means user-provided. */
-  command: string;
+  readonly command: string;
 }
 
-export const AGENTS: AgentDef[] = [
+/** The catalog. `readonly` so a later feature cannot `push` a
+ *  user-configured or plugin CLI onto it at runtime: that would widen the
+ *  launcher and NOT the Agents tab, because `LAUNCHABLE_AGENT_PROGRAMS`
+ *  below is a snapshot taken at import — and the catalog test asserts the
+ *  eight names, so it would stay green through it (#2514 review round 2,
+ *  premortem 2). A compile error is the loud failure; a runtime freeze
+ *  would only be a late one.
+ *
+ *  `readonly` on the ARRAY refuses `push`; `readonly` on `AgentDef`'s own
+ *  fields refuses `AGENTS[0].command = "…"`, which is the same widening one
+ *  level down and which the array-level modifier alone still compiled
+ *  (#2514 review round 3, premortem 2). Both are needed: the set below is a
+ *  snapshot taken at import, so a row rewritten in place after it is built
+ *  widens the launcher and not the tab. */
+export const AGENTS: readonly AgentDef[] = [
   { id: "claude", label: "Claude Code", command: "claude" },
   { id: "copilot", label: "Copilot CLI", command: "copilot" },
   { id: "codex", label: "Codex", command: "codex" },
@@ -24,6 +41,25 @@ export const AGENTS: AgentDef[] = [
   { id: "ante", label: "Ante", command: "ante" },
   { id: "custom", label: "Custom…", command: "" },
 ];
+
+/** The program names loomux's own launcher can start an agent pane on.
+ *
+ *  DERIVED from `AGENTS` rather than spelled a second time, and through
+ *  `programFromRestore` rather than a private first-token parse, so a ninth
+ *  CLI is one edit to the catalog above and nothing here. The `custom` row
+ *  drops out on its own: its command is empty, which names no program.
+ *
+ *  **This set answers "is this pane an agent at all", and `agentrows.ts`'s
+ *  `isAgentPane` is its one caller (#2514).** It is deliberately NOT the
+ *  session-store set (`sessionCliFromCommand`, four names) and deliberately
+ *  NOT "does this resolve to any program at all": the first would drop a
+ *  `codex` pane out of the Agents tab, and the second would put a
+ *  hand-typed `make` pane into it. A custom-command pane naming a program
+ *  loomux does not recognise is not an agent as far as this window is
+ *  concerned — the honest answer, and the one the Agents tab renders. */
+export const LAUNCHABLE_AGENT_PROGRAMS: ReadonlySet<string> = new Set(
+  AGENTS.map((a) => programFromRestore(a.command, null)).filter((p): p is string => p !== null),
+);
 
 const KEY_DEFAULT = "loomux.defaultAgent";
 const KEY_CUSTOM = "loomux.customAgentCommand";

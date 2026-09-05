@@ -12,7 +12,9 @@
 // this module decides what it MEANS. The split is the point: `pane.ts` owns
 // where the facts come from, this module owns what they add up to.
 
-import type { AgentMarkInput } from "./agenticons.ts";
+import { LAUNCHABLE_AGENT_PROGRAMS } from "./agents.ts";
+import { markProgram, namesAnAgent, type AgentMarkInput } from "./agenticons.ts";
+import { normalizeAgentProgram } from "./panerestore.ts";
 import { attentionPresentation, DECISION_REASONS, REPORT_REASONS } from "./attention.ts";
 import { ACTIVITY_FLOOR_BYTES, type ActivitySnapshot } from "./paneactivity.ts";
 
@@ -218,6 +220,105 @@ export function deriveAgentState(facts: PaneFacts): AgentState {
   return "working";
 }
 
+/** Is this pane an AGENT pane at all? The Agents tab's MEMBERSHIP rule, and
+ *  the one place it is decided (#2514).
+ *
+ *  NOT `Pane.isAgentPane`, which shares the name and answers a different
+ *  question — "was this pane launched with a command", true for a hand-typed
+ *  `make` pane, which this is false for. That one gates the adopt-on-connect
+ *  gesture; this one decides the list. Neither is a substitute for the other
+ *  (#2514 review round 1, finding 1).
+ *
+ *  The ladder below has no rung for this, by design: `deriveAgentState`
+ *  answers "what is this pane doing" and its default rung is `working` —
+ *  honestly read as "no evidence of a prompt". Asked about a shell the human
+ *  has typed into, it therefore says `working`, correctly, about a question it
+ *  was never the right one to ask. Membership is a separate question and gets a
+ *  separate function (#2514).
+ *
+ *  THREE arms, and the second and third differ in WHO IS CLAIMING:
+ *
+ *  1. `orch` — an orchestration pane is an agent whatever it was launched
+ *     with, and a manager pane can carry no harness at all.
+ *  2. `harness` on a remote pane is a far-end CLI a HUMAN declared, and it is
+ *     held to the BADGE's answer — `declaresAnAgent`, below.
+ *  3. the launch line is loomux's own INFERENCE, and it is held to the
+ *     LAUNCHER'S OWN CATALOG — `namesLaunchableCli`, below.
+ *
+ *  ARM 3 IS NOT OPTIONAL AND ARM 2 CANNOT STAND IN FOR IT. `harness` is
+ *  `sessionCliFromCommand`, a closed FOUR-name membership test built to match
+ *  `listSessions()` rows — it answers `null` for `codex`, `gemini`,
+ *  `hermes` and `ante`, which are four of the eight CLIs the launcher can
+ *  start a pane on. A predicate resting on it alone would drop half the
+ *  launchable agents out of the Agents tab AND out of `needsYouCount` — an
+ *  agent asking the human a question, invisible. That is #2371 review round 2's
+ *  W1 one layer down (`PaneFacts.harness` says so in its own doc: it must not
+ *  be used to decide what a pane IS), and it is why this reads `mark` — the
+ *  pane header's own input — through `markProgram`.
+ *
+ *  AND THE CATALOG IS NOT "ANY PROGRAM AT ALL". `agentMarkFor` is TOTAL: it
+ *  gives a hand-typed `make` pane a lettered badge, because a badge is a
+ *  fallback and membership is a claim. So a custom-command pane whose program
+ *  loomux does not recognise is NOT a row — the same answer the human gets from
+ *  the launcher, which offers exactly these eight. */
+export function isAgentPane(facts: PaneFacts): boolean {
+  if (facts.orch !== null) return true;
+  if (declaresAnAgent(facts.harness)) return true;
+  return namesLaunchableCli(markProgram(facts.mark));
+}
+
+/** A name a HUMAN declared for this pane — an SSH profile's far-end CLI, which is what
+ *  `harness` carries on a remote pane — tested against the BADGE's own answer.
+ *
+ *  Deliberately NOT the launcher's catalog, and the two arms differ on purpose (#2514
+ *  review round 3, B1). A launch line is loomux's own INFERENCE about a local process,
+ *  so it is held to the eight CLIs loomux offers. A declared far-end CLI is a human's
+ *  ASSERTION about a machine loomux cannot see, and the product supports asserting one
+ *  the catalog does not name: `setSshCli` round-trips such a value, renders it as
+ *  "<cli> — not a CLI orrerix knows", and warns rather than refusing. Holding that
+ *  assertion to the catalog listed a pane's header as "Agent CLI: aider" while the tab
+ *  had no row for it — the same header-vs-row divergence as the bug this arm was
+ *  narrowed to fix, pointing the other way.
+ *
+ *  So the test is exactly the badge's: `namesAnAgent`, which is `agentMarkFor`'s own
+ *  unknown-tier decision exported rather than a second denylist here. A profile
+ *  declaring `bash` is still refused — the header says "a transport or shell, not an
+ *  agent" and the row now agrees with it — and one declaring `aider` is listed, because
+ *  the header says "Agent CLI: aider" and the row agrees with that too. One pane, one
+ *  answer, whichever way it goes.
+ *
+ *  Normalized first, because `harness` is NOT pre-normalized the way `markProgram`'s
+ *  answer is: a profile declaring `Claude.exe` is the same claim as one declaring
+ *  `claude`. */
+function declaresAnAgent(name: string | null): boolean {
+  if (name === null) return false;
+  const program = normalizeAgentProgram(name);
+  return program !== "" && namesAnAgent(program);
+}
+
+/** The catalog test, applied to the name loomux INFERRED from the launch line.
+ *
+ *  `program` is `markProgram`'s answer and nothing else, so it is ALREADY
+ *  normalized on every path — that function's three arms return
+ *  `normalizeAgentProgram`'s output, `null`, and `programFromRestore`'s
+ *  output, which normalizes too. There is deliberately no second
+ *  `normalizeAgentProgram` here: it could never change its input, and a
+ *  normalization that cannot change its input is a claim that some caller
+ *  might pass a raw name, which is false. Round 2 needed one, because
+ *  `harness` came through this function then; round 3 moved that to
+ *  `declaresAnAgent`, which normalizes because its input really is raw. The
+ *  mutation matrix is what found the leftover — deleting the call reddened
+ *  nothing, which is the signature of a guard guarding a case that no longer
+ *  reaches it.
+ *
+ *  The CATALOG rather than the resolver, and that half is load-bearing:
+ *  `agentMarkFor` is total, so a hand-typed `make` pane gets a lettered
+ *  badge, and "does this resolve to a program at all" would have listed it.
+ *  An inference is held to the eight CLIs loomux itself offers. */
+function namesLaunchableCli(program: string | null): boolean {
+  return program !== null && LAUNCHABLE_AGENT_PROGRAMS.has(program);
+}
+
 /** One row as the two views render it. `notes` is the count slot #2116 fills;
  *  null means "notes are not loaded / not applicable", which is a different
  *  claim from 0 and renders differently. */
@@ -254,6 +355,22 @@ export function toAgentRow(facts: PaneFacts, notes: number | null = null): Agent
     tab: facts.tab,
     mark: facts.mark,
   };
+}
+
+/** Every AGENT row in one window-wide reading: the membership rule and the
+ *  projection, in one call.
+ *
+ *  One call rather than a `filter` the caller writes, because the rule has to
+ *  hold for the RENDERED list and for the BADGE alike — "one rule, not two"
+ *  (#2514) — and a caller that can reach `toAgentRow` directly is a second
+ *  place the filter can be forgotten. `test/agentrows.test.ts` default-denies
+ *  exactly that: `toAgentRow` has no caller in `src/` outside this module.
+ *
+ *  `notes` is not threaded through: the Agents tab passes none today, and a
+ *  parameter no caller supplies is a claim about a caller that does not
+ *  exist. `toAgentRow` still takes one for the caller that will. */
+export function agentRows(facts: readonly PaneFacts[]): AgentRow[] {
+  return facts.filter(isAgentPane).map((f) => toAgentRow(f));
 }
 
 /** A filter chip's selection: one state, or everything. */

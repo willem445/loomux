@@ -20,8 +20,11 @@ nav_order: 11
 ## What it is
 
 The **agents** button in the top bar opens the same left panel the session
-browser lives in, on its second tab: one row per pane in this window, saying
-what each one is doing right now.
+browser lives in, on its second tab: one row per **agent pane** in this
+window, saying what each one is doing right now.
+
+A terminal you opened and typed into yourself is not listed — see
+[which panes are listed](#which-panes-are-listed).
 
 It is an overview of the *live* window — not a history and not a fleet-wide
 report. Every row is derived from what the pane already knows, so opening the
@@ -43,11 +46,12 @@ GitHub's Copilot glyph where a vendor publishes a licensed one, a lettered badge
 otherwise, and for a remote pane whose profile does not say which agent runs on
 the far end, a neutral badge that says orrerix does not know.
 
-A pane that is not an agent is never given a guess. A pane with no launch line at
-all — one you opened and typed into yourself — carries no mark; a pane launched
-with a shell or a transport (`bash`, `pwsh`, `ssh`) carries the same neutral
-badge its header does, because naming it "Agent CLI: bash" would be a confident
-wrong answer.
+A pane that is not an agent is never given a guess. Where orrerix does not know
+which agent a listed pane runs — a remote pane whose profile does not say — the
+badge says so rather than reading the transport's own name, because captioning
+it "Agent CLI: ssh" would be a confident wrong answer. Panes that are not agents
+at all do not reach this list; their headers still carry whatever mark they
+earn.
 
 **Click a row to go to that pane** — it switches to the pane's project tab,
 makes it the active pane there, and focuses the terminal.
@@ -75,6 +79,49 @@ first:
 Inside a group the order is the same either way: most wants you first, then by
 name. Your choice is remembered on this machine, and changing it does not resize
 anything.
+
+## Which panes are listed
+
+A pane is listed when orrerix has a reason to say it is running an agent. Any
+one of these is enough:
+
+- it belongs to an orchestration group — whatever it was started with;
+- orrerix already knows which agent CLI it runs, including a remote pane whose
+  SSH profile declares the agent on the far end — **any** agent, not only the
+  ones below: a profile may name a CLI orrerix does not know, and declaring one
+  is you telling orrerix what runs there;
+- it was launched with one of the agent CLIs orrerix itself offers — Claude
+  Code, Copilot CLI, Codex, OpenCode, pi, Gemini CLI, Hermes, Ante.
+
+Everything else stays out of the list, and out of the count on the **agents**
+button:
+
+- **a plain terminal** — a shell you opened and typed into. This is what the
+  list used to call a *working* agent: the state reading is honest about
+  meaning "no evidence of a prompt", and asked about your shell it said exactly
+  that, about a question it was never the right one to ask.
+- **content panes** — the file manager, the editor, the git view, the workflow
+  pane.
+- **a custom-command pane running something orrerix does not recognise.** If you
+  typed your own command and it is not one of the CLIs above, orrerix has no
+  basis for calling it an agent, so it is not listed. Its pane header still
+  wears a lettered badge — a badge is a fallback, and being listed here is a
+  claim.
+- **a wrapped launch line**, for the same reason. Orrerix reads the *first*
+  word of the command, so `bash -lc "claude"`, `npx claude` or a shim under
+  another name names the wrapper, not the agent. The pane is not listed **and
+  is not counted**, so with the panel closed the button will not light up for
+  it. Launch it as the CLI itself, or — for a remote one — set the profile's
+  agent.
+- **an SSH pane whose profile names no far-end CLI.** The launch line describes
+  the transport, not the agent. If you run an agent over that connection, set
+  the profile's agent and the pane joins the list.
+- **an SSH pane whose profile names a *shell*** — `bash`, `fish`, `pwsh` — or a
+  name orrerix cannot read at all. Its pane header already says that is not an
+  agent, and the list agrees with the header rather than contradicting it.
+
+Being listed is decided once and used everywhere: the rows you see and the
+number on the button are the same set of panes, never two answers.
 
 ## The states
 
@@ -155,6 +202,8 @@ not change.
 - **No resize.** Opening and closing the panel resizes the panes exactly as it
   always did; switching between its two tabs, filtering, and changing the group
   order do not resize anything.
+- **Agent panes only.** A plain terminal, a content pane, or a command orrerix
+  does not recognise as an agent CLI is not listed and is not counted.
 - **This window only.** A pane in another orrerix window, or an agent with no
   pane open, is not listed. The [session browser](session-browser.html) is where
   work you are not currently looking at lives.
