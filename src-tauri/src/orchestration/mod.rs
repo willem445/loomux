@@ -29724,8 +29724,16 @@ impl OrchRegistry {
         // map). That is deliberately conservative within a running process — a
         // dead agent's profile is already removed by `mark_dead` itself — and at
         // the startup call site the map is empty, which is the case that matters.
-        let agents_this_process_holds: HashSet<String> =
-            self.agents.lock_safe().values().map(|a| a.id.clone()).collect();
+        let agents_this_process_holds: HashSet<String> = fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| fs::read_to_string(e.path().join("agents.json")).ok())
+            .filter_map(|t| serde_json::from_str::<Vec<AgentRecord>>(&t).ok())
+            .flatten()
+            .map(|r| r.id)
+            .collect();
         {
             if let Some(home) = self.codex_home_dir() {
                 // The one refusal that survives, and it is the half that was
