@@ -1431,14 +1431,13 @@ mod tests {
     /// carries between app launches, what `list_agents`/`session_roles` hand
     /// the webview, and what the frontend matches on to decide a roster row's
     /// badge. Changing one is a breaking change to a state file, not a rename.
-    const WIRE_NAMES: [(Role, &str); 7] = [
+    const WIRE_NAMES: [(Role, &str); 6] = [
         (Role::Orchestrator, "orchestrator"),
         (Role::Worker, "worker"),
         (Role::Reviewer, "reviewer"),
         (Role::Planner, "planner"),
         (Role::Manager, "manager"),
         (Role::Solo, "solo"),
-        (Role::Lead, "lead"),
     ];
 
     /// `Role`'s serde form is `rename_all = "lowercase"`, and this states it
