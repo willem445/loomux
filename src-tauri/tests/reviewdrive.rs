@@ -9189,3 +9189,102 @@ fn a_code_fail_at_the_bound_still_parks_immediately() {
     );
     assert!(!status_grace(&reg, &group), "…so it is still there for a body-only round");
 }
+
+/// How many times `src` **assigns** to `field` — `x.field = …`. A comparison
+/// (`x.field == …`) does not match, because the needle requires `= ` and a
+/// comparison has `==` there; nor does a struct-literal `field: …` or a
+/// declaration. See the caller for the residual this leaves.
+///
+/// A second counter beside [`count_calls`] rather than a generalisation of it:
+/// the two match different shapes, and a guard that cannot say which shape it
+/// matched is two guards.
+fn count_assignments(src: &str, field: &str) -> usize {
+    src.matches(&format!(".{field} = ")).count()
+}
+
+/// **#2509's one-shot grace has exactly one writer and one proposal site**, and
+/// this is a default-deny scan that says so.
+///
+/// The whole safety argument for granting a round past INVARIANT 9's bound is
+/// that it is granted ONCE. That is not a property of a `bool` — it is a
+/// property of there being a single writer, in `advance`, on an arc `decide`
+/// refuses to propose twice. A second assignment anywhere in the driver, or a
+/// second site proposing `Counter::BodyOnlyGrace`, is a second place the "never
+/// stacking" rule can be broken, and neither would redden any behavioural test:
+/// each would look locally correct where it stood.
+///
+/// **Decided on shape, never on a name** (CLAUDE.md's source-scanning-guard
+/// convention). The two things counted are a field ASSIGNMENT and an enum
+/// VARIANT path — neither can be spelled another way and still compile, so a
+/// rename moves the whole guard rather than stepping over it. The scan runs over
+/// [`DRIVER_FILES`], a file scope rather than an `rd_*` prefix, for the reason
+/// that list already carries.
+///
+/// **Per file, and each count is a different fact.** `reviewdrive.rs` names the
+/// variant twice — once where `decide_review_wait` proposes the arc, once in
+/// `advance`'s bump arm — and `rdtick.rs` names it once, where the tick reads
+/// the step to decide whether to write `rd-round-grace`. Collapsing the three
+/// into one total would let a second proposal site hide behind a deleted read.
+///
+/// # What this scan cannot see, stated rather than implied
+///
+/// It bounds explicit assignment. It does NOT see a whole-`Counters` write —
+/// `entry.counters = Counters::seeded(n)` — which re-grants the grace along with
+/// the three counts. That is `drive_review(reset_counters: true)`, an explicit,
+/// audited orchestrator decision to spend a fresh budget (§2.3), and it is right
+/// that it restores this one too; a scan refusing it would be refusing the
+/// documented resume. It equally cannot see a struct literal
+/// (`Counters { body_only_grace: false, .. }`), which nothing in the driver
+/// writes today. The compiler is what keeps the field's writers inside the
+/// crate; this is what keeps them countable.
+#[test]
+fn the_one_shot_grace_has_one_writer_and_one_proposal_site() {
+    let expected = |rel: &str| -> (usize, usize, &'static str) {
+        if rel.ends_with("reviewdrive.rs") {
+            (1, 2, "the engine proposes the arc and spends the grace on it")
+        } else if rel.ends_with("rdtick.rs") {
+            (0, 1, "the tick only READS the step, to decide whether to audit")
+        } else {
+            (0, 0, "nothing else in the driver touches the grace at all")
+        }
+    };
+    for rel in DRIVER_FILES {
+        let src = driver_production_source(rel);
+        let (w, p, why) = expected(rel);
+        assert_eq!(
+            count_assignments(&src, "body_only_grace"),
+            w,
+            "{rel}: {why} — assignments to `body_only_grace`"
+        );
+        assert_eq!(
+            src.matches("Counter::BodyOnlyGrace").count(),
+            p,
+            "{rel}: {why} — mentions of `Counter::BodyOnlyGrace`"
+        );
+    }
+
+    // **Self-verifying**: both counters must fire on a planted specimen, in the
+    // SAME shape the scan uses — a control run in another shape certifies
+    // nothing, and a scan that silently matched nothing reads exactly like a
+    // clean one.
+    assert_eq!(
+        count_assignments("fn f() { self.counters.body_only_grace = true; }", "body_only_grace"),
+        1,
+        "the assignment counter must see a real assignment"
+    );
+    assert_eq!(
+        count_assignments("fn f() -> bool { c.body_only_grace == true }", "body_only_grace"),
+        0,
+        "…and must not mistake a comparison for one"
+    );
+    assert_eq!(
+        count_assignments("struct C { body_only_grace: bool }", "body_only_grace"),
+        0,
+        "…nor a field declaration"
+    );
+    assert_eq!(
+        "DriveStep::spend(x, Counter::BodyOnlyGrace)".matches("Counter::BodyOnlyGrace").count(),
+        1,
+        "the variant counter must see a real proposal"
+    );
+}
