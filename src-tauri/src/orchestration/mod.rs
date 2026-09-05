@@ -7932,7 +7932,7 @@ pub fn single_pane_autopilot_flags(program: &str) -> String {
         // invariant and for the reason pi's arm gives: "they agree there is
         // nothing to put on the LINE" is a claim, and two independent
         // `String::new()`s could not make it.
-        "codex" => String::new(),
+        "codex" => "-a never".to_string(),
         _ => String::new(),
     }
 }
