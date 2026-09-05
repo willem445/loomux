@@ -1499,6 +1499,34 @@ mod tests {
 
     // ---- the setup phase's shape, on fake steps ----
 
+    /// The fake phase's shared budget, and how long each fake step overruns the
+    /// deadline it is handed — which is what a bounded capture does when it has
+    /// to reap the child it killed.
+    ///
+    /// **Both are sized against a failure mode, not picked.** The first draft
+    /// used 30 ms and 200 ms, and each had a defect a green run cannot show you
+    /// (#2661 review, rev-std 1 and rev-final W2):
+    ///
+    /// - The BUDGET is the window in which the first step must be STARTED. At
+    ///   30 ms, a scheduler stall of 30 ms between `Instant::now()` and
+    ///   `run_setup_steps`'s first clock read leaves `left` zero, starts nothing,
+    ///   and reddens the start-count assert with nothing wrong. Half a second is
+    ///   beyond any plausible preemption on a CI runner, and a correct phase
+    ///   still costs only budget + one overrun.
+    /// - The OVERRUN sets what the un-fixed code costs, and the ceiling has to
+    ///   sit strictly below that or the clock assert is a coin flip under the
+    ///   very mutation it exists for. At 30 + 200 + 400 the ceiling was 630 ms
+    ///   and the un-fixed three-step cost was also ~630 ms — the same number, so
+    ///   only the FOUR-step arm ever separated.
+    const PHASE_BUDGET: Duration = Duration::from_millis(500);
+    const PHASE_OVERRUN: Duration = Duration::from_millis(500);
+
+    /// Tolerance for a CI runner whose `sleep` is not a metronome. It is what is
+    /// left over once the ceiling has cleared the un-fixed cost, not a number
+    /// chosen first: 500 + 500 + 400 = 1400 ms, 600 ms clear of the 2000 ms an
+    /// un-fixed three-step phase takes.
+    const PHASE_SLACK: Duration = Duration::from_millis(400);
+
     /// Run `count` steps that each overrun whatever deadline they are given by
     /// `overrun` — which is exactly what a bounded capture does when it has to
     /// reap the child it killed. Returns how many were STARTED and how long the
@@ -1532,47 +1560,45 @@ mod tests {
         // Pinned by adding a step rather than by arithmetic over a count, which
         // is the shape #2397 review B1 removed from this module — a count is
         // exactly what a fourth step falsifies in silence.
-        // **Both figures below are sized against a failure mode, not picked.**
-        // The first draft used a 30 ms budget and a 200 ms overrun, and each of
-        // those numbers had a defect that a green run cannot show you (#2661
-        // review, rev-std 1 and rev-final W2):
-        //
-        // - The BUDGET is the window in which the first step must be started.
-        //   At 30 ms, a scheduler stall of 30 ms between `Instant::now()` and
-        //   `run_setup_steps`'s first clock read leaves `left` zero, starts
-        //   nothing, and reddens `three_started == 1` with nothing wrong. Half a
-        //   second is beyond any plausible preemption on a CI runner, and the
-        //   phase still costs only budget + overrun when the code is correct.
-        // - The CEILING must sit strictly BELOW what the un-fixed code costs, or
-        //   the clock assert is a coin flip under the very mutation it exists
-        //   for. At 30 + 200 + 400 the ceiling was 630 ms and the un-fixed
-        //   three-step cost was also ~630 ms — the same number. The arithmetic
-        //   is set out beside the assert below.
-        let budget = Duration::from_millis(500);
-        let overrun = Duration::from_millis(500);
-        let (three_started, three_took) = overrunning_phase(3, budget, overrun);
-        let (four_started, four_took) = overrunning_phase(4, budget, overrun);
+        let (three_started, _) = overrunning_phase(3, PHASE_BUDGET, PHASE_OVERRUN);
+        let (four_started, _) = overrunning_phase(4, PHASE_BUDGET, PHASE_OVERRUN);
 
         assert_eq!(three_started, 1, "only the step that had time left may run");
         assert_eq!(four_started, three_started, "a fourth step must not add a fourth start");
+    }
 
-        // The clock is a SECOND witness, and it is only a witness if it can
-        // fail. Correct, a phase costs budget + one overrun whatever its step
-        // count: 500 + 500 = 1000 ms. Un-fixed, every step is started and each
-        // overruns, so N steps cost budget + N x overrun — 2000 ms for three and
-        // 2500 ms for four.
+    #[test]
+    fn the_setup_phase_costs_one_overrun_however_many_steps_it_has() {
+        // The CLOCK witness for the test above, and split out of it (#2661
+        // review, rev-final W2) rather than left as three more asserts at the
+        // end of it.
         //
-        // The ceiling therefore has to separate 1000 from 2000, and the slack is
-        // what is left over: 400 ms of tolerance for a CI runner whose `sleep` is
-        // not a metronome, leaving a 600 ms margin below the nearest un-fixed
-        // figure. Both arms discriminate, which was the point of the finding —
-        // the previous ceiling only separated the FOUR-step arm.
-        let ceiling = budget + overrun + Duration::from_millis(400);
+        // A red evidences only the assertion it REACHED. Both witnesses fail
+        // under the same mutation, and the start-count assert runs first, so
+        // while they shared a test the clock assert had never been observed
+        // failing at all — its message could not reach a log, and "the clock
+        // says the same thing the start count does" was a claim with no round
+        // behind it. Separated, one neuter reddens two tests and each says its
+        // own thing.
+        //
+        // Correct, a phase costs budget + ONE overrun whatever its step count:
+        // 500 + 500 = 1000 ms. Un-fixed, every step is started and every step
+        // overruns, so N steps cost budget + N x overrun — 2000 ms for three and
+        // 2500 ms for four. The ceiling has to separate 1000 from 2000.
+        let (_, three_took) = overrunning_phase(3, PHASE_BUDGET, PHASE_OVERRUN);
+        let (_, four_took) = overrunning_phase(4, PHASE_BUDGET, PHASE_OVERRUN);
+
+        let ceiling = PHASE_BUDGET + PHASE_OVERRUN + PHASE_SLACK;
+        // The property the two asserts below rest on, pinned rather than left in
+        // a comment: a later edit that shrinks the overrun makes the ceiling
+        // meet the un-fixed cost again and this test goes red, instead of going
+        // quietly vacuous the way it did the first time (the ceiling was 630 ms
+        // against an un-fixed 630 ms — the same number).
         assert!(
-            ceiling < budget + overrun * 3,
-            "the ceiling must sit below the un-fixed three-step cost, or the assert below \
-             is a coin flip: ceiling {ceiling:?} vs un-fixed {:?}",
-            budget + overrun * 3
+            ceiling < PHASE_BUDGET + PHASE_OVERRUN * 3,
+            "the ceiling must sit below the un-fixed three-step cost, or the asserts below \
+             are a coin flip: ceiling {ceiling:?} vs un-fixed {:?}",
+            PHASE_BUDGET + PHASE_OVERRUN * 3
         );
         assert!(three_took < ceiling, "three steps took {three_took:?}, ceiling {ceiling:?}");
         assert!(four_took < ceiling, "four steps took {four_took:?}, ceiling {ceiling:?}");
