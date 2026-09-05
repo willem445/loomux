@@ -76,7 +76,7 @@ export function isBlockKind(v: string): v is BlockKind {
  *  only containment axis is an all-or-nothing `sandbox_mode`. A pane's
  *  validation surface must not try to reproduce that rule; it belongs to
  *  `cli_can_host`, which quotes the measured reason back. */
-export const WORKFLOW_CLIS = ["claude", "codex", "copilot", "gemini", "opencode", "pi"] as const;
+export const WORKFLOW_CLIS = ["claude", "copilot", "gemini", "opencode", "pi", "codex"] as const;
 export type WorkflowCli = (typeof WORKFLOW_CLIS)[number];
 
 export function isWorkflowCli(v: string): v is WorkflowCli {

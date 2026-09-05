@@ -61793,19 +61793,46 @@ fn every_argv_seam_cli_has_a_solo_mcp_arm() {
     let (reg, dir) = test_registry();
     let cwd = dir.path().to_string_lossy().into_owned();
     let seam: Vec<&str> = CLI_CAPS.iter().filter(|c| c.mcp_argv_seam).map(|c| c.cli).collect();
-    assert!(
-        seam.contains(&"pi"),
-        "this test is vacuous unless the table really has pi as a seam CLI: {seam:?}"
-    );
+    for expect in ["pi", "codex"] {
+        assert!(
+            seam.contains(&expect),
+            "this test is vacuous unless the table really has {expect} as a seam CLI: {seam:?}"
+        );
+    }
     for cli in seam {
         let out = reg
             .solo_prepare(cli, &cwd, &format!("solo-{cli}"))
             .unwrap_or_else(|e| panic!("solo_prepare({cli}) must not fail: {e}"));
         let args = out["mcp_args"].as_str().unwrap_or_default();
+        // The flag string must name the artifact loomux just wrote for this
+        // pane, and WHICH substring says so is per-CLI.
+        //
+        // This used to be `args.contains("mcp")`, which was true of every seam
+        // CLI only while every seam flag was literally `--mcp-config` /
+        // `--additional-mcp-config`. codex (#2515 C1) took the specimen out of
+        // that class: its seam is `-p <profile>`, one indirection further out,
+        // and the word "mcp" appears nowhere on its line. Per CLAUDE.md the
+        // property is relocated onto a witness that still distinguishes rather
+        // than relaxed to fit — so the map below is TOTAL over the seam set,
+        // and a new seam CLI panics here asking for its row instead of
+        // silently passing on a substring that means nothing for it.
+        let want = match cli {
+            "claude" | "copilot" | "pi" => "mcp",
+            // Not "-p": that is two characters and would match almost any
+            // path. The generated profile NAME is the thing only this pane's
+            // own artifact can supply.
+            "codex" => "orrerix-solo-",
+            other => panic!(
+                "{other} is declared argv-seam but this test has no row saying what its solo \
+                 flags must contain — add one beside the `solo_prepare` arm rather than \
+                 weakening the assertion"
+            ),
+        };
         assert!(
-            args.contains("mcp"),
-            "{cli} is declared argv-seam, so solo_prepare must produce its MCP flags — an empty \
-             string here is the arm that used to be `unreachable!()`: {out}"
+            args.contains(want),
+            "{cli} is declared argv-seam, so solo_prepare must produce flags naming this pane's \
+             own generated config (expected to contain {want:?}) — an empty string here is the \
+             arm that used to be `unreachable!()`: {out}"
         );
         assert_eq!(
             out["delivery_only"],

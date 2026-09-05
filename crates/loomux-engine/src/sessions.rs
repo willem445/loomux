@@ -1521,6 +1521,121 @@ pub fn scan_codex_jsonl(path: &Path) -> CodexSessionHead {
     CodexSessionHead { id, title, cwd, orch }
 }
 
+/// The outcome of one look for a codex pane's own session (#2515 C1).
+///
+/// Three states rather than an `Option`, and it is the third that earns the
+/// type: several panes in one group routinely share a directory (the
+/// orchestrator, a reviewer, any worker without its own worktree), so "two
+/// rollouts appeared under this cwd and neither is distinguishable" is a real
+/// and recurring answer that must never collapse into "here is one of them".
+/// Deliberately the same shape as `opencodedb::Identified`, which the one
+/// caller already knows how to consume, so the two stores' answers cannot come
+/// apart in that `match`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CodexIdentified {
+    /// Nothing new under this directory yet — keep polling.
+    None,
+    One(String),
+    /// More than one candidate, carrying how many. Refused, never guessed.
+    Contested(usize),
+}
+
+/// Every thread id the store currently holds — the baseline snapshot taken
+/// immediately before a codex pane is spawned, so the rollout it goes on to
+/// create can be told from the ones that were already there.
+///
+/// Ids come from the FILE NAME (`codex_rollout_thread_id_of`), not from
+/// headers: a baseline is taken on the spawn path, where a read per session
+/// ever recorded would be paid for nothing. The name is authoritative enough
+/// for this question — it only has to be the same string
+/// [`newest_new_codex_session`] will later compare against, and that function
+/// derives its own ids the same way before it opens anything.
+///
+/// An unreadable store yields an EMPTY set, which is the dangerous direction
+/// and is why the caller does not use this alone: `capture_session_baseline`
+/// refuses to watch at all when it cannot take a real snapshot, because an
+/// empty baseline makes every pre-existing session a candidate. What is empty
+/// here is only ever "codex has never run", which `find_codex_session_cwd`
+/// treats the same way.
+pub fn codex_session_ids(root: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    walk_codex_session_files(root, |path| -> Option<()> {
+        let name = path.file_name().and_then(|s| s.to_str())?;
+        ids.insert(codex_rollout_thread_id_of(name)?.to_string());
+        // Always `None`: the walker stops on the first `Some`, and this visits
+        // every file on purpose.
+        None
+    });
+    ids
+}
+
+/// The codex session a just-spawned pane created: a rollout absent from
+/// `baseline`, not already `claimed` by another pane in this group, whose
+/// header records `cwd`.
+///
+/// **A cwd match is REQUIRED, with no newest-wins fallback**, and that is the
+/// one place this departs from `newest_new_copilot_session` above. copilot
+/// falls back to the newest fresh session because it may not have written a
+/// `workspace.yaml` yet, so "no cwd match" there is routinely "not yet". codex
+/// writes `cwd` in the rollout's FIRST line, at creation, so a file that exists
+/// and does not match this directory is a different pane's session, full stop —
+/// and binding it would hand this pane somebody else's conversation. Failing to
+/// identify is recoverable and visible (`session-untracked` in the audit); a
+/// wrong binding is neither.
+///
+/// The consequence, stated rather than left to be discovered: a rollout whose
+/// header cannot be read — torn mid-write, or a `.zst` this module deliberately
+/// does not decompress — never matches. For a torn header that is a single
+/// missed poll and the next one succeeds. A compressed rollout is seven days
+/// old and cannot be the one this pane just made, so excluding it is correct
+/// rather than a degrade.
+///
+/// `claimed` is what stops two panes in one directory both binding the same
+/// id, and it is only half the guard: `associate_session` refuses the same
+/// collision again under the lock that performs the write, because two watchers
+/// can both read this exclusion before either writes.
+pub fn newest_new_codex_session(
+    root: &Path,
+    baseline: &HashSet<String>,
+    cwd: &str,
+    claimed: &HashSet<String>,
+) -> CodexIdentified {
+    let want = norm_path(cwd);
+    if want.is_empty() {
+        // A pane with no recorded directory cannot be told from any other, so
+        // there is nothing to match against. Never "take the newest".
+        return CodexIdentified::None;
+    }
+    let mut hits: Vec<String> = Vec::new();
+    walk_codex_session_files(root, |path| -> Option<()> {
+        let name = path.file_name().and_then(|s| s.to_str())?;
+        let id = codex_rollout_thread_id_of(name)?;
+        if baseline.contains(id) || claimed.contains(id) {
+            return None;
+        }
+        // Only now is a file opened. The two set lookups above are what keep a
+        // poll every second from costing one header read per session in the
+        // store: on the ordinary tick every candidate is in the baseline.
+        let header = codex_header(path)?;
+        // The header decides the id as well as the cwd, exactly as
+        // `find_codex_session_cwd` has it: a file whose header names a
+        // different thread is not this session whatever its name says.
+        if header.pointer("/payload/id").and_then(Value::as_str).is_some_and(|h| h != id) {
+            return None;
+        }
+        let recorded = header.pointer("/payload/cwd").and_then(Value::as_str).unwrap_or_default();
+        if norm_path(recorded) == want {
+            hits.push(id.to_string());
+        }
+        None
+    });
+    match hits.len() {
+        0 => CodexIdentified::None,
+        1 => CodexIdentified::One(hits.remove(0)),
+        n => CodexIdentified::Contested(n),
+    }
+}
+
 #[cfg(test)]
 mod orch_signature_tests {
     use super::detect_orch_signature;
