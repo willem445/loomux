@@ -8243,7 +8243,12 @@ fn build_agent_argv_matches_command_line() {
     // Every adapter, not just the two the matrix started with: an arm only one
     // of the two builders emits is precisely the drift this exists to catch,
     // and a CLI absent from the list is an arm nobody is checking.
-    for cli in ["claude", "copilot", "gemini", "opencode", "pi", "totally-unknown-cli"] {
+    // codex joined with #2515 C1. Its arms are the ones this matrix is most
+    // worth running over: they are the only pair where the two forms differ in
+    // SHAPE rather than only in quoting — the string form appends
+    // ` resume <id>` while the argv form pushes two tokens — so a divergence
+    // here is a real possibility rather than a formality.
+    for cli in ["claude", "codex", "copilot", "gemini", "opencode", "pi", "totally-unknown-cli"] {
         for auto_ops in [false, true] {
             // Every tier, not just the two that existed before #462 — a
             // middle tier that only one of the two forms emits is exactly the

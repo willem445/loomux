@@ -1677,7 +1677,11 @@ test("a remote block must SPELL OUT cli: claude (#1457)", () => {
   // inherits the group default — picked at launch, unknowable to a parser — so
   // it is refused rather than parsed into a promise the spawn would have to
   // break.
-  for (const cli of ["copilot", "gemini", "opencode", "pi"]) {
+  // codex joined with #2515 C1, for the ORDINARY reason — it recognizes a
+  // session by scanning a local store — so it is the plainest member of this
+  // loop, and it is here to keep the pane's mirror total as WORKFLOW_CLIS grows
+  // rather than because anything about it is special.
+  for (const cli of ["copilot", "gemini", "opencode", "pi", "codex"]) {
     const f = analyzeWorkflow(remoteDoc({ kind: "worker", cli, remote: "buildbox" })).findings;
     assert.ok(has(f, "remote-requires-claude"), `${cli}: ${codes(f)}`);
   }
