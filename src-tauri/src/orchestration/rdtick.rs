@@ -290,6 +290,14 @@ struct RdLaneOpen {
     /// `rd-lane-resume-failed` is a separate row rather than a flag here: this
     /// says what happened, that says what was tried.
     resumed: bool,
+    /// The round's scope line exactly as the brief rendered it (#2508) — the
+    /// one fact about the round that nothing else on the row records, so a
+    /// before/after count of whole-diff rounds does not re-derive it. Computed
+    /// BEFORE `open_lane` writes the record, the same point the brief itself
+    /// sampled, and threaded out for that reason: re-deriving it after the
+    /// record was written would read `at_head == head` and answer
+    /// `body-only` for every round.
+    scope: String,
 }
 
 /// What one entry's step produced, for the caller to emit outside the lock.
@@ -401,6 +409,43 @@ pub struct RdDriveReport {
     /// Set when the tick refused outright — a `review_drives.json` this build
     /// will not read (§2.4). **Not** the same as "nothing was driven".
     pub refused: Option<&'static str>,
+}
+
+/// The round's scope line for one lane brief (#2508) — `scope: whole-diff` |
+/// `scope: delta since <prev head>` | `scope: body-only` — the machine-visible
+/// trigger the rev-std persona's Rule 6 acts on.
+///
+/// **Derived from the same facts the brief's own arms read, and nothing else.**
+/// `verify` decides first — a verification round reads the body as it stands,
+/// which is `body-only` by definition, and the grant can arrive on a lane with
+/// no record (the undriven-to-driven transition, #2308 W1), so the lane history
+/// cannot be asked before it. Otherwise `entry.lane(block)` is the lane's own
+/// history, sampled BEFORE `open_lane` writes the record, exactly as
+/// `rd_lane_brief`'s template-arm `match` does — a lane with no record has
+/// never measured this PR, so it gets the whole diff whatever the round counter
+/// says (round 1 is always that lane state, which is why round 1 never says
+/// delta: structurally, there is no previous revision to name). A re-brief then
+/// follows the delta arm's own split: an unchanged head is a body-only round,
+/// and a moved head names the revision it is a delta from.
+///
+/// The three values are a closed set, and the line is rendered into the brief
+/// AND carried on the `rd-lane-spawned` audit row, so a reader counting
+/// whole-diff rounds for a beta's before/after does not re-derive them from
+/// round numbers and head moves.
+fn rd_lane_scope(
+    entry: &reviewdrive::DriveEntry,
+    block: &str,
+    brief: &RdBrief,
+    verify: bool,
+) -> String {
+    if verify {
+        return "scope: body-only".to_string();
+    }
+    match entry.lane(block).filter(|l| !l.at_head.is_empty()) {
+        Some(rec) if rec.at_head == brief.head => "scope: body-only".to_string(),
+        Some(rec) => format!("scope: delta since {}", rd_fact(&rec.at_head)),
+        None => "scope: whole-diff".to_string(),
+    }
 }
 
 impl OrchRegistry {
@@ -1221,7 +1266,13 @@ impl OrchRegistry {
         if block.is_empty() {
             return Err("no lane at that index".into());
         }
-        let text = self.rd_lane_brief(entry, block, brief, limits, verify);
+        // #2508: the scope is derived ONCE, here, at the same pre-record point
+        // the brief renders from, and threaded both into the render and out on
+        // [`RdLaneOpen`] for the `rd-lane-spawned` audit row — two
+        // derivations would read the same state today and could drift the day
+        // one of them moves after `open_lane` writes.
+        let scope = rd_lane_scope(entry, block, brief, verify);
+        let text = self.rd_lane_brief(entry, block, brief, limits, verify, &scope);
         // **The lane's session is the pane's session, and the record is only
         // one of the two places it is written** (#2109).
         //
@@ -1422,7 +1473,7 @@ impl OrchRegistry {
             anchor,
             verify,
         );
-        Ok(RdLaneOpen { agent, session: session_id, resumed })
+        Ok(RdLaneOpen { agent, session: session_id, resumed, scope })
     }
 
     /// The session a lane must be RESUMED on, or `None` when this build cannot
@@ -1886,6 +1937,7 @@ impl OrchRegistry {
         brief: &RdBrief,
         limits: &reviewdrive::DriveLimits,
         verify: bool,
+        scope: &str,
     ) -> String {
         let round = entry.counters.review_rounds.saturating_add(1).to_string();
         let max = limits.max_review_rounds.to_string();
@@ -2044,6 +2096,7 @@ impl OrchRegistry {
                         ("CI", ci),
                         ("ROUND", &round),
                         ("MAX_ROUNDS", &max),
+                        ("SCOPE", scope),
                     ],
                 )
             }
@@ -2085,6 +2138,7 @@ impl OrchRegistry {
                         // transition — is briefed HERE, and before this it was
                         // stamped `briefed_verify` without ever being told.
                         ("VERIFICATION", verification),
+                        ("SCOPE", scope),
                     ],
                 )
             }
@@ -2575,7 +2629,7 @@ impl OrchRegistry {
                 // because a re-open the cap refused has re-opened nothing.
                 let replaced = entry.lane(&block).and_then(|rec| self.rd_dead_lane_pane(rec));
                 match self.rd_open_lane(group, entry, &block, &brief, limits, now, *verify) {
-                    Ok(RdLaneOpen { agent, session, resumed }) => {
+                    Ok(RdLaneOpen { agent, session, resumed, scope }) => {
                         entry.lane_index = *index;
                         if let Some((pane, killed_by)) = replaced {
                             out.audits.push((
@@ -2603,9 +2657,13 @@ impl OrchRegistry {
                             // same kind of pane id, and the same brief, so the
                             // only pre-#2109 way to tell nine panes from six was
                             // to count them by hand across three PRs.
+                            // #2508: `scope` beside them, the same string the
+                            // brief rendered — a reader counting whole-diff
+                            // rounds for a beta's before/after reads it here
+                            // rather than re-deriving it from round numbers.
                             json!({ "pr": pr, "block": block, "agent": agent,
                                     "head": brief.head, "session": session,
-                                    "resumed": resumed,
+                                    "resumed": resumed, "scope": scope,
                                     "round": entry.counters.review_rounds + 1 }),
                         ));
                     }

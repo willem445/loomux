@@ -6,4 +6,6 @@ Your previous verdict was {{PREV_VERDICT}} at head {{PREV_HEAD}}, and the PR bod
 
 {{CI}} This is round {{ROUND}} of at most {{MAX_ROUNDS}}.
 
+{{SCOPE}}
+
 Re-run your pass over what moved, post the review, and record it with review_verdict at head {{HEAD}}.

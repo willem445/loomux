@@ -1275,6 +1275,8 @@ fn the_first_call_brief_is_byte_for_byte_what_a_reviewer_receives() {
              \n\
              Your lane is rev-std. This is round 1 of at most 3.\n\
              \n\
+             scope: whole-diff\n\
+             \n\
              Post your review on the PR, then record it with review_verdict at head {HEAD_A}. \
              A verdict binds to a revision: if the head has moved by the time you record, \
              re-read at the new head rather than recording against this one.\n"
@@ -1918,6 +1920,177 @@ fn a_lane_that_has_answered_is_re_briefed_with_the_delta_template() {
         "…and it must name the revision that lane previously answered at: {delta}"
     );
     assert!(delta.contains(HEAD_B), "…and the one it is being asked about now: {delta}");
+}
+
+/// **#2508: the brief states the round's scope on one machine-readable line** —
+/// `scope: whole-diff` | `scope: delta since <sha>` | `scope: body-only` — and
+/// the rev-std persona keys how wide the round measures off that line.
+///
+/// One drive per mode, each asserting its own scope line AND the absence of the
+/// other two: a scope that silently widened is the exact defect the issue
+/// measures — late blockers in round-1 code a delta-scoped round never saw.
+/// The negative control is the first drive and it is structural, not asserted
+/// into existence: round 1 has no previous revision to name, so a delta line
+/// there means the derivation read a lane record that did not exist.
+///
+/// The `rd-lane-spawned` audit row carries the same string, asserted on the
+/// whole-diff drive — the row is what a beta's before/after count reads, and a
+/// row that disagreed with the brief would make that count measure nothing.
+#[test]
+fn the_lane_brief_names_the_round_scope_on_every_round_mode() {
+    // ── whole-diff: a first round, nothing has ever been briefed or answered ──
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let (group, agent) = briefed(&reg, &repo, &gh);
+        let brief = lane_brief(&reg, &agent);
+        assert!(
+            brief.contains("scope: whole-diff"),
+            "a first-round brief must be scoped to the whole diff: {brief}"
+        );
+        assert!(
+            !brief.contains("scope: delta"),
+            "round 1 never says delta — there is no previous revision to name: {brief}"
+        );
+        assert!(
+            !brief.contains("scope: body-only"),
+            "a first-round brief is not a verification round: {brief}"
+        );
+        let row = lane_spawn_rows(&reg, &group)
+            .last()
+            .cloned()
+            .expect("the first round spawned a lane, which emitted rd-lane-spawned");
+        assert_eq!(
+            row["scope"], json!("scope: whole-diff"),
+            "rd-lane-spawned must carry the scope the brief rendered: {row}"
+        );
+    }
+    // ── delta since: the lane answered at HEAD_A, the head moved to HEAD_B ──
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let (group, _s) = driven(&reg, &repo, &gh);
+        let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+        with_pane(&reg, &orch.id, 7001);
+        reg.set_pr_head_override(Some(HEAD_A.to_string()));
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+        let (_pr, _b, lane) = first.lanes_opened.first().cloned().expect("lane 0 opens");
+        // The lane answers at HEAD_A through the real recording path (the same
+        // fixture `a_lane_that_has_answered_is_re_briefed_with_the_delta_template`
+        // uses), then the head moves and the drive re-briefs it.
+        dispatch(
+            &reg,
+            &Caller {
+                agent_id: lane.clone(),
+                group: group.clone(),
+                role: Role::Reviewer,
+                role_hint: None,
+            },
+            "tools/call",
+            &json!({ "name": "review_verdict", "arguments": {
+                "pr": "1758", "verdict": "pass", "summary": "pass - nothing blocking" } }),
+        )
+        .expect("the lane records");
+        gh.set_facts("OPEN", HEAD_B);
+        reg.set_pr_head_override(Some(HEAD_B.to_string()));
+        reg.rd_drive_group_with(&group, &gh, 30_000); // review-wait -> ci-wait
+        reg.rd_drive_group_with(&group, &gh, 40_000); // ci-wait -> review-wait
+        let again = reg.rd_drive_group_with(&group, &gh, 50_000); // re-brief
+        let (_pr, _b, lane2) = again
+            .lanes_opened
+            .first()
+            .cloned()
+            .expect("the stale lane must be re-briefed at the new head");
+        let delta = lane_brief(&reg, &lane2);
+        assert!(
+            delta.contains(&format!("scope: delta since {HEAD_A}")),
+            "a re-brief at a moved head must name the revision it deltas from: {delta}"
+        );
+        assert!(
+            !delta.contains("scope: whole-diff"),
+            "a delta brief must not claim the whole diff: {delta}"
+        );
+        assert!(
+            !delta.contains("scope: body-only"),
+            "the head moved, so this is not a body-only round: {delta}"
+        );
+        let row = lane_spawn_rows(&reg, &group)
+            .last()
+            .cloned()
+            .expect("the re-brief spawned a lane, which emitted rd-lane-spawned");
+        assert_eq!(
+            row["scope"], json!(format!("scope: delta since {HEAD_A}")),
+            "rd-lane-spawned must carry the scope the brief rendered: {row}"
+        );
+    }
+    // ── body-only: the verification round (#2308 E2) — head unchanged, body moved ──
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let (group, _s) = driven(&reg, &repo, &gh);
+        let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+        with_pane(&reg, &orch.id, 7001);
+        reg.set_pr_head_override(Some(HEAD_A.to_string()));
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+        let (_pr, _b, lane) = first.lanes_opened.first().cloned().expect("lane 0 opens");
+        dispatch(
+            &reg,
+            &Caller {
+                agent_id: lane.clone(),
+                group: group.clone(),
+                role: Role::Reviewer,
+                role_hint: None,
+            },
+            "tools/call",
+            &json!({ "name": "review_verdict", "arguments": {
+                "pr": "1758", "verdict": "pass", "summary": "pass - nothing blocking" } }),
+        )
+        .expect("the lane records");
+        // End the lane's turn the way a reviewer does, so the re-brief is not
+        // refused as a duplicate (#2109/#2162) — the premise
+        // `a_verification_brief_announces_itself_on_every_path_that_grants_it`
+        // documents for the same fixture.
+        dispatch(
+            &reg,
+            &Caller {
+                agent_id: lane.clone(),
+                group: group.clone(),
+                role: Role::Reviewer,
+                role_hint: None,
+            },
+            "tools/call",
+            &json!({ "name": "report", "arguments": {
+                "outcome": "approved", "note": "nothing blocking", "ref": "#1758" } }),
+        )
+        .expect("the lane reports, which ends its turn");
+        // A body-only edit at the unchanged head: every lane has passed the
+        // code, so `decide_review_wait` grants `verify` — the body-only round.
+        gh.set_body("the body somebody edited afterwards");
+        reg.set_pr_body_override(Some("the body somebody edited afterwards".to_string()));
+        let opened = tick_until_lane(&reg, &gh, &group, 30_000);
+        let agent = opened.unwrap_or_else(|| panic!("the verification round must re-brief"));
+        let text = lane_brief(&reg, &agent);
+        assert!(
+            text.contains("scope: body-only"),
+            "a verification round must be scoped to the body: {text}"
+        );
+        assert!(
+            !text.contains("scope: whole-diff"),
+            "a verification round must not re-measure the whole diff: {text}"
+        );
+        assert!(
+            !text.contains("scope: delta since"),
+            "the head did not move, so there is no revision to delta from: {text}"
+        );
+    }
 }
 
 /// **A resume with a NEW session drops the old pane**, because that pane is an

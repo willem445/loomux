@@ -144,7 +144,7 @@ blocks:
 
   # -- reviewers: rev-std runs every round; rev-final ONCE, last, code PRs only
   - id: rev-std
-    name: "Standard review (EVERY ROUND - GLM Flash; every finding must carry a repro; iterate to PASS with a FINAL body)"
+    name: "Standard review (EVERY ROUND - GLM Flash; round 1 measures the WHOLE diff, later rounds the scope line the brief names; every finding must carry a repro; iterate to PASS with a FINAL body)"
     kind: reviewer
     cli: opencode
     model: openrouter/z-ai/glm-5.3-flash
