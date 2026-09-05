@@ -209,11 +209,11 @@ pub fn classify_ssh_add_line(line: &str) -> SshAddEvent {
     // refused a launch with the key never offered (#2397 review W3). The two
     // templates are disjoint — the retry says `try again for`, not `Enter
     // passphrase for` — so testing the ask first is total, not a tie-break.
+    if line.contains("Bad passphrase") {
+        return SshAddEvent::BadPassphrase;
+    }
     if line.contains("Enter passphrase for") {
         return SshAddEvent::Prompt;
-    }
-    if line.contains("Bad passphrase, try again for") {
-        return SshAddEvent::BadPassphrase;
     }
     if line.contains("Identity added") {
         return SshAddEvent::Added;
