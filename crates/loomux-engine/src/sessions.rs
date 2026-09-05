@@ -1325,7 +1325,7 @@ fn find_codex_session_cwd(root: &Path, session_id: &PathSegment) -> Result<Optio
             // Compressed, torn, or not a `session_meta` line: found, workspace
             // unknown. Deliberately NOT `None`, which would read as "no such
             // session" for a session that demonstrably exists.
-            None => Some(String::new()),
+            None => None,
         }
     }))
 }
