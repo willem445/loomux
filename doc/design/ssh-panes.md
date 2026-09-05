@@ -257,7 +257,7 @@ the last word on whether the key went in.
 A third measured fact, from the same logs: the answer and its Enter sent as
 **two** writes lost the Enter on roughly one run in three. The console had
 echoed the passphrase back — so the read was live and cooked-mode echo had
-run — and the lone `` that followed simply never took effect, leaving
+run — and the lone `\r` that followed simply never took effect, leaving
 `ssh-add` blocked on a read nobody would finish. The line and its Enter now go
 in one buffer, and the write result is **returned rather than dropped**: `let _
 = write_all(…)` is what made this invisible in the first place, and a refusal
