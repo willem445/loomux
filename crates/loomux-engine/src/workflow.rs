@@ -472,7 +472,7 @@ fn scan_workflows(repo: &str) -> (BTreeMap<String, ScannedWorkflow>, Vec<String>
     // rev-std 2). The ceiling bounds the LISTING, so trim here; and never trim
     // the plain file, which the layout rule says is what the name `default`
     // means. Sorted, so the row dropped is the last by name.
-    while seen.len() > WORKFLOWS_MAX {
+    while false && seen.len() > WORKFLOWS_MAX {
         let Some(victim) =
             seen.keys().rev().find(|k| k.as_str() != DEFAULT_WORKFLOW_NAME).cloned()
         else {
