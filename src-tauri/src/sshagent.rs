@@ -78,7 +78,31 @@ use std::time::{Duration, Instant};
 /// review B1 it then waited for that child unbounded. “Enforced” has to survive
 /// the last statement, not just the loop — so the reap is bounded too, and its
 /// budget is part of this sum rather than a step outside it.
-pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(27);
+///
+/// The fourth term is [`SETUP_STEP_OVERRUN`], and it is the same omission one
+/// layer out: each setup step is a `capture_raw_with_timeout`, whose own
+/// post-kill reap runs AFTER the `timeout` it was handed and is therefore
+/// outside [`AGENT_SETUP_BUDGET`]. The shared budget bounds when a step may
+/// **start**; it cannot bound what a step spends past its own deadline. So the
+/// setup phase really ends at its budget plus an overrun, and this constant said
+/// 27 s against a path that could take 33 — three setup steps, three overruns
+/// (#2594 item 2).
+///
+/// One overrun and not one per step, because [`run_setup_steps`] re-reads the
+/// shared deadline BETWEEN steps and stops once it has passed: a step is only
+/// ever started while time remains, so at most one step can be in flight when
+/// the deadline falls. That is what keeps this a construction rather than a
+/// count — a fourth setup step tomorrow costs budget, not another 2 s, and
+/// `a_fourth_setup_step_costs_no_more_than_the_third` pins it.
+pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(29);
+
+/// How far past [`AGENT_SETUP_BUDGET`] the setup phase can run: one bounded
+/// capture's own post-kill reap, which happens after the timeout that capture
+/// was given.
+///
+/// Aliased rather than restated, so a change to the engine's reap budget moves
+/// this number instead of silently falsifying it.
+const SETUP_STEP_OVERRUN: Duration = loomux_engine::subproc::GH_CAPTURE_REAP_TIMEOUT;
 
 /// One deadline shared by **everything before the conversation** — the first
 /// probe, the start attempt, and the re-probe together.
@@ -227,6 +251,33 @@ pub enum SshAddEvent {
 /// for …`) must be recognised before the first ask, or a mistyped passphrase
 /// would be answered with the same wrong passphrase forever.
 pub fn classify_ssh_add_line(line: &str) -> SshAddEvent {
+    classify_ssh_add_chunk(line, true)
+}
+
+/// [`classify_ssh_add_line`] over a chunk cut out of a longer stream.
+///
+/// `at_line_start` says whether `chunk`'s first byte begins a line in the stream
+/// it came from, and it exists for one arm: `Identity added` (#2594 item 4).
+///
+/// `ssh-add` prints that verdict at the start of a line and can print it nowhere
+/// else, while the driver's chunk is the transcript tail since it last acted —
+/// which, right after the passphrase has been sent, begins in the MIDDLE of the
+/// prompt line, where the console's echo of what was typed lands. So a bare
+/// substring test reads a passphrase containing `Identity added` as ssh-add's
+/// own success: a wrong passphrase reported as a loaded key. The real `ssh-add`
+/// reads with echo off and prints nothing back, so this is failure-safe against
+/// the vendor binary and reachable only through the same foreign shim
+/// [`scrub_secret`] defends against (rev-std round 2 f1 on #2397) — anchored
+/// here rather than argued away, because the cost of being wrong is a FALSE
+/// SUCCESS and the anchor is free.
+///
+/// The two asks and the no-agent lines are deliberately left unanchored. The
+/// asymmetry is the reason: missing an ask costs the whole bound and refuses a
+/// launch that would have worked, and ConPTY renders a screen, so an ask can
+/// arrive with a repaint in front of it. Missing a no-agent line costs the
+/// hint, not correctness. Only `Added` can turn a miss into a success that did
+/// not happen.
+pub fn classify_ssh_add_chunk(chunk: &str, at_line_start: bool) -> SshAddEvent {
     // The FIRST ask is tested first, and the retry is matched on the vendor's
     // whole template rather than on `Bad passphrase` alone. Both halves of that
     // are load-bearing, and the reason is that the identity PATH is interpolated
@@ -236,23 +287,47 @@ pub fn classify_ssh_add_line(line: &str) -> SshAddEvent {
     // refused a launch with the key never offered (#2397 review W3). The two
     // templates are disjoint — the retry says `try again for`, not `Enter
     // passphrase for` — so testing the ask first is total, not a tie-break.
-    if line.contains("Enter passphrase for") {
+    if chunk.contains("Enter passphrase for") {
         return SshAddEvent::Prompt;
     }
-    if line.contains("Bad passphrase, try again for") {
+    if chunk.contains("Bad passphrase, try again for") {
         return SshAddEvent::BadPassphrase;
     }
-    if line.contains("Identity added") {
+    if starts_a_line(chunk, "Identity added", at_line_start) {
         return SshAddEvent::Added;
     }
     // Two spellings, both real: the portable string, and the one Win32-OpenSSH
     // prints when the named pipe is not there because the service is stopped.
-    if line.contains("Could not open a connection to your authentication agent")
-        || line.contains("Error connecting to agent")
+    if chunk.contains("Could not open a connection to your authentication agent")
+        || chunk.contains("Error connecting to agent")
     {
         return SshAddEvent::NoAgent;
     }
     SshAddEvent::Other
+}
+
+/// Whether `needle` occurs in `hay` at the start of a line.
+///
+/// `hay`'s own first byte counts as a line start only when `at_line_start` says
+/// the stream it was cut from put it there — the property a substring test
+/// cannot recover once the chunk has been sliced. Both `\n` and `\r` open a
+/// line: a pty echoes CRLF, and a ConPTY repaint can emit a bare `\r`.
+fn starts_a_line(hay: &str, needle: &str, at_line_start: bool) -> bool {
+    let mut from = 0usize;
+    while let Some(offset) = hay[from..].find(needle) {
+        let at = from + offset;
+        let anchored = match at {
+            0 => at_line_start,
+            _ => matches!(hay.as_bytes()[at - 1], b'\n' | b'\r'),
+        };
+        if anchored {
+            return true;
+        }
+        // Past the match rather than one byte on: `at` is a char boundary
+        // `find` gave us and `needle` is ASCII, so this stays on one.
+        from = at + needle.len();
+    }
+    false
 }
 
 /// Where `ssh-add` lives **given** an `ssh` path — pure layout, no filesystem.
@@ -397,36 +472,74 @@ fn try_start_agent(_ssh_add: &Path, _budget: Duration) {}
 /// carried their own ceiling is precisely how the 35 s path in #2397 B1 came to
 /// exist.
 ///
-/// A step given no time left still runs and fails immediately —
-/// `capture_raw_with_timeout` kills at once and `probe_agent` reads a capture it
-/// could not make as `Absent` — so an exhausted budget fails **closed**, into the
-/// refusal that carries the platform's fix, rather than into a launch with no
-/// agent behind it.
-/// **Not covered by a timed test, and the reason is worth stating.** Proving
-/// the budget by the clock needs a program that ignores `-l` and then BLOCKS,
-/// executed directly (`probe_agent` runs `<ssh-add> -l`, not a shell). The
-/// repo's fixture technique is a `.bat`, which `std::process::Command` cannot
-/// launch directly on Windows, and constraint 3 forbids the real `ssh-add` and
-/// `ssh-agent`. So what is pinned is the arithmetic
-/// (`the_stated_worst_case_covers_every_path_because_there_is_only_one_shape`)
-/// and the shape is left to inspection: one `deadline`, computed once, with
-/// `left()` re-read before each of the three steps. Stated rather than left for
-/// a reader to discover the test they expected is absent.
+/// An exhausted budget fails **closed**: [`run_setup_steps`] starts no further
+/// step and nothing below it reports success, so the run ends in the refusal
+/// that carries the platform's fix rather than in a launch with no agent behind
+/// it.
+///
+/// **The real steps are not driven by a timed test, and the reason is worth
+/// stating.** Proving the budget against `ssh-add` by the clock needs a program
+/// that ignores `-l` and then BLOCKS, executed directly (`probe_agent` runs
+/// `<ssh-add> -l`, not a shell). The repo's fixture technique is a `.bat`, which
+/// `std::process::Command` cannot launch directly on Windows, and constraint 3
+/// forbids the real `ssh-add` and `ssh-agent`. What IS pinned is the phase's
+/// shape, on fake steps whose overrun is milliseconds rather than seconds
+/// (`a_fourth_setup_step_costs_no_more_than_the_third`), plus the arithmetic
+/// above it (`the_stated_worst_case_covers_every_path_because_there_is_only_one_shape`).
+/// The step list below — which binaries run, in which order — is still left to
+/// inspection. Stated rather than left for a reader to discover the test they
+/// expected is absent.
 fn ensure_agent(ssh_add: &Path) -> Option<SshAddOutcome> {
     let deadline = Instant::now() + AGENT_SETUP_BUDGET;
-    let left = || deadline.saturating_duration_since(Instant::now());
-
-    if probe_agent(ssh_add, left()) == AgentProbe::Present {
-        return None;
-    }
-    // One attempt to bring it up, then one re-probe. A machine whose agent is
-    // merely stopped is the common case; a Disabled service is the one the hint
-    // is for.
-    try_start_agent(ssh_add, left());
-    if probe_agent(ssh_add, left()) == AgentProbe::Present {
+    // One attempt to bring it up between the two probes. A machine whose agent
+    // is merely stopped is the common case; a Disabled service is the one the
+    // hint is for.
+    let mut steps: Vec<Box<dyn FnMut(Duration) -> bool + '_>> = vec![
+        Box::new(|left| probe_agent(ssh_add, left) == AgentProbe::Present),
+        Box::new(|left| {
+            try_start_agent(ssh_add, left);
+            false
+        }),
+        Box::new(|left| probe_agent(ssh_add, left) == AgentProbe::Present),
+    ];
+    if run_setup_steps(deadline, &mut steps) {
         return None;
     }
     Some(SshAddOutcome::NoAgent { hint: agent_hint() })
+}
+
+/// Run `steps` under ONE shared deadline, stopping at the first step that
+/// settles the question — or at the first moment the deadline has passed.
+///
+/// Each step is handed the time it has left and answers whether it settled the
+/// question. The deadline is re-read BETWEEN steps, so a step is only ever
+/// STARTED while time remains, and that ordering is the whole point (#2594
+/// item 2). A step costs its own timeout plus at most [`SETUP_STEP_OVERRUN`] —
+/// the post-kill reap `capture_raw_with_timeout` runs after the timeout it was
+/// handed, which no caller's budget can reach inside. A phase that never starts
+/// a step past its deadline therefore ends at that deadline plus ONE overrun,
+/// however many steps it has. Checking the clock only INSIDE each step costs
+/// one overrun each instead, which is the arithmetic that had
+/// [`WORST_CASE_TOTAL`] claiming 27 s against a code path that could take 33.
+///
+/// Taking the steps as a list rather than inlining them into [`ensure_agent`] is
+/// what lets that property be pinned at all: a test can hand this fake steps
+/// whose overrun is milliseconds, and add a fourth one to show the bound does
+/// not move (`a_fourth_setup_step_costs_no_more_than_the_third`). Inlined, the
+/// only pin available would be arithmetic over a step count — which is the
+/// enumeration shape #2397 review B1 removed from this module in the first
+/// place.
+fn run_setup_steps(deadline: Instant, steps: &mut [Box<dyn FnMut(Duration) -> bool + '_>]) -> bool {
+    for step in steps.iter_mut() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        if step(left) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The platform's one-time fix for "no agent".
@@ -578,59 +691,98 @@ pub fn drive_ssh_add_with_transcript(
     passphrase: &[u8],
     timeout: Duration,
 ) -> (SshAddOutcome, String) {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-
     let Some((program, args)) = argv.split_first() else {
         return (SshAddOutcome::Failed { detail: "no ssh-add command to run".to_string() }, String::new());
     };
-    let pair = match native_pty_system().openpty(PtySize {
-        rows: 24,
-        cols: 120,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
-        Ok(p) => p,
-        Err(e) => {
-            return (SshAddOutcome::Failed { detail: format!("could not open a console: {e}") }, String::new())
-        }
+    let Wired { master, mut child, mut killer, mut writer, rx } = match open_and_wire(program, args)
+    {
+        Ok(wired) => wired,
+        Err(detail) => return (SshAddOutcome::Failed { detail }, String::new()),
     };
+
+    let mut end = run_conversation(&mut child, &mut writer, &rx, passphrase, timeout);
+
+    // ONE bounded reap, on every way out of the conversation.
+    //
+    // Until #2594 this was two arms and only one of them waited: a run whose
+    // outcome a transcript line had already decided merely KILLED the child, on
+    // the argument that waiting for a status nobody reads was an unbounded
+    // block. Unbounded it is not — the wait here is `reap_bounded`, the same
+    // `CHILD_REAP_BUDGET` poll `WORST_CASE_TOTAL` already carries — and off
+    // Windows the kill-only arm leaked a zombie per launch: `spawn_command`
+    // yields a `std::process::Child` whose `Drop` does no wait, and nothing else
+    // in this process ever reaps it. A `Timeout` was cleaned up and a SUCCESS
+    // was not, and success is the arm every working launch takes (#2594 item 1).
+    if end.status.is_none() {
+        end.status = reap_bounded(&mut child, &mut killer);
+    }
+    let (outcome, seen) = verdict(end, passphrase);
+    close_console_while_the_reader_drains(writer, master, rx);
+    (outcome, seen)
+}
+
+/// The live ends of one hidden console.
+struct Wired {
+    /// Dropping this is `ClosePseudoConsole` — see
+    /// [`close_console_while_the_reader_drains`], which is the only place it
+    /// should happen.
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    writer: Box<dyn std::io::Write + Send>,
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+/// Open the hidden console, spawn `program` on its slave end, and start the
+/// reader thread draining its master. `Err` carries the `detail` of a
+/// [`SshAddOutcome::Failed`].
+///
+/// Split out of [`drive_ssh_add_with_transcript`] (#2594 item 6), and not only
+/// for length: four fallible set-up steps each with their own refusal string
+/// were four early returns out of the middle of that function, and an early
+/// return is a return that skips the reap and the ordered close its tail now
+/// performs exactly once.
+fn open_and_wire(program: &str, args: &[String]) -> Result<Wired, String> {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+    let pair = native_pty_system()
+        .openpty(PtySize { rows: 24, cols: 120, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| format!("could not open a console: {e}"))?;
     let mut builder = CommandBuilder::new(program);
     for a in args {
         builder.arg(a);
     }
-    let child = match pair.slave.spawn_command(builder) {
-        Ok(c) => c,
-        Err(e) => {
-            return (SshAddOutcome::Failed { detail: format!("could not run ssh-add: {e}") }, String::new())
-        }
-    };
+    let mut child =
+        pair.slave.spawn_command(builder).map_err(|e| format!("could not run ssh-add: {e}"))?;
     drop(pair.slave);
-
-    let mut child = child;
     let mut killer = child.clone_killer();
-    let mut writer = match pair.master.take_writer() {
-        Ok(w) => w,
+
+    // Past this point the child is LIVE, so a failure here kills and reaps it
+    // rather than only killing it — the same zombie the conversation's own tail
+    // used to leave off Windows (#2594 item 1), on a path that is rarer but no
+    // less real.
+    let writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
         Err(e) => {
-            let _ = killer.kill();
-            return (
-                SshAddOutcome::Failed { detail: format!("could not write to the console: {e}") },
-                String::new(),
-            );
+            reap_bounded(&mut child, &mut killer);
+            return Err(format!("could not write to the console: {e}"));
         }
     };
     let reader = match pair.master.try_clone_reader() {
-        Ok(r) => r,
+        Ok(reader) => reader,
         Err(e) => {
-            let _ = killer.kill();
-            return (
-                SshAddOutcome::Failed { detail: format!("could not read the console: {e}") },
-                String::new(),
-            );
+            reap_bounded(&mut child, &mut killer);
+            return Err(format!("could not read the console: {e}"));
         }
     };
+    Ok(Wired { master: pair.master, child, killer, writer, rx: spawn_reader(reader) })
+}
 
-    // The reader must be its own thread: a pty read blocks until the child
-    // writes or exits, and the deadline below has to keep running while it does.
+/// Drain the console on its own thread, into a channel the driver can poll.
+///
+/// It must be a thread: a pty read blocks until the child writes or exits, and
+/// the conversation's deadline has to keep running while it does.
+fn spawn_reader(reader: Box<dyn std::io::Read + Send>) -> std::sync::mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         use std::io::Read as _;
@@ -647,30 +799,217 @@ pub fn drive_ssh_add_with_transcript(
             }
         }
     });
+    rx
+}
 
+/// Close the console in the one order that cannot block: the input side first,
+/// then the console itself **while the reader thread is still draining it**, and
+/// the receiving end last.
+///
+/// The three ends are taken by value in that order, so the ordering is a
+/// property of this signature rather than of where three bindings happen to sit
+/// in the caller — where it was the reverse, and silently (#2594 item 5).
+///
+/// Dropping the master is `ClosePseudoConsole`, which is documented to wait for
+/// an attached client to finish with the console. Nothing is draining it once
+/// `rx` has gone: the reader thread's next `send` fails and it breaks out of its
+/// loop, so a close that waits would be waiting on a pipe with no reader — an
+/// unbounded block on the blocking pool, which is the one failure every bound in
+/// this module exists to prevent. Holding `rx` across the close keeps the thread
+/// reading until the console is actually gone, at which point its `read` returns
+/// and it exits on its own.
+///
+/// The thread is not joined, deliberately: a join here would reintroduce the
+/// unbounded wait in the very place this function removes it.
+fn close_console_while_the_reader_drains(
+    writer: Box<dyn std::io::Write + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    drop(writer);
+    drop(master);
+    drop(rx);
+}
+
+/// What one conversation ended up having seen and done.
+struct ConversationEnd {
+    /// Set when a transcript line decided the outcome by itself.
+    terminal: Option<SshAddOutcome>,
+    /// The child's exit status, once it has been observed — by the loop's own
+    /// `try_wait`, or by the caller's bounded reap after it.
+    status: Option<portable_pty::ExitStatus>,
+    /// Whether the empty-line give-up was sent, i.e. `ssh-add` re-asked.
+    gave_up: bool,
+    /// The raw pty transcript.
+    seen: String,
+    /// Whether the loop ended on its deadline rather than on an answer.
+    timed_out: bool,
+}
+
+/// The driver's state across one conversation: the transcript, how much of it
+/// has been acted on, and which of the two one-shot answers have been sent.
+struct Conversation {
+    seen: String,
+    /// How much of `seen` this driver has already acted on. See
+    /// [`Conversation::step`] for why the tail, and not the whole transcript,
+    /// is what gets classified.
+    consumed: usize,
+    answered: bool,
+    gave_up: bool,
+    /// When the last answer was sent, and whether the one permitted re-send has
+    /// been used. See [`Conversation::rearm`].
+    last_write: Instant,
+    rearmed: bool,
+}
+
+impl Conversation {
+    fn new() -> Self {
+        Conversation {
+            seen: String::new(),
+            consumed: 0,
+            answered: false,
+            gave_up: false,
+            last_write: Instant::now(),
+            rearmed: false,
+        }
+    }
+
+    /// Classify the UNCONSUMED TAIL — everything since the last thing this
+    /// driver acted on — and act on it. Returns a terminal outcome when one has
+    /// been decided.
+    ///
+    /// Not a line: the two asks carry no trailing newline, so a line-oriented
+    /// read would never see either until the process waiting for an answer had
+    /// exited. Not the whole transcript either: once the first ask has been
+    /// answered its text stays in `seen` forever, so every later chunk
+    /// re-classifies as `Prompt` and nothing after it can ever be recognised
+    /// (#2397 review W3 / rev-std 1). The tail keeps the no-newline property —
+    /// it spans every chunk since the last action, so an ask split across reads
+    /// still matches — while making each ask decidable once.
+    ///
+    /// `consumed` is only ever set to `seen.len()`, and `seen` is built from
+    /// `from_utf8_lossy`, so the slice is always on a char boundary. What it is
+    /// NOT always on is a LINE start: right after an answer the tail begins
+    /// mid-prompt, exactly where a console echo of what was typed lands. That is
+    /// the distinction [`classify_ssh_add_chunk`]'s second argument carries, and
+    /// why it is computed here rather than assumed (#2594 item 4).
+    fn step(
+        &mut self,
+        writer: &mut Box<dyn std::io::Write + Send>,
+        passphrase: &[u8],
+    ) -> Option<SshAddOutcome> {
+        let at_line_start =
+            self.consumed == 0 || matches!(self.seen.as_bytes()[self.consumed - 1], b'\n' | b'\r');
+        match classify_ssh_add_chunk(&self.seen[self.consumed..], at_line_start) {
+            SshAddEvent::Added => Some(SshAddOutcome::Added),
+            SshAddEvent::NoAgent => Some(SshAddOutcome::NoAgent { hint: agent_hint() }),
+            // ssh-add's own exit: an empty passphrase ends the retry loop.
+            // Anything else re-asks forever.
+            SshAddEvent::BadPassphrase if !self.gave_up => {
+                self.gave_up = true;
+                self.answer(writer, b"")
+            }
+            SshAddEvent::Prompt if !self.answered => {
+                self.answered = true;
+                self.answer(writer, passphrase)
+            }
+            _ => None,
+        }
+    }
+
+    /// Send one answer, mark the tail consumed, and start the re-arm clock.
+    fn answer(
+        &mut self,
+        writer: &mut Box<dyn std::io::Write + Send>,
+        line: &[u8],
+    ) -> Option<SshAddOutcome> {
+        self.consumed = self.seen.len();
+        self.last_write = Instant::now();
+        write_refusal(send_answer(writer, line))
+    }
+
+    /// Whether the one permitted re-send is due.
+    fn rearm_due(&self, now: Instant, child_running: bool) -> bool {
+        (self.answered || self.gave_up)
+            && !self.rearmed
+            && child_running
+            && now.saturating_duration_since(self.last_write) >= ANSWER_REARM
+    }
+
+    /// One re-send of the answer, and only one.
+    ///
+    /// It re-sends **what the reader is still waiting for**, which is not always
+    /// an empty line. When the answer was two writes, only the trailing `\r`
+    /// could go missing and the parked reader was always the retry ask — so a
+    /// bare Enter was the right thing to repeat. Since [`send_answer`] made it
+    /// ONE buffer the surviving residual is the opposite shape: the whole write
+    /// is lost, and the reader still parked is then the FIRST ask, where a bare
+    /// Enter is an *empty passphrase* and `ssh-add` answers `Bad passphrase, try
+    /// again for …` — reporting a CORRECT passphrase as rejected (#2397 review
+    /// W2). So repeat the passphrase while the first ask is what is outstanding,
+    /// and the empty give-up once it is not.
+    ///
+    /// A lost write is indistinguishable from a slow one, and the cost of being
+    /// wrong stays asymmetric: a duplicate answer is read by nobody if the first
+    /// one landed, while a lost one costs the user the whole bound and refuses a
+    /// launch that would have worked.
+    ///
+    /// `consumed` is deliberately NOT advanced: this repeats what is already
+    /// outstanding, and swallowing the bytes that arrived meanwhile would lose
+    /// the ask or the verdict among them.
+    fn rearm(
+        &mut self,
+        writer: &mut Box<dyn std::io::Write + Send>,
+        passphrase: &[u8],
+    ) -> Option<SshAddOutcome> {
+        self.rearmed = true;
+        write_refusal(send_answer(writer, if self.gave_up { b"" } else { passphrase }))
+    }
+}
+
+/// Turn a failed write to the console into the refusal it deserves.
+///
+/// Every answer goes through here, the re-send included. `let _ = send_answer(…)`
+/// on the re-arm was the last write on this path whose failure was dropped, and
+/// [`send_answer`]'s own argument applies to it unchanged: a refusal naming the
+/// write is a bug report, and a fifteen-second `Timeout` is not (#2594 item 3).
+/// A re-send that fails is if anything the stronger signal — the first write to
+/// the same console already succeeded, so what it reports is a console that has
+/// gone away mid-conversation, which no amount of further waiting recovers.
+fn write_refusal(result: std::io::Result<()>) -> Option<SshAddOutcome> {
+    result
+        .err()
+        .map(|e| SshAddOutcome::Failed { detail: format!("could not answer ssh-add: {e}") })
+}
+
+/// Answer what the child asks until a line decides the outcome, the child
+/// exits, or the deadline falls.
+///
+/// Split out of [`drive_ssh_add_with_transcript`] (#2594 item 6). It reaps
+/// nothing and closes nothing — its caller does both, once, on every path —
+/// which is why the deadline arm here BREAKS with `timed_out` set instead of
+/// returning `Timeout` from the middle of the loop the way it used to.
+fn run_conversation(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    writer: &mut Box<dyn std::io::Write + Send>,
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    passphrase: &[u8],
+    timeout: Duration,
+) -> ConversationEnd {
     let deadline = Instant::now() + timeout;
-    let mut seen = String::new();
-    let mut answered = false;
-    let mut gave_up = false;
+    let mut conv = Conversation::new();
     let mut terminal: Option<SshAddOutcome> = None;
     // `portable_pty`'s own status type, not `std::process`'s: a pty child is
     // reaped through the pty, and the two have similar names and distinct types.
     let mut status: Option<portable_pty::ExitStatus> = None;
     let mut drain_until: Option<Instant> = None;
-    // When the last answer was sent, and whether the one permitted re-send has
-    // been used. See the re-arm below.
-    let mut last_write = Instant::now();
-    let mut rearmed = false;
-    // How much of `seen` this driver has already acted on. See the classify
-    // call below for why the tail, and not the whole transcript, is what is
-    // classified.
-    let mut consumed = 0usize;
+    let mut timed_out = false;
 
     while terminal.is_none() {
         let now = Instant::now();
         if now >= deadline {
-            reap_bounded(&mut child, &mut killer);
-            return (SshAddOutcome::Timeout, seen);
+            timed_out = true;
+            break;
         }
         // The child's EXIT is the other way this conversation ends, and it has
         // to be polled for: a ConPTY master read does not return EOF when the
@@ -681,8 +1020,8 @@ pub fn drive_ssh_add_with_transcript(
         // `Timeout` (#2368). `spawn_pty_blocking` does not need it because a
         // pane's death is reported by its own `child.wait()` waiter thread.
         if status.is_none() {
-            if let Ok(Some(st)) = child.try_wait() {
-                status = Some(st);
+            if let Ok(Some(exited)) = child.try_wait() {
+                status = Some(exited);
                 // ConPTY renders a SCREEN, so the last frame before a fast exit
                 // can be dropped: the success fixture's `Identity added` line
                 // never arrived at all. Give the pump a moment to deliver
@@ -693,123 +1032,61 @@ pub fn drive_ssh_add_with_transcript(
         if drain_until.is_some_and(|until| now >= until) {
             break;
         }
-        // One re-send of the answer, and only one.
-        //
-        // It re-sends **what the reader is still waiting for**, which is not
-        // always an empty line. When the answer was two writes, only the
-        // trailing `\r` could go missing and the parked reader was always the
-        // retry ask — so a bare Enter was the right thing to repeat. Since
-        // `send_answer` made it ONE buffer the surviving residual is the
-        // opposite shape: the whole write is lost, and the reader still parked
-        // is then the FIRST ask, where a bare Enter is an *empty passphrase*
-        // and `ssh-add` answers `Bad passphrase, try again for …` — reporting a
-        // CORRECT passphrase as rejected (#2397 review W2). So repeat the
-        // passphrase while the first ask is what is outstanding, and the empty
-        // give-up once it is not.
-        //
-        // A lost write is indistinguishable from a slow one, and the cost of
-        // being wrong stays asymmetric: a duplicate answer is read by nobody if
-        // the first one landed, while a lost one costs the user the whole bound
-        // and refuses a launch that would have worked.
-        if (answered || gave_up)
-            && !rearmed
-            && status.is_none()
-            && now.saturating_duration_since(last_write) >= ANSWER_REARM
-        {
-            rearmed = true;
-            let _ = send_answer(&mut writer, if gave_up { b"" } else { passphrase });
+        if conv.rearm_due(now, status.is_none()) {
+            terminal = conv.rearm(writer, passphrase);
+            if terminal.is_some() {
+                break;
+            }
         }
         // Step rather than wait-to-deadline: the exit poll above only runs
         // between receives, so a long block here would defeat it.
         let step = POLL_STEP.min(deadline.saturating_duration_since(now));
         let chunk = match rx.recv_timeout(step) {
-            Ok(c) => c,
-            // Reachable only once the master is dropped, which is after this
-            // function returns — kept as the correctness arm rather than as the
-            // mechanism, which is the exit poll above.
+            Ok(chunk) => chunk,
+            // Reachable only once the master is dropped, which is after the
+            // caller has returned — kept as the correctness arm rather than as
+            // the mechanism, which is the exit poll above.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
         };
-        seen.push_str(&String::from_utf8_lossy(&chunk));
-
-        // Classify the UNCONSUMED TAIL — everything since the last thing this
-        // driver acted on — rather than a line or the whole transcript.
-        //
-        // Not a line: the two asks carry no trailing newline, so a
-        // line-oriented read would never see either until the process waiting
-        // for an answer had exited. Not the whole transcript either: once the
-        // first ask has been answered its text stays in `seen` forever, so
-        // every later chunk re-classifies as `Prompt` and nothing after it can
-        // ever be recognised (#2397 review W3 / rev-std 1). The tail keeps the
-        // no-newline property — it spans every chunk since the last action, so
-        // an ask split across reads still matches — while making each ask
-        // decidable once.
-        //
-        // `consumed` is only ever set to `seen.len()`, and `seen` is built from
-        // `from_utf8_lossy`, so the slice below is always on a char boundary.
-        let tail = &seen[consumed..];
-        match classify_ssh_add_line(tail) {
-            SshAddEvent::Added => terminal = Some(SshAddOutcome::Added),
-            SshAddEvent::NoAgent => terminal = Some(SshAddOutcome::NoAgent { hint: agent_hint() }),
-            SshAddEvent::BadPassphrase => {
-                if !gave_up {
-                    gave_up = true;
-                    consumed = seen.len();
-                    last_write = Instant::now();
-                    // ssh-add's own exit: an empty passphrase ends the retry
-                    // loop. Anything else re-asks forever.
-                    if let Err(e) = send_answer(&mut writer, b"") {
-                        terminal = Some(SshAddOutcome::Failed {
-                            detail: format!("could not answer ssh-add: {e}"),
-                        });
-                    }
-                }
-            }
-            SshAddEvent::Prompt => {
-                if !answered {
-                    answered = true;
-                    consumed = seen.len();
-                    last_write = Instant::now();
-                    if let Err(e) = send_answer(&mut writer, passphrase) {
-                        terminal = Some(SshAddOutcome::Failed {
-                            detail: format!("could not answer ssh-add: {e}"),
-                        });
-                    }
-                }
-            }
-            SshAddEvent::Other => {}
-        }
+        conv.seen.push_str(&String::from_utf8_lossy(&chunk));
+        terminal = conv.step(writer, passphrase);
     }
 
-    // Reap only when the answer actually depends on it. `terminal` being set
-    // means a line already decided the outcome, and the `match` below discards
-    // `status` on every one of those arms — so waiting there was an unbounded
-    // block for a value nobody reads (#2397 review B1).
-    let status = match (status, terminal.is_some()) {
-        (Some(st), _) => Some(st),
-        (None, true) => {
-            let _ = killer.kill();
-            None
-        }
-        (None, false) => reap_bounded(&mut child, &mut killer),
-    };
+    ConversationEnd { terminal, status, gave_up: conv.gave_up, seen: conv.seen, timed_out }
+}
+
+/// What the run MEANT, given what it saw and what the child's exit said.
+///
+/// Split out of [`drive_ssh_add_with_transcript`] (#2594 item 6): "how the
+/// conversation was driven" and "what it amounts to" are different questions,
+/// and separating them is what lets the deadline be one arm here rather than a
+/// return from inside a loop.
+///
+/// Takes the end by value and hands the transcript back, so the one buffer that
+/// can carry an echoed passphrase is moved rather than copied.
+fn verdict(end: ConversationEnd, passphrase: &[u8]) -> (SshAddOutcome, String) {
+    if let Some(decided) = end.terminal {
+        return (decided, end.seen);
+    }
+    if end.timed_out {
+        return (SshAddOutcome::Timeout, end.seen);
+    }
     let secret = String::from_utf8_lossy(passphrase).into_owned();
-    let detail = scrub_secret(last_meaningful_line(&seen), &secret);
-    let outcome = match terminal {
-        Some(other) => other,
-        None if gave_up => SshAddOutcome::BadPassphrase { detail },
-        // No terminal line, but the child exited **0**. `ssh-add` documents
-        // that as "the identity was added", and it is a stronger signal than
-        // the transcript precisely because the transcript can lose the last
-        // frame (see the drain above). The bytes decide the CONVERSATION — what
-        // to answer, and when to give up; the exit status decides the VERDICT
-        // when the bytes ran out first.
-        // `as_ref` because a match guard may not move out of the binding it
-        // reads, and this status is not `Copy`.
-        None if status.as_ref().is_some_and(|st| st.success()) => SshAddOutcome::Added,
-        None => SshAddOutcome::Failed { detail },
-    };
-    (outcome, seen)
+    let detail = scrub_secret(last_meaningful_line(&end.seen), &secret);
+    if end.gave_up {
+        return (SshAddOutcome::BadPassphrase { detail }, end.seen);
+    }
+    // No terminal line, but the child exited **0**. `ssh-add` documents that as
+    // "the identity was added", and it is a stronger signal than the transcript
+    // precisely because the transcript can lose the last frame (see the drain in
+    // `run_conversation`). The bytes decide the CONVERSATION — what to answer,
+    // and when to give up; the exit status decides the VERDICT when the bytes
+    // ran out first.
+    if end.status.is_some_and(|status| status.success()) {
+        return (SshAddOutcome::Added, end.seen);
+    }
+    (SshAddOutcome::Failed { detail }, end.seen)
 }
 
 /// The last non-blank line of a transcript — what a human reading the console
@@ -946,6 +1223,78 @@ mod tests {
         assert_eq!(
             classify_ssh_add_line("Identity added: /home/a/.ssh/id_ed25519 (a@host)"),
             SshAddEvent::Added
+        );
+    }
+
+    #[test]
+    fn an_echoed_passphrase_cannot_impersonate_the_success_line() {
+        // #2594 item 4, the echo half of the substring hazard. The driver
+        // classifies the transcript tail SINCE its last action, and right after
+        // it answers the first ask that tail begins in the middle of the prompt
+        // line — which is where a console echo of what was typed lands. A bare
+        // substring test therefore reads a passphrase containing the vendor's
+        // success wording as the vendor SAYING it: a wrong passphrase reported
+        // as a loaded key, which is the one direction of this bug that fails
+        // open.
+        //
+        // `ssh-add` prints `Identity added` at the start of a line and can print
+        // it nowhere else, so the anchor costs nothing and closes it.
+        assert_eq!(
+            classify_ssh_add_chunk("Identity added: /k/id (a@host)", false),
+            SshAddEvent::Other,
+            "mid-line text is an echo, not ssh-add's verdict"
+        );
+        // The discriminator: the SAME bytes at a line start are the verdict, so
+        // this cannot be passed by never returning `Added` at all.
+        assert_eq!(
+            classify_ssh_add_chunk("Identity added: /k/id (a@host)", true),
+            SshAddEvent::Added
+        );
+        // …and the shape the driver really sees: the prompt, then the echo, then
+        // ssh-add's own line. The tail does not start a line, and the verdict is
+        // still found — on the `\r\n` a pty echoes.
+        assert_eq!(
+            classify_ssh_add_chunk("Identity added\r\nIdentity added: /k/id (a@host)\r\n", false),
+            SshAddEvent::Added
+        );
+    }
+
+    #[test]
+    fn a_line_start_is_either_end_of_a_crlf() {
+        // A pty echoes CRLF and a ConPTY repaint can emit a bare `\r`, so both
+        // open a line. Pinned because the anchor above is only as good as what
+        // it counts as a line break.
+        assert!(starts_a_line("x\nIdentity added: k", "Identity added", false));
+        assert!(starts_a_line("x\rIdentity added: k", "Identity added", false));
+        assert!(!starts_a_line("x Identity added: k", "Identity added", false));
+        // A first match that is NOT anchored must not hide a later one that is —
+        // the loop keeps looking rather than answering on the first hit.
+        assert!(starts_a_line("echo Identity added\nIdentity added: k", "Identity added", false));
+        // Non-ASCII before the match, so the scan's byte-index arithmetic is
+        // exercised on a string where a char boundary is not a byte boundary.
+        assert!(starts_a_line("é\nIdentity added: k", "Identity added", false));
+        assert!(!starts_a_line("é Identity added: k", "Identity added", false));
+    }
+
+    #[test]
+    fn the_asks_are_deliberately_not_anchored() {
+        // The asymmetry, pinned so a later tidy-up does not "finish the job" and
+        // anchor these too. Missing an ask costs the whole bound and refuses a
+        // launch that would have worked; missing a no-agent line costs the hint.
+        // Only `Added` can turn a miss into a success that did not happen — and
+        // ConPTY renders a screen, so an ask can arrive with a repaint in front
+        // of it.
+        assert_eq!(
+            classify_ssh_add_chunk("...Enter passphrase for /k/id: ", false),
+            SshAddEvent::Prompt
+        );
+        assert_eq!(
+            classify_ssh_add_chunk("...Bad passphrase, try again for /k/id: ", false),
+            SshAddEvent::BadPassphrase
+        );
+        assert_eq!(
+            classify_ssh_add_chunk("...Error connecting to agent: nope", false),
+            SshAddEvent::NoAgent
         );
     }
 
@@ -1113,14 +1462,135 @@ mod tests {
         // the setup phase shares one deadline whatever runs inside it, and the
         // conversation always gets its own. So there is one sum, and a step
         // added to `ensure_agent` tomorrow cannot invent a path this misses.
+        //
+        // The fourth term arrived with #2594 item 2 and is the same omission one
+        // layer out: a setup step is a bounded capture, and a bounded capture's
+        // own post-kill reap runs AFTER the timeout it was handed, where no
+        // caller's budget can reach it. One overrun and not one per step,
+        // because `run_setup_steps` starts no step past the shared deadline —
+        // which `a_fourth_setup_step_costs_no_more_than_the_third` is what pins,
+        // rather than a count that a fourth step would silently falsify.
         assert_eq!(
             WORST_CASE_TOTAL,
-            AGENT_SETUP_BUDGET + SSH_ADD_TIMEOUT + CHILD_REAP_BUDGET
+            AGENT_SETUP_BUDGET + SETUP_STEP_OVERRUN + SSH_ADD_TIMEOUT + CHILD_REAP_BUDGET
         );
         // …and the setup phase cannot borrow from the conversation, which is the
         // property that makes the sum above an upper bound rather than a hope.
         assert!(AGENT_SETUP_BUDGET < WORST_CASE_TOTAL);
         assert!(SSH_ADD_TIMEOUT < WORST_CASE_TOTAL);
+        // The overrun is the engine's, not a second copy of it: a change to
+        // `GH_CAPTURE_REAP_TIMEOUT` has to move this number rather than quietly
+        // falsify it.
+        assert_eq!(SETUP_STEP_OVERRUN, loomux_engine::subproc::GH_CAPTURE_REAP_TIMEOUT);
+    }
+
+    // ---- the setup phase's shape, on fake steps ----
+
+    /// Run `count` steps that each overrun whatever deadline they are given by
+    /// `overrun` — which is exactly what a bounded capture does when it has to
+    /// reap the child it killed. Returns how many were STARTED and how long the
+    /// phase took.
+    fn overrunning_phase(count: usize, budget: Duration, overrun: Duration) -> (usize, Duration) {
+        let started = std::cell::Cell::new(0usize);
+        let mut steps: Vec<Box<dyn FnMut(Duration) -> bool + '_>> = (0..count)
+            .map(|_| {
+                let step: Box<dyn FnMut(Duration) -> bool + '_> = Box::new(|left: Duration| {
+                    started.set(started.get() + 1);
+                    std::thread::sleep(left + overrun);
+                    false
+                });
+                step
+            })
+            .collect();
+        let began = Instant::now();
+        let settled = run_setup_steps(began + budget, &mut steps);
+        let elapsed = began.elapsed();
+        assert!(!settled, "no fake step reports success, so the phase must not claim one");
+        (started.get(), elapsed)
+    }
+
+    #[test]
+    fn a_fourth_setup_step_costs_no_more_than_the_third() {
+        // #2594 item 2. `WORST_CASE_TOTAL` carries ONE `SETUP_STEP_OVERRUN`, not
+        // one per step, and the only thing that makes that true is that
+        // `run_setup_steps` re-reads the shared deadline BETWEEN steps: a step
+        // that would start past it is not started at all.
+        //
+        // Pinned by adding a step rather than by arithmetic over a count, which
+        // is the shape #2397 review B1 removed from this module — a count is
+        // exactly what a fourth step falsifies in silence.
+        let budget = Duration::from_millis(30);
+        let overrun = Duration::from_millis(200);
+        let (three_started, three_took) = overrunning_phase(3, budget, overrun);
+        let (four_started, four_took) = overrunning_phase(4, budget, overrun);
+
+        assert_eq!(three_started, 1, "only the step that had time left may run");
+        assert_eq!(four_started, three_started, "a fourth step must not add a fourth start");
+        // The clock says the same thing the start count does, and says it about
+        // the property the constant actually claims. Without the between-steps
+        // check a phase of N overrunning steps costs budget + N x overrun, so
+        // four steps would take ~830 ms against three's ~630 ms; both must land
+        // inside one overrun of the budget instead. The ceiling is loose because
+        // a CI runner's `sleep` is not a metronome — it is still nowhere near
+        // 630 ms.
+        let ceiling = budget + overrun + Duration::from_millis(400);
+        assert!(three_took < ceiling, "three steps took {three_took:?}, ceiling {ceiling:?}");
+        assert!(four_took < ceiling, "four steps took {four_took:?}, ceiling {ceiling:?}");
+    }
+
+    #[test]
+    fn every_step_runs_while_there_is_time_and_the_first_success_ends_the_phase() {
+        // The positive control for the test above, which asserts that steps do
+        // NOT run — an assertion a `run_setup_steps` that returned immediately
+        // would satisfy just as well, taking the agent probe with it.
+        let started = std::cell::Cell::new(0usize);
+        let mut steps: Vec<Box<dyn FnMut(Duration) -> bool + '_>> = (0..4)
+            .map(|_| {
+                let step: Box<dyn FnMut(Duration) -> bool + '_> = Box::new(|_left: Duration| {
+                    started.set(started.get() + 1);
+                    false
+                });
+                step
+            })
+            .collect();
+        assert!(!run_setup_steps(Instant::now() + Duration::from_secs(30), &mut steps));
+        assert_eq!(started.get(), 4, "with time left, every step runs");
+
+        // …and the first step that settles the question ends the phase, which is
+        // what makes the agent probe stop at the first agent it finds.
+        let started = std::cell::Cell::new(0usize);
+        let counter = &started;
+        let mut steps: Vec<Box<dyn FnMut(Duration) -> bool + '_>> = (0..4)
+            .map(|i| {
+                let step: Box<dyn FnMut(Duration) -> bool + '_> = Box::new(move |_left: Duration| {
+                    counter.set(counter.get() + 1);
+                    i == 1
+                });
+                step
+            })
+            .collect();
+        assert!(run_setup_steps(Instant::now() + Duration::from_secs(30), &mut steps));
+        assert_eq!(started.get(), 2, "the phase stops at the step that settled it");
+    }
+
+    #[test]
+    fn a_failed_write_becomes_a_refusal_that_names_it() {
+        // #2594 item 3. The re-arm's write used to be `let _ = send_answer(…)`,
+        // so a console that had gone away mid-conversation was reported as a
+        // fifteen-second `Timeout` — the exact failure `send_answer`'s own doc
+        // says a dropped result caused the first time. Every answer now goes
+        // through this one mapping, the re-send included.
+        let broken = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the console went away");
+        match write_refusal(Err(broken)) {
+            Some(SshAddOutcome::Failed { detail }) => {
+                assert!(detail.contains("could not answer ssh-add"), "got: {detail}");
+                assert!(detail.contains("the console went away"), "the cause survives: {detail}");
+            }
+            other => panic!("a failed write must refuse, got {other:?}"),
+        }
+        // The control: a write that worked decides nothing, so the conversation
+        // carries on rather than refusing every run.
+        assert_eq!(write_refusal(Ok(())), None);
     }
 
     #[test]
