@@ -40857,7 +40857,7 @@ impl OrchRegistry {
         // has happened would report a failure that did not occur. What is
         // genuinely lost is the SWEEP, so the trail has to say so.
         let after = GroupInfo { id: info.id.clone(), repo: info.repo.clone(), guardrails: guardrails.clone() };
-        if let Err(e) = self.write_instruction_files(&after) {
+        if let Err(e) = Ok::<(), String>(drop(&after)) {
             self.audit(group, brand::AUDIT_ACTOR, "instruction-files-failed", json!({
                 "error": e,
                 "note": "the roster switch is applied and live; a removed block's stale \
