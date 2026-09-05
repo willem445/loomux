@@ -159,8 +159,7 @@ fn hold_label(repo: &str, group: Option<&Guardrails>) -> String {
             .flatten()
             .map(|wf| wf.intake.hold),
     };
-    raw.as_deref()
-        .and_then(loomux_engine::workflow::usable_intake_label)
+    raw.filter(|h| !h.trim().is_empty())
         .unwrap_or_else(|| loomux_engine::workflow::builtin_intake_profile().hold)
 }
 
