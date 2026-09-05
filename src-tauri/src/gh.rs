@@ -152,13 +152,11 @@ const FIXED_LABELS: [&str; 3] = ["agent-ready", "agent-investigation", "agent-ma
 /// unusable falls back the same way, and to the same value `read_intake` would
 /// itself have produced for that field.
 fn hold_label(repo: &str, group: Option<&Guardrails>) -> String {
-    let raw = match group {
-        Some(rails) => Some(rails.intake.hold.clone()),
-        None => crate::orchestration::load_active_workflow(repo, &Guardrails::default())
-            .ok()
-            .flatten()
-            .map(|wf| wf.intake.hold),
-    };
+    let _ = group;
+    let raw = crate::orchestration::load_active_workflow(repo, &Guardrails::default())
+        .ok()
+        .flatten()
+        .map(|wf| wf.intake.hold);
     raw.as_deref()
         .and_then(loomux_engine::workflow::usable_intake_label)
         .unwrap_or_else(|| loomux_engine::workflow::builtin_intake_profile().hold)
