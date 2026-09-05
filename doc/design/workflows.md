@@ -2963,7 +2963,7 @@ is #1566's apply-an-edit path and AC 4's one-row model swap, deliberately the
 same mechanism, because a second way to adopt an edit would be a second consent
 story.
 
-### Two commands, and what the notice does not say yet
+### Two commands
 
 `orch_workflow_switch_preview(group_id, name)` and
 `orch_apply_workflow(group_id, name)`, both `async` — so neither joins the
@@ -2973,10 +2973,46 @@ their raw `name` at the boundary through `command_workflow_name`, so a
 
 The switch notice tells the orchestrator which ids it may spawn by, which are
 gone, what the gate now requires, and that a bare resume of a removed block will
-be refused. It does **not** yet tell it to call `list_blocks` after a compact:
-that tool is slice C, and a notice naming a tool this build does not expose
-would be a false claim in the one place an agent cannot check it. Slice C adds
-the clause with the tool.
+be refused. It names no tool, and slice C deliberately left it that way rather
+than adding a `list_blocks` clause: the notice must stay one paragraph, and the
+place an orchestrator is taught a tool is the instruction surface, not a
+delivery. The pointer lives in the kickoff's workflow section instead — see the
+read-back subsection below.
+
+### The read-back: `list_blocks` (#1689 slice C)
+
+The notice is a delivery, not a record — a compact can take it and the pane's
+scrollback with it, while the roster a switch installed outlives any one
+delivery. The durable read-back is the orchestrator-only MCP tool `list_blocks`:
+
+- **Dispatch double-gates.** `require_orchestrator` (the listing is cosmetic)
+  and `require_in_group` on the *caller's own* agent id — there is no target
+  argument, so membership is proven on the caller itself. A forged or mis-routed
+  caller whose agent id belongs to another group, or to no group, gets the same
+  `unknown agent: <id>` wording every target-taking tool uses, so the refusal
+  leaks no other group's roster.
+- **The registry method derives from `workflow_status`.** `list_blocks(group)`
+  returns `{workflow, name, advanced, blocks}` with each block carrying
+  id/kind/cli/model/persona — the same `roster_json` rows the status payload
+  publishes and the gate reader reads. One load, one answer: a switch cannot
+  leave the read-back describing a roster the human's status payload disagrees
+  with.
+- **The tool pointer is taught in the workflow section, not the notice and not
+  the pinned template.** `templates/workflow.md` — rendered by
+  `workflow_section`, which is already where workflow-conditional prose lives
+  (the #891 S3 rule) — gains one paragraph naming the switch notice and the
+  read-back. The paragraph sits behind `roster_is_custom`, so a built-in
+  group's KICKOFF never reads a word about either (the
+  `advisor_and_process_prose_stays_silent_unless_a_block_declares_the_hint`
+  rule) and the pre222 fixtures stay byte-identical: `workflow.md` is
+  deliberately not fixture-pinned, `orchestrator.md` is. The TOOL is the other
+  half of that sentence and is deliberately NOT gated: `tool_defs` is never
+  handed the roster (its arguments are role, hint, locks, manager_declared), so
+  `list_blocks` is listed for every orchestrator, a built-in group's included —
+  and its answer there is honest, `{workflow: "default", advanced: false,
+  blocks: <built-in roster>}`. Gating the listing would mean threading roster
+  state into every listing call to refuse a read whose true answer is harmless;
+  the honest-answer cost is zero and the docs pin the distinction.
 
 ### `list_workflows` got its bound here (#2658)
 
@@ -3003,8 +3039,9 @@ the last directory row by name.
   (`WorkflowSwitchPreview`) and the wrappers in `orchestration.ts`. D2 must
   disable **Review & apply** while `workflow_status.advanced` is false and say
   why, rather than offering an action the backend will refuse.
-- **No `list_blocks`.** The orchestrator's read-back of its own roster is slice
-  C, and the notice above is written to be extended by it.
+- **No `list_blocks`.** The orchestrator's read-back of its own roster was slice
+  C's — it landed with the tool and the teaching paragraph in the workflow
+  section above.
 
 ## Still to come
 
