@@ -385,10 +385,14 @@ above, which supersedes this paragraph's shape while leaving its diagnosis
 intact. A profile declaring `bash` is still refused, by both versions and for
 the same reason.
 
-What survives unchanged is the **normalization**: whichever test a name is put
-to, it is normalized first, because only `markProgram`'s answer arrives that
-way — a profile declaring `Claude.exe` is the same claim as one declaring
-`claude`.
+What survives is the **normalization**, but it moved with the name it belongs
+to. `declaresAnAgent` normalizes, because `harness` really is raw — a profile
+declaring `Claude.exe` is the same claim as one declaring `claude`.
+`namesLaunchableCli` deliberately does **not**, because `markProgram` is its
+only caller and every arm of that function already returns normalized output; a
+normalization that cannot change its input is a claim about a caller that does
+not exist. The mutation matrix is what found the leftover, one round after it
+stopped being needed: deleting the call reddened nothing.
 
 ### The empty-state line was the fourth surface (review round 2, W1)
 

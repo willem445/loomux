@@ -298,24 +298,25 @@ function declaresAnAgent(name: string | null): boolean {
 
 /** The catalog test, applied to the name loomux INFERRED from the launch line.
  *
- *  ONE rule over BOTH inputs, and the asymmetry it removes was real (#2514
- *  review round 2, W2). An earlier draft tested `mark` against the catalog
- *  and accepted `harness` on sight. `harness` is `agentCli ?? sshDefaultCli`,
- *  and only the first half is the closed four-name set: `sshDefaultCli` is
- *  free text a human types into an SSH profile — `normalizeSshProfile` only
- *  trims it, and the launcher deliberately APPENDS a select option for a
- *  value its catalog does not offer. So a profile declaring `bash` walked in
- *  through the very door the other arm exists to close, and the pane was a
- *  counted agent row whose own header read "bash — a transport or shell, not
- *  an agent". One pane, two answers: the divergence this module says it
- *  exists to prevent (CLAUDE.md: a guard reads every one of its inputs by
- *  one rule).
+ *  `program` is `markProgram`'s answer and nothing else, so it is ALREADY
+ *  normalized on every path — that function's three arms return
+ *  `normalizeAgentProgram`'s output, `null`, and `programFromRestore`'s
+ *  output, which normalizes too. There is deliberately no second
+ *  `normalizeAgentProgram` here: it could never change its input, and a
+ *  normalization that cannot change its input is a claim that some caller
+ *  might pass a raw name, which is false. Round 2 needed one, because
+ *  `harness` came through this function then; round 3 moved that to
+ *  `declaresAnAgent`, which normalizes because its input really is raw. The
+ *  mutation matrix is what found the leftover — deleting the call reddened
+ *  nothing, which is the signature of a guard guarding a case that no longer
+ *  reaches it.
  *
- *  Normalized first, because `harness` is NOT pre-normalized on the
- *  `sshDefaultCli` path the way `markProgram`'s answer is. */
-function namesLaunchableCli(name: string | null): boolean {
-  if (name === null) return false;
-  return LAUNCHABLE_AGENT_PROGRAMS.has(normalizeAgentProgram(name));
+ *  The CATALOG rather than the resolver, and that half is load-bearing:
+ *  `agentMarkFor` is total, so a hand-typed `make` pane gets a lettered
+ *  badge, and "does this resolve to a program at all" would have listed it.
+ *  An inference is held to the eight CLIs loomux itself offers. */
+function namesLaunchableCli(program: string | null): boolean {
+  return program !== null && LAUNCHABLE_AGENT_PROGRAMS.has(program);
 }
 
 /** One row as the two views render it. `notes` is the count slot #2116 fills;
