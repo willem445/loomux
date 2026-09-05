@@ -1181,6 +1181,47 @@ fn lead_bind_delivers_the_lead_kickoff_once() {
     assert!(werr.contains("only for lead panes"), "{werr}");
 }
 
+/// **A kickoff that cannot be delivered leaves the pane bound, and leaves a
+/// trail.**
+///
+/// The counterfactual `lead_bind`'s doc states, performed rather than
+/// asserted in prose (CLAUDE.md: a documented escape hatch is only pinned by a
+/// test that takes it). By the time `lead_bind` runs the pane is open and the
+/// human is looking at it, so an `Err` would report a launch failure for a
+/// launch that plainly happened — but a dropped kickoff must not be INVISIBLE,
+/// or a lead that never learned it is one becomes a pane whose behaviour
+/// nobody can explain from the outside.
+///
+/// Headless is the real thing here rather than a stand-in: with no `AppHandle`
+/// `deliver_prompt` withdraws its own admission and returns
+/// `Err("no app handle")` (see `announce_pause_suppression`'s doc), which is
+/// exactly the shape a production drop takes — the queue ends up empty and the
+/// caller gets an error. The contrast with
+/// `lead_bind_delivers_the_lead_kickoff_once`, which pauses the group and so
+/// takes the early Ok, is what makes this test about the FAILURE path.
+#[test]
+fn an_undeliverable_lead_kickoff_degrades_rather_than_failing_the_bind() {
+    let (reg, _d, _repo, gid, agent_id, _out) = prepared_lead("claude", 4);
+    // Deliberately NOT paused: the delivery is attempted for real and fails.
+    reg.lead_bind(&agent_id, 9701).expect("the bind must succeed even so");
+
+    let a = reg.agent(&agent_id).expect("the lead entry");
+    assert_eq!(a.pty_id, Some(9701), "the pane is bound…");
+    assert_eq!(reg.queue_depth(9701), 0, "…and the kickoff really was not delivered");
+
+    let row = reg
+        .audit_log(&gid)
+        .into_iter()
+        .find(|e| e.action == "error" && e.detail["what"] == json!("lead kickoff not delivered"))
+        .expect("a dropped kickoff must be findable in the trail, not inferred from silence");
+    assert_eq!(row.detail["agent"], json!(agent_id), "{:?}", row.detail);
+    assert!(
+        row.detail["err"].as_str().unwrap_or_default().contains("no app handle"),
+        "…carrying the delivery's own error rather than a generic one: {:?}",
+        row.detail
+    );
+}
+
 /// **A dead lead takes its children with it**, and a dead worker takes nothing.
 ///
 /// One test, both poles, because the asymmetry IS the property: the arm added
