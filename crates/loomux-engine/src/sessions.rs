@@ -1053,7 +1053,7 @@ const CODEX_COMPRESSED_SUFFIX: &str = ".zst";
 /// `plain_file_name` that is "always the canonical `.jsonl` filename used for
 /// timestamp and id parsing".
 fn codex_plain_rollout_name(name: &str) -> Option<&str> {
-    let plain = name.strip_suffix(CODEX_COMPRESSED_SUFFIX).unwrap_or(name);
+    let plain = name;
     (plain.starts_with("rollout-") && plain.ends_with(".jsonl")).then_some(plain)
 }
 
