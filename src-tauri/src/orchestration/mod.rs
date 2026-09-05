@@ -37390,7 +37390,6 @@ impl OrchRegistry {
         // recorded orchestration" failures; a marker left behind by a group that
         // has ended is cleared by the next claim of its id, rather than by hoping
         // nothing reuses it.
-        let _ = fs::write(self.group_dir(&group.id).join(LEAD_MARKER), b"1");
 
         self.audit(&group.id, "human", "lead-prepare", json!({
             "agent": agent_id, "cli": cli, "max_agents": max_agents,
