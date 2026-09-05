@@ -1616,7 +1616,10 @@ pub fn newest_new_codex_session(
         // Only now is a file opened. The two set lookups above are what keep a
         // poll every second from costing one header read per session in the
         // store: on the ordinary tick every candidate is in the baseline.
-        let header = codex_header(path)?;
+        let Some(header) = codex_header(path) else {
+            hits.push(id.to_string());
+            return None;
+        };
         // The header decides the id as well as the cwd, exactly as
         // `find_codex_session_cwd` has it: a file whose header names a
         // different thread is not this session whatever its name says.
