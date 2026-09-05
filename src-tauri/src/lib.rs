@@ -5,7 +5,7 @@ mod editor;
 pub mod fileedit; // pub: the file-editor integration test links its pure fns (#174)
 pub mod filehash; // pub: the hashing integration test links its pure fns (#214)
 pub mod filemgr; // pub: the file-manager integration test links its pure fns (#214)
-mod gh;
+pub mod gh; // pub: the #2663 integration test drives its label resolution against a real group
 mod git;
 mod gitwatch;
 mod liveness; // the webview half of the #1601 liveness heartbeat

@@ -10696,13 +10696,24 @@ fn the_workflow_path_a_delegate_is_told_about_is_the_groups_own_file() {
 ///
 /// So **26 sites moved, and 14 of them — every `workflow_path` and every
 /// `workflow_file_exists` — were invisible to a trigger watching
-/// `load_workflow` alone.** #2663 then moved the 27th: the `head` 1 in the
-/// first row was `gh.rs::hold_label`, and it is 0 now. All three functions are
-/// still `pub` and still answer only for `default`. Adding an audit line or a
-/// template var as `workflow::workflow_path(&g.repo)` type-checks, reads
-/// naturally, and is exactly what twelve lines in `mod.rs` said one commit ago;
-/// a group running `b.yml` would then be told in its own audit trail that it
-/// runs `.orrerix/workflow.yml`.
+/// `load_workflow` alone.** All three functions are still `pub` and still
+/// answer only for `default`. Adding an audit line or a template var as
+/// `workflow::workflow_path(&g.repo)` type-checks, reads naturally, and is
+/// exactly what twelve lines in `mod.rs` said one commit ago; a group running
+/// `b.yml` would then be told in its own audit trail that it runs
+/// `.orrerix/workflow.yml`.
+///
+/// **#2663 moved the 27th**, the `head` 1 in the first row above — `gh.rs`'s
+/// `hold_label`. Same instrument, its own base and head:
+///
+/// | spelling | base `a1a0714e` | head | rerouted |
+/// | --- | --- | --- | --- |
+/// | `workflow::load_workflow(` | 1 (`gh.rs`) | 0 | 1 |
+/// | `workflow::workflow_path(` | 0 | 0 | 0 |
+/// | `workflow::workflow_file` | 1 (`mod.rs`, the NAMED sibling) | 1 | 0 |
+///
+/// The last row is the `RESIDUALS` entry below and is expected to stay 1: it is
+/// `workflow_file_named(`, matched only because the trigger is a prefix.
 ///
 /// A textual scan, with the limits that implies — it reads call TEXT, so a
 /// caller that bound the function to a local first would be invisible. **So

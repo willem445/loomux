@@ -194,7 +194,8 @@ fn hold_label(repo: &str, group: Option<&Guardrails>) -> String {
 /// alphabet. `read_intake` applies that same rule when it loads a `group.json`,
 /// so the two agree; this boundary does not depend on that, which is the point
 /// of asking twice.
-fn allowed_labels(repo: &str, group: Option<&Guardrails>) -> Vec<String> {
+#[doc(hidden)] // pub for integration tests: #2663 drives this against a real group
+pub fn allowed_labels(repo: &str, group: Option<&Guardrails>) -> Vec<String> {
     let mut out: Vec<String> = FIXED_LABELS.iter().map(|s| s.to_string()).collect();
     let hold = hold_label(repo, group);
     if !out.contains(&hold) {
@@ -244,7 +245,8 @@ fn label_spec(name: &str) -> Option<(&'static str, &'static str)> {
 /// stays legible on GitHub to someone who has never read the orchestrator
 /// contract — including the human deciding whether to apply it — under whatever
 /// name the repo chose.
-fn label_spec_for(
+#[doc(hidden)] // pub for integration tests: #2663 drives this against a real group
+pub fn label_spec_for(
     repo: &str,
     group: Option<&Guardrails>,
     name: &str,
@@ -1003,7 +1005,8 @@ where
 /// [`allowed_labels`]. Takes the set rather than reading the const so the
 /// resolution happens once per call at the command boundary, and so this stays a
 /// pure function a unit test can drive with any vocabulary.
-fn validate_labels(allowed: &[String], labels: &[String]) -> Result<(), String> {
+#[doc(hidden)] // pub for integration tests: #2663 drives this against a real group
+pub fn validate_labels(allowed: &[String], labels: &[String]) -> Result<(), String> {
     for l in labels {
         if !allowed.iter().any(|a| a == l) {
             return Err(format!("label not allowed: {l:?}"));
