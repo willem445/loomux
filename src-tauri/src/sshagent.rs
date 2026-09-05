@@ -51,17 +51,39 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// The worst case a human waits, end to end — **20 s**, not [`SSH_ADD_TIMEOUT`].
+/// The worst case a human waits, end to end. The launcher awaits the whole
+/// sequence behind one modal "Connecting…", so this — not [`SSH_ADD_TIMEOUT`] —
+/// is the number a human experiences.
 ///
-/// `run_ssh_add` sequences probe → start-attempt → probe → drive, so the two
-/// paths that can run longest are `AGENT_PROBE_TIMEOUT` + `AGENT_START_TIMEOUT`
-/// + `AGENT_PROBE_TIMEOUT` = 20 s to a `NoAgent` refusal, and
-/// `AGENT_PROBE_TIMEOUT` + `SSH_ADD_TIMEOUT` = 20 s to a `Timeout`. The launcher
-/// awaits the whole sequence behind one "Connecting…", so this — not the 15 s
-/// below — is the number a human experiences. Named here so a reader who edits
-/// any one of the three constants can see what they are really changing (#2397
-/// review premortem).
-pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(20);
+/// **It is a bound because the code enforces it, not because someone added up
+/// the paths.** The first version of this constant was arithmetic over an
+/// enumerated path list, and it was wrong: `run_ssh_add`'s agent check does not
+/// return on success, it FALLS THROUGH to the conversation, so
+/// probe + start + probe + drive was a real fourth-step path nobody had summed —
+/// 35 s against a constant claiming 20, with a test that pinned the two
+/// compositions someone had listed and therefore *certified* the false number
+/// (#2397 review B1; `CLAUDE.md`'s "a guard's green is evidence about its
+/// POPULATION" in its most literal form).
+///
+/// So the shape changed rather than the number. Everything before the
+/// conversation now shares ONE deadline ([`AGENT_SETUP_BUDGET`], enforced by
+/// [`ensure_agent`]), and the conversation gets its own full
+/// [`SSH_ADD_TIMEOUT`] whatever the setup spent. There is no longer a set of
+/// paths to enumerate — every path is setup-then-conversation — which is what
+/// makes this total true by construction rather than by a list that the next
+/// person to add a step will forget to update.
+pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(25);
+
+/// One deadline shared by **everything before the conversation** — the first
+/// probe, the start attempt, and the re-probe together.
+///
+/// Shared rather than one ceiling each, because per-step ceilings compose: three
+/// steps at 5 + 10 + 5 is a 20 s wait before `ssh-add` is even asked, and it is
+/// the machine whose agent the start attempt just recovered — the case
+/// `try_start_agent` exists for — that pays it. A shared budget makes the setup
+/// phase cost at most this much however many steps inside it run, and it cannot
+/// borrow from the conversation.
+const AGENT_SETUP_BUDGET: Duration = Duration::from_secs(10);
 
 /// How long the whole `ssh-add` conversation may take before it is abandoned.
 ///
@@ -91,12 +113,6 @@ const ANSWER_REARM: Duration = Duration::from_secs(2);
 /// that prints one line and exits immediately can have that line dropped.
 const POST_EXIT_DRAIN: Duration = Duration::from_millis(300);
 
-/// How long `ssh-add -l` may take to answer "is there an agent".
-const AGENT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long `ssh-agent` gets to ask the service manager to start the service
-/// before we give up on it and report the agent absent.
-const AGENT_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The one-time, **administrator** step that makes the Windows OpenSSH agent
 /// available. Carried in the refusal verbatim rather than described, because a
@@ -294,11 +310,11 @@ pub fn classify_agent_probe(code: Option<i32>, stderr: &str) -> AgentProbe {
 }
 
 /// Ask `ssh-add -l` whether an agent is reachable, under a bound.
-fn probe_agent(ssh_add: &Path) -> AgentProbe {
+fn probe_agent(ssh_add: &Path, budget: Duration) -> AgentProbe {
     let mut cmd = std::process::Command::new(ssh_add);
     cmd.arg("-l");
     no_console(&mut cmd);
-    match loomux_engine::subproc::capture_raw_with_timeout(cmd, AGENT_PROBE_TIMEOUT) {
+    match loomux_engine::subproc::capture_raw_with_timeout(cmd, budget) {
         Ok((status, _stdout, stderr)) => classify_agent_probe(status.code(), &stderr),
         // A capture that could not even run is not evidence of an agent.
         Err(_) => AgentProbe::Absent,
@@ -332,7 +348,7 @@ fn no_console(cmd: &mut std::process::Command) {
 /// Off Windows there is no service to start and this does nothing: an agent is
 /// the session's business there, which is what `UNIX_AGENT_HINT` says.
 #[cfg(target_os = "windows")]
-fn try_start_agent(ssh_add: &Path) {
+fn try_start_agent(ssh_add: &Path, budget: Duration) {
     let Some(dir) = ssh_add.parent() else { return };
     let agent = dir.join("ssh-agent.exe");
     if !agent.is_file() {
@@ -340,12 +356,50 @@ fn try_start_agent(ssh_add: &Path) {
     }
     let mut cmd = std::process::Command::new(agent);
     no_console(&mut cmd);
-    let _ = loomux_engine::subproc::capture_raw_with_timeout(cmd, AGENT_START_TIMEOUT);
+    let _ = loomux_engine::subproc::capture_raw_with_timeout(cmd, budget);
 }
 
 #[cfg(not(target_os = "windows"))]
-fn try_start_agent(_ssh_add: &Path) {
-    let _ = AGENT_START_TIMEOUT;
+fn try_start_agent(_ssh_add: &Path, _budget: Duration) {}
+
+/// Make sure an agent is reachable, inside [`AGENT_SETUP_BUDGET`] **total**.
+///
+/// Returns `None` when there is an agent to add the key to, or `Some` with the
+/// refusal when there is not. The whole phase shares one deadline, so a slow or
+/// wedged step spends the budget rather than extending it: three steps that each
+/// carried their own ceiling is precisely how the 35 s path in #2397 B1 came to
+/// exist.
+///
+/// A step given no time left still runs and fails immediately —
+/// `capture_raw_with_timeout` kills at once and `probe_agent` reads a capture it
+/// could not make as `Absent` — so an exhausted budget fails **closed**, into the
+/// refusal that carries the platform's fix, rather than into a launch with no
+/// agent behind it.
+/// **Not covered by a timed test, and the reason is worth stating.** Proving
+/// the budget by the clock needs a program that ignores `-l` and then BLOCKS,
+/// executed directly (`probe_agent` runs `<ssh-add> -l`, not a shell). The
+/// repo's fixture technique is a `.bat`, which `std::process::Command` cannot
+/// launch directly on Windows, and constraint 3 forbids the real `ssh-add` and
+/// `ssh-agent`. So what is pinned is the arithmetic
+/// (`the_stated_worst_case_covers_every_path_because_there_is_only_one_shape`)
+/// and the shape is left to inspection: one `deadline`, computed once, with
+/// `left()` re-read before each of the three steps. Stated rather than left for
+/// a reader to discover the test they expected is absent.
+fn ensure_agent(ssh_add: &Path) -> Option<SshAddOutcome> {
+    let deadline = Instant::now() + AGENT_SETUP_BUDGET;
+    let left = || deadline.saturating_duration_since(Instant::now());
+
+    if probe_agent(ssh_add, left()) == AgentProbe::Present {
+        return None;
+    }
+    // One attempt to bring it up, then one re-probe. A machine whose agent is
+    // merely stopped is the common case; a Disabled service is the one the hint
+    // is for.
+    try_start_agent(ssh_add, left());
+    if probe_agent(ssh_add, left()) == AgentProbe::Present {
+        return None;
+    }
+    Some(SshAddOutcome::NoAgent { hint: agent_hint() })
 }
 
 /// The platform's one-time fix for "no agent".
@@ -756,14 +810,10 @@ fn run_ssh_add(ssh_path: &str, identity_file: &str, passphrase: &[u8]) -> SshAdd
             detail: "ssh-add was not found beside your ssh client or on PATH.".to_string(),
         };
     };
-    if probe_agent(&ssh_add) == AgentProbe::Absent {
-        // One attempt to bring it up, then one re-probe. A machine whose agent
-        // is merely stopped is the common case; a Disabled service is the one
-        // the hint is for.
-        try_start_agent(&ssh_add);
-        if probe_agent(&ssh_add) == AgentProbe::Absent {
-            return SshAddOutcome::NoAgent { hint: agent_hint() };
-        }
+    // Setup, then the conversation — and only ever those two, which is what
+    // makes WORST_CASE_TOTAL a construction rather than a sum over a path list.
+    if let Some(refusal) = ensure_agent(&ssh_add) {
+        return refusal;
     }
     let argv = vec![ssh_add.to_string_lossy().into_owned(), identity_file.to_string()];
     drive_ssh_add(&argv, passphrase, SSH_ADD_TIMEOUT)
@@ -987,21 +1037,22 @@ mod tests {
     }
 
     #[test]
-    fn the_stated_worst_case_is_what_the_constants_actually_compose_to() {
-        // `WORST_CASE_TOTAL` is a claim on a permanent surface — the module doc,
-        // the design note, and the sentence a human reads about how long
-        // "Connecting…" can sit there. Editing any one of the three constants
-        // it composes reddens this rather than silently falsifying all three.
-        assert_eq!(
-            WORST_CASE_TOTAL,
-            AGENT_PROBE_TIMEOUT + AGENT_START_TIMEOUT + AGENT_PROBE_TIMEOUT,
-            "the no-agent path: probe, start-attempt, re-probe"
-        );
-        assert_eq!(
-            WORST_CASE_TOTAL,
-            AGENT_PROBE_TIMEOUT + SSH_ADD_TIMEOUT,
-            "the timeout path: probe, then the conversation"
-        );
+    fn the_stated_worst_case_covers_every_path_because_there_is_only_one_shape() {
+        // The previous version of this test enumerated two compositions and
+        // pinned the constant against them — and `run_ssh_add` had a THIRD,
+        // because its agent check falls through to the conversation rather than
+        // returning. The constant had been chosen to satisfy the list, so the
+        // test certified a false number instead of exposing it (#2397 B1).
+        //
+        // It is no longer an enumeration. Every path is setup-then-conversation:
+        // the setup phase shares one deadline whatever runs inside it, and the
+        // conversation always gets its own. So there is one sum, and a step
+        // added to `ensure_agent` tomorrow cannot invent a path this misses.
+        assert_eq!(WORST_CASE_TOTAL, AGENT_SETUP_BUDGET + SSH_ADD_TIMEOUT);
+        // …and the setup phase cannot borrow from the conversation, which is the
+        // property that makes the sum above an upper bound rather than a hope.
+        assert!(AGENT_SETUP_BUDGET < WORST_CASE_TOTAL);
+        assert!(SSH_ADD_TIMEOUT < WORST_CASE_TOTAL);
     }
 
     #[test]

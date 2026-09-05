@@ -220,7 +220,7 @@ INV-2 refuses on the webview thread outright).
 | `added` | — | the agent now holds the key |
 | `badPassphrase` | `detail` | `ssh-add` rejected it; `detail` is its own last line, scrubbed |
 | `noAgent` | `hint` | nothing to add the key to; `hint` is the platform's one-time fix |
-| `timeout` | — | the conversation outran its 15 s bound and the child was killed (the human waits up to **20 s** — see below) |
+| `timeout` | — | the conversation outran its 15 s bound and the child was killed (the human waits up to **25 s** end to end — see below) |
 | `failed` | `detail` | `ssh-add` missing, a spawn failure, or an unrecognised refusal |
 
 The conversation itself answers **at most one** prompt with the passphrase and
@@ -271,12 +271,31 @@ the whole bound and refuses a launch that would have worked.
 
 #### Two things this widens, named rather than left implicit
 
-**The bound a human experiences is 20 s, not 15.** `run_ssh_add` sequences probe
-(5 s) → start-attempt (10 s) → probe (5 s) → drive (15 s), so the worst case to a
-`NoAgent` refusal is 5 + 10 + 5 and the worst case to a `Timeout` is 5 + 15 —
-both 20 s, awaited behind one "Connecting…" with no client-side bound.
-`WORST_CASE_TOTAL` names it beside the three constants that compose it, so
-editing any one of them shows what is really being changed.
+**The bound a human experiences is 25 s, and it is enforced rather than summed.**
+The launcher awaits the whole sequence behind one modal "Connecting…", so the
+15 s conversation bound is not the number anyone waits.
+
+The first attempt at stating that got it wrong, and the way it was wrong is the
+reason the shape changed. Per-step ceilings — probe 5 s, start-attempt 10 s,
+re-probe 5 s, conversation 15 s — **compose**, and `run_ssh_add`'s agent check
+does not return on success: it falls through to the conversation. So there was a
+fourth-step path, probe + start + probe + drive = **35 s**, against a constant
+claiming 20 and a test that pinned only the two compositions someone had listed.
+The constant had been picked to satisfy that list, so the test certified the
+false number instead of exposing it.
+
+The fix is structural, because a corrected sum would have had the same defect one
+step later. Everything before the conversation now shares **one** deadline
+(`AGENT_SETUP_BUDGET`, 10 s, enforced in `ensure_agent`), and the conversation
+always gets its own full `SSH_ADD_TIMEOUT` whatever the setup spent. Every path
+is therefore setup-then-conversation — there is no path *set* to enumerate — and
+`WORST_CASE_TOTAL` is their sum by construction. A step added to the setup phase
+tomorrow costs budget rather than inventing a path the pin misses.
+
+An exhausted budget fails **closed**: a step with no time left is killed at once
+and `probe_agent` reads a capture it could not make as `Absent`, so the run ends
+in the refusal that carries the platform's fix rather than in a launch with no
+agent behind it.
 
 **The set of binaries this feature will execute goes from one to three.** An SSH
 pane used to run exactly the `ssh` the human named. This adds `ssh-add` and, on
