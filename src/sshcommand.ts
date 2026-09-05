@@ -116,12 +116,67 @@ function cmdQuoteCwd(token: string): string {
   return `"${token.replace(/"/g, '""')}"`;
 }
 
+/** Builds the POSIX-targeted remote command string.
+ *
+ *  The `cd`-then-`exec` core is wrapped in `exec "$SHELL" -l -i -c <core>`
+ *  (#2395), and that wrap is the whole fix for "bash: exec: copilot: not
+ *  found" on a host where `copilot` is installed and an interactive login
+ *  finds it. sshd runs a remote command through the account's shell with `-c`
+ *  — sshd(8): "the client either requests an interactive shell or execution of
+ *  a non-interactive command, which sshd will execute via the user's shell
+ *  using its -c option" — which is neither a login shell nor an interactive
+ *  one, so it reads neither the login files (`/etc/profile`, `~/.profile`,
+ *  `~/.zprofile`) nor the interactive ones (`~/.bashrc`, `~/.zshrc`). Those
+ *  are where a user-installed CLI gets onto `PATH`: nvm's export,
+ *  `~/.local/bin`, `~/.npm-global/bin`, the pnpm/volta/bun shims. A CLI in
+ *  `/usr/bin` works; the ones agents actually install do not. Re-entering the
+ *  account's own shell as a login+interactive one gets the same `PATH` the
+ *  human sees at a prompt.
+ *
+ *  Both flags are load-bearing, and neither alone fixes it:
+ *  - `-l` alone misses nvm on Ubuntu, because that export lives in `~/.bashrc`
+ *    past its `case $- in *i*) ;; *) return;; esac` early return, which a
+ *    non-interactive shell takes.
+ *  - `-i` alone misses `~/.profile` — bash reads it for a LOGIN shell, and an
+ *    interactive non-login shell goes to `~/.bashrc` instead — which is where
+ *    `~/.local/bin` and `~/.npm-global/bin` are usually added.
+ *
+ *  `"$SHELL"` rather than a literal `bash`: the account's shell may be zsh or
+ *  fish, and `bash -lic` would then source the wrong files entirely — the same
+ *  class of guess `remoteShell` exists to refuse. `$SHELL` is not a guess, it
+ *  is read from the environment sshd itself set up: openssh-portable's
+ *  `session.c` does `child_set_env(&env, &envsize, "SHELL", shell)` over
+ *  `shell = (pw->pw_shell[0] == '\0') ? _PATH_BSHELL : pw->pw_shell`, so on
+ *  this path it is always set and always non-empty. It is double-quoted so a
+ *  shell path containing a space is one word.
+ *
+ *  Not a `PATH=`-prefix: that would mean naming the directories a CLI might be
+ *  installed in, which is the machine-specific guess CLAUDE.md constraint 8
+ *  forbids baking into product code.
+ *
+ *  The core is `posixQuote`d ONCE more, so the whole of it arrives as a single
+ *  `-c` argument no matter what is in `remoteCwd` or the command tokens — the
+ *  outer shell sees one single-quoted word. Both `exec`s are kept: the outer
+ *  replaces sshd's shell with the login shell, the inner replaces the login
+ *  shell with the CLI, so the wrap costs no extra process at the far end.
+ *
+ *  The cost, accepted because `-t` is already forced and a TUI is expected: an
+ *  interactive login shell can print MOTD/banner/rc chatter before the TUI
+ *  paints. Documented in docs/features/ssh-panes.md. */
 function buildPosixRemoteCommand(remoteCwd: string | undefined, remoteCommand: string[]): string {
   const cmd = remoteCommand.map(posixQuote).join(" ");
-  return remoteCwd ? `cd ${posixQuote(remoteCwd)} && exec ${cmd}` : `exec ${cmd}`;
+  const core = remoteCwd ? `cd ${posixQuote(remoteCwd)} && exec ${cmd}` : `exec ${cmd}`;
+  return `exec "$SHELL" -l -i -c ${posixQuote(core)}`;
 }
 
 /** Builds the cmd.exe-targeted remote command string.
+ *
+ *  Deliberately UNCHANGED by #2395's login-shell wrap, and not by oversight:
+ *  cmd.exe has no login/non-login distinction and no per-user rc file that
+ *  sshd's `-c` invocation skips, so there is no lost `PATH` for a wrap to
+ *  recover — and `"$SHELL"` would reach cmd.exe as that literal text, not an
+ *  expansion (cmd.exe's own variable syntax is `%VAR%`). A test pins this path
+ *  byte-for-byte against its pre-#2395 shape.
  *
  *  ALWAYS prefixes with `cd /d <quoted-cwd-or-".">` — even when the caller
  *  passed no `remoteCwd` — so the emitted string can never begin with a `"`
