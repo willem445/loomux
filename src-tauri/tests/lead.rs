@@ -1324,7 +1324,14 @@ fn lead_group_cap_and_spawn_rate_apply_to_children() {
         .lead_prepare("claude", &repo.path(), "l2", 8, false, 5, 1, 5)
         .expect("a second lead group, on a repo that already has one");
     let gid2 = GroupId::parse(out2["group_id"].as_str().unwrap()).unwrap();
-    assert_ne!(gid2, gid, "a live group is never reattached to — this is a fresh id");
+    // Its own registry means its own orchestration ROOT, so the id it derives
+    // from this repo path is the same one — `next_group_id` reads the live
+    // agents of THIS registry and `reg2` has none. That is why the precondition
+    // to assert is the guardrail pair rather than the id: a cap of 8 cannot be
+    // what refuses below, so a refusal there is the rate backstop's.
+    let rails2 = reg2.group(&gid2).unwrap().guardrails;
+    assert_eq!(rails2.max_spawns_per_hour, 1, "one spawn per hour");
+    assert_eq!(rails2.max_agents, 8, "…and a cap far above the two spawned here");
     reg2.spawn_agent(&gid2, Role::Worker, "w1", "t", false, None).expect("the first is admitted");
     let rate = reg2
         .spawn_agent(&gid2, Role::Worker, "w2", "t", false, None)
