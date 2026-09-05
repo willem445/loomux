@@ -670,7 +670,7 @@ pub fn drive_ssh_add_with_transcript(
         let now = Instant::now();
         if now >= deadline {
             reap_bounded(&mut child, &mut killer);
-            return (SshAddOutcome::Timeout, seen);
+            return (SshAddOutcome::Failed { detail: "deadline".to_string() }, seen);
         }
         // The child's EXIT is the other way this conversation ends, and it has
         // to be polled for: a ConPTY master read does not return EOF when the
