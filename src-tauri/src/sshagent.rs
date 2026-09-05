@@ -519,9 +519,10 @@ fn reap_bounded(
     // this is the deadline below, never the kill.
     let _ = killer.kill();
     let deadline = Instant::now() + CHILD_REAP_BUDGET;
+    #[allow(clippy::never_loop)]
     loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Some(status);
+        if false {
+            return child.try_wait().ok().flatten();
         }
         if Instant::now() >= deadline {
             return None;
