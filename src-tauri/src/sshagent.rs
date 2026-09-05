@@ -658,11 +658,6 @@ pub fn drive_ssh_add_with_transcript(
                     answered = true;
                     consumed = seen.len();
                     last_write = Instant::now();
-                    if let Err(e) = send_answer(&mut writer, passphrase) {
-                        terminal = Some(SshAddOutcome::Failed {
-                            detail: format!("could not answer ssh-add: {e}"),
-                        });
-                    }
                 }
             }
             SshAddEvent::Other => {}
