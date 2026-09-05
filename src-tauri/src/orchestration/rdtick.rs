@@ -2209,11 +2209,13 @@ impl OrchRegistry {
     /// next blocking fail parks the drive whatever it is about.
     fn grace_clause(grace: bool) -> &'static str {
         if grace {
-            " This is a GRACE round past the review bound: the last blocking \
-             fail came back on a lane that was re-briefed about the PR body \
-             alone, at a head that had not moved. It is granted once per drive \
-             and is now spent, so the next blocking fail parks the drive \
-             whatever it is about."
+            " This is a GRACE round PAST the review bound: the last blocking \
+             fail came back on a lane that had been re-briefed about the PR \
+             body alone, at a head that had not moved. The attempt count below \
+             still reads at the bound, and that is not a mistake — a grace \
+             round is not a review round. It is granted once per drive and is \
+             now spent, so the next blocking fail parks the drive whatever it \
+             is about."
         } else {
             ""
         }
