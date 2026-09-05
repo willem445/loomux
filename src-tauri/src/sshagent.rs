@@ -761,6 +761,16 @@ fn open_and_wire(program: &str, args: &[String]) -> Result<Wired, String> {
     // rather than only killing it — the same zombie the conversation's own tail
     // used to leave off Windows (#2594 item 1), on a path that is rarer but no
     // less real.
+    //
+    // These two arms return with `pair` still owning the master, so its drop is
+    // the `ClosePseudoConsole` that [`close_console_while_the_reader_drains`]
+    // exists to order — and there is no reader thread yet, since `spawn_reader`
+    // runs only on the `Ok` path. That is deliberate rather than an oversight
+    // the ordering rule escaped: the reap above has already ENDED the child, so
+    // there is no attached client for the close to wait on, which is the whole
+    // condition that made the ordering matter. The reap is therefore
+    // load-bearing here for a second reason beyond the zombie, and must stay
+    // above both returns (#2661 review, rev-final premortem 2).
     let writer = match pair.master.take_writer() {
         Ok(writer) => writer,
         Err(e) => {
@@ -1522,21 +1532,48 @@ mod tests {
         // Pinned by adding a step rather than by arithmetic over a count, which
         // is the shape #2397 review B1 removed from this module — a count is
         // exactly what a fourth step falsifies in silence.
-        let budget = Duration::from_millis(30);
-        let overrun = Duration::from_millis(200);
+        // **Both figures below are sized against a failure mode, not picked.**
+        // The first draft used a 30 ms budget and a 200 ms overrun, and each of
+        // those numbers had a defect that a green run cannot show you (#2661
+        // review, rev-std 1 and rev-final W2):
+        //
+        // - The BUDGET is the window in which the first step must be started.
+        //   At 30 ms, a scheduler stall of 30 ms between `Instant::now()` and
+        //   `run_setup_steps`'s first clock read leaves `left` zero, starts
+        //   nothing, and reddens `three_started == 1` with nothing wrong. Half a
+        //   second is beyond any plausible preemption on a CI runner, and the
+        //   phase still costs only budget + overrun when the code is correct.
+        // - The CEILING must sit strictly BELOW what the un-fixed code costs, or
+        //   the clock assert is a coin flip under the very mutation it exists
+        //   for. At 30 + 200 + 400 the ceiling was 630 ms and the un-fixed
+        //   three-step cost was also ~630 ms — the same number. The arithmetic
+        //   is set out beside the assert below.
+        let budget = Duration::from_millis(500);
+        let overrun = Duration::from_millis(500);
         let (three_started, three_took) = overrunning_phase(3, budget, overrun);
         let (four_started, four_took) = overrunning_phase(4, budget, overrun);
 
         assert_eq!(three_started, 1, "only the step that had time left may run");
         assert_eq!(four_started, three_started, "a fourth step must not add a fourth start");
-        // The clock says the same thing the start count does, and says it about
-        // the property the constant actually claims. Without the between-steps
-        // check a phase of N overrunning steps costs budget + N x overrun, so
-        // four steps would take ~830 ms against three's ~630 ms; both must land
-        // inside one overrun of the budget instead. The ceiling is loose because
-        // a CI runner's `sleep` is not a metronome — it is still nowhere near
-        // 630 ms.
+
+        // The clock is a SECOND witness, and it is only a witness if it can
+        // fail. Correct, a phase costs budget + one overrun whatever its step
+        // count: 500 + 500 = 1000 ms. Un-fixed, every step is started and each
+        // overruns, so N steps cost budget + N x overrun — 2000 ms for three and
+        // 2500 ms for four.
+        //
+        // The ceiling therefore has to separate 1000 from 2000, and the slack is
+        // what is left over: 400 ms of tolerance for a CI runner whose `sleep` is
+        // not a metronome, leaving a 600 ms margin below the nearest un-fixed
+        // figure. Both arms discriminate, which was the point of the finding —
+        // the previous ceiling only separated the FOUR-step arm.
         let ceiling = budget + overrun + Duration::from_millis(400);
+        assert!(
+            ceiling < budget + overrun * 3,
+            "the ceiling must sit below the un-fixed three-step cost, or the assert below \
+             is a coin flip: ceiling {ceiling:?} vs un-fixed {:?}",
+            budget + overrun * 3
+        );
         assert!(three_took < ceiling, "three steps took {three_took:?}, ceiling {ceiling:?}");
         assert!(four_took < ceiling, "four steps took {four_took:?}, ceiling {ceiling:?}");
     }

@@ -80,27 +80,70 @@ fn announced_pid(transcript: &str) -> u32 {
         .unwrap_or_else(|e| panic!("unparsable pid {digits:?}: {e}; transcript: {}", show(transcript)))
 }
 
-/// Whether the OS still has a process table entry for `pid`.
+/// Whether the OS still has a process table entry for `pid` — the slot, not
+/// what is in it.
 ///
 /// **A zombie counts as present**, which is the entire point: a killed child
 /// nobody waited on is still listed, so this separates "reaped" from "merely
 /// dead" — the distinction `Child::kill` alone cannot make. `ps` rather than a
 /// `libc` call because this crate takes no new dependency for a test, and
 /// `-o pid=` prints the pid with no header on both Linux and macOS.
+///
+/// Used only by the instrument control. Every assertion about the driver goes
+/// through [`still_our_shell_child`] instead — see its doc for why a bare pid
+/// probe is the wrong question.
 fn process_exists(pid: u32) -> bool {
+    !ps(pid, "pid=").is_empty()
+}
+
+/// Whether `pid` is still **the child this test spawned**: our own direct child,
+/// running a shell.
+///
+/// A bare `ps -p <pid>` answers "is that slot occupied", and the slot is not the
+/// question (#2661 review, rev-std 2). Between the driver reaping the child and
+/// this probe, the OS may hand that pid to something else, and the test would
+/// then report a correctly-reaped child as a leak — a flake that fires on a
+/// green tree and points at the one line it is not about.
+///
+/// Two facts identify the process rather than the number, and both survive the
+/// zombie state this test has to detect:
+///
+/// - `ppid` stays this test process until the child is **reaped**, which is
+///   exactly the transition under test. A recycled pid belongs to some other
+///   parent.
+/// - `comm` is the shell the fixture runs. This test spawns no other shell, so
+///   the residual — a recycled pid that is ALSO a fresh shell child of ours —
+///   has no way to arise here. The one other process this test starts is `ps`
+///   itself, and `ps` is not `sh`.
+///
+/// `ps_finds_our_own_shell_child_and_loses_it_once_reaped` is the positive
+/// control: an assertion that this returns **false** passes just as well when it
+/// can never return true.
+fn still_our_shell_child(pid: u32) -> bool {
+    let line = ps(pid, "ppid=,comm=");
+    let mut fields = line.split_whitespace();
+    let ppid: Option<u32> = fields.next().and_then(|p| p.parse().ok());
+    let comm = fields.next().unwrap_or("");
+    // `comm` is the basename on Linux and may carry a leading `-` for a login
+    // shell on macOS, so match the tail rather than the whole field.
+    ppid == Some(std::process::id()) && comm.ends_with("sh")
+}
+
+/// One `ps` read of one pid, with the requested no-header format.
+fn ps(pid: u32, format: &str) -> String {
     let out = std::process::Command::new("ps")
-        .args(["-o", "pid=", "-p", &pid.to_string()])
+        .args(["-o", format, "-p", &pid.to_string()])
         .output()
         .expect("`ps` must be available to run this test at all");
-    !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 #[test]
 fn ps_reports_a_live_process_as_present() {
-    // The positive control for every assertion below, and it is not optional:
-    // `process_exists` returning false is what those tests read as success, and
-    // a `ps` that failed, printed a header, or was invoked wrongly would return
-    // false for everything — including a process that is definitely there.
+    // The instrument control, and it is not optional: every assertion below
+    // reads a probe returning false as success, and a `ps` that failed, printed
+    // a header, or was invoked wrongly would return false for everything —
+    // including a process that is definitely there.
     assert!(
         process_exists(std::process::id()),
         "`ps -o pid= -p <self>` must find this very test process, or the instrument is blind"
@@ -108,6 +151,39 @@ fn ps_reports_a_live_process_as_present() {
     // …and it must not simply answer `true`: pid 0 is not a process any `ps`
     // lists on Linux or macOS.
     assert!(!process_exists(0), "`ps` must not claim pid 0 exists");
+}
+
+#[test]
+fn ps_finds_our_own_shell_child_and_loses_it_once_reaped() {
+    // The positive control for [`still_our_shell_child`], which is the probe the
+    // two tests below actually assert on. Both assert it is **false**, and a
+    // predicate that can never return true satisfies that for every input —
+    // including a child sitting right there unreaped, which is the defect #2594
+    // item 1 fixed. The control above proves `ps` runs; this one proves the
+    // question asked of it can be answered yes.
+    //
+    // The whole transition is driven on a child this test owns: alive and ours,
+    // then killed and waited on, then gone. No agent CLI is involved (CLAUDE.md
+    // constraint 3) — it is `/bin/sh` blocking on a read.
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "read x"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn a shell that blocks on a read");
+    let pid = child.id();
+    assert!(
+        still_our_shell_child(pid),
+        "a live `/bin/sh` child of this process must be recognised, or every assertion \
+         below passes vacuously; `ps -o ppid=,comm= -p {pid}` said {:?}",
+        ps(pid, "ppid=,comm=")
+    );
+
+    child.kill().expect("kill the control child");
+    child.wait().expect("reap the control child");
+    assert!(
+        !still_our_shell_child(pid),
+        "a reaped child must stop being recognised — pid {pid} still reads as ours"
+    );
 }
 
 #[test]
@@ -133,10 +209,10 @@ fn a_success_decided_by_a_transcript_line_still_reaps_the_child() {
     );
     let pid = announced_pid(&seen);
     assert!(
-        !process_exists(pid),
-        "the driver must reap the child it killed — pid {pid} is still in the process \
-         table, which off Windows means a zombie held for the life of the app; \
-         transcript: {}",
+        !still_our_shell_child(pid),
+        "the driver must reap the child it killed — pid {pid} is still an unreaped shell \
+         child of this process, which off Windows means a zombie held for the life of the \
+         app; transcript: {}",
         show(&seen)
     );
 }
@@ -171,5 +247,10 @@ fn a_timed_out_child_is_reaped_too() {
         show(&seen)
     );
     let pid = announced_pid(&seen);
-    assert!(!process_exists(pid), "pid {pid} survived the timeout arm; transcript: {}", show(&seen));
+    assert!(
+        !still_our_shell_child(pid),
+        "pid {pid} is still an unreaped shell child of this process after the timeout arm; \
+         transcript: {}",
+        show(&seen)
+    );
 }

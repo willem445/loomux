@@ -318,6 +318,13 @@ pins it on the platform it actually bit, by looking for the child in the process
 table afterwards. A zombie is still *listed* there, which is what separates
 "reaped" from "merely killed" — the distinction a `kill` on its own cannot make.
 
+That probe asks whether the pid is still **this test's own unreaped shell child**
+(`ppid` and `comm`), not whether the slot is occupied. The slot is the wrong
+question: between the reap and the probe the OS may hand that pid to something
+else, and a correctly-reaped child would then be reported as a leak (#2661
+review). `ppid` stays the parent until the child is reaped — which is exactly the
+transition under test — so it identifies the process rather than the number.
+
 The console is then closed in one order, and it is a load-bearing one. Dropping
 the master is `ClosePseudoConsole`, documented to wait for an attached client to
 finish with the console; the reader thread stops draining the moment its channel
