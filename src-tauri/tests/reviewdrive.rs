@@ -2032,7 +2032,12 @@ fn the_lane_brief_names_the_round_scope_on_every_round_mode() {
     {
         let dir = tempfile::tempdir().unwrap();
         let reg = relaunch_registry(dir.path());
-        let repo = Repo::new();
+        // **The gate must DECLARE `body-unchanged`** (#2168 E2): on the stock
+        // roster a body edit leaves the gate satisfied, the drive reaches
+        // `gate-check` and terminates, and no verification round ever opens —
+        // the exact premise `a_verification_brief_announces_itself_on_every_
+        // path_that_grants_it` documents for the same reason.
+        let repo = Repo::with(WORKFLOW_BODY_UNCHANGED);
         let gh = FakeGh::green(HEAD_A);
         let (group, _s) = driven(&reg, &repo, &gh);
         let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
