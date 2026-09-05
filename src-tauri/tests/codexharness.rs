@@ -22,8 +22,9 @@
 //! tag `rust-v0.153.4` and quoted in `doc/design/codex.md`.
 
 use loomux_lib::orchestration::{
-    codex_profile_name, codex_profile_toml, codex_user_mcp_exposure, single_pane_autopilot_flags,
-    CodexMcpAuth, PathSegment,
+    codex_profile_file_name, codex_profile_name, codex_profile_name_of_path,
+    codex_profile_toml, codex_user_mcp_exposure, single_pane_autopilot_flags, CodexMcpAuth,
+    PathSegment,
 };
 use std::fs;
 use std::path::Path;
@@ -341,6 +342,45 @@ fn a_codex_contract_with_triple_quotes_is_escaped_not_truncated() {
 // 4. The profile NAME — the vendor's alphabet, refused rather than sanitized
 // ---------------------------------------------------------------------------
 
+/// The writer's literal and the readers' const are ONE fact (#2515 C1).
+///
+/// `codex_profile_file_name` spells `.config.toml` literally in its `format!`
+/// template — it has to, or `no_raw_identifier_is_interpolated_into_a_file_name`
+/// would not see the site at all, since that scan's trigger is an extension
+/// literal inside the template. The orphan sweep and
+/// `codex_profile_name_of_path` cannot use a literal: `strip_suffix` needs the
+/// value. So the suffix is spelled twice, and this is what stops that being
+/// #502's "a delete path that re-derives a write path's shape either misses
+/// files or matches too widely".
+///
+/// Asserted as a ROUND TRIP rather than as `assert_eq!` on two strings, because
+/// the round trip is the property that actually matters: whatever the writer
+/// produces, the reader must recover the same name from it. A test comparing
+/// the two spellings would pass on a pair that agreed with each other and with
+/// nothing the filesystem holds.
+#[test]
+fn the_codex_profile_suffix_and_its_file_name_builder_agree() {
+    for id in ["w-3", "orch-1", "solo-27"] {
+        let file = codex_profile_file_name(&seg(id)).unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert_eq!(file, format!("orrerix-{id}.config.toml"));
+        assert_eq!(
+            codex_profile_name_of_path(Path::new(&file)),
+            Some(format!("orrerix-{id}").as_str()),
+            "the reader must recover exactly the name `-p` is spelled with, from the file name \
+             the writer produced — the two spellings of the suffix are one fact"
+        );
+    }
+    // `file_stem` is the obvious wrong reader and would answer
+    // `orrerix-w-3.config` — a name `-p` would look for under a file that is
+    // not there. Pinned so the cheaper-looking implementation cannot be
+    // adopted silently.
+    let file = codex_profile_file_name(&seg("w-3")).unwrap();
+    assert_ne!(
+        codex_profile_name_of_path(Path::new(&file)),
+        Path::new(&file).file_stem().and_then(|s| s.to_str()),
+        "the extension has two dots, so a file_stem reader is wrong rather than merely different"
+    );
+}
 /// A profile name is valid **by construction**, and the check inside
 /// `codex_profile_name` is a backstop against somebody else's alphabet moving.
 ///

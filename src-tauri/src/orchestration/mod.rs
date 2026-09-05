@@ -7125,12 +7125,44 @@ pub fn pi_repo_mcp_exposure(
 /// pane's environment with no reader at all.
 const CODEX_TOKEN_ENV: &str = "ORRERIX_AGENT_TOKEN";
 
-/// The suffix a profile-v2 file takes under `CODEX_HOME`, and the shape the
-/// orphan sweep matches. Named because three sites spell it — the writer, the
-/// per-agent removal and the sweep — and #502's lesson was that a delete path
-/// re-deriving a write path's shape either misses files (they accumulate) or
-/// matches too widely (it deletes something loomux never wrote).
+/// The suffix a profile-v2 file takes under `CODEX_HOME` — the shape the orphan
+/// sweep and `codex_profile_name_of_path` STRIP, as opposed to the one the
+/// writer builds.
+///
+/// **The two directions are spelled differently on purpose, and the difference
+/// is not a drift.** A const cannot appear inside a `format!` template's
+/// extension position without making the site invisible to
+/// `no_raw_identifier_is_interpolated_into_a_file_name`, whose trigger is an
+/// extension LITERAL in the template (constraint 6). A file name loomux builds
+/// from an identifier must be visible to that scan, so
+/// [`codex_profile_file_name`] writes `.config.toml` literally and carries an
+/// allowlist row arguing why it is safe. The readers cannot use a literal —
+/// `strip_suffix` needs the value, not a template — so they take this const.
+///
+/// `the_codex_profile_suffix_and_its_file_name_builder_agree` pins the two
+/// spellings equal, which is what keeps #502's "a delete path that re-derives a
+/// write path's shape either misses files or matches too widely" from applying:
+/// they are one fact checked in one place, not two literals maintained apart.
 const CODEX_PROFILE_FILE_EXT: &str = ".config.toml";
+
+/// The file name one agent's codex profile takes — **the one place an
+/// identifier becomes a codex profile file name** (constraint 6).
+///
+/// Split out of its two callers so there is a single declared assembly point,
+/// exactly as `claude_transcript_path` and `pi_session_file_in_dir` are, and it
+/// takes the same proof at its signature: a `&PathSegment` cannot be handed a
+/// raw `&str`, so the type is the guarantee and the scan's allowlist row pins
+/// the type rather than the line.
+///
+/// The value interpolated is narrower still than the parameter — the name comes
+/// from [`codex_profile_name`], which refuses anything outside codex's own
+/// `[A-Za-z0-9_-]` alphabet — but the signature is what a textual scan can
+/// check, so that is what the row names.
+#[doc(hidden)] // pub for integration tests
+pub fn codex_profile_file_name(agent: &PathSegment) -> Result<String, String> {
+    let name = codex_profile_name(agent)?;
+    Ok(format!("{name}.config.toml"))
+}
 
 /// Timeout (secs) on loomux's entry in a codex profile, raised from codex's own
 /// 60s default for the reason [`PI_MCP_TIMEOUT_MS`] gives, and to the same
@@ -7289,7 +7321,8 @@ pub fn codex_profile_name(agent: &PathSegment) -> Result<String, String> {
 /// resolve, is an error at startup nobody is watching for. Neither is good;
 /// this is the less bad one, and the real defence is that the value comes from
 /// the writer rather than from a caller.
-fn codex_profile_name_of_path(cfg: &Path) -> Option<&str> {
+#[doc(hidden)] // pub for integration tests
+pub fn codex_profile_name_of_path(cfg: &Path) -> Option<&str> {
     cfg.file_name()?.to_str()?.strip_suffix(CODEX_PROFILE_FILE_EXT)
 }
 
@@ -29152,13 +29185,13 @@ impl OrchRegistry {
         let home = self
             .codex_home_dir()
             .ok_or_else(|| "cannot resolve codex's home directory (no CODEX_HOME and no user home)".to_string())?;
-        let name = codex_profile_name(agent)?;
+        let file = codex_profile_file_name(agent)?;
         // codex itself requires `CODEX_HOME` to EXIST — it errors out with
         // "CODEX_HOME points to {val:?}, but that path is not a directory" —
         // so creating it is not loomux overstepping: a pane whose home is
         // missing does not boot at all.
         fs::create_dir_all(&home).map_err(|e| format!("{}: {e}", home.display()))?;
-        let path = home.join(format!("{name}{CODEX_PROFILE_FILE_EXT}"));
+        let path = home.join(&file);
         let port = self.port();
         let body =
             codex_profile_toml(port, auth, workdir, unattended, effort, developer_instructions);
@@ -29171,7 +29204,7 @@ impl OrchRegistry {
             row["agent"] = json!(agent.as_str());
             self.audit(group, brand::AUDIT_ACTOR, "codex-user-mcp-merged", row);
         }
-        Ok((path, name))
+        Ok((path, codex_profile_name(agent)?))
     }
 
     /// Remove one agent's codex profile file. Best-effort and idempotent: the
@@ -29182,9 +29215,9 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn remove_codex_profile(&self, agent_id: &str) {
         let Ok(seg) = PathSegment::parse(agent_id) else { return };
-        let Ok(name) = codex_profile_name(&seg) else { return };
+        let Ok(file) = codex_profile_file_name(&seg) else { return };
         let Some(home) = self.codex_home_dir() else { return };
-        let path = home.join(format!("{name}{CODEX_PROFILE_FILE_EXT}"));
+        let path = home.join(file);
         if fs::remove_file(&path).is_ok() {
             crate::obs::breadcrumb(
                 "codex-profile",
