@@ -68,9 +68,20 @@ pub use loomux_engine::sessions::{
 // `yaml_field` read, and the four `orchestration/mod.rs` spawn-path calls all
 // stayed in this crate.
 pub(crate) use loomux_engine::sessions::{
-    claude_projects_root, claude_session_ids, codex_session_ids, codex_sessions_root,
-    copilot_session_dir_at, copilot_session_ids, copilot_session_state_root,
-    newest_new_codex_session, newest_new_copilot_session, norm_path, yaml_field, CodexIdentified,
+    claude_projects_root, claude_session_ids, codex_sessions_root, copilot_session_dir_at,
+    copilot_session_ids, copilot_session_state_root, newest_new_copilot_session, norm_path,
+    yaml_field,
+};
+
+// The codex store WATCHER's three names (#2515 C1). `pub` rather than
+// `pub(crate)` for the reason `pi_sessions_root_from` above is: the watcher's
+// decision — cwd match required, contest refused, claimed ids excluded — is
+// pinned by `tests/orchestration.rs`, and an integration test can only reach
+// this crate's surface. The spawn path in `orchestration/mod.rs` is the only
+// other caller.
+#[doc(hidden)] // pub for integration tests
+pub use loomux_engine::sessions::{
+    codex_session_ids, newest_new_codex_session, CodexIdentified,
 };
 
 // Was module-private: only the scan machinery below calls these, so a bare
