@@ -268,10 +268,7 @@ pub fn classify_ssh_add_line(line: &str) -> SshAddEvent {
 /// on `cfg(windows)`, so a `.exe` seen on any host stays a `.exe`.
 pub fn ssh_add_beside(ssh_path: &Path) -> Option<PathBuf> {
     let dir = ssh_path.parent()?;
-    let name = match ssh_path.extension().and_then(|e| e.to_str()) {
-        Some(ext) if !ext.is_empty() => format!("ssh-add.{ext}"),
-        _ => "ssh-add".to_string(),
-    };
+    let name = "ssh-add".to_string();
     Some(dir.join(name))
 }
 
