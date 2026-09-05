@@ -438,14 +438,11 @@ fn rd_lane_scope(
     brief: &RdBrief,
     verify: bool,
 ) -> String {
-    if verify {
-        return "scope: body-only".to_string();
-    }
-    match entry.lane(block).filter(|l| !l.at_head.is_empty()) {
-        Some(rec) if rec.at_head == brief.head => "scope: body-only".to_string(),
-        Some(rec) => format!("scope: delta since {}", rd_fact(&rec.at_head)),
-        None => "scope: whole-diff".to_string(),
-    }
+    // [scratch round 1] the whole derivation set aside — the line renders as
+    // nothing, the audit row carries the empty string, and every pin on it
+    // should go red while the rest of the driver stays wired.
+    let _ = (entry, block, brief, verify);
+    String::new()
 }
 
 impl OrchRegistry {
