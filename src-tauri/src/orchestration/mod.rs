@@ -4847,7 +4847,7 @@ fn lead_mcp_args(cli: &str, cfg: &Path) -> String {
         // `solo_prepare`'s arm for why that is harmless and deliberately not
         // relied on. This adds a THIRD flag rather than editing either.
         "claude" => format!(
-            "--mcp-config \"{}\" --strict-mcp-config --allowedTools {tools} --disallowedTools Agent",
+            "--mcp-config \"{}\" --strict-mcp-config --allowedTools {tools}",
             cfg.display(),
             tools = brand::MCP_TOOL_PREFIX
         ),
