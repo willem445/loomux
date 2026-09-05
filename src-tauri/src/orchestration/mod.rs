@@ -4787,8 +4787,8 @@ impl KickoffOrigin {
 /// exists, and a second spelling for those would be exactly the drift this
 /// function is here to prevent. A `GroupInfo` caller passes `&g.repo,
 /// &g.guardrails`.
-pub fn active_workflow_path(repo: &str, rails: &Guardrails) -> String {
-    workflow::workflow_path_named(repo, &rails.workflow)
+pub fn active_workflow_path(repo: &str, _rails: &Guardrails) -> String {
+    workflow::workflow_path(repo).to_string()
 }
 
 /// Read + validate the workflow file THIS GROUP runs (#1689).
@@ -4800,9 +4800,9 @@ pub fn active_workflow_path(repo: &str, rails: &Guardrails) -> String {
 /// file `load_workflow` would have opened.
 pub fn load_active_workflow(
     repo: &str,
-    rails: &Guardrails,
+    _rails: &Guardrails,
 ) -> Result<Option<workflow::Workflow>, Vec<String>> {
-    workflow::load_workflow_named(repo, &rails.workflow)
+    workflow::load_workflow(repo)
 }
 
 #[derive(Clone, Debug, Default)]
