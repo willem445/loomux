@@ -4137,14 +4137,22 @@ const OPENCODE_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 // `$CODEX_HOME/sessions` for a rollout that was not there before the spawn.
 /// How often to walk the rollout store for the pane's new thread.
 ///
-/// Slower than copilot's tick, and NOT for opencode's reason (a SQLite open).
-/// This walk is three directory levels deep over a store that holds the
-/// human's whole codex history, and it runs once per booting codex pane. The
-/// per-tick cost is bounded by the baseline set rather than by the store's
-/// size — a candidate already in the baseline is rejected on a set lookup and
-/// never opened — but the LISTING is paid every tick regardless, so the tick
-/// is the thing to keep cheap.
-const CODEX_SESSION_POLL: Duration = Duration::from_secs(2);
+/// The slowest of the three, and the reason is neither copilot's (one directory
+/// listing) nor opencode's (one SQLite query). This walk is **three directory
+/// levels deep over the human's entire codex history**: one `read_dir` per
+/// year, per month, and per DAY they have ever used codex, plus one entry per
+/// rollout. A year of daily use is ~365 day-directories and as many files, and
+/// that whole listing is paid on every tick — the baseline set makes each
+/// candidate cheap to REJECT (a set lookup, no file opened) but does nothing to
+/// shorten the walk itself.
+///
+/// Multiplied by the ten-minute deadline below, a two-second tick would be 300
+/// full walks per booting pane. Five seconds is 120, and nothing whatsoever
+/// waits on the result: the id is bound in the background, and a pane that
+/// identifies four seconds later is indistinguishable to every consumer. So the
+/// tick is set by what the walk COSTS rather than by how soon the answer could
+/// be had.
+const CODEX_SESSION_POLL: Duration = Duration::from_secs(5);
 /// Give up watching after this long.
 ///
 /// opencode's ten minutes rather than copilot's 90 seconds, and the fact that
@@ -7537,10 +7545,17 @@ pub fn codex_profile_name(agent: &PathSegment) -> Result<String, String> {
 /// stem would answer `orrerix-w-3.config` — a name `-p` would look for under a
 /// file that is not there.
 ///
-/// `None` for a path that is not one of loomux's profile files. The builders
-/// then emit no `-p` at all, which is the honest degrade: a pane with the
-/// human's own base config and no orrerix layer, rather than one pointed at a
-/// profile that does not exist (codex errors on an unresolvable `--profile`).
+/// `None` is **unreachable on the codex path**, and it is worth being precise
+/// about why rather than calling it a degrade. Every codex pane's `cfg` comes
+/// from `write_mcp_config`'s codex branch, which returns the profile file it
+/// just wrote — so the suffix always strips. If it somehow did not, the pane
+/// would launch with the human's base config and no orrerix layer, which is
+/// **not** a graceful outcome: no trust key means it boots into the trust
+/// dialog and eats its kickoff. That is at least LOUD — a human sees the
+/// dialog — where the alternative, emitting `-p` for a name codex cannot
+/// resolve, is an error at startup nobody is watching for. Neither is good;
+/// this is the less bad one, and the real defence is that the value comes from
+/// the writer rather than from a caller.
 fn codex_profile_name_of_path(cfg: &Path) -> Option<&str> {
     cfg.file_name()?.to_str()?.strip_suffix(CODEX_PROFILE_FILE_EXT)
 }
@@ -37390,10 +37405,19 @@ impl OrchRegistry {
         // spawns itself. Asking the old question here would have run gemini
         // into the `unreachable!` below. See `CliCaps::mcp_argv_seam`.
         let has_seam = cli_caps(cli).is_some_and(|c| c.mcp_argv_seam);
-        let (token, mcp_args) = if cli == "codex" {
+        let (token, mcp_args) = if cli == "codex" && has_seam {
             // codex (#2515 C1) is the one seam CLI whose SOLO profile is not
             // the same document as its group profile, so it is written here
             // rather than through `write_mcp_config` below.
+            //
+            // `&& has_seam` is not belt-and-braces, it is what keeps this arm
+            // DATA-driven like the `match` below it. Without it, a `CLI_CAPS`
+            // row that set `mcp_argv_seam: false` for codex — the deliberate
+            // way to make a CLI delivery-only — would be silently overruled
+            // here: the pane would still mint a token and write a profile
+            // while the table said it could not. With it, such a row falls to
+            // the `else if has_seam` below, misses, and the pane is
+            // delivery-only exactly as the table says.
             //
             // The difference is one field and it is forced: a solo launch only
             // ever appends a flag string to a command line the human owns — it
