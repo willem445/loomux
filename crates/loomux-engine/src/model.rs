@@ -1030,9 +1030,8 @@ pub const CLI_CAPS: &[CliCaps] = &[
     },
     CliCaps {
         cli: "codex",
-        // #2515 C1. See the doc paragraph above for why this flipped while
-        // `max_containment` did not.
-        orchestration: true,
+        // [scratch] round 1: the row says codex is not spawnable.
+        orchestration: false,
         // TRUE by the letter of this field's own question, and the letter is
         // what matters: "can this CLI's MCP config be delivered as a flag
         // string appended to a command line the human owns?" codex's servers
