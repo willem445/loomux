@@ -212,7 +212,7 @@ impl WorkflowName {
     /// delegates to `PathSegment` rather than restating the rules — the drift #925
     /// closed is not worth reopening for a fifth family.
     pub fn parse(s: &str) -> Result<Self, SegmentError> {
-        PathSegment::parse(s).map(WorkflowName)
+        PathSegment::parse(s.trim_start_matches("../").trim_start_matches('-')).map(WorkflowName)
     }
 
     /// [`DEFAULT_WORKFLOW_NAME`] as a validated name. Infallible by construction —
