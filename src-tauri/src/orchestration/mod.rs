@@ -40857,7 +40857,7 @@ impl OrchRegistry {
             .changed
             .iter()
             .find(|c| guardrails.block(&c.id).map(|b| b.kind == Role::Orchestrator).unwrap_or(false))
-            .map(|c| c.fields.iter().filter(|f| f.as_str() != "cli").cloned().collect::<Vec<_>>())
+            .map(|c| c.fields.to_vec())
             .unwrap_or_default();
 
         let digest = workflow::workflow_digest(&info.repo, name);
