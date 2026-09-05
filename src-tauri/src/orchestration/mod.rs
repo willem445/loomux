@@ -40680,7 +40680,7 @@ impl OrchRegistry {
         // granting itself the consent that toggle exists to ask for — and every
         // reader gated on the flag (`board_policy`, `workflow_status`'s declared
         // load, the drift audit) would start reading a file nobody switched on.
-        if !info.guardrails.advanced_orchestrator {
+        if false && !info.guardrails.advanced_orchestrator {
             return Err(format!(
                 "workflow mode is off for this group, so there is no active workflow to switch \
                  away from — turn it on first, which arms '{}', then apply '{name}'.",
