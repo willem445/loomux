@@ -220,7 +220,7 @@ INV-2 refuses on the webview thread outright).
 | `added` | — | the agent now holds the key |
 | `badPassphrase` | `detail` | `ssh-add` rejected it; `detail` is its own last line, scrubbed |
 | `noAgent` | `hint` | nothing to add the key to; `hint` is the platform's one-time fix |
-| `timeout` | — | the conversation outran its 15 s bound and the child was killed (the human waits up to **27 s** end to end — see below) |
+| `timeout` | — | the conversation outran its 15 s bound and the child was killed (the human waits up to **29 s** end to end — see below) |
 | `failed` | `detail` | `ssh-add` missing, a spawn failure, or an unrecognised refusal |
 
 The conversation itself answers **at most one** prompt with the passphrase and
@@ -263,15 +263,81 @@ in one buffer, and the write result is **returned rather than dropped**: `let _
 = write_all(…)` is what made this invisible in the first place, and a refusal
 naming the failed write is a bug report where a fifteen-second `Timeout` is not.
 
-What is left of the race is bounded by exactly one re-send of the Enter. The
-cost of being wrong is asymmetric: a duplicate Enter can only supply an *empty*
-line, and the only reader that can still be waiting is the retry ask — where an
-empty line is the give-up this driver sends anyway. A lost one costs the user
+What is left of the race is bounded by exactly one re-send, of whichever answer
+is still outstanding — the passphrase while the first ask is what is parked, the
+empty give-up once it is not. The cost of being wrong is asymmetric: a duplicate
+answer is read by nobody if the first one landed, while a lost one costs the user
 the whole bound and refuses a launch that would have worked.
+
+The re-send's own write result was itself dropped until #2594 item 3 — the same
+`let _ = …` one paragraph up, on the one write the paragraph did not cover. Every
+answer, the re-send included, now goes through `write_refusal`, so a console that
+went away mid-conversation is a `failed` naming the write rather than a
+fifteen-second `timeout`. A failed re-send is if anything the stronger signal:
+the first write to that console already succeeded.
+
+#### The success line is anchored; the asks are not
+
+`classify_ssh_add_chunk` requires `Identity added` to begin a **line**, and tests
+the two asks and the no-agent spellings as bare substrings. The asymmetry is
+deliberate (#2594 item 4).
+
+The driver classifies the transcript tail *since it last acted*, and right after
+it answers the first ask that tail begins in the middle of the prompt line —
+which is where a console echo of what was typed lands. A bare substring test
+therefore reads a passphrase containing `Identity added` as ssh-add's own
+verdict: a wrong passphrase reported as a loaded key. The real `ssh-add` reads
+with echo off and prints nothing back, so this is failure-safe against the vendor
+binary and reachable only through the same foreign shim `scrub_secret` defends
+against — anchored rather than argued away, because `ssh-add` prints that line at
+the start of a line and nowhere else, so the anchor costs nothing.
+
+The asks stay unanchored because their failure runs the other way. Missing an ask
+costs the whole bound and refuses a launch that would have worked, and ConPTY
+renders a screen, so an ask can arrive with a repaint in front of it. Missing a
+no-agent line costs the hint, not correctness. Only `Added` can turn a miss into
+a success that did not happen.
+
+#### One reap, and a close the reader is still draining
+
+The conversation ends four ways — a transcript line decided it, the child exited,
+the deadline fell, or a write failed — and until #2594 only some of them waited
+for the child. The arm that did not was the one a **successful** launch takes: a
+run whose outcome `Identity added` had already settled merely killed the child,
+on the argument that waiting for a status nobody reads was an unbounded block.
+
+That argument was wrong twice over. The wait available there is `reap_bounded`,
+whose 2 s `CHILD_REAP_BUDGET` is already the third term of the total above, so it
+was never unbounded. And off Windows the consequence was not cosmetic:
+`sshagent.rs` is not platform-gated, `spawn_command` yields a
+`std::process::Child` whose `Drop` does no wait, and nothing else in the process
+ever reaps it — so every key a macOS or Linux user loaded left a zombie behind
+for the life of the app. There is now exactly one bounded reap, in the driver's
+tail, on every path out of the conversation; `src-tauri/tests/sshagent_unix.rs`
+pins it on the platform it actually bit, by looking for the child in the process
+table afterwards. A zombie is still *listed* there, which is what separates
+"reaped" from "merely killed" — the distinction a `kill` on its own cannot make.
+
+The console is then closed in one order, and it is a load-bearing one. Dropping
+the master is `ClosePseudoConsole`, documented to wait for an attached client to
+finish with the console; the reader thread stops draining the moment its channel
+receiver goes away. Closing with the receiver already gone would therefore be a
+close that may wait on a pipe nothing is reading — an unbounded block on the
+blocking pool, in the one function whose whole design is about not having one.
+The order was the wrong way round by accident: three locals dropped in reverse
+declaration order, which put the receiver first. `close_console_while_the_reader_drains`
+now takes the three ends **by value, in the order they must go**, so the ordering
+is a property of a signature rather than of where bindings happen to sit. The
+reader thread is not joined — that would be the unbounded wait again, in the
+place this removes it.
+
+The residual, stated: nothing here fails on a host where `ClosePseudoConsole`
+does not block, which is every host CI runs on, so this ordering has no
+discriminating test. It is an argument in a signature, checked by reading it.
 
 #### Two things this widens, named rather than left implicit
 
-**The bound a human experiences is 27 s, and it is enforced rather than summed.**
+**The bound a human experiences is 29 s, and it is enforced rather than summed.**
 The launcher awaits the whole sequence behind one modal "Connecting…", so the
 15 s conversation bound is not the number anyone waits.
 
@@ -302,10 +368,31 @@ is therefore setup-then-conversation — there is no path *set* to enumerate —
 `WORST_CASE_TOTAL` is their sum by construction. A step added to the setup phase
 tomorrow costs budget rather than inventing a path the pin misses.
 
-An exhausted budget fails **closed**: a step with no time left is killed at once
-and `probe_agent` reads a capture it could not make as `Absent`, so the run ends
-in the refusal that carries the platform's fix rather than in a launch with no
-agent behind it.
+**A fourth term, and the third time this claim was found short (#2594 item 2).**
+A shared budget bounds when a setup step may *start*; it cannot bound what a step
+spends past its own deadline. Each of those steps is a
+`subproc::capture_raw_with_timeout`, and that primitive's last act on the timeout
+path is to kill its child and reap it under `GH_CAPTURE_REAP_TIMEOUT` — 2 s that
+run **after** the timeout it was handed, where the caller's budget cannot reach.
+So the setup phase really ended at its budget plus an overrun *per step*, and
+the constant said 27 s against a path that could take 33.
+
+One overrun, and not one per step, because `ensure_agent`'s steps now run through
+`run_setup_steps`, which re-reads the shared deadline **between** them and starts
+no step once it has passed. At most one step can therefore be in flight when the
+deadline falls, however many the phase has. That is deliberately not a corrected
+sum: multiplying 2 s by today's three steps would have been a step *count* in the
+pin, which is the enumeration shape this section's own history is about — a
+fourth step tomorrow would falsify it in silence, exactly as the fourth path did
+in #2397. `a_fourth_setup_step_costs_no_more_than_the_third` pins the phase's
+shape by adding a step and showing the bound does not move.
+
+An exhausted budget fails **closed**, and now does so sooner: `run_setup_steps`
+starts no further step and nothing below it reports success, so the run ends in
+the refusal that carries the platform's fix rather than in a launch with no agent
+behind it. The one behaviour this changed is that a start attempt with no budget
+left is skipped rather than spawned and killed at once — the same refusal, one
+process earlier.
 
 **The set of binaries this feature will execute goes from one to three.** An SSH
 pane used to run exactly the `ssh` the human named. This adds `ssh-add` and, on

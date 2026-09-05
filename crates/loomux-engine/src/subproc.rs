@@ -50,7 +50,11 @@ const GH_CAPTURE_POLL_STEP: Duration = Duration::from_millis(25);
 /// one case where the kill cannot land immediately (a child in
 /// uninterruptible sleep). Short, because waiting longer buys nothing: if it
 /// hasn't been reaped by now it is not the sleep that is slow.
-const GH_CAPTURE_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+/// It is `pub` because it is the one part of a bounded capture that falls
+/// OUTSIDE the `timeout` its caller asked for: a caller composing this call into
+/// a larger bound has to add it, and `sshagent::WORST_CASE_TOTAL` does (#2594
+/// item 2).
+pub const GH_CAPTURE_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Ceiling on reader threads left blocked on children `capture_with_timeout`
 /// abandoned (#656, rev-lead finding 1). Two per timed-out call, and a tick
 /// makes at most `notify::MAX_POLLS_PER_TICK` × 2 + `intake::
