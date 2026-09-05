@@ -341,7 +341,7 @@ impl Role {
     /// other. Nothing here weakens the manager's guarantee: that check keys on
     /// `Role::Manager` and on the `Delivery` kind, and neither moves.
     pub fn is_root(self) -> bool {
-        matches!(self, Role::Orchestrator | Role::Lead)
+        matches!(self, Role::Orchestrator)
     }
 
     /// Every capability class, for the set assertions that pin the predicates
