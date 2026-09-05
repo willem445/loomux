@@ -2577,6 +2577,172 @@ the moment `merge_queue:` became one, because this repo's own workflow file
 writes it above `blocks:`. A fixed order would have relocated it, and the
 comment block introducing it, on the first unrelated edit.
 
+## Named workflows and the per-group pin (#1689 slice A)
+
+Everything above this section is written as though a repo has *one* workflow.
+It has one *by default*, and that is unchanged — but a repo may now declare
+several, and a group records **which one it runs**.
+
+### Layout
+
+```
+.orrerix/
+  workflow.yml            # the workflow named `default`
+  workflows/
+    review-heavy.yml      # the workflow named `review-heavy`
+    solo-fast.yml         # the workflow named `solo-fast`
+```
+
+Same schema, same `parse_workflow`, one document per file. `.orrerix/workflow.yml`
+is not a special format — it is the `default` name's file, and it keeps that
+role permanently: a repo that has only ever had it behaves byte-for-byte as it
+did before this existed, because `workflows/` does not exist and nothing under
+it is ever opened.
+
+`.loomux/workflows/` is discovered when `.orrerix/workflows/` is absent, on
+exactly the terms `.loomux/workflow.yml` is discovered — `brand::resolve_repo_dir`,
+which is `resolve_repo_file`'s rule asked of directories rather than a second
+rule. Neither is ever renamed on the repo's behalf (`doc/design/rebrand-filesystem.md`).
+
+**Both `workflow.yml` and `workflows/default.yml` is possible, and the plain
+file wins.** `list_workflows` reports it as a *listing finding* naming both
+paths; nothing is blocked, because a workflow file must never be able to stop a
+launch (`#225`). The finding is not an entry `errors` — the winning file parses
+perfectly well, and what is wrong is that two files claim one name.
+
+### The name is a path component, so it is one of `pathseg`'s families
+
+`<name>` becomes `<name>.yml`, so `WorkflowName` is the fifth identifier family
+through `pathseg::check_segment` (CLAUDE.md constraint 6 lists the other four).
+It **refuses, never rewrites**: `../x`, `a/b`, `CON`, `-x` and `my.workflow` are
+errors, not repairs. That is the difference from `workflow::sanitize_id`, the
+predicate a workflow BLOCK id goes through, which rewrites `../x` to `x` — and
+that difference is the reason a new family was not routed through it.
+
+There is exactly **one place** a name becomes a file name:
+`workflow::workflow_path_named`, whose signature takes `&WorkflowName`.
+`workflow_file_named` joins the repo root onto that function's result rather
+than re-spelling the name, so there is no second assembly point to keep in step.
+`src-tauri/tests/pathseg.rs` allowlists that one line with the signature as its
+proof, and `.yml` joined that scan's `EXTENSIONS` in the same commit — the scan
+was blind to the whole extension before, so adding the row without adding the
+extension would have been a row watching nothing.
+
+The type is what actually holds the property. A textual scan cannot see types,
+and `format!` accepts a `&str` and a `WorkflowName` alike; what stops a raw
+string reaching the join is that the function will not take one.
+
+### The group pins the name, beside the roster it produced
+
+`Guardrails.workflow` is a `WorkflowName`, persisted in `group.json`'s
+`guardrails` object in the **same atomic write** as `blocks`. Two facts, one
+write: a name stored anywhere else could disagree with the roster after a crash,
+and then nothing on disk would say which of the two the human consented to.
+
+- **Absent** — every `group.json` written before #1689 — reads as `default`,
+  which resolves to `.orrerix/workflow.yml`. That is the file such a group has
+  always been running, so the migration is a no-op rather than a conversion.
+- **Unusable** (a hand-edited traversal, a device name) also reads as `default`.
+  A group must stay rejoinable; the refusal that matters happened at
+  `WorkflowName::parse`, which is what keeps the string out of a path join in
+  the first place. Same posture `agent_cli` and `clamped()`'s roster
+  normalization already take toward a hand-edited file.
+- A **promote** that reattaches a dormant group restores the name off disk
+  alongside the roster, the CLI and the toggle, for the reason all three are
+  restored: the promote modal has no workflow picker, so re-pinning to `default`
+  would arm a file the human never chose.
+
+### One pair of readers, and the residual
+
+Every group-scoped reader goes through:
+
+```rust
+load_active_workflow(repo, &Guardrails) -> Result<Option<Workflow>, Vec<String>>
+active_workflow_path(repo, &Guardrails) -> String
+```
+
+`(repo, &Guardrails)` rather than `&GroupInfo`, because `create_group_ex` and
+`promote_orchestrator_cli` decide which file to read *before* a `GroupInfo`
+exists — and a second spelling for those two is exactly the drift the pair is
+here to prevent. A `GroupInfo` caller passes `&g.repo, &g.guardrails`.
+
+What that covers: the launch roster and its capacity record, the drift audit,
+the merge gate and its 30-second reload, `lock_resources`, `board_policy`,
+`merge_queue_policy`, `driver_policy`, `workflow_status`, the orchestrator's
+roster note, the "no worker block" launch notice, the live toggle's two refusal
+messages, and the `{{WORKFLOW_PATH}}` variable rendered into `workflow.md` and
+`block.md`. Neither of those two templates is `pre222`-fixture-pinned, which is
+what makes it legitimate for their text to move for a named workflow; the four
+role templates are pinned and were not touched.
+
+**Two residuals stay on the `default` file, both argued and both pinned** by
+`only_the_argued_residuals_still_read_the_default_workflow_directly`
+(`src-tauri/tests/workflow.rs`), which is default-deny over `src-tauri/src` and
+fails when a row goes stale:
+
+- `gh.rs::hold_label(repo)` — the `gh` shim's label allow-list is resolved from
+  a REPO, before any group is in hand. A group's own intake profile is pinned in
+  `guardrails.intake` at launch anyway, so this is not a group-scoped question
+  wearing a repo-scoped signature.
+- `orch_workflow_preview_sync` with no `name` — the launcher's default, and the
+  one call whose whole question is "what does this repo declare by default".
+
+It is a textual scan, with the limits that implies: a caller that bound the
+function to a local first would be invisible to it. What it is defence in depth
+over is a *new* group-scoped reader being added against `workflow::load_workflow`,
+which is how the reroute would realistically erode — and where the compiler
+cannot help, because both functions exist and both type-check.
+
+### The two commands
+
+- **`orch_workflow_list(repo)`** — `{workflows: [{name, path, display_name,
+  valid, errors}], findings: [...]}`, sorted by name. A file that will not parse
+  is carried as an entry with its errors rather than dropped: a workflow that
+  vanishes from the picker the moment it gets a syntax error is one the human
+  cannot navigate back to in order to fix it.
+- **`orch_workflow_preview(repo, agent_cli, name?)`** — `name` omitted is
+  `default`, and `Some("default")` is asserted to be the *same answer*, which is
+  what makes the omitted case a default rather than a second code path. A name
+  the repo does not declare previews as absent (`present: false, valid: true`);
+  a name that is not a usable one previews as a validation error, and the raw
+  string is **not** echoed into `path`, which is a display surface.
+
+Both are `async`, so neither is in the frame-mandatory sync-command class
+(CLAUDE.md constraint 10); both are read-only and take no registry state.
+
+### Confirmed for slice B: which path writes a new block's `<id>.md`
+
+The plan left this open, and the answer is **both, at different moments, and
+`apply_workflow` should use the group-level one**:
+
+- `write_instruction_files(&GroupInfo)` runs at `create_group_ex` only. It
+  writes the playbook, the class-fallback files, and one `<id>.md` per declared
+  block — **and it sweeps stale ones**, reconciling the group dir against the
+  `.instruction-files-manifest` it wrote on the previous render (#423).
+- `spawn_agent_bound` re-renders **one** block's file per spawn, through the
+  same `instruction_vars` builder (#1187), so a persona edit or a `mode: replace`
+  swap reaches the next agent without a relaunch.
+- `set_advanced_orchestrator` — the live toggle — writes **no** instruction
+  files at all. Today that is invisible because the toggle does not add blocks
+  the group dir has never seen; a b-only block introduced by an apply is exactly
+  the case it would be visible in.
+
+So slice B's `apply_workflow` calls `write_instruction_files` after the
+in-memory swap. The per-spawn render alone would eventually produce a new
+block's file, but it would never *remove* a removed block's — and a stale
+`<id>.md` for a block the roster no longer declares is precisely what #423's
+sweep exists to stop.
+
+### What slice A deliberately did not do
+
+- **No launcher argument.** `create_orchestration`'s wire shape is unchanged;
+  `Guardrails.workflow` is how a caller pins a name, and the launcher's picker
+  is slice D1's. A `PromoteConfig` has no workflow field either — a fresh
+  promote runs `default`, a reattaching one restores what is on disk.
+- **No switching.** Changing a live group's workflow is slice B
+  (`apply_workflow`), and it is a consent-preserving action with a diff and a
+  confirmation, not a side effect of this pin existing.
+
 ## Still to come
 
 - **`no-live-agents-on-pr`** (#197 Scope A.1) — "no agent tied to this PR is still
