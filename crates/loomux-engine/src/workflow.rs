@@ -133,6 +133,7 @@
 //! nudge never churns the semantic diff.
 
 use crate::model::{cli_can_host, default_model, Role, SUPPORTED_CLIS};
+use crate::pathseg::{PathSegment, SegmentError};
 use crate::notify::{
     clamp_expires_minutes, NOTIFY_EXPIRES_DEFAULT_MIN, NOTIFY_EXPIRES_MAX, NOTIFY_EXPIRES_MIN,
 };

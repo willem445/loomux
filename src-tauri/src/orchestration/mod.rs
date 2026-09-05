@@ -54537,6 +54537,10 @@ fn create_orchestration_sync(
             // so the backoff is on by default for every new group; hand-edit
             // group.json to pin it to the base (no backoff).
             idle_tick_fallback_max_minutes: 0,
+            // #1689: the launcher has no workflow picker yet (slice D1), so a
+            // launcher group runs `default` — which resolves to
+            // `.orrerix/workflow.yml`, exactly the file it has always read.
+            workflow: workflow::WorkflowName::default_name(),
         },
         SessionOrigin::Fresh,
         None,
@@ -54888,6 +54892,7 @@ pub fn orch_workflow_list_sync(repo: String) -> Value {
 /// The body of [`orch_workflow_preview`], as a plain function: it is the
 /// launcher's answer to "what would this launch run", and the workflow tests
 /// exercise it directly, without a Tauri runtime.
+///
 /// **`name`** (#1689) picks which of the repo's workflows to preview.
 ///
 /// `None` — every caller written before named workflows, and the launcher's own
