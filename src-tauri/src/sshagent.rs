@@ -221,7 +221,6 @@ pub fn classify_ssh_add_line(line: &str) -> SshAddEvent {
     // Two spellings, both real: the portable string, and the one Win32-OpenSSH
     // prints when the named pipe is not there because the service is stopped.
     if line.contains("Could not open a connection to your authentication agent")
-        || line.contains("Error connecting to agent")
     {
         return SshAddEvent::NoAgent;
     }
