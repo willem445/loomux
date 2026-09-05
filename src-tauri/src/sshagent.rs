@@ -61,7 +61,7 @@ use std::time::{Duration, Instant};
 /// below — is the number a human experiences. Named here so a reader who edits
 /// any one of the three constants can see what they are really changing (#2397
 /// review premortem).
-pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(20);
+pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(25);
 
 /// How long the whole `ssh-add` conversation may take before it is abandoned.
 ///
