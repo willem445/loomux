@@ -1009,10 +1009,8 @@ pub fn codex_sessions_root_from(
     env_codex_home: Option<&str>,
     home: Option<&Path>,
 ) -> Option<PathBuf> {
-    let codex_home = match env_codex_home.filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => home?.join(".codex"),
-    };
+    let _ = env_codex_home;
+    let codex_home = home?.join(".codex");
     Some(codex_home.join("sessions"))
 }
 
