@@ -363,18 +363,42 @@ pub struct WorkflowListing {
     pub findings: Vec<String>,
 }
 
-/// Every workflow this repo declares (#1689).
+/// The most workflow files one repo may declare (#1689 slice B, closing the
+/// unbounded-read residual #2658 raised on slice A).
 ///
-/// `.orrerix/workflow.yml` is listed as [`DEFAULT_WORKFLOW_NAME`]; every
-/// `<name>.yml` under [`workflows_dir`] is listed under its own stem. Sorted by
-/// name, because `read_dir` order is a filesystem accident (and on Windows not
-/// even a stable one), and a picker that reorders itself between reads is a
-/// picker nobody can point at.
-pub fn list_workflows(repo: &str) -> WorkflowListing {
-    let mut listing = WorkflowListing::default();
-    // Keyed by name and iterated in key order at the end: the sort is the map's,
-    // not a separate step that could be forgotten.
-    let mut seen: BTreeMap<String, WorkflowEntry> = BTreeMap::new();
+/// A ceiling, not a design limit: a repo with more than this is not a repo
+/// anybody picks a workflow out of by hand, and `read_dir` here is on a path
+/// the group-view publisher walks once a second per leased group. Exceeding it
+/// is a listing FINDING rather than an error, for the same reason every other
+/// listing problem is: a workflow file may never block a launch (#225).
+pub const WORKFLOWS_MAX: usize = 64;
+
+/// The largest workflow file this build will parse (#1689 slice B, #2658).
+///
+/// Same posture as [`WORKFLOWS_MAX`]: a file above it is carried as an entry
+/// with an error — visible in the picker, navigable back to — rather than read
+/// into memory to find out.
+pub const WORKFLOW_FILE_MAX_BYTES: u64 = 256 * 1024;
+
+/// One name the repo declares, resolved to the file it means.
+struct ScannedWorkflow {
+    name: WorkflowName,
+    /// Absolute, for reading.
+    abs: PathBuf,
+    /// Repo-relative, for display.
+    rel: String,
+}
+
+/// Which names this repo declares, and which files they resolve to — the ONE
+/// walk behind both [`list_workflows`] and [`list_workflow_names`], so the two
+/// cannot disagree about what a repo offers.
+///
+/// Sorted by name (it is a `BTreeMap`), because `read_dir` order is a
+/// filesystem accident — and on Windows not even a stable one — and a picker
+/// that reorders itself between reads is a picker nobody can point at.
+fn scan_workflows(repo: &str) -> (BTreeMap<String, ScannedWorkflow>, Vec<String>) {
+    let mut seen: BTreeMap<String, ScannedWorkflow> = BTreeMap::new();
+    let mut findings: Vec<String> = Vec::new();
 
     let dir_rel = workflows_dir(repo);
     let dir = Path::new(repo).join(dir_rel);
@@ -392,16 +416,29 @@ pub fn list_workflows(repo: &str) -> WorkflowListing {
                     // a path: the whole reason this row exists is that `stem` did
                     // NOT parse, so nothing here may be joined onto anything.
                     let file = path.file_name().and_then(|s| s.to_str()).unwrap_or(stem);
-                    listing
-                        .findings
-                        .push(format!("{dir_rel}/{file} is not offered: its {e}"));
+                    findings.push(format!("{dir_rel}/{file} is not offered: its {e}"));
                     continue;
                 }
             };
+            if seen.len() >= WORKFLOWS_MAX {
+                // Said once, not once per surplus file: the finding is about the
+                // directory, and a listing that scrolls its own truncation notice
+                // has buried it.
+                if !findings.iter().any(|f| f.contains("more than")) {
+                    findings.push(format!(
+                        "{dir_rel} declares more than {WORKFLOWS_MAX} workflow files — only the \
+                         first {WORKFLOWS_MAX} by name are offered"
+                    ));
+                }
+                break;
+            }
             // The directory's own answer, never `workflow_path_named`'s — see
             // `workflows_dir_file`.
             let rel = workflows_dir_file(repo, &name);
-            seen.insert(name.as_str().to_string(), read_entry(&path, name, rel));
+            seen.insert(
+                name.as_str().to_string(),
+                ScannedWorkflow { name, abs: path, rel },
+            );
         }
     }
 
@@ -413,24 +450,74 @@ pub fn list_workflows(repo: &str) -> WorkflowListing {
     let plain = Path::new(repo).join(plain_rel);
     if plain.is_file() {
         if let Some(shadowed) = seen.remove(DEFAULT_WORKFLOW_NAME) {
-            listing.findings.push(format!(
+            findings.push(format!(
                 "both {plain_rel} and {shadowed} declare the workflow named \
                  '{DEFAULT_WORKFLOW_NAME}' — {plain_rel} is the one that is read",
-                shadowed = shadowed.path
+                shadowed = shadowed.rel
             ));
         }
         seen.insert(
             DEFAULT_WORKFLOW_NAME.to_string(),
-            read_entry(&plain, WorkflowName::default_name(), plain_rel.to_string()),
+            ScannedWorkflow {
+                name: WorkflowName::default_name(),
+                abs: plain,
+                rel: plain_rel.to_string(),
+            },
         );
     }
 
-    listing.workflows = seen.into_values().collect();
-    listing
+    (seen, findings)
+}
+
+/// Every workflow this repo declares (#1689).
+///
+/// `.orrerix/workflow.yml` is listed as [`DEFAULT_WORKFLOW_NAME`]; every
+/// `<name>.yml` under [`workflows_dir`] is listed under its own stem. Sorted by
+/// name.
+///
+/// **Reads and parses every file it lists**, which is why it is bounded twice
+/// ([`WORKFLOWS_MAX`], [`WORKFLOW_FILE_MAX_BYTES`]) and why the group-view
+/// publisher uses [`list_workflow_names`] instead: a picker needs to know why a
+/// file will not parse, a status payload only needs the names (#2658).
+pub fn list_workflows(repo: &str) -> WorkflowListing {
+    let (seen, findings) = scan_workflows(repo);
+    WorkflowListing {
+        workflows: seen.into_values().map(|s| read_entry(&s.abs, s.name, s.rel)).collect(),
+        findings,
+    }
+}
+
+/// The names alone, sorted — no file is opened (#1689 slice B).
+///
+/// This is what `workflow_status` publishes as `available`, on a call the group
+/// view's publisher makes once a second per leased group. [`list_workflows`]
+/// would answer the same question by reading and YAML-parsing every declared
+/// file, which is the unbounded read #2658 recorded against slice A; a name is
+/// a directory-entry fact and needs none of it.
+pub fn list_workflow_names(repo: &str) -> Vec<String> {
+    scan_workflows(repo).0.into_keys().collect()
 }
 
 /// One [`WorkflowEntry`] off an absolute path already known to be a file.
 fn read_entry(path: &Path, name: WorkflowName, rel: String) -> WorkflowEntry {
+    // Size-checked BEFORE the read (#2658): a file above the ceiling is carried
+    // as an entry with an error, never read into memory to find out. A file
+    // whose size cannot be read at all falls through to the read below, which
+    // produces the unreadable-file error with the real reason.
+    if let Ok(md) = std::fs::metadata(path) {
+        if md.len() > WORKFLOW_FILE_MAX_BYTES {
+            return WorkflowEntry {
+                name,
+                path: rel,
+                display_name: String::new(),
+                errors: vec![format!(
+                    "the file is {} bytes, above the {WORKFLOW_FILE_MAX_BYTES}-byte ceiling a \
+                     workflow file is read under",
+                    md.len()
+                )],
+            };
+        }
+    }
     let parsed = std::fs::read_to_string(path)
         .map_err(|e| vec![format!("{} is unreadable: {e}", path.display())])
         .and_then(|text| parse_workflow(&text));
@@ -439,7 +526,6 @@ fn read_entry(path: &Path, name: WorkflowName, rel: String) -> WorkflowEntry {
         Err(errors) => WorkflowEntry { name, path: rel, display_name: String::new(), errors },
     }
 }
-
 /// Schema version this build understands. Recorded in the file so a future
 /// breaking change can be detected rather than mis-parsed.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -5488,6 +5574,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+
+    // ── the listing's two bounds, and the names-only walk (#1689 slice B) ──
+    //
+    // #2658 recorded `list_workflows` as an unbounded read against slice A:
+    // `read_dir` plus a full YAML parse of every file, per call, with the
+    // group-view publisher about to call it once a second.
+
+    #[test]
+    fn the_names_only_walk_answers_exactly_what_the_full_listing_does() {
+        // The two share one scan on purpose — a second walk is a second answer
+        // to "what does this repo declare", and the first time they disagreed
+        // the picker and the status payload would be offering different rosters.
+        let root = temp_repo("names-agree");
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("Plain"));
+        write_at(&root, ".orrerix/workflows/b.yml", &wf_doc("B"));
+        // A file that will NOT parse is still a declared name, and both surfaces
+        // must say so — the full listing carries its errors, the names-only walk
+        // still offers it, because a workflow that vanishes the moment it breaks
+        // is one the human cannot navigate back to.
+        write_at(&root, ".orrerix/workflows/broken.yml", "version: 1\nblocks:\n  - id: m\n    kind: wizard\n");
+        let repo = root.to_str().unwrap();
+
+        let full = list_workflows(repo);
+        assert_eq!(names(&full), vec!["b", "broken", "default"], "{:?}", names(&full));
+        assert_eq!(list_workflow_names(repo), vec!["b", "broken", "default"]);
+        assert!(
+            full.workflows.iter().any(|e| e.name.as_str() == "broken" && !e.errors.is_empty()),
+            "positive control: the broken file must really be broken, or this proves nothing"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_listing_stops_at_the_file_ceiling_and_says_so() {
+        let root = temp_repo("too-many");
+        for i in 0..(WORKFLOWS_MAX + 3) {
+            // Zero-padded so the ordering the cap truncates is the SORTED one a
+            // reader can predict, not `read_dir`'s.
+            write_at(&root, &format!(".orrerix/workflows/w{i:03}.yml"), &wf_doc("W"));
+        }
+        let repo = root.to_str().unwrap();
+        let listing = list_workflows(repo);
+        assert_eq!(
+            listing.workflows.len(),
+            WORKFLOWS_MAX,
+            "the listing must stop at the ceiling, not read every file on disk"
+        );
+        assert_eq!(
+            listing.findings.iter().filter(|f| f.contains("more than")).count(),
+            1,
+            "said once, about the directory — not once per surplus file: {:?}",
+            listing.findings
+        );
+        assert_eq!(list_workflow_names(repo).len(), WORKFLOWS_MAX, "the names-only walk is bounded too");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_oversized_file_is_an_entry_with_an_error_not_a_read() {
+        let root = temp_repo("oversize");
+        let mut fat = wf_doc("Fat");
+        // Comment padding: the file stays VALID YAML, so what the entry reports
+        // can only be the size ceiling and never a parse failure.
+        fat.push_str(&format!("# {}\n", "x".repeat(WORKFLOW_FILE_MAX_BYTES as usize + 1)));
+        write_at(&root, ".orrerix/workflows/fat.yml", &fat);
+        write_at(&root, ".orrerix/workflows/thin.yml", &wf_doc("Thin"));
+        let listing = list_workflows(root.to_str().unwrap());
+
+        let fat_entry = listing.workflows.iter().find(|e| e.name.as_str() == "fat").unwrap();
+        assert!(
+            fat_entry.errors.iter().any(|e| e.contains("ceiling")),
+            "the oversized file must be carried with the size reason: {:?}",
+            fat_entry.errors
+        );
+        assert!(fat_entry.display_name.is_empty(), "nothing was parsed out of it");
+        // Negative control: the ceiling refuses the fat file only. A cap that
+        // rejected everything would satisfy the assertion above just as well.
+        let thin = listing.workflows.iter().find(|e| e.name.as_str() == "thin").unwrap();
+        assert_eq!(thin.display_name, "Thin", "{:?}", thin.errors);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     // ── the roster diff a switch is confirmed against (#1689 slice B) ────
     //
