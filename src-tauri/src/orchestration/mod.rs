@@ -7696,7 +7696,7 @@ pub fn codex_profile_toml(
     // ── top-level scalars, all of them, before any table header ──
     s.push_str(&format!(
         "approval_policy = \"{}\"\n",
-        if unattended { "never" } else { "on-request" }
+        "never"
     ));
     s.push_str("sandbox_mode = \"workspace-write\"\n");
     // Omitted entirely when empty, for the reason the model flag is omitted:
