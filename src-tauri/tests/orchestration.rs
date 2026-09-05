@@ -46829,14 +46829,28 @@ fn list_blocks_after_an_apply_returns_the_new_roster() {
     // tests-first commit compiled and ran against the tree WITHOUT the tool and
     // reddened on `unknown tool: list_blocks` — a behavioral red, not a
     // compile error masking one.
+    //
+    // The declared ids are compared in the file's own order AFTER filtering the
+    // `orchestrator` block `clamped()` synthesizes when a roster declares none
+    // (workflow.rs: a roster with no orchestrator *kind* gets one, id
+    // `orchestrator`) — that row is engine behavior this slice's fixture shares
+    // with every other two-workflow test, and the red run at 876c8265 caught the
+    // first cut asserting the unfiltered exact vec.
+    let declared_ids = |v: &Value| -> Vec<String> {
+        v["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["id"].as_str().unwrap().to_string())
+            .filter(|id| id != "orchestrator")
+            .collect()
+    };
     let before_raw = list_blocks_call(&reg, &co);
     assert_eq!(before_raw["isError"], json!(false), "{before_raw}");
     let before: Value =
         serde_json::from_str(before_raw["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(before["workflow"], json!("default"), "{before}");
-    let before_ids: Vec<&str> =
-        before["blocks"].as_array().unwrap().iter().map(|b| b["id"].as_str().unwrap()).collect();
-    assert_eq!(before_ids, vec!["w-a", "rev-a"], "{before}");
+    assert_eq!(declared_ids(&before), vec!["w-a", "rev-a"], "{before}");
 
     reg.apply_workflow(&g.id, &wf("b"), None, "human").unwrap();
 
@@ -46849,8 +46863,11 @@ fn list_blocks_after_an_apply_returns_the_new_roster() {
     assert_eq!(text["workflow"], json!("b"), "{text}");
     assert_eq!(text["name"], json!("focused-b"), "the file's own name: field: {text}");
     let rows = text["blocks"].as_array().unwrap();
-    let ids: Vec<&str> = rows.iter().map(|b| b["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, vec!["w-b", "rev-b"], "the NEW roster, in the file's own order: {text}");
+    assert_eq!(
+        declared_ids(&text),
+        vec!["w-b", "rev-b"],
+        "the NEW roster's declared blocks, in the file's own order: {text}"
+    );
     // The wire rows are the same `roster_json` shape `workflow_status`
     // publishes — that is what makes the read-back comparable against the
     // notice and the human's status payload with no second vocabulary.
