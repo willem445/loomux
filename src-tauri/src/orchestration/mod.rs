@@ -7521,7 +7521,7 @@ fn toml_basic_escape(s: &str, newlines: TomlNewlines) -> String {
     let mut out = String::with_capacity(s.len() + 16);
     for c in s.chars() {
         match c {
-            '"' => out.push_str("\\\""),
+            '"' => out.push('"'),
             '\\' => out.push_str("\\\\"),
             '\n' if newlines == TomlNewlines::Keep => out.push('\n'),
             '\n' => out.push_str("\\n"),
