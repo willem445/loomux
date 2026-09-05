@@ -243,14 +243,24 @@ spawn-rate backstop.
 
 No new dependencies.
 
-## Two `unreachable!` arms this slice leaves, and why they are safe
+## Two `unreachable!` arms this slice leaves, and the shape of that residual
 
-`kickoff_prompt` and its mechanics core panic on `Role::Lead`. They are
-unreachable in fact and not merely by convention: `kickoff_prompt` is called
-only from a spawn that has an app handle, and no shipped path spawns a lead —
-`kind_from_str` has no `lead` vocabulary, so neither a workflow file nor
+`kickoff_prompt` and its mechanics core panic on `Role::Lead`. No shipped path
+reaches them: `kickoff_prompt` runs only from a spawn that has an app handle,
+`kind_from_str` has no `lead` vocabulary so neither a workflow file nor
 `spawn_agent` can produce one, and `orch_lead_prepare` does not exist yet. Slice
 B's first test hits both, so it cannot ship without giving them arms.
+
+**The residual is "no producer", not "no consumer", and the distinction is worth
+stating because this slice narrowed it** (rev-final premortem 2). `Role`'s serde
+form now carries the wire string `"lead"`, so an `agents.json` row reading
+`"role": "lead"` **parses**, where before this slice it failed that row's parse.
+Nothing in the tree writes such a row yet — that is the "no producer" half, and
+it is what makes the arms unreachable today — but the file format is now
+permissive ahead of the code, so a hand-edited, restored or forward-version
+roster carrying a lead row and reaching a fresh-kickoff spawn would find a panic
+rather than a refusal. Slice B closes it by giving the arms real bodies; until
+then the honest statement is the one above, not "a lead pane cannot exist".
 
 The two arms that are NOT panics are the ones a public path already reaches, and
 that asymmetry is the rule this slice applied rather than a judgement call per
@@ -265,7 +275,22 @@ picked the model in their own launcher); `role_template` answers the real file.
 - **The launch path.** `orch_lead_prepare` / `orch_lead_bind`, the group mint,
   the per-CLI `mcp_args` (including Claude Code's `--disallowedTools Agent`), the
   kickoff delivery, and the "exactly one root per group" invariant that group
-  creation will enforce — all slice B.
+  creation will enforce — all slice B. **Two tripwires for whoever writes it**
+  (rev-final premortem, recorded here because slice A can build no test that
+  fires on them):
+  - **The root lookup takes the FIRST match.** `deliver_relayed_to_root` is a
+    `find` over a `HashMap`, whose iteration order is not stable, so a group
+    holding two `is_root()` agents delivers a child's report to whichever comes
+    back — with no error on either side. That is the whole reason the one-root
+    invariant is not optional, and it has to be enforced at the mint.
+  - **`Guardrails::clamped` prepends an orchestrator BLOCK to any roster that
+    declares none**, which every toggle-minted roster will. A block is not an
+    agent, so nothing is wrong today; the mint must not turn that row into a
+    spawned orchestrator, or the previous tripwire fires.
+- **The consent argument is stated here and enforced nowhere yet.** "A lead
+  group runs the built-in roster and never a workflow file" is this note's
+  claim; no code in slice A creates a lead group, so slice B's mint is what has
+  to make it true.
 - **The per-CLI subagent-disable table with citations**, which belongs with the
   command lines that carry it (slice B) rather than being written here against a
   plan.
