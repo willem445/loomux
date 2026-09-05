@@ -2217,6 +2217,36 @@ const OPENCODE_KNOBS: CliKnobs = {
 const lookupWithOpencode = (cli: string, model: string) =>
   cli === "opencode" ? knobState(OPENCODE_KNOBS, cli, model) : lookup(cli, model);
 
+test("a block may run cli: codex as a worker, and the pane does not adjudicate the kinds (#2515 C1)", () => {
+  // The backend spawns it (`SUPPORTED_CLIS`), so a pane that flagged the file
+  // would send a human to fix a file that is already correct — and the block
+  // editor would not even offer the CLI in its dropdown.
+  assert.ok(isWorkflowCli("codex"));
+  const w = starterWorkflow();
+  w.blocks[1]!.cli = "codex";
+  assert.deepEqual(codes(validateWorkflow(w, lookup)), []);
+
+  // **The load-bearing half.** codex hosts a worker and CANNOT host a reviewer
+  // or a planner — its only containment axis is an all-or-nothing
+  // `sandbox_mode`. That refusal belongs to the backend's `cli_can_host`, which
+  // quotes the measured reason back, and this pane must NOT reproduce it: a
+  // second copy of a containment rule is a copy that drifts, and the one that
+  // drifts silently is the one in the surface that cannot enforce anything.
+  //
+  // So a `codex` reviewer is clean HERE and refused at load. Pinned rather
+  // than left implicit, because "add a warning for it" is exactly the
+  // plausible-looking change this comment exists to argue against.
+  const rev = starterWorkflow();
+  rev.blocks[2]!.cli = "codex";
+  assert.equal(rev.blocks[2]!.kind, "reviewer", "this test needs a reviewer block to be about");
+  assert.deepEqual(
+    codes(validateWorkflow(rev, lookup)),
+    [],
+    "membership in WORKFLOW_CLIS is spawnability; which KINDS a CLI can host is cli_can_host's, " +
+      "and duplicating it here would be a rule that drifts"
+  );
+});
+
 test("a block may run cli: opencode, model and all (#722)", () => {
   // The backend spawns it (`SUPPORTED_CLIS`), so a pane that flagged the file
   // would send a human to fix a file that is already correct — and the pane's

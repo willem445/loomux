@@ -59,6 +59,33 @@ layout, the exact merge ranks, `--agent` failure behavior, `run` without
 recorded as labeled observations in `doc/design/opencode.md` — not inferred,
 and not presented as contract.
 
+Codex (root: https://developers.openai.com/codex/ — every URL there
+**308-redirects** to `https://learn.chatgpt.com/docs/…`, and the `.md` files
+under `github.com/openai/codex/docs/` are one-line stubs pointing at the same
+place, so follow the redirect rather than citing the old host):
+
+- CLI reference (`-C/--cd`, `-m`, `-p/--profile`, `-s/--sandbox`,
+  `-a/--ask-for-approval`, `--add-dir`, `resume`):
+  https://learn.chatgpt.com/docs/developer-commands?surface=cli
+- Config file — every key, incl. `projects.<path>.trust_level`,
+  `sandbox_workspace_write`, `developer_instructions`, `mcp_servers.*`
+  (`url`, `http_headers`, `env_http_headers`, `default_tools_approval_mode`),
+  `model_reasoning_effort`, `tui.alternate_screen`:
+  https://learn.chatgpt.com/docs/config-file/config-reference
+- Config layering and profiles (defaults → user → profile → project → `-c`):
+  https://learn.chatgpt.com/docs/config-file/config-advanced
+- Approvals and sandboxing: the agent-approvals-security and sandboxing pages
+  under the same root.
+
+The published docs are silent on, or wrong about, several surfaces orrerix
+depends on — that `--profile` layers a WHOLE config document rather than the
+legacy `[profiles.<name>]` table, the rollout store's layout and its `.zst`
+compression, `ReasoningEffort`'s real vocabulary, and when the rollout file is
+first created. Those are read from `openai/codex`'s own source at the tag
+pinned in `doc/design/codex.md` and recorded there as labeled observations —
+not inferred, and not presented as contract. Three of them corrected #2515's
+own slice plan, which is the reason the pin is a tag rather than `main`.
+
 pi (root: https://github.com/earendil-works/pi/tree/main/packages/coding-agent/docs):
 
 - CLI reference, tool options, slash commands, design principles (`--model`,

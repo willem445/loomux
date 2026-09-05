@@ -40,7 +40,7 @@ src-tauri/src/
   ptyout.rs         per-pane coalescing of PTY output before it crosses IPC (#712): a `pty-output` event costs one one-shot script compilation on the GUI thread, so the emit rate is bounded to one per 60 Hz frame per pane (leading-edge, so a quiet pane's chunk still crosses on arrival) instead of one per `read()` return. Bytes, order and the orchestration output ring are untouched. See doc/design/pty-output-coalescing.md
   sessions.rs       agent session discovery (one collect_*_candidates fn per file-backed source, plus scan_opencode for the one that is a SQLite store); metadata-first + a persisted head-parse index (session-index.json) so a long history costs a stat, not a parse (#493). See doc/design/session-index.md
   orchestration/    agent groups: registry, guardrails, MCP server, audit. Four agent-CLI
-    adapters (claude, copilot, gemini, opencode) whose per-CLI differences live as DATA in
+    adapters (claude, copilot, gemini, opencode, pi, codex) whose per-CLI differences live as DATA in
     `CLI_CAPS` rather than as `if cli == …` at a call site — that table, the capability
     class (`Role`) and the deny tier it selects (`Containment`) now live in
     crates/loomux-engine (#888 slice A2 batch 4) and are re-exported here, so every
@@ -54,7 +54,12 @@ src-tauri/src/
     `Role::Lead`, a human-driven pane that opens helper panes instead of harness subagents,
     is doc/design/lead-pane.md; opencode's whole seam — an
     env-delivered config document, its permission-key containment and its per-group session
-    store — is `doc/design/opencode.md`. Compact-survival is
+    store — is `doc/design/opencode.md`, and codex's — a whole config document layered by
+    `-p/--profile` into the user's own `CODEX_HOME`, carrying the project trust that keeps a
+    pane off the trust dialog, the approval posture, the MCP server and the role contract —
+    is `doc/design/codex.md`. codex is the one adapter whose generated file lands outside
+    loomux's state root, so it is brand-namespaced, removed with its agent, and swept at
+    startup by the same `sweep_orphaned_agent_files` described below. Compact-survival is
     layered (#329, #416, #417): a durable role CONTRACT riding the CLI's own system-prompt layer
     (a generated `~/.claude/agents`/`~/.copilot/agents` custom-agent file on both CLIs — Claude's
     own inline `--agents` JSON flag was replaced with a file in a later correction round after a

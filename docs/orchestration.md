@@ -2179,7 +2179,7 @@ line, plus number fields bounded to the ranges shown above - #1869.)
 
 ### Setting up a cross-model reviewer
 
-`cli:` accepts `claude`, `copilot`, `gemini`, `opencode`, or `pi`. So a workflow
+`cli:` accepts `claude`, `copilot`, `gemini`, `opencode`, `pi`, or `codex`. So a workflow
 whose worker runs on Claude gets a genuinely different model family
 reviewing it by naming one on a reviewer block:
 
@@ -2278,11 +2278,67 @@ and two of its omissions change what an orrerix block on it means:
   setup and the one exposure this bridge has (the extension merges your repo's
   own `.mcp.json` into the pane's tools).
 
-**Why not codex?** codex can't deny its editing tool by name, and its sandbox
-is all-or-nothing — strict enough to block the tests and `gh` a review needs,
-or open enough to let the reviewer rewrite the code it's reviewing. A reviewer
-that can't be contained would quietly weaken the merge gate, so orrerix refuses
-the pairing rather than shipping it.
+`cli: codex` is the sixth choice, and the one that comes with a setup step and
+two things worth knowing before your first run:
+
+- **Everything orrerix configures rides one file, in your own Codex home.**
+  codex has no MCP flag and no way to append to its system prompt, but it does
+  have `-p/--profile <name>`, which layers `~/.codex/<name>.config.toml` over
+  your own config. orrerix writes one of those per agent — named
+  `orrerix-<agent id>` — carrying the block's role contract, orrerix's MCP
+  server, the sandbox posture, and the trust level for the pane's directory. It
+  is removed when the agent exits, and anything left behind by a crash is swept
+  at startup. This is the only file orrerix writes into another tool's home
+  directory, so it is namespaced and cleaned up deliberately;
+  `doc/design/codex.md` carries the argument for every key in it.
+- **Your own `[mcp_servers.*]` entries are still there, and orrerix's layer
+  wins a name collision.** The profile is a layer over `~/.codex/config.toml`,
+  not a replacement for it, and codex's TUI has no exclusive-config switch. So
+  a codex pane sees your MCP servers as well as orrerix's — which is usually
+  what you want — and if you happen to have a server named `orrerix`, the
+  pane gets orrerix's rather than yours. Every spawn that finds any records
+  what it saw in the audit log (`codex-user-mcp-merged`) so a pane whose tools
+  look wrong is diagnosable rather than mysterious.
+- **A `reviewer` and a `planner` block cannot run on codex**, and orrerix
+  refuses the file rather than launching one — see *Why not codex for a
+  reviewer?* below.
+- **`allow:` doesn't apply to a `codex` block**, for gemini's reason and one of
+  its own: codex's rules engine can forbid a command prefix, but it loads rules
+  only from `~/.codex/rules/` and the repo's `.codex/rules/`, neither of which
+  is per-agent. A `codex` block runs with its class's baseline and can't be
+  widened.
+- **The posture toggle is real, and it lives in the profile rather than on the
+  command line.** An unattended (`auto_ops`) codex pane runs
+  `approval_policy = "never"`; an attended one runs `on-request` and will raise
+  an approval overlay, which orrerix's attention scan picks up. This is the
+  opposite of pi above: the two postures produce an identical `codex …` command
+  line precisely *because* the difference is in the file.
+- **The sandbox is `workspace-write`, with network on.** Edits inside the
+  workspace, and network access explicitly enabled because a worker that cannot
+  reach GitHub cannot open a PR. codex's `read-only` rung is not a middle
+  ground — it blocks running commands and the network too — and orrerix never
+  emits the bypass flag. On Windows, codex's sandbox may run commands as a
+  separate user on a private desktop; if `gh` or `git` behave oddly in a codex
+  pane, that is the first thing to check.
+- **Session history works, the copilot way.** codex has no flag that pre-assigns
+  a session id, so orrerix watches your `~/.codex/sessions` store for the
+  rollout the pane creates and binds it afterwards. If two codex panes in the
+  same directory both start a session before either is identified, orrerix
+  refuses to guess between them and leaves both unidentified — recorded as
+  `session-untracked` in the audit log — rather than binding one pane to the
+  other's conversation.
+- **No model is set unless a block asks for one.** The `model` key in your own
+  `~/.codex/config.toml` is what a codex pane runs on; orrerix's profile
+  deliberately names none. A block that wants something specific pins its own
+  `model:`.
+
+**Why not codex for a reviewer?** codex can't deny its editing tool by name,
+and its sandbox is all-or-nothing — strict enough to block the tests and `gh` a
+review needs, or open enough to let the reviewer rewrite the code it's
+reviewing. Its rules engine could express the missing denial but cannot be
+scoped to one agent. A reviewer that can't be contained would quietly weaken
+the merge gate, so orrerix refuses the pairing rather than shipping it. The
+same reasoning refuses a `planner`, which is read-only and needs strictly more.
 
 Turning it on live shows the same resolved-roster confirm (name, blocks, any
 declared gate) the launcher's own preview shows at launch time; turning it off
@@ -2990,7 +3046,7 @@ it gates, the per-item approve-with-comment grants, and the gate's audit trail.
 
 ## Requirements
 
-- An agent CLI on `PATH` — `claude`, `copilot`, `gemini`, `opencode`, or `pi`. Roles
+- An agent CLI on `PATH` — `claude`, `copilot`, `gemini`, `opencode`, `pi`, or `codex`. Roles
   can run on different ones (see [cross-model reviewers](#setting-up-a-cross-model-reviewer)).
   The launcher warns inline as you pick, and re-checks on submit — if one of
   those CLIs isn't on `PATH` it refuses the whole launch rather than starting

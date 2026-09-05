@@ -69,6 +69,32 @@ test("the curated opencode ids keep their provider prefix, `/` intact (#722)", (
   }
 });
 
+test("codex is a CLI a group can be launched on, and pins no model (#2515 C1)", () => {
+  const ids = ORCH_CLIS.map((c) => c.id);
+  assert.ok(ids.includes("codex"), `codex must be offered in orchestrator mode: ${ids.join(", ")}`);
+  // Not the fallback row: `orchCliFor` returns ORCH_CLIS[0] for anything it
+  // does not know, so a typo'd id must not silently become codex.
+  assert.notEqual(ORCH_CLIS[0]!.id, "codex");
+  assert.equal(orchCliFor("codex").id, "codex");
+
+  // Inherit on every role, mirroring `default_model("codex", _)`. codex is the
+  // clearest of the three inherit rows: the `model` key in the human's own
+  // ~/.codex/config.toml IS where they already chose, and the profile orrerix
+  // layers on top deliberately names no model — so a default here would be a
+  // silent override rather than merely the hardcoded table #329 warns about.
+  const cx = orchCliFor("codex");
+  for (const { key } of ORCH_ROLES) {
+    assert.equal(
+      cx.defaults[key],
+      INHERIT_MODEL,
+      `codex must inherit the human's own model on ${key}, not pin one`
+    );
+  }
+  // The control: a row that DOES pin one, so the loop above is asserting a
+  // decision rather than a property every row in this table happens to share.
+  assert.notEqual(orchCliFor("claude").defaults.worker, INHERIT_MODEL);
+});
+
 test("every role default is something the picker actually offers", () => {
   // Otherwise the form opens on `custom…` with a prefilled id that looks like
   // the human typed it. Empty is always legal — it means "send no --model".
