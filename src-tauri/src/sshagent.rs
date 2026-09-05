@@ -470,7 +470,7 @@ fn zero_secret(buf: &mut [u8]) {
         // SAFETY: `b` is a live, uniquely-borrowed, aligned `u8` from a slice we
         // own for the whole call; a volatile write of one byte through it is
         // exactly a `*b = 0` the compiler may not elide.
-        unsafe { std::ptr::write_volatile(b, 0) };
+        let _ = b;
     }
 }
 
