@@ -46528,13 +46528,36 @@ fn a_preview_names_the_orchestrator_keys_that_wait_for_a_resume() {
     let g = switchable_group(&reg, &repo);
 
     let preview = reg.workflow_switch_preview(&g.id, &wf("f")).unwrap();
-    assert_eq!(
-        preview["next_resume"],
-        json!(["effort", "model"]),
-        "sorted, and `cli` is never here — that one is a refusal: {preview}"
-    );
+    assert_eq!(preview["next_resume"], json!(["effort", "model"]), "sorted: {preview}");
     assert_eq!(preview["refusal"], Value::Null, "knobs alone do not refuse: {preview}");
     assert_eq!(preview["empty"], json!(false), "it is a real change, just a deferred one");
+
+    // THE DISCRIMINATING HALF, and the first cut of this test did not have it
+    // (#2659 round-2 mutation m9 came back GREEN). `f.yml` moves `model` and
+    // `effort` and leaves `cli` alone, so filtering `cli` out of that row is a
+    // no-op and the assertion above holds with or without the filter — which is
+    // exactly the regression rev-std 1 named. `g.yml` moves `cli` TOO, so the
+    // filter is the only thing keeping it out of the list.
+    fs::write(
+        repo.path().join(".orrerix").join("workflows").join("g.yml"),
+        "version: 1\nname: knobs-and-cli\n\
+         blocks:\n\
+         \x20 - id: orchestrator\n    kind: orchestrator\n    cli: copilot\n    model: sonnet\n\
+         \x20 - id: w-a\n    kind: worker\n\
+         \x20 - id: rev-a\n    kind: reviewer\n    prompt: Everything.\n\
+         gates:\n  merge:\n    reviewers: [rev-a]\n",
+    )
+    .unwrap();
+    let both = reg.workflow_switch_preview(&g.id, &wf("g")).unwrap();
+    assert_eq!(both["diff"]["orchestrator_cli_changed"], json!(true), "{both}");
+    assert!(both["refusal"].is_string(), "a CLI move refuses: {both}");
+    let keys: Vec<&str> =
+        both["next_resume"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(
+        !keys.contains(&"cli"),
+        "`cli` is a REFUSAL, never a key that waits for a resume: {both}"
+    );
+    assert!(keys.contains(&"model"), "and the deferred knob beside it is still reported: {both}");
 }
 
 #[test]
