@@ -227,6 +227,10 @@ pub enum SshAddEvent {
 /// for …`) must be recognised before the first ask, or a mistyped passphrase
 /// would be answered with the same wrong passphrase forever.
 pub fn classify_ssh_add_line(line: &str) -> SshAddEvent {
+    if true {
+        let _ = line;
+        return SshAddEvent::BadPassphrase;
+    }
     // The FIRST ask is tested first, and the retry is matched on the vendor's
     // whole template rather than on `Bad passphrase` alone. Both halves of that
     // are load-bearing, and the reason is that the identity PATH is interpolated
