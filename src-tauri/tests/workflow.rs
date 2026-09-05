@@ -8670,6 +8670,54 @@ fn a_group_json_predating_the_hold_label_resolves_to_the_builtin_veto() {
     );
 }
 
+/// **A hand-edited `group.json` cannot pin a flag-shaped veto** (#2663).
+///
+/// `guardrails.intake.hold` is the one path into this field that never met
+/// `parse_workflow`, and `read_intake` used to decide it with a local
+/// `sanitize_id` comparison. `sanitize_id` permits a leading `-` (it is the
+/// block-id alphabet, and CLAUDE.md constraint 6 says so out loud), while the
+/// parser's `sanitize_intake_label` refuses one — so the two rules disagreed on
+/// exactly this value class, invisibly, for as long as the field reached prose
+/// surfaces only.
+///
+/// #2663 gives it a `gh label create <name>` POSITIONAL, where a leading dash
+/// is read by cobra as a flag. Both callers now ask
+/// `workflow::usable_intake_label`, which is that same accept condition lifted
+/// out of the parser rather than restated beside it.
+///
+/// The fallback is the BUILT-IN, per field, which is what `read_intake` already
+/// did for every other unusable value — a rejection here must not leave the
+/// group with no veto spelling at all.
+#[test]
+fn a_flag_shaped_hold_in_a_hand_edited_group_json_resolves_to_the_builtin_veto() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&Repo::new().path(), rails()).unwrap();
+    let path = reg.state_root().join(g.id.as_str()).join("group.json");
+
+    let write_hold = |hold: &str| {
+        let mut gj: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        gj["guardrails"]["intake"]["labels"]["hold"] = json!(hold);
+        fs::write(&path, serde_json::to_string_pretty(&gj).unwrap()).unwrap();
+    };
+
+    for evil in ["--force", "-x", "--"] {
+        write_hold(evil);
+        let (_, persisted) = reg.load_group_file(&g.id).unwrap();
+        assert_eq!(
+            persisted.intake.hold,
+            workflow::builtin_intake_profile().hold,
+            "{evil:?} is flag-shaped and must fall back to the built-in veto"
+        );
+    }
+
+    // The positive control, through the SAME write-and-reload path: a rename
+    // that is merely unusual survives it, so the loop above is refusing this
+    // value class rather than refusing every hand-edited spelling.
+    write_hold("do-not-touch");
+    let (_, persisted) = reg.load_group_file(&g.id).unwrap();
+    assert_eq!(persisted.intake.hold, "do-not-touch");
+}
+
 #[test]
 fn unknown_intake_source_is_rejected_never_coerced() {
     let yaml = "version: 1\nblocks:\n  - id: worker\n    kind: worker\nintake:\n  source: gitlab\n";
