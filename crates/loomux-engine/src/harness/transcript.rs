@@ -87,7 +87,7 @@ pub const TOOL_PREVIEW_BYTES: usize = 120;
 /// Fixing this by setting `convertEol: true` on the shared `Terminal` was
 /// rejected: that terminal is every pane's, so it would change how a real PTY
 /// pane parses a lone `LF` too.
-const NEWLINE: &str = "\r\n";
+const NEWLINE: &str = "\n";
 
 /// Dim, for loomux's own annotations.
 const DIM: &str = "\x1b[2m";
