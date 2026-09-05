@@ -81,8 +81,8 @@ codegen generates:
 | `gh-read` | 7 | auth status, issue/PR list and view, lifecycle activity |
 | `gh-write` | 4 | issue create/set-labels/comment, PR comment |
 | `gitwatch` | 2 | `git_watch`, `git_unwatch` |
-| `orch-read` | 25 | tasks, audit, session roles, autonomy/usage/summary, channel list, … |
-| `orch-control` | 58 | create/bind/steer/approve/grant-merge/grant-release, task & channel mgmt, autonomy settings, group lifecycle, solo and lead panes |
+| `orch-read` | 26 | tasks, audit, session roles, autonomy/usage/summary, channel list, … |
+| `orch-control` | 59 | create/bind/steer/approve/grant-merge/grant-release, task & channel mgmt, autonomy settings, applying a named workflow to a live group, group lifecycle, solo and lead panes |
 | `fileedit-read` | 5 | read file, list dir, search/list-files jobs |
 | `fileedit-write` | 2 | `ft_write_file`, `ft_replace` |
 | `filemgr-read` | 2 | `fm_list`, `fm_capabilities` |
