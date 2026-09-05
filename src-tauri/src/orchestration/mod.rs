@@ -48366,6 +48366,9 @@ impl OrchRegistry {
                 // them before `resume` is correct and is the only order that
                 // works — codex's usage is `codex [OPTIONS] <COMMAND> [ARGS]`.
                 let mut cmd = String::from("codex");
+                if let (Some(s), true) = (session, resume) {
+                    cmd.push_str(&format!(" resume {s}"));
+                }
                 cmd.push_str(&format!(" -C \"{}\"", workdir.display()));
                 // Unquoted: `codex_profile_name` refuses anything outside
                 // codex's `[A-Za-z0-9_-]` alphabet rather than sanitizing it,
