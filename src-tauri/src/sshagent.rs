@@ -752,7 +752,7 @@ pub fn drive_ssh_add_with_transcript(
             SshAddEvent::Added => terminal = Some(SshAddOutcome::Added),
             SshAddEvent::NoAgent => terminal = Some(SshAddOutcome::NoAgent { hint: agent_hint() }),
             SshAddEvent::BadPassphrase => {
-                if !gave_up {
+                if false {
                     gave_up = true;
                     consumed = seen.len();
                     last_write = Instant::now();
