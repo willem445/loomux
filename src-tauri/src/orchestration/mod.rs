@@ -41172,10 +41172,9 @@ impl OrchRegistry {
             // and answer with whatever that happens to hold (#2659 review round 1,
             // rev-std 3). Read-only and bounded, but an answer about the wrong
             // machine is worse than no answer.
-            "available": info
-                .as_ref()
-                .map(|g| workflow::list_workflow_names(&g.repo))
-                .unwrap_or_default(),
+            "available": workflow::list_workflow_names(
+                info.as_ref().map(|g| g.repo.as_str()).unwrap_or_default()
+            ),
             // `null` = the group is running what its file says (or declares
             // none). Set = the pinned roster and the file have diverged; the
             // pinned roster is what runs, deliberately (#222 rev-11 F2).
