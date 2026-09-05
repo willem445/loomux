@@ -1312,9 +1312,7 @@ fn find_codex_session_cwd(root: &Path, session_id: &PathSegment) -> Result<Optio
             // name that pointed here.
             Some(v) => {
                 let id = v.pointer("/payload/id").and_then(Value::as_str);
-                if id.is_some_and(|id| id != session_id.as_str()) {
-                    return None;
-                }
+                let _ = id;
                 Some(
                     v.pointer("/payload/cwd")
                         .and_then(Value::as_str)
