@@ -319,6 +319,8 @@ pub fn run() {
             orchestration::orch_channel_set_sender,
             orchestration::orch_solo_prepare,
             orchestration::orch_solo_bind,
+            orchestration::orch_lead_prepare,
+            orchestration::orch_lead_bind,
             orchestration::orch_confirm_solo_copilot_autopilot,
             orchestration::orch_solo_adopt,
             cliprobe::probe_agent_cli,

@@ -804,16 +804,16 @@ pub const MANAGER_TPL: &str = include_str!("templates/manager.md");
 /// nobody turned on. It is written by the block loop, for the roster the
 /// launcher's toggle mints.
 ///
-/// **Unlike `manager.md` it is NOT golden-pinned in this slice**, and that is a
-/// decision rather than an oversight. The pin (`tests/fixtures/pre222/` + the
-/// `LIVE` pairing in `tests/workflow.rs`) exists to make an accidental edit to
-/// bytes a shipped pane already reads fail loudly; nothing delivers this file
-/// yet — slice A ships the CLASS, and the launch path that pastes a kickoff is
-/// slice B — so there is no shipped reading to regress. `block.md` and
-/// `workflow.md` are unpinned on the same terms. It joins the pin in the slice
-/// that delivers it, when its per-CLI content is settled, rather than being
-/// blessed once here and re-blessed there — a fixture re-blessed per slice is
-/// one chance per slice to bless a mistake.
+/// **Golden-pinned since slice B**, and the timing was the decision. The pin
+/// (`tests/fixtures/pre222/` + the `LIVE` pairing in `tests/workflow.rs`)
+/// exists to make an accidental edit to bytes a shipped pane already reads
+/// fail loudly. Slice A shipped the CLASS and delivered nothing, so there was
+/// no shipped reading to regress and pinning then would have meant a re-bless
+/// in slice B — one chance per slice to bless a mistake. Slice B ships the
+/// launch path that pastes this file's kickoff, so it is pinned here, in
+/// `GOLDENS` and `LIVE` but NOT in `PRE222`: a default group has no lead block,
+/// so no `lead.md` is written into its dir. `block.md` and `workflow.md` stay
+/// unpinned, on the terms this paragraph used to state for all three.
 ///
 /// It carries `{{GROUP_ID}}` and `{{REPO}}` and no other placeholder: a lead
 /// may never carry a repo persona (`workflow::persona_allowed` is false for
@@ -870,7 +870,7 @@ pub(crate) fn role_template(role: Role) -> &'static str {
         // block loop renders every block in a roster, so it runs the moment a
         // lead block exists — which is before any lead pane is opened, and in a
         // function whose failure mode would be a process abort rather than an
-        // error. See [`LEAD_TPL`] for why it is not golden-pinned in this slice.
+        // error. See [`LEAD_TPL`] for when it joined the golden pin, and why.
         Role::Lead => LEAD_TPL,
     }
 }
@@ -4460,11 +4460,57 @@ review gates do not loosen, and nothing you relay opens one."
         // A solo pane never gets a kickoff/persona — it's an arbitrary
         // human-launched CLI, not a orrerix delegate. Never reached.
         Role::Solo => unreachable!("solo panes have no mechanics core — they receive no kickoff"),
-        // #2519 slice A ships the class, not the kickoff — see `role_template`
-        // for why nothing in this slice can reach either.
-        Role::Lead => unreachable!(
-            "the lead's mechanics core lands with the launch path that delivers it (#2519 slice B)"
-        ),
+        // #2519 slice B. A real contract rather than the `unreachable!()` slice A
+        // left, and constraint 10 is why it could not stay one: this function runs
+        // from `render_block_instructions`'s replace-mode arm and from
+        // `copilot_agent_body`, both of which are reached for EVERY block in a
+        // roster — so a hand-edited `group.json` giving a lead block a
+        // `mode: replace` persona would abort the process rather than degrade,
+        // and slice B is the slice that makes a lead block exist on disk at all.
+        //
+        // **Keep this arm in lockstep with `templates/lead.md`.** Same rule as the
+        // manager's arm above and for the same reason: a `mode: replace` persona on
+        // a lead block reads THIS text and nothing else, so a rule that lives only
+        // in the template is a rule such a lead was never told.
+        //
+        // What it deliberately drops, so the gap is a decision: the template's
+        // "prefer these over your CLI's own subagents" argument, which is
+        // persuasion rather than mechanics, and the per-tool descriptions the MCP
+        // listing already carries on every turn.
+        Role::Lead => "\
+These orrerix mechanics are guaranteed by the app and are NOT optional, whatever your \
+persona says:
+\
+- **You are the human's own pane, and the ROOT of this group — not one of its \
+delegates.** Nobody spawned you and there is nobody above you: you hold no `report` and \
+no `message_orchestrator`, because this group has no orchestrator. Tell the human what \
+you would have reported; they are right here.
+\
+- **`spawn_agent(kind: \"worker\")` opens a helper as a real orrerix pane** — its own git \
+worktree and branch, watchable and steerable by your human, still there when your turn \
+ends. It accepts `worker` and refuses every other kind, with the reason: this group has \
+no review gate and no task board, so a reviewer or a planner would have nothing to \
+answer to. A helper starts cold and knows only what you write in `task`.
+\
+- Drive and read a helper with `send_prompt`, `get_output`, `list_agents`, \
+`kill_agent`, `focus_agent`, `rename_agent`, and `group_usage` for what it has cost. \
+`get_output` is what keeps a helper's output OUT of your context until you ask for it. \
+These tools never need approval; use them, don't ask the human to.
+\
+- **A helper's `report(\"done\"|\"blocked\")` is typed into THIS pane**, prefixed \
+`[orrerix]` and naming the agent. A `progress` report is recorded rather than delivered \
+— it never interrupts you — so ask for a tail when you want to know how something is \
+going mid-flight.
+\
+- You have no task board, no review gate, no merge queue and no verdicts, and you never \
+merge, tag or publish. Your helpers open PRs; the human reviews and merges them.
+\
+- Your helpers count against the live-agent cap the human set, a spawn-rate backstop \
+bounds a runaway loop, and an idle helper is reaped on the group's timeout. None of \
+that applies to this pane: it is never reaped, never nagged and never counted — and you \
+cannot kill it, from here or from a helper. Closing it is the human's gesture, and it \
+ends the group."
+            .to_string(),
     };
     // A role_hint (#250/#324/#891) addendum — the same non-overridable treatment as
     // the rest of this function, for the same reason: a `mode: replace` persona on an
@@ -4684,6 +4730,230 @@ pub fn solo_group_id() -> &'static GroupId {
     SOLO.get_or_init(|| GroupId::parse(SOLO_GROUP).expect("SOLO_GROUP must be a valid group id"))
 }
 
+
+/// Marker file, in the group dir, recording that a group was minted by the
+/// "orrerix subagents" toggle rather than by a launcher orchestration (#2519).
+///
+/// It exists because the ROSTER cannot answer that question durably.
+/// `read_blocks` resolves every persisted block `kind` through
+/// `workflow::kind_from_str`, which has no `lead` arm by design — that absence
+/// is what stops a repo's workflow file declaring one and stops a lead opening
+/// a lead (`doc/design/lead-pane.md`, *Consent*) — so a `kind: "lead"` row in
+/// `group.json` is DROPPED on reload rather than restored. Every reader that
+/// needs the fact after a restart asks this file instead.
+///
+/// **It has a LIFETIME, and both ends of it are code** (rev-final B1). A group
+/// id is repo-derived and handed out again: `next_group_id` returns the first
+/// candidate with no LIVE agent, and the group directory is never removed. So a
+/// marker that is only ever written outlives the group that wrote it, and the
+/// next ordinary orchestration to reattach to that id answers `is_lead_group()`
+/// forever — every session in it refused as unresumable, citing a toggle nobody
+/// flipped, with `offersStartFresh` false for that kind so the UI offers no way
+/// out. It is written by `lead_prepare` (last, below every step that can fail)
+/// and CLEARED by `create_group_ex`, which is the one place an id is claimed.
+///
+/// That pairing is the `paused` marker's precedent taken WHOLE: `end_group`
+/// removes that one so "a future relaunch on this repo starts clean rather than
+/// silently paused", and `invalidate_usage_memo` beside it states the general
+/// form — "a group id is chosen by liveness and can be handed out again".
+/// Clearing at the CLAIM rather than at teardown is the one difference, and it
+/// is required: a lead that simply dies never runs `end_group` at all.
+///
+/// Best-effort at both ends, and each failure leaves the pre-existing answer
+/// standing rather than inventing one: a write that fails loses the resume
+/// refusal, and a remove that fails leaves a refusal that was already there.
+pub const LEAD_MARKER: &str = "lead";
+
+/// The `AgentEntry` for a pane the HUMAN's own launcher opens — a solo pane or
+/// a lead — where orrerix mints the identity but never builds the command line.
+///
+/// Extracted rather than copied (#2519): this struct has around sixty fields
+/// and four construction sites, and the two that share every one of these
+/// defaults are exactly the two human-launched ones. A fifth hand-written copy
+/// is how a field added next month gets the wrong value in one site and nothing
+/// goes red to say so.
+///
+/// Every field below is the value BOTH sites already had, unchanged. What the
+/// two genuinely differ on is the argument list: a solo pane carries its CLI
+/// directly (`solo_cli`, because `__solo__` is one pseudo-group across panes
+/// running different CLIs), while a lead's comes from its block like any other
+/// group member's — see `AgentEntry::solo_cli`.
+///
+/// `spawn_agent_ex`'s and `register_orchestrator_pane`'s literals are
+/// deliberately NOT folded in here: those two carry a session id, a task, a
+/// branch, a board binding and a resolved contract carrier, so they would each
+/// need a post-construction fixup for most of what they set. `solo_adopt`'s is
+/// the one remaining near-twin, and it differs on the two fields this shape
+/// makes load-bearing (`status`/`pty_id`: it adopts an already-running pane);
+/// folding it in would mean a builder rather than a function, which is more
+/// machinery than three call sites earn.
+#[allow(clippy::too_many_arguments)] // the fields the two sites genuinely differ on
+fn human_pane_entry(
+    id: &str,
+    group: GroupId,
+    name: String,
+    block: &str,
+    role: Role,
+    token: &str,
+    cwd: &str,
+    solo_cli: Option<String>,
+) -> AgentEntry {
+    AgentEntry {
+        id: id.to_string(),
+        group,
+        name,
+        name_source: NameSource::Default,
+        block: block.to_string(),
+        role,
+        token: token.to_string(),
+        status: AgentStatus::Starting,
+        pty_id: None,
+        task: String::new(),
+        task_id: None, // a human-launched pane has no board binding
+        session_id: None,
+        cwd: cwd.to_string(),
+        branch: None, // neither class is part of the multi-agent worktree/branch model
+        idle_since_ms: None,
+        started_ms: now_ms(),
+        last_progress_ms: now_ms(),
+        last_mcp_activity_ms: 0,
+        // Neither class is idle-ticked (the tick is `Role::Orchestrator`-only);
+        // inert for both.
+        last_output_progress_ms: now_ms(),
+        last_output_total: 0,
+        watchdog_notified: false,
+        watchdog_watch_suppressed: false,
+        idle_tick_notified: false,
+        compact_nudge_notified: false,
+        compact_nudge_last_output_total: 0,
+        compact_requested: false,
+        compact_pending: false,
+        compact_seen_busy: false,
+        compact_pending_baseline_tokens: None,
+        compact_pending_baseline_marker_count: None,
+        compact_pending_trusted: false,
+        compact_reinject_attempted_ms: None,
+        compact_reinject_attempts: 0,
+        compact_reinject_busy_deferred: false,
+        compact_pending_armed_ms: None,
+        compact_last_lost_reason: None,
+        compact_last_lost_ms: None,
+        compact_last_ack: None,
+        compact_last_ack_ms: None,
+        last_context_tokens: None,
+        last_context_model: None,
+        compact_inference_guard_until_ms: 0,
+        compact_hook_precompact_seen_ms: None,
+        compact_hook_sessionstart_seen_ms: None,
+        compact_pending_evidence: None,
+        compact_hook_native_notice_delivered: false,
+        // A solo pane has no group/persona system at all, and a lead's contract
+        // rides in its kickoff rather than in a system layer — so `KickoffOnly`,
+        // the enum's own default, is the accurate value for both rather than
+        // merely the conservative one.
+        contract_carrier: ContractCarrier::default(),
+        last_state_write_ms: 0,
+        compact_escalation_notified: false,
+        idle_tick_skip_rearm_ms: 0,
+        solo_cli,
+        last_exit_tail: None,
+        killed_by: None,
+    }
+}
+
+/// The exact per-CLI flag string a LEAD pane's command line needs, appended by
+/// the launcher to the line the human owns (#2519). Empty for a CLI with no arm
+/// — `lead_prepare` treats that as a loomux bug and refuses, unlike
+/// `solo_prepare`, which degrades.
+///
+/// **It is `solo_prepare`'s string plus a per-CLI subagent denial**, and the
+/// two halves have different jobs. The first half is the MCP wiring, identical
+/// to a solo pane's because the question it answers is identical. The second is
+/// what makes the toggle mean what it says: a lead that can still reach its
+/// harness's own in-process subagents will use them, because they are one call
+/// away and `spawn_agent` is three.
+///
+/// # Per CLI, cited to the vendor page as fetched
+///
+/// - **claude — `--disallowedTools Agent`.** Two documented facts composed,
+///   and the composition is stated because neither page states it alone. The
+///   sub-agents page names the TOOL and the deny: "To prevent Claude from
+///   delegating to any subagent, deny the `Agent` tool itself with
+///   `permissions.deny`" (and, in a note: "In version 2.1.63, the Task tool was
+///   renamed to Agent. Existing `Task(...)` references in settings and agent
+///   definitions still work as aliases"). The CLI reference gives the flag that
+///   spells a deny rule on a command line: `--disallowedTools` is "Deny rules. A
+///   bare tool name removes the matching tools from Claude's context: `\"Edit\"`
+///   removes Edit, `\"*\"` removes every tool". So a bare `Agent` on that flag is
+///   the argv spelling of the deny the sub-agents page prescribes.
+///   `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` is narrower — the built-in
+///   explore/plan agents only — and is not used here.
+/// - **copilot — nothing, and the reason is the FLAG, not the tool.** The plan
+///   this slice was written from recorded copilot as documenting no subagent
+///   tool name at all; re-fetching says otherwise, so the premise is corrected
+///   here rather than transcribed. `custom-agents-configuration` does name one
+///   — the `agent` tool (aliases `custom-agent`, `Task`), "Allows a different
+///   custom agent to be invoked to accomplish a task" — but it names it as a key
+///   in a custom agent's own `tools:` list, which is a FILE orrerix would have to
+///   hand the pane with `--agent`, replacing whatever agent the human chose.
+///   The flag seam this function writes into cannot express it: the CLI
+///   configuration guide says "To use the --deny-tool and --allow-tool options,
+///   you must specify what type of tool you want to allow or deny" and lists
+///   exactly three — shell commands, `write`, and MCP server tools (the same
+///   enumeration `KNOWN_COPILOT_DENY_CATEGORIES` is pinned against). A bare tool
+///   name is not among them. So a copilot lead is instruction-only:
+///   `templates/lead.md` asks it to prefer `spawn_agent` and nothing
+///   structurally stops it doing otherwise. Inventing a `--deny-tool agent`
+///   value the vendor does not document would be a claim, not a denial; the
+///   follow-up is the generated-custom-agent route, which is a product decision
+///   about overriding the human's own `--agent` choice and not this slice's.
+/// - **pi — nothing to deny.** `docs/usage.md` at the pinned tag: pi "intentionally
+///   does not include built-in MCP, sub-agents, permission popups, plan mode,
+///   to-dos, or background bash", and no delegation tool appears in its toolset
+///   (`read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`).
+///
+/// The absent CLIs (opencode, codex, gemini) never reach here:
+/// `lead_prepare` refuses any CLI without an argv MCP seam before calling this.
+fn lead_mcp_args(cli: &str, cfg: &Path) -> String {
+    match cli {
+        // `--disallowedTools` is APPENDED, and every join site appends, so a
+        // lead launched with the launcher's autopilot flags on ends up with two
+        // `--allowedTools` occurrences exactly as a solo pane does — see
+        // `solo_prepare`'s arm for why that is harmless and deliberately not
+        // relied on. This adds a THIRD flag rather than editing either.
+        "claude" => format!(
+            "--mcp-config \"{}\" --strict-mcp-config --allowedTools {tools} --disallowedTools Agent",
+            cfg.display(),
+            tools = brand::MCP_TOOL_PREFIX
+        ),
+        "copilot" => format!(
+            "--additional-mcp-config \"@{}\" --allow-tool {server}",
+            cfg.display(),
+            server = MCP_SERVER
+        ),
+        "pi" => format!("--mcp-config \"{}\"", cfg.display()),
+        _ => String::new(),
+    }
+}
+
+/// The two checks every group-minting path runs against the repository path it
+/// was handed, before anything is created.
+///
+/// Extracted from `create_orchestration_group` (#2519) rather than restated in
+/// `lead_prepare`: the quote guard in particular is not obvious, and a second
+/// copy that forgot it would be a pane whose command line the path escapes.
+fn validate_group_repo(repo: &str) -> Result<(), String> {
+    // Paths are interpolated into a quoted shell line; a quote inside one
+    // would escape it. (Windows filesystems forbid `"` in names; this
+    // guards the Unix builds and hand-typed paths.)
+    if repo.contains('"') {
+        return Err("repository path must not contain a quote character".into());
+    }
+    if !Path::new(repo).is_dir() {
+        return Err(format!("repository path does not exist: {repo}"));
+    }
+    Ok(())
+}
 /// Which kind of start a `create_group` call is (#222).
 ///
 /// It exists for exactly one decision — **does the repo's `.loomux/workflow.yml`
@@ -17787,6 +18057,15 @@ pub enum ExitInitiator {
     /// report. `reviewdrive::releasable` is the closed rule and
     /// `OrchRegistry::release_driven_pane` is the only thing that stamps this.
     DriverRelease,
+    /// The LEAD pane of this delegate's group, by dying (#2519). A lead group
+    /// has no root once its lead is gone, so its helpers are ended with it —
+    /// `OrchRegistry::end_lead_children` is the only thing that stamps this.
+    ///
+    /// Demoted for a reason the other three do not have: there is nobody left
+    /// to prompt. The pane an exit notice would be typed into is the one whose
+    /// death caused the exit, so a `Prompt` here is a delivery whose only
+    /// possible outcome is a dropped notice.
+    LeadExit,
 }
 
 impl ExitInitiator {
@@ -17795,6 +18074,7 @@ impl ExitInitiator {
             ExitInitiator::Orchestrator => "orchestrator",
             ExitInitiator::IdleTimeout => "idle-timeout",
             ExitInitiator::DriverRelease => "driver-release",
+            ExitInitiator::LeadExit => "lead-exit",
         }
     }
 }
@@ -17849,7 +18129,8 @@ pub fn exit_notice_route(initiator: Option<ExitInitiator>) -> ExitNoticeRoute {
     match initiator {
         Some(ExitInitiator::Orchestrator)
         | Some(ExitInitiator::IdleTimeout)
-        | Some(ExitInitiator::DriverRelease) => ExitNoticeRoute::AuditOnly,
+        | Some(ExitInitiator::DriverRelease)
+        | Some(ExitInitiator::LeadExit) => ExitNoticeRoute::AuditOnly,
         // Crash, watchdog-driven death, an agent quitting unexpectedly, a
         // human closing the pane — nobody in this process asked for it.
         None => ExitNoticeRoute::Prompt,
@@ -33165,6 +33446,35 @@ impl OrchRegistry {
         fs::create_dir_all(dir.join("configs")).map_err(|e| e.to_string())?;
         let resumed = dir.join("group.json").is_file();
 
+        // #2519 B1 (rev-final). A group id is claimed HERE and nowhere else, and
+        // this is the one line that makes the lead marker mean "the group at this
+        // id, AS IT EXISTS NOW, was minted by the toggle".
+        //
+        // The hazard is the one `end_group` clears the `paused` marker for, and
+        // its neighbour states the general form: "a group id is chosen by
+        // liveness and can be handed out again". `next_group_id` returns the
+        // first candidate with no LIVE agent, and the group DIRECTORY is never
+        // removed — so a lead group whose pane has died leaves its id, and its
+        // marker, free for an ordinary orchestration to reattach to. Without
+        // this line that ordinary group answers `is_lead_group()` for the rest of
+        // its life and `resume_recorded_session` refuses every session in it,
+        // citing a toggle nobody flipped — and `offersStartFresh` is false for
+        // that kind, so the UI offers no way out either.
+        //
+        // **Unconditional rather than `Launch::Fresh`-only**, and the extra
+        // coverage is the argument: a `Launch::Promote` reattaches a dormant
+        // group by exactly the same id selection, so a promote onto a dead
+        // lead's id inherits the same stale marker. A `Launch::Resume` cannot
+        // reach a lead group at all — `resume_recorded_session` refuses one
+        // before anything is created — so there is no case where clearing here
+        // erases a fact that is still true. `lead_prepare` re-writes it after
+        // its own mint succeeds, which is what keeps the marker one group wide.
+        //
+        // Best-effort like the `paused` remove it mirrors: a marker that could
+        // not be deleted leaves the pre-existing refusal standing, which is the
+        // direction this fails in either way.
+        let _ = fs::remove_file(dir.join(LEAD_MARKER));
+
         // #407: a PROMOTE reattaching a dormant group brings the promote
         // modal's defaults with it — a right-click is not the launcher, and
         // there is no roster preview in it — so the ROSTER (and the toggle and
@@ -36670,66 +36980,16 @@ impl OrchRegistry {
         };
         let delivery_only = token.is_empty();
 
-        let entry = AgentEntry {
-            id: agent_id.clone(),
-            group: solo_group_id().clone(),
-            name: display,
-            name_source: NameSource::Default,
-            block: "solo".to_string(),
-            role: Role::Solo,
-            token: token.clone(),
-            status: AgentStatus::Starting,
-            pty_id: None,
-            task: String::new(),
-            task_id: None, // a solo pane has no board binding
-            session_id: None,
-            cwd: cwd.to_string(),
-            branch: None, // solo panes aren't part of the multi-agent worktree/branch model
-            idle_since_ms: None,
-            started_ms: now_ms(),
-            last_progress_ms: now_ms(),
-            last_mcp_activity_ms: 0,
-            last_output_progress_ms: now_ms(), // solo panes are never idle-ticked (not Role::Orchestrator); inert
-            last_output_total: 0,
-            watchdog_notified: false,
-            watchdog_watch_suppressed: false,
-            idle_tick_notified: false,
-            compact_nudge_notified: false,
-            compact_nudge_last_output_total: 0,
-            compact_requested: false,
-            compact_pending: false,
-            compact_seen_busy: false,
-            compact_pending_baseline_tokens: None,
-            compact_pending_baseline_marker_count: None,
-            compact_pending_trusted: false,
-            compact_reinject_attempted_ms: None,
-            compact_reinject_attempts: 0,
-            compact_reinject_busy_deferred: false,
-            compact_pending_armed_ms: None,
-            compact_last_lost_reason: None,
-            compact_last_lost_ms: None,
-            compact_last_ack: None,
-            compact_last_ack_ms: None,
-            last_context_tokens: None,
-            last_context_model: None,
-            compact_inference_guard_until_ms: 0,
-            compact_hook_precompact_seen_ms: None,
-            compact_hook_sessionstart_seen_ms: None,
-            compact_pending_evidence: None,
-            compact_hook_native_notice_delivered: false,
-            // Solo panes have no group/persona system at all — `compact_
-            // nudge_tick`'s reinjection path never reaches a `Role::Solo`
-            // entry (it's skipped at `groups.get(&a.group)`), so this is
-            // unused; the enum's own `KickoffOnly` default is the safe/
-            // conservative value regardless.
-            contract_carrier: ContractCarrier::default(),
-            last_state_write_ms: 0,
-            compact_escalation_notified: false,
-            idle_tick_skip_rearm_ms: 0,
-            solo_cli: Some(cli.to_string()),
-            last_exit_tail: None,
-            killed_by: None,
-        };
+        let entry = human_pane_entry(
+            &agent_id,
+            solo_group_id().clone(),
+            display,
+            "solo",
+            Role::Solo,
+            &token,
+            cwd,
+            Some(cli.to_string()),
+        );
         self.agents.lock_safe().insert(agent_id.clone(), entry);
         if !token.is_empty() {
             self.by_token.lock_safe().insert(token, agent_id.clone());
@@ -36955,6 +37215,423 @@ impl OrchRegistry {
         Ok(json!({ "agent_id": agent_id }))
     }
 
+
+    // ---------- lead panes (#2519) ----------
+    //
+    // A lead is a human-launched pane like a solo one — orrerix never builds
+    // its command line, the launcher does, and `lead_prepare` runs BEFORE the
+    // CLI boots so its MCP flags can be appended to that line. What it is not
+    // is a solo pane: it is the ROOT of a real, freshly-minted orchestration
+    // group whose delegates report into it. So the two halves below are
+    // deliberately borrowed from different places — the group mint from
+    // `create_orchestration_group`, the identity/flag half from
+    // `solo_prepare` — rather than either being copied.
+    //
+    // See `doc/design/lead-pane.md` for the class, the surface and the
+    // consent argument.
+
+    /// Human-only (the launcher's "orrerix subagents" toggle, constraint 5):
+    /// mint a lead group and the lead's own identity BEFORE its CLI boots, so
+    /// the MCP flags can be appended to the command line the launcher is about
+    /// to run. Returns `{group_id, agent_id, mcp_args}`.
+    ///
+    /// **What it creates, and what it deliberately does not.** A real group —
+    /// group dir, `group.json`, instruction files, audit log — through the same
+    /// `create_group_ex` every launch uses, under the same `creation` mutex, so
+    /// two toggles racing on one repo cannot pick the same id. What it does NOT
+    /// create is an orchestrator: `register_orchestrator_pane` is not called
+    /// and no `Role::Orchestrator` agent is ever inserted. The roster still
+    /// gains an orchestrator BLOCK, because `Guardrails::clamped` step 4
+    /// prepends one to any roster that declares none — a row, not a pane, and
+    /// the one-root check below is what keeps that distinction from mattering
+    /// (slice A's design note flagged exactly this as a tripwire for this
+    /// function).
+    ///
+    /// **`advanced_orchestrator: false`, and that is the consent argument in
+    /// code.** A repo's workflow file is a consent surface: the launcher
+    /// previews the roster it declares and the human agrees to it before the
+    /// group runs (#222). A lead group has no preview and no such moment — the
+    /// toggle is the whole of the human's gesture — so it runs the built-in
+    /// roster, and with the flag off `create_group_ex` never opens the file at
+    /// all.
+    ///
+    /// **The roster carries reviewer and planner blocks it will never open**,
+    /// on purpose. The refusal a lead gets for `kind: "reviewer"` is the
+    /// caller-class check in `mcp::call_tool`, which is the refusal
+    /// `doc/design/lead-pane.md` argues for and
+    /// `a_lead_may_spawn_a_worker_and_nothing_else` pins. Drop the blocks and
+    /// the same call fails on "no such block" instead — a different refusal,
+    /// from a different mechanism, and one that would silently start passing if
+    /// the class check were ever removed.
+    ///
+    /// Refuses a CLI whose MCP config cannot ride on a command line
+    /// (`CliCaps::mcp_argv_seam`): unlike a solo pane, which degrades to
+    /// delivery-only and is still useful, a lead with no MCP server holds none
+    /// of the tools the toggle exists to grant, so a pane that launched anyway
+    /// would be a lead in name only.
+    #[allow(clippy::too_many_arguments)] // the launcher's guardrail fields, one each
+    pub fn lead_prepare(
+        &self,
+        cli: &str,
+        cwd: &str,
+        name: &str,
+        max_agents: u32,
+        auto_ops: bool,
+        idle_kill_minutes: u32,
+        max_spawns_per_hour: u32,
+        watchdog_stall_minutes: u32,
+    ) -> Result<Value, String> {
+        if !SUPPORTED_CLIS.contains(&cli) {
+            return Err(format!(
+                "unsupported CLI {cli:?} for a lead pane — supported: {}",
+                SUPPORTED_CLIS.join(", ")
+            ));
+        }
+        // Not `SUPPORTED_CLIS`, and the distinction is `solo_prepare`'s (#267):
+        // the question is whether THIS pane's MCP config can be delivered as a
+        // flag string appended to a command line the human owns. opencode and
+        // codex answer no — their MCP config is a file or an environment
+        // variable, and the launcher's seam sets no environment — so the toggle
+        // is refused for them here as well as being hidden for them in the
+        // launcher. Naming the follow-up in the message matters: this is a
+        // missing seam, not a policy, and whoever reads it should know which.
+        if !cli_caps(cli).is_some_and(|c| c.mcp_argv_seam) {
+            return Err(format!(
+                "{cli} cannot host a lead pane yet: its MCP config is delivered through the \
+                 pane's environment or a config file, not as flags on the command line the \
+                 launcher builds, and a lead with no orrerix MCP server holds none of the \
+                 tools this toggle grants. See doc/design/lead-pane.md — widening the prepare \
+                 seam to carry environment pairs is the follow-up that lifts this."
+            ));
+        }
+        validate_group_repo(cwd)?;
+
+        // Every roster loomux synthesizes on a group's behalf pins no model
+        // knob (`default_roster_ex`'s own doc), and this is one: the human
+        // picked their model in their own launcher, and their helpers inherit
+        // the CLI they launched.
+        let blocks = workflow::default_roster(&[
+            (Role::Lead, cli, ""),
+            (Role::Worker, cli, ""),
+            (Role::Reviewer, cli, ""),
+            (Role::Planner, cli, ""),
+        ]);
+        let rails = Guardrails {
+            max_agents,
+            agent_cli: cli.to_string(),
+            blocks,
+            advanced_orchestrator: false,
+            auto_ops,
+            idle_kill_minutes,
+            max_spawns_per_hour,
+            watchdog_stall_minutes,
+            ..Guardrails::default()
+        };
+
+        // Held across the mint AND the one-root check below, for
+        // `create_orchestration_group`'s reason: id selection by liveness and
+        // root registration are one unit, or two toggles racing on one repo
+        // both see the other's candidate as free and both register a root in
+        // it.
+        let _creation = self.creation.lock_safe();
+        let group = self.create_group_ex(cwd, rails, Launch::Fresh)?;
+
+        // THE ONE-ROOT INVARIANT, enforced at the mint because there is nowhere
+        // else it can be. `deliver_relayed_to_root` is a `find` over a
+        // `HashMap`, whose iteration order is not stable, so a group holding two
+        // `is_root()` agents delivers a child's report to whichever comes back
+        // first — with no error on either side, and possibly a different answer
+        // between runs. `next_group_id` already skips groups with live agents,
+        // so this is a backstop rather than the primary defence; it is here
+        // because the cost of it being wrong is silent misdelivery rather than
+        // a failure.
+        let existing_root = self
+            .agents
+            .lock_safe()
+            .values()
+            .find(|a| a.group == group.id && a.status != AgentStatus::Dead && a.role.is_root())
+            .map(|a| (a.id.clone(), a.role));
+        if let Some((other_id, other_role)) = existing_root {
+            return Err(format!(
+                "group {} already has a live {} ({other_id}) — a group has exactly one root, and \
+                 a second one would make which pane receives a child's report depend on hash \
+                 order. Close that pane first, or open the lead on another repository",
+                group.id,
+                other_role.as_str(),
+            ));
+        }
+
+        // N2 (rev-final): the identity half, split at the seam the review named
+        // — everything above this line decides WHICH GROUP, everything below it
+        // decides WHO THE PANE IS. It is also every remaining step that can
+        // FAIL, which is what lets the marker below be written knowing no error
+        // return can strand one (B1, second trigger).
+        let (agent_id, mcp_args) = self.mint_lead_identity(&group, cli, cwd, name, auto_ops)?;
+
+        // THE MARKER, written LAST. It used to sit above `write_mcp_config`'s `?`
+        // and the empty-flags refusal, so either error return left a `lead`
+        // marker on a group that never became a lead group — the same
+        // false-refusal state B1's main chain produces, reached from the other
+        // side. Nothing below this line can fail.
+        //
+        // A MARKER FILE rather than the roster, which is the part worth reading
+        // twice. `group.json` does carry the lead block, but `read_blocks`
+        // resolves every persisted `kind` through `workflow::kind_from_str` —
+        // which has no `lead` arm, deliberately and structurally (that absence is
+        // what stops a repo file declaring one and stops a lead opening a lead) —
+        // so an unknown kind is DROPPED on reload. A reattach or a resume
+        // therefore sees a roster with no lead block at all, and anything that
+        // asked the roster "is this a lead group?" would answer no for every lead
+        // group that has been through a restart.
+        //
+        // Best-effort, like the `paused` marker it mirrors — and the pairing with
+        // `create_group_ex`'s remove is what makes that safe. A failed write
+        // loses the resume refusal, which falls through to the ordinary "no
+        // recorded orchestration" failures; a marker left behind by a group that
+        // has ended is cleared by the next claim of its id, rather than by hoping
+        // nothing reuses it.
+        let _ = fs::write(self.group_dir(&group.id).join(LEAD_MARKER), b"1");
+
+        self.audit(&group.id, "human", "lead-prepare", json!({
+            "agent": agent_id, "cli": cli, "max_agents": max_agents,
+        }));
+        crate::obs::breadcrumb(
+            "lead-prepare",
+            &format!("group={} agent={agent_id} cli={cli}", group.id),
+        );
+        Ok(json!({
+            "group_id": group.id,
+            "agent_id": agent_id,
+            "mcp_args": mcp_args,
+        }))
+    }
+
+    /// The lead pane's own identity: its id, its token, its MCP config, and the
+    /// flag string the launcher appends (#2519, split out per rev-final N2).
+    ///
+    /// The seam is a statement rather than a line-count trim.
+    /// [`lead_prepare`](Self::lead_prepare) decides WHICH GROUP — the argument
+    /// checks, the mint, the one-root invariant — and this decides WHO THE PANE
+    /// IS, given that group. It is also every step of the prepare that can still
+    /// fail, which is what lets its caller write the `lead` marker below the call
+    /// and know no error return can strand one.
+    ///
+    /// Runs under the caller's `creation` guard, and takes `&GroupInfo` rather
+    /// than a `&GroupId` so it cannot re-resolve a group its caller has already
+    /// pinned.
+    fn mint_lead_identity(
+        &self,
+        group: &GroupInfo,
+        cli: &str,
+        cwd: &str,
+        name: &str,
+        auto_ops: bool,
+    ) -> Result<(String, String), String> {
+        let seq = self.mint_agent_seq(&group.id);
+        let agent_id = format!("lead-{seq}");
+        let display = sanitize_agent_name(name);
+        let display = if display.is_empty() { agent_id.clone() } else { display };
+        let token = new_token();
+        // Derived from the class, never hand-passed — `register_orchestrator_
+        // pane`'s rule: `Role::Lead` is `Containment::None` today, and a literal
+        // here would be a second place to remember if that ever changes.
+        let containment = Role::Lead.containment();
+        // `PersonaInject::default()`, like `solo_prepare`: a lead group has no
+        // workflow file, so no block in it can carry a persona, and every CLI
+        // that reads `persona` out of this config is one whose seam
+        // `lead_prepare` has already refused, above the call to this function.
+        let cfg = self.write_mcp_config(
+            &group.id,
+            &agent_id,
+            &token,
+            cli,
+            Path::new(cwd),
+            containment,
+            auto_ops || containment.forces_unattended(),
+            &PersonaInject::default(),
+        )?;
+        let mcp_args = lead_mcp_args(cli, &cfg.path);
+        if mcp_args.is_empty() {
+            // `solo_prepare`'s argument, with the opposite conclusion. There, a
+            // pane with no flags still had a use (delivery-only), so it launched
+            // degraded; here the flags ARE the feature, so an argv-seam CLI with
+            // no arm refuses rather than shipping a pane advertised as a lead
+            // that can do nothing. `every_argv_seam_cli_has_a_lead_mcp_arm` is
+            // what keeps the pairing from drifting in the first place.
+            self.audit(&group.id, brand::AUDIT_ACTOR, "error", json!({
+                "what": "lead MCP flag missing for an argv-seam CLI",
+                "cli": cli,
+                "detail": "CLI_CAPS says this CLI's MCP config is argv-deliverable, but \
+                           lead_mcp_args has no flag string for it — add the arm beside the row.",
+            }));
+            return Err(format!(
+                "loomux has no lead command-line flags for {cli} — this is a loomux bug; nothing \
+                 was launched"
+            ));
+        }
+
+        let entry = human_pane_entry(
+            &agent_id,
+            group.id.clone(),
+            display,
+            // The lead block `default_roster` just built. Named by id rather
+            // than resolved through `block_for` because this function is what
+            // put it there: a lookup here could only ever disagree with itself.
+            Role::Lead.as_str(),
+            Role::Lead,
+            &token,
+            cwd,
+            // `None`, unlike a solo pane, and it is the same statement
+            // `solo_cli`'s own doc makes: a non-solo agent's CLI comes from its
+            // BLOCK, and this one's block carries `cli` because the roster
+            // `lead_prepare` built pinned it. A `Some` here would be a second
+            // source for one fact.
+            None,
+        );
+        self.agents.lock_safe().insert(agent_id.clone(), entry.clone());
+        self.by_token.lock_safe().insert(token, agent_id.clone());
+        // Persisted, unlike a solo pane's: this row is what makes the pane
+        // visible to the session browser and the Agents tab, and it is the
+        // `"role": "lead"` row `doc/design/lead-pane.md` lists as a
+        // public-contract change.
+        self.persist_agent_record(&entry, "running");
+        Ok((agent_id, mcp_args))
+    }
+
+    /// Human-only: bind the pty the launcher just opened for a lead pane, then
+    /// type its kickoff. The bookkeeping half mirrors
+    /// [`solo_bind`](Self::solo_bind) exactly — `lead_prepare` returned
+    /// synchronously with no spawner thread waiting, so this is direct
+    /// bookkeeping and not a wakeup, and registering `by_pty[pty_id]` is what
+    /// routes the EXISTING pty-exit path (`by_pty` -> `on_pty_exit` ->
+    /// `mark_dead`) at this pane with no new teardown code.
+    ///
+    /// **The kickoff is the half `solo_bind` has no counterpart for.** A solo
+    /// pane is an arbitrary human-launched CLI and is typed nothing, ever; a
+    /// lead is a capability class, and `Delivery::FreshKickoff` is the
+    /// mechanism every class learns its identity by. It is delivered from HERE
+    /// rather than from `lead_prepare` because there is no pane to type into
+    /// until the bind: `deliver_prompt` is keyed on `pty_id`.
+    ///
+    /// **A kickoff that cannot be delivered does NOT fail the bind**, and the
+    /// outcome is audited rather than discarded — `open_manager_pane_at_launch`
+    /// review N3, which is the same shape. By the time this runs the pane is
+    /// open, the pty is spawned and the human is looking at it; returning `Err`
+    /// would report a launch failure for a launch that plainly happened, and
+    /// there is nothing for the caller to retry or undo. What a dropped kickoff
+    /// must not be is INVISIBLE — a lead that never learned it is one is a pane
+    /// whose behaviour nobody can explain from the outside — so the delivery's
+    /// own error is written to the audit log with the agent named.
+    ///
+    /// A second bind of the same lead is REFUSED rather than tolerated,
+    /// because the kickoff is not idempotent — it would type a second one into
+    /// a conversation already under way.
+    /// `lead_bind_delivers_the_lead_kickoff_once` is the pin.
+    pub fn lead_bind(&self, agent_id: &str, pty_id: u32) -> Result<(), String> {
+        let group_id = {
+            let mut agents = self.agents.lock_safe();
+            let a = agents.get_mut(agent_id).ok_or("unknown agent")?;
+            if a.role != Role::Lead {
+                return Err("lead_bind is only for lead panes".into());
+            }
+            if a.pty_id.is_some() {
+                return Err(format!("lead {agent_id} is already bound to a terminal"));
+            }
+            a.pty_id = Some(pty_id);
+            a.status = AgentStatus::Running;
+            a.group.clone()
+        };
+        self.by_pty.lock_safe().insert(pty_id, agent_id.to_string());
+        self.audit(&group_id, brand::AUDIT_ACTOR, "agent-bind", json!({ "agent": agent_id, "pty": pty_id }));
+        crate::obs::breadcrumb("agent-bind", &format!("agent={agent_id} pty={pty_id} role=Lead"));
+
+        let (Some(a), Some(g)) = (self.agent(agent_id), self.group(&group_id)) else {
+            // The pane is bound and usable; only the kickoff is lost. Audited
+            // rather than returned as an error for the reason
+            // `open_manager_pane_at_launch` gives: a degraded pane the human can
+            // still type into beats a launch that refused to happen.
+            self.audit(&group_id, brand::AUDIT_ACTOR, "error", json!({
+                "what": "lead kickoff skipped", "agent": agent_id,
+                "detail": "the agent or its group vanished between the bind and the kickoff",
+            }));
+            return Ok(());
+        };
+        // No branch note (the kickoff's own arm says where a lead works, and it
+        // is never given a worktree) and no persona: a lead group has no
+        // workflow file, so no block in it can carry one.
+        let kickoff = self.kickoff_prompt(&a, &g, "", None);
+        if let Err(e) = self.deliver_prompt(agent_id, &kickoff, brand::AUDIT_ACTOR, Delivery::FreshKickoff) {
+            self.audit(&group_id, brand::AUDIT_ACTOR, "error", json!({
+                "what": "lead kickoff not delivered", "agent": agent_id, "err": e,
+                "detail": "the pane is bound and usable; it did not receive its contract. See \
+                           OrchRegistry::lead_bind for why this is not a launch failure.",
+            }));
+        }
+        Ok(())
+    }
+
+    /// Every live delegate in a dead lead's group, ended (#2519).
+    ///
+    /// **A crash must cost what a deliberate close costs.** Closing a lead pane
+    /// is a frontend gesture that ends the whole group, so a lead whose CLI
+    /// simply dies must not leave its helpers running with nothing to report
+    /// to: their `report` would resolve no root, their panes would sit under a
+    /// tab whose lead is gone, and they would keep spending the human's tokens
+    /// unattended.
+    ///
+    /// Goes straight through `mark_dead` after killing each pty, exactly as
+    /// `end_group` does and for the same reason: that skips `on_pty_exit`'s
+    /// orchestrator-notification path, and there is no orchestrator in a lead
+    /// group to tell.
+    ///
+    /// Deliberately NOT `end_group` itself: that function audits as actor
+    /// `human` and performs a whole orderly teardown (worktree cleanup when
+    /// asked, the generated-agent-file reclaim, the pause marker), which is the
+    /// right thing for a human's End-group click and an overstatement for a
+    /// pane that crashed. What must happen either way is that no helper
+    /// outlives its lead; the rest is the frontend's gesture to ask for.
+    ///
+    /// `ExitInitiator::LeadExit` on each child, because that is what ended them.
+    /// It is what routes their exit notices to the audit log rather than at a
+    /// prompt (`exit_notice_route`), which matters here more than for the other
+    /// three initiators: the pane those notices would be typed into is the one
+    /// whose death caused the exit.
+    fn end_lead_children(&self, lead: &AgentEntry) {
+        let children: Vec<(String, Option<u32>)> = self
+            .agents
+            .lock_safe()
+            .values()
+            .filter(|a| a.group == lead.group && a.id != lead.id && a.status != AgentStatus::Dead)
+            .map(|a| (a.id.clone(), a.pty_id))
+            .collect();
+        if children.is_empty() {
+            return;
+        }
+        let app = self.app.lock_safe().clone();
+        let mut ended = Vec::new();
+        for (id, pty) in children {
+            if let (Some(app), Some(pty)) = (app.as_ref(), pty) {
+                app.state::<crate::pty::PtyManager>().kill(pty);
+            }
+            self.record_exit_initiator(&id, ExitInitiator::LeadExit);
+            self.mark_dead(&id, None);
+            ended.push(id);
+        }
+        self.audit(&lead.group, brand::AUDIT_ACTOR, "lead-children-ended", json!({
+            "lead": lead.id, "ended": ended,
+        }));
+    }
+
+    /// Is this group one a lead pane owns? See `lead_prepare`'s marker-file
+    /// comment for why this is not a question about the roster.
+    ///
+    /// Reads the marker on disk rather than the live registry, so it answers
+    /// for a group whose panes are all gone — which is the case that needs it,
+    /// the resume of a dead lead group's child.
+    #[doc(hidden)] // pub for integration tests
+    pub fn is_lead_group(&self, group: &GroupId) -> bool {
+        self.group_dir(group).join(LEAD_MARKER).is_file()
+    }
     // ---------- autonomous mode (#83): idle-tick + budget enforcement ----------
 
     /// Read every live orchestrator pane's output counter and last human-keystroke
@@ -48965,10 +49642,39 @@ impl OrchRegistry {
             // A solo pane never gets a kickoff (see `role_template`'s doc) —
             // `spawn_agent_ex`/`kickoff_prompt` are never called for one.
             Role::Solo => unreachable!("solo panes never receive a kickoff"),
-            // #2519 slice A ships the class, not the kickoff — see
-            // `role_template` for why nothing in this slice can reach either.
-            Role::Lead => unreachable!(
-                "the lead's kickoff lands with the launch path that delivers it (#2519 slice B)"
+            // #2519 slice B — the lead's first line, delivered by `lead_bind`
+            // once the human's own launcher has opened the pane.
+            //
+            // Its own arm rather than joining the delegate one above, on
+            // `Role::Manager`'s precedent and for the same two reasons: a lead has
+            // no assigned task (the human's first message is the task), and "call
+            // report(\"progress\", \"ready\") and wait for prompts" names a tool it
+            // does not hold and a delivery channel it does not take. The head is
+            // otherwise deliberately the same shape — name, id, group, repo,
+            // instructions file, workspace note, delivery id — so the one thing
+            // that differs is the thing that genuinely differs.
+            //
+            // No `branch_note`: a lead runs in the human's own checkout, which the
+            // sentence below says outright, and `lead_prepare` passes no branch.
+            // No `grounding_note` either — a lead is never spawned against a board
+            // row, and its group has no board to hold one.
+            Role::Lead => format!(
+                "You are \"{name}\" ({id}), the LEAD of orrerix group {gid} for repository \
+                 {repo} — the human's own pane, driven by them, with the fleet tools to open \
+                 helper panes.
+\
+                 First read your role instructions: {ins}
+\
+                 You work in the repository itself — the human's own checkout. Helpers you \
+                 open get their own worktree and branch, so they never touch it.
+{delivery}
+\
+                 Greet the human briefly, say that `spawn_agent` now opens real orrerix panes \
+                 instead of your own in-process subagents, and wait. They set the agenda in \
+                 this pane; nothing else will.",
+                name = a.name, id = a.id, gid = g.id, repo = g.repo,
+                ins = instructions.display(),
+                delivery = kickoff_delivery_note(&g.id, &a.id),
             ),
         }
     }
@@ -54268,7 +54974,19 @@ impl OrchRegistry {
             }
         }
         if let Some(a) = self.mark_dead(&agent_id, exit_code) {
-            if a.role != Role::Orchestrator {
+            // #2519: a lead that dies takes its helpers with it, so a crash
+            // costs what the human’s own deliberate pane close costs. This is the
+            // whole of the orphan guard: it runs on the pty-exit path, which every
+            // ending funnels through — a close, a kill, or the CLI simply dying.
+            //
+            // ITS OWN ARM rather than a statement inside the branch below, because
+            // the exit NOTICE that branch sends has no recipient here:
+            // `deliver_to_orchestrator` resolves the group’s root, and the root is
+            // the pane that just died. Sending it anyway would be a delivery
+            // attempt whose only possible outcome is a dropped notice.
+            if a.role == Role::Lead {
+                self.end_lead_children(&a);
+            } else if a.role != Role::Orchestrator {
                 let elapsed_ms = now_ms().saturating_sub(started_ms);
                 let cause = exit_cause(expected, tail, total_bytes);
                 let notice = format!(
@@ -57014,6 +57732,79 @@ pub async fn orch_solo_adopt(
     run_blocking(move || reg.solo_adopt(pty_id, &name, &cwd)).await
 }
 
+// ---------- lead panes (#2519): human-only, from the launcher's
+// "orrerix subagents" toggle on an agent-pane launch.
+
+/// Mint a lead group and the lead's identity BEFORE its pane boots. See
+/// `OrchRegistry::lead_prepare`.
+///
+/// **Off-thread (#762), like every other group mint**, and deliberately not a
+/// synchronous command: this writes `group.json`, the whole roster's
+/// instruction files and the pane's MCP config before the CLI is launched, and
+/// `create_orchestration`'s own doc calls that "the longest single-gesture stall
+/// in the orchestration surface". Every millisecond of it on the webview thread
+/// is latency the human reads as a frozen launcher. An `async` command's body
+/// runs on the async runtime rather than in the WebView2 COM frame, so it is
+/// outside `synccommands.rs`'s population by construction — the same posture
+/// `orch_solo_prepare` and `create_orchestration` already take, and the reason
+/// this one does not take `mutating_command`.
+///
+/// **Reentrancy.** `lead_prepare` holds `OrchRegistry::creation` across the
+/// group mint AND the one-root check, so two toggles racing on one repo
+/// serialize and the second sees the first's group as live — the same guarantee
+/// `create_orchestration` documents, for the same reason (id selection by
+/// liveness and root registration are one unit).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // the launcher's guardrail fields, one each
+pub async fn orch_lead_prepare(
+    app: AppHandle,
+    cli: String,
+    cwd: String,
+    name: String,
+    max_agents: u32,
+    auto_ops: bool,
+    idle_kill_minutes: u32,
+    max_spawns_per_hour: u32,
+    watchdog_stall_minutes: u32,
+) -> Result<Value, String> {
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        reg.lead_prepare(
+            &cli,
+            &cwd,
+            &name,
+            max_agents,
+            auto_ops,
+            idle_kill_minutes,
+            max_spawns_per_hour,
+            watchdog_stall_minutes,
+        )
+    })
+    .await
+}
+
+/// Bind a just-spawned lead pane's pty to the `AgentEntry` `orch_lead_prepare`
+/// created, and type its kickoff. See `OrchRegistry::lead_bind`.
+///
+/// **Off-thread (#762), unlike its sibling `orch_solo_bind`, and the difference
+/// is the kickoff.** `solo_bind` is three in-memory writes and no I/O, so it
+/// runs inline on the webview thread inside a `mutating_command` frame. This
+/// one additionally DELIVERS: `deliver_prompt` appends an audit row, persists
+/// the pane's queue and may start a drainer thread — disk work the GUI thread
+/// must not pay for, and the reason every other command in this module that
+/// delivers (`orch_steer`) is `async` too. Being `async` also puts it outside
+/// `synccommands.rs`'s population by construction: Tauri spawns an async body
+/// onto the runtime rather than running it in the WebView2 COM frame, so an
+/// unwind there is a task failure and not a process abort.
+#[tauri::command]
+pub async fn orch_lead_bind(
+    app: AppHandle,
+    agent_id: String,
+    pty_id: u32,
+) -> Result<(), String> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.lead_bind(&agent_id, pty_id)).await
+}
 /// End a whole orchestration: kill all its agents and (optionally) remove
 /// their worktrees. Human-initiated, destructive, audited — the frontend
 /// confirms before calling this.
@@ -57117,15 +57908,10 @@ pub fn create_orchestration_group(
     expect_group: Option<&str>,
     initial_workers: Option<u32>,
 ) -> Result<SpawnRequest, String> {
-    // Paths are interpolated into a quoted shell line; a quote inside one
-    // would escape it. (Windows filesystems forbid `"` in names; this
-    // guards the Unix builds and hand-typed paths.)
-    if repo.contains('"') {
-        return Err("repository path must not contain a quote character".into());
-    }
-    if !Path::new(repo).is_dir() {
-        return Err(format!("repository path does not exist: {repo}"));
-    }
+    // The checks every group-minting path shares (`lead_prepare` is the other
+    // caller): a quote would escape the quoted shell line a path is
+    // interpolated into, and a repo that is not there cannot host a group.
+    validate_group_repo(repo)?;
     let _creation = reg.creation.lock_safe();
     // #407 rev-1 B1: the one refusal that needs a RESOLVED roster, hoisted
     // above `create_group_ex` so that it, like the other six, runs before
@@ -57921,6 +58707,37 @@ pub fn resume_recorded_session(
                 record.group_id
             ));
         }
+    }
+
+    // #2519 — NOTHING IN A LEAD GROUP CAN BE RESUMED, and the refusal is above
+    // both branches below because it is true of both.
+    //
+    // A lead group has no orchestrator, so the orchestrator branch has nothing to
+    // reopen; and its root is a HUMAN pane that orrerix did not launch and cannot
+    // relaunch, so rejoining one of its children would put a worker into a group
+    // whose `report` resolves no root at all — a delegate typing into nothing, on
+    // a branch and worktree whose owner is gone. That is the restore residual
+    // `doc/design/lead-pane.md` records, and this is the message the session
+    // browser shows in its place.
+    //
+    // Decided by the group MARKER, not by the roster: `read_blocks` drops a
+    // persisted `kind: "lead"` row (see `LEAD_MARKER`), so a roster read back off
+    // disk would answer "not a lead group" for every lead group there has ever
+    // been. Tagged like every other resume failure (`resumeerror.ts` parses the
+    // `resume-<tag>:` prefix) and deliberately NOT `start fresh`-able: a fresh
+    // session would join the same rootless group.
+    if reg.is_lead_group(&record.group_id) {
+        return Err(format!(
+            "resume-lead-group: session {session_id} belongs to {}, a group opened by the \
+             orrerix-subagents toggle on someone's own agent pane. That pane is the group's \
+             root and orrerix never launched it, so there is nothing here to resume into: a \
+             rejoined helper would have no lead to report to. Turn the toggle on again in a \
+             fresh pane to open a new lead, and brief a new helper — the conversation itself \
+             is not lost, and reopens outside orchestration through the CLI's own resume \
+             command (shown in the session row's tooltip), as a plain pane with no group \
+             membership.",
+            record.group_id,
+        ));
     }
 
     if record.role == "orchestrator" {

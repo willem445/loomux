@@ -82,6 +82,7 @@ stub_commands!(
     orch_end_group, orch_channel_connect,
     orch_channel_disconnect, orch_channel_list, orch_channel_for_pane, orch_channel_set_sender,
     orch_solo_prepare, orch_solo_bind, orch_confirm_solo_copilot_autopilot, orch_solo_adopt,
+    orch_lead_prepare, orch_lead_bind,
     probe_agent_cli,
     list_cli_models,
     open_in_editor,
@@ -168,11 +169,11 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_167() {
+fn app_commands_len_is_169() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        167,
-        "APP_COMMANDS drifted from the expected count of 167 (120 per the #363 plan's audited \
+        169,
+        "APP_COMMANDS drifted from the expected count of 169 (120 per the #363 plan's audited \
          count, +1 for orch_confirm_solo_copilot_autopilot added in #364, +2 for \
          orch_set_advanced_orchestrator/orch_workflow_status added in #316/#355, +3 for \
          orch_set_compact_nudge_minutes/orch_set_compact_nudge_roles/ \
@@ -221,13 +222,16 @@ fn app_commands_len_is_167() {
          +1 for orch_workflow_list — the repo's named-workflow listing the launcher picker and \
          the group header read, added in #1689 slice A, +2 for \
          orch_workflow_switch_preview/orch_apply_workflow — the confirmation payload and the \
-         consent-preserving live roster switch behind it, added in #1689 slice B) — \
+         consent-preserving live roster switch behind it, added in #1689 slice B, \
+         +2 for orch_lead_prepare/orch_lead_bind — the launch path for a lead pane (the \
+         orrerix-subagents toggle: mint the group and its MCP flags before the pane boots, \
+         then bind the pty and type the lead's kickoff), added in #2519 slice B) — \
          if this is an intentional addition/removal, update this tripwire's count too"
     );
 }
 
 #[test]
-fn main_has_all_167_and_zero_permission_denies_dangerous_spread() {
+fn main_has_all_169_and_zero_permission_denies_dangerous_spread() {
     // Catches drift in *this test file* before it can mask a real gap: the
     // stub list above must match APP_COMMANDS exactly.
     let mut stub_names: Vec<&str> = STUB_COMMAND_NAMES.to_vec();

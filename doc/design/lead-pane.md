@@ -1,11 +1,12 @@
 # The lead pane — a human-driven pane that opens orrerix panes
 
-*#2519. **Slice A** (this note as it stands) is the capability class:
-`Role::Lead`, its enumerated MCP surface, the root invariant behind a child's
-`report`, and the guardrail exemptions. The launch path that mints a lead group
-and pastes its kickoff is **slice B**; the launcher toggle, the pane chip and
-the Agents-tab grouping are **slice C**. Each slice extends this note rather
-than replacing it. What is not yet shipped is one list, at the end.*
+*#2519. **Slice A** is the capability class: `Role::Lead`, its enumerated MCP
+surface, the root invariant behind a child's `report`, and the guardrail
+exemptions. **Slice B** (this note as it stands) is the launch path that mints
+a lead group, hands the launcher the pane's MCP flags, types its kickoff, ends
+its helpers when it dies, and refuses to resume it. The launcher toggle, the
+pane chip and the Agents-tab grouping are **slice C**. Each slice extends this
+note rather than replacing it. What is not yet shipped is one list, at the end.*
 
 Companion notes: [manager.md](manager.md) — the opposite pole, and the guarantee
 this feature must not weaken; [workflows.md](workflows.md) for the block model
@@ -167,12 +168,20 @@ not any check — is what makes three refusals structural:
    effective-class check reads the recorded *block*: `Some(Role::Lead)` for the
    lead's own block, refused as `resolves to kind "lead"`; `Some(Role::Worker)`
    for a worker block, which is **permitted**; and `None` only when the recorded
-   block id no longer resolves at all. What carries the property there is the
-   missing `lead` arm itself — no block can have kind `Lead` while
-   `kind_from_str` cannot name one, so no resume of any shape yields a lead
-   pane. An earlier draft of this item said "both routes refuse", which is false
-   of the corrupt-data subcase and points a reader at the wrong invariant
-   (rev-final N1 / rev-std round 2).
+   block id no longer resolves at all. An earlier draft of this item said
+   "both routes refuse", which is false of the corrupt-data subcase and points
+   a reader at the wrong invariant (rev-final N1 / rev-std round 2).
+
+   **What carries the property there is the effective-class check, and slice A
+   said otherwise.** Its argument was the vocabulary — "no block can have kind
+   `Lead` while `kind_from_str` cannot name one" — which was true while nothing
+   minted a lead block, and `lead_prepare` is what makes it false: a real group
+   on disk now holds one. Two of the three refusals above are unaffected (both
+   read `kind_from_str` directly); this one is not, and it is the check in
+   `mcp::call_tool` that refuses a lead its own block by the class the block
+   resolves to. `a_lead_cannot_open_a_lead_by_naming_its_own_block` asserts the
+   premise — a minted group really does hold a `Lead`-kind block — before it
+   asserts the refusal, so the test cannot go vacuous the way the sentence did.
 
 `Role::Solo` is absent from that vocabulary for the identical reason and is the
 precedent.
@@ -228,7 +237,7 @@ would take away the CLI they launched, which is not something a toggle that
 *adds* a capability may do. What bounds the fan-out is the cap and the
 spawn-rate backstop.
 
-## Public-contract changes in this slice
+## Public-contract changes
 
 1. **`Role` gains the wire string `"lead"`** — in `agents.json`'s `role`, audit
    rows, `list_agents` JSON and `PaneFacts.orch.role`. An older build reading a
@@ -241,69 +250,282 @@ spawn-rate backstop.
    group has zero agents while a pane is plainly running. `live_delegates` is
    unchanged — it is derived through `counts_against_max_agents`, not by summing
    the tallies.
-3. **`templates/lead.md`** is new and is **not** golden-pinned in this slice.
-   The `pre222` pin exists to make an accidental edit to bytes a shipped pane
-   already reads fail loudly, and nothing delivers this file yet — slice A ships
-   the class, slice B the launch path. `block.md` and `workflow.md` are unpinned
-   on the same terms. It joins the pin in the slice that delivers it, when its
-   per-CLI content is settled, rather than being blessed here and re-blessed
-   there.
+3. **`templates/lead.md`** is new in slice A and **golden-pinned since slice
+   B**. The `pre222` pin exists to make an accidental edit to bytes a shipped
+   pane already reads fail loudly, and slice A delivered nothing — so it was
+   blessed once, in the slice that ships the launch path, rather than blessed
+   in A and re-blessed in B. It sits in `GOLDENS` and `LIVE` but not in
+   `PRE222`, on `manager.md`'s terms: a default group declares no lead block,
+   so no `lead.md` is written into its dir. Its `LIVE` key list is empty, which
+   is a statement — the file carries no workflow-conditional prose at all.
+   `block.md` and `workflow.md` stay unpinned.
+4. **Two Tauri commands, `orch_lead_prepare` and `orch_lead_bind`** (slice B),
+   in the `orch-control` ACL set. `orch_solo_prepare`/`SoloPrepared` are
+   deliberately NOT widened to carry a lead: a lead is a different thing, in a
+   real group rather than `__solo__`.
+5. **`ExitInitiator` gains `LeadExit`** (slice B). Additive, and its own
+   variant rather than a reuse because the three that existed all describe
+   somebody in this process choosing to end a pane, while this one describes a
+   pane ending because the pane its notice would go to has died.
 
 No new dependencies.
 
-## Two `unreachable!` arms this slice leaves, and the shape of that residual
+## The two `unreachable!` arms, closed
 
-`kickoff_prompt` and its mechanics core panic on `Role::Lead`. No shipped path
-reaches them: `kickoff_prompt` runs only from a spawn that has an app handle,
-`kind_from_str` has no `lead` vocabulary so neither a workflow file nor
-`spawn_agent` can produce one, and `orch_lead_prepare` does not exist yet. Slice
-B's first test hits both, so it cannot ship without giving them arms.
+`kickoff_prompt`'s body and `mechanics_core` panicked on `Role::Lead` through
+slice A, on the argument that no shipped path reached them. Slice B's first
+test is what closed that, and the reason it could not wait is CLAUDE.md
+constraint 10: an unwind out of a synchronous `#[tauri::command]` is a process
+**abort**, not a degrade — there is no `catch_unwind` anywhere on the WebView2
+COM path — so "unreachable today" is not a safe place to leave a panic.
 
-**The residual is "no producer", not "no consumer", and the distinction is worth
-stating because this slice narrowed it** (rev-final premortem 2). `Role`'s serde
-form now carries the wire string `"lead"`, so an `agents.json` row reading
-`"role": "lead"` **parses**, where before this slice it failed that row's parse.
-Nothing in the tree writes such a row yet — that is the "no producer" half, and
-it is what makes the arms unreachable today — but the file format is now
-permissive ahead of the code, so a hand-edited, restored or forward-version
-roster carrying a lead row and reaching a fresh-kickoff spawn would find a panic
-rather than a refusal. Slice B closes it by giving the arms real bodies; until
-then the honest statement is the one above, not "a lead pane cannot exist".
+The residual slice A stated was "no producer, not no consumer", and it was the
+right shape: `Role`'s serde form already carried the wire string `"lead"`, so
+an `agents.json` row reading `"role": "lead"` PARSED. Slice B is the producer.
+`mechanics_core` now returns a real non-overridable contract — reachable from
+`render_block_instructions`'s replace-mode arm and from `copilot_agent_body`,
+both of which run for every block in a roster — and `kickoff_body` returns the
+lead's own first line, on `Role::Manager`'s pattern: no assigned task (the
+human's first message is the task) and no "call `report(\"progress\")` and wait
+for prompts", which names a tool a lead does not hold and a channel it does not
+take. `a_lead_role_never_reaches_a_panicking_arm` pins both.
 
-The two arms that are NOT panics are the ones a public path already reaches, and
-that asymmetry is the rule this slice applied rather than a judgement call per
-site: `Guardrails::clamped` normalizes every block's effective model and
-`write_instruction_files` renders every block in a roster, so `default_model` and
-`role_template` run the moment a lead block exists in a roster — before any pane
-is opened. `default_model` answers `""` on the opencode/pi argument (the human
-picked the model in their own launcher); `role_template` answers the real file.
+**`mechanics_core`'s arm is in lockstep with `templates/lead.md`**, the same
+rule `Role::Manager`'s arm carries and for the same reason: a `mode: replace`
+persona on a lead block reads that arm and nothing else, so a rule living only
+in the template is a rule such a lead was never told. What the arm deliberately
+drops is the template's "prefer these over your CLI's own subagents"
+argument — persuasion rather than mechanics — and the per-tool descriptions the
+MCP listing already carries on every turn.
 
-## What this slice does not ship
+## The launch path (slice B)
 
-- **The launch path.** `orch_lead_prepare` / `orch_lead_bind`, the group mint,
-  the per-CLI `mcp_args` (including Claude Code's `--disallowedTools Agent`), the
-  kickoff delivery, and the "exactly one root per group" invariant that group
-  creation will enforce — all slice B. **Two tripwires for whoever writes it**
-  (rev-final premortem, recorded here because slice A can build no test that
-  fires on them):
-  - **The root lookup takes the FIRST match.** `deliver_relayed_to_root` is a
-    `find` over a `HashMap`, whose iteration order is not stable, so a group
-    holding two `is_root()` agents delivers a child's report to whichever comes
-    back — with no error on either side. That is the whole reason the one-root
-    invariant is not optional, and it has to be enforced at the mint.
-  - **`Guardrails::clamped` prepends an orchestrator BLOCK to any roster that
-    declares none**, which every toggle-minted roster will. A block is not an
-    agent, so nothing is wrong today; the mint must not turn that row into a
-    spawned orchestrator, or the previous tripwire fires.
-- **The consent argument is stated here and enforced nowhere yet.** "A lead
-  group runs the built-in roster and never a workflow file" is this note's
-  claim; no code in slice A creates a lead group, so slice B's mint is what has
-  to make it true.
-- **The per-CLI subagent-disable table with citations**, which belongs with the
-  command lines that carry it (slice B) rather than being written here against a
-  plan.
-- **The UI.** The launcher toggle, the `LEAD` pane chip, children indented under
-  their lead in the Agents tab, and the close-lead confirm — slice C.
+A lead pane is opened by the **human's own launcher**, not by orrerix, and that
+one fact shapes everything below. orrerix never builds this pane's command line;
+it appends flags to the line the human is about to run. So the launch is two
+calls with the pty spawn between them, exactly as a solo pane's is:
+
+1. **`orch_lead_prepare(cli, cwd, name, max_agents, auto_ops, idle_kill_minutes,
+   max_spawns_per_hour, watchdog_stall_minutes)`** — mints the group and the
+   lead's identity and returns `{group_id, agent_id, mcp_args}`. It runs *before*
+   the CLI boots, because you cannot inject an MCP server into an already-running
+   process.
+2. the launcher spawns the pty with `mcp_args` appended;
+3. **`orch_lead_bind(agent_id, pty_id)`** — records the pty and types the lead's
+   `FreshKickoff`.
+
+A kickoff that cannot be delivered does **not** fail step 3. By then the pane is
+open and the human is looking at it, so an `Err` would report a launch failure
+for a launch that plainly happened, and there is nothing for the caller to retry
+or undo — `open_manager_pane_at_launch`'s argument, and its review-N3 correction
+with it: the delivery OUTCOME is audited rather than discarded, because a lead
+that never learned it is one is a pane whose behaviour nobody can explain from
+the outside.
+
+The guardrail arguments are the launcher's own fields, passed through rather than
+defaulted: a group whose `idle_kill_minutes` arrived as `0` would have the reaper
+switched off for the lead's helpers, which is the opposite of the guardrails
+table above.
+
+### What the mint creates, and what it refuses to
+
+`OrchRegistry::lead_prepare` goes through `create_group_ex` — the same function
+every launch uses — under the same `creation` mutex, so two toggles racing on one
+repo cannot pick the same id. What it does **not** call is
+`register_orchestrator_pane`: no `Role::Orchestrator` agent is ever inserted, and
+the lead is the group's only pane.
+
+The roster is `workflow::default_roster` over `Lead | Worker | Reviewer |
+Planner` with `advanced_orchestrator: false` — which is the *Consent* section in
+code. With that flag off, `create_group_ex` never opens the repo's workflow file
+at all, so there is no roster to preview and no consent moment to skip.
+
+Three things about that roster are deliberate and each has been mistaken for an
+oversight at least once:
+
+- **`Guardrails::clamped` prepends an orchestrator BLOCK**, because it prepends
+  one to any roster declaring none. That is a row, not a pane. Slice A flagged it
+  as a tripwire for this function, and the answer is that nothing in the mint
+  turns a block into an agent — pinned by
+  `lead_prepare_mints_a_group_with_the_builtin_roster_and_no_orchestrator`, which
+  asserts the block IS there and that no agent holds it.
+- **Reviewer and planner blocks are declared even though a lead may never open
+  one.** The refusal a lead gets for `kind: "reviewer"` must be the caller-class
+  check — the one this note argues for. Drop the blocks and the same call fails
+  on "no such block": a different refusal, from a different mechanism, that would
+  silently start passing if the class check were ever removed.
+- **The lead's own block is named `lead`**, so its instructions file is
+  `lead.md` — which `write_instruction_files` renders from `LEAD_TPL` for every
+  block in the roster, before any pane exists. That file is what the kickoff
+  points at.
+
+**The one-root invariant is checked at the mint**, under the same lock, and the
+check is a **backstop**: `next_group_id` picks the first candidate id with no
+*live* agent, so a second toggle on a repo whose lead is running opens a second
+group rather than a second root in one, and no test can drive the explicit
+refusal through a public path. It is kept because the failure it guards is
+silent — `deliver_relayed_to_root` is a `find` over a `HashMap`, so a group with
+two roots would deliver a child's report to whichever came back — and because a
+future caller that *names* an id (the `expect_group` shape
+`create_orchestration_group` already has) would not be protected by liveness at
+all. `a_group_never_ends_up_with_two_roots` pins the property over both groups
+and says which mechanism delivers it.
+
+### Telling the harness not to use its own subagents
+
+The toggle's promise is that `spawn_agent` replaces the CLI's in-process
+subagents. A lead that can still reach them will, because they are one call away
+and `spawn_agent` is three — so where the vendor documents a way to take them
+off the command line, orrerix takes it. `lead_mcp_args` is a solo pane's MCP
+flags plus that denial, and the per-CLI answer is not the same shape three times:
+
+| CLI | Native subagents | What the lead's command line does | Source |
+| --- | --- | --- | --- |
+| claude | the `Agent` tool (renamed from `Task` in 2.1.63) | `--disallowedTools Agent` | two documented facts composed — see below |
+| copilot | yes, the `agent` tool (aliases `custom-agent`, `Task`) | nothing; instruction-only | the tool is a custom-agent `tools:` key, and the CLI's deny flags take three value shapes, none of them a bare tool name |
+| pi | none | nothing to deny | `docs/usage.md`: pi "intentionally does not include built-in MCP, sub-agents, …" |
+| opencode, codex | yes | **refused at `lead_prepare`** | no argv MCP seam — see below |
+
+**Claude's flag is a composition, and saying so matters** because neither page
+states it alone. The sub-agents page names the tool and the deny: *"To prevent
+Claude from delegating to any subagent, deny the `Agent` tool itself with
+`permissions.deny`."* The CLI reference gives the flag that spells a deny rule on
+a command line: `--disallowedTools` is *"Deny rules. A bare tool name removes the
+matching tools from Claude's context."* A bare `Agent` on that flag is therefore
+the argv spelling of the deny the sub-agents page prescribes.
+`CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` is narrower — the built-in explore and
+plan agents only — and is not used.
+
+**Copilot's row is a correction to the plan this slice was built from**, which
+recorded Copilot as documenting no subagent tool name at all. Re-fetching says
+otherwise: `custom-agents-configuration` names the `agent` tool and describes it
+as *"Allows a different custom agent to be invoked to accomplish a task."* But it
+names it as a key in a custom agent's own `tools:` list — a *file* orrerix would
+have to hand the pane with `--agent`, replacing whatever agent the human chose —
+and the flag seam this function writes into cannot express it: the CLI
+configuration guide says *"To use the --deny-tool and --allow-tool options, you
+must specify what type of tool you want to allow or deny"* and enumerates exactly
+three, shell commands, `write`, and MCP server tools (the same list
+`KNOWN_COPILOT_DENY_CATEGORIES` is pinned against). A bare tool name is not among
+them. So a copilot lead is instruction-only, `templates/lead.md` asks it to
+prefer `spawn_agent`, and nothing structurally stops it doing otherwise.
+Inventing a `--deny-tool agent` value the vendor does not document would be a
+claim, not a denial. The follow-up is the generated-custom-agent route, which is
+a product decision about overriding the human's own `--agent` choice rather than
+a wiring gap.
+
+**opencode and codex are refused rather than degraded**, and that is where a lead
+differs from a solo pane. `solo_prepare` gives a CLI with no argv MCP seam a
+delivery-only identity, which is still a useful pane. A lead with no MCP server
+holds *none* of the tools the toggle grants, so a pane that launched anyway would
+be a lead in name only. The refusal names the follow-up — widening the prepare
+seam to return environment pairs, which is what an opencode lead needs
+(`OPENCODE_CONFIG_CONTENT` carrying the MCP config and `permission.task: "deny"`)
+— so it reads as a missing seam rather than a policy.
+
+### Lifecycle: the lead's death ends the group
+
+Closing a lead pane ends its group, and a lead whose CLI simply *dies* must cost
+the same. Otherwise its helpers keep running with nothing to report to: their
+`report` would resolve no root, their panes would sit under a tab whose lead is
+gone, and they would keep spending the human's tokens unattended.
+
+`on_pty_exit` gets a `Role::Lead` arm that calls `end_lead_children`, which kills
+each live delegate's pty and marks it dead directly — `end_group`'s technique,
+for `end_group`'s reason: it skips the orchestrator-notification path, and there
+is no orchestrator here to tell. It is deliberately **not** `end_group` itself,
+which audits as actor `human` and performs a whole orderly teardown (worktree
+cleanup when asked, the generated-agent-file reclaim, the pause marker). That is
+the right thing for a human's End-group click and an overstatement for a pane
+that crashed; what must happen either way is that no helper outlives its lead.
+
+The arm is its own rather than a statement inside the existing delegate branch,
+because that branch sends an exit notice and here there is no recipient — the
+pane it would be typed into is the one that died. For the same reason each child
+is stamped **`ExitInitiator::LeadExit`**, a new variant whose whole content is
+that its notice has nowhere to go: `exit_notice_route` sends it to the audit log.
+
+`a_dead_lead_takes_its_children_with_it` drives this through `on_pty_exit` — the
+entry point every ending funnels through — and carries its own control: a dead
+*worker* takes nothing with it, which a build that tore the group down on any
+exit would fail.
+
+### Restore: a lead group cannot be resumed
+
+`resume_recorded_session` refuses every session belonging to a lead group, above
+both of its branches, because the refusal is true of both. The lead's own pane is
+a human-launched CLI orrerix never opened and cannot relaunch; its helpers,
+rejoined into a group whose root is gone, would have no pane to report into at
+all. The error is tagged `resume-lead-group:` like every other resume failure,
+classified in `src/resumeerror.ts`, and deliberately not `start fresh`-able — a
+fresh session would join the same rootless group. The way back is a new lead
+pane.
+
+**It is decided by a marker file, not by the roster, and that is worth reading
+twice.** `group.json` does carry the lead block, but `read_blocks` resolves every
+persisted `kind` through `workflow::kind_from_str`, which has no `lead` arm by
+design — that absence is what stops a repo file declaring one and stops a lead
+opening a lead. So an unknown kind is *dropped* on reload, and a roster read back
+off disk would answer "not a lead group" for every lead group there has ever
+been. `lead_prepare` writes a `lead` marker into the group dir and
+`is_lead_group` asks that.
+`a_reloaded_lead_group_loses_its_lead_block_but_keeps_its_marker` pins both
+halves, so the day `kind_from_str` grows a `lead` arm that test goes red rather
+than the marker quietly becoming redundant.
+
+**The marker has a LIFETIME, and both ends of it are code.** This is the
+`paused` marker's precedent taken whole rather than half, and taking half of it
+was a real defect (rev-final B1). A group id is repo-derived and handed out
+again — `next_group_id` returns the first candidate with no LIVE agent, and the
+group directory is never removed — so a lead group whose pane has died leaves
+its id, and a write-only marker, free for an ordinary orchestration to reattach
+to. That group would then answer `is_lead_group()` for the rest of its life,
+and every session in it would be refused as unresumable, citing a toggle nobody
+flipped, with no start-fresh affordance to escape through (`lead-group` is
+deliberately not one of the two kinds that offer it).
+
+So the marker is **cleared in `create_group_ex`**, which is the one place a
+group id is claimed, and re-written by `lead_prepare` after its own mint. Not
+at teardown, and that is the load-bearing difference from `end_group`'s `paused`
+remove: a lead that simply dies never runs `end_group` at all — its helpers go
+through `end_lead_children`, which is not the same path. Clearing at the claim
+covers the death, the crash and the deliberate close identically, and it covers
+`Launch::Promote` too, which reattaches a dormant group by exactly the same id
+selection. `an_ordinary_group_reusing_a_dead_leads_id_is_not_a_lead_group` is
+the pin, and it is written so the two operands COLLIDE — same registry, same
+repo, same id — because the first version of the resume test built its control
+in a second registry on a second repo and could not have failed on this.
+
+The write also moved BELOW every step of the prepare that can fail. It used to
+sit above `write_mcp_config` and the empty-flags refusal, so either error return
+left a `lead` marker on a group that never became a lead group — the same false
+refusal, reached from the other side.
+
+### A correction slice A's note could not make
+
+Slice A's *Consent* section argued that a lead cannot open a lead partly from the
+vocabulary: *"no block can have kind `Lead` while `kind_from_str` cannot name
+one"*. That was true while nothing minted a lead block. **`lead_prepare` is what
+makes it false** — a real group on disk now holds one — so the property moves
+onto the **effective-class check** in `mcp::call_tool`, which reads the resolved
+block rather than the `kind` argument and refuses with *"resolves to kind
+`lead`"*. `a_lead_cannot_open_a_lead_by_naming_its_own_block` asserts the premise
+(a minted group really does hold a `Lead`-kind block) before it asserts the
+refusal, so the test cannot go vacuous the way the sentence did.
+
+Nothing else in that section moves: a workflow file still cannot declare
+`kind: lead`, and `spawn_agent(kind: "lead")` is still refused as an unknown kind
+by the parse rather than by an arm.
+
+## What is not shipped yet
+
+- **The UI.** Everything a human touches: slice C. Until it lands there is no
+  way to reach `orch_lead_prepare` at all — the two commands exist and nothing
+  calls them.
 - **`spawn_agent(cli:)`**, the model/CLI-mixing half of the feature's own
   motivation. Independent of A–C and recommended as its own issue.
 - **Restore.** A persisted lead pane and its children across an app restart.
+  Slice B ships the REFUSAL — `resume_recorded_session` turns away every
+  session in a lead group, with the message a human sees — and not the
+  capability. Bringing a lead back means re-minting the group, which is a
+  launcher gesture and therefore slice C at the earliest.
