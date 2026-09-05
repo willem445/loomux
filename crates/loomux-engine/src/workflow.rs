@@ -3716,9 +3716,12 @@ impl RosterDiff {
 /// diff silently stops reporting — the same field-inventory idiom the intake
 /// schema uses to keep a new key from arriving unnoticed.
 pub fn roster_diff(agent_cli: &str, old: RosterSide<'_>, new: RosterSide<'_>) -> RosterDiff {
-    let by_id = |bs: &[Block]| -> BTreeMap<&str, &Block> {
+    // A nested fn, not a closure: a closure cannot express "the map borrows
+    // from the slice it was given", so its two elided lifetimes are unrelated
+    // and the collect does not compile.
+    fn by_id(bs: &[Block]) -> BTreeMap<&str, &Block> {
         bs.iter().map(|b| (b.id.as_str(), b)).collect()
-    };
+    }
     let (o, n) = (by_id(old.blocks), by_id(new.blocks));
 
     let added: Vec<BlockId> =
