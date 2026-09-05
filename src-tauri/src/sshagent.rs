@@ -975,8 +975,10 @@ impl Conversation {
         writer: &mut Box<dyn std::io::Write + Send>,
         passphrase: &[u8],
     ) -> Option<SshAddOutcome> {
+        // [scratch #2594 R5] the pre-fix dropped result.
         self.rearmed = true;
-        write_refusal(send_answer(writer, if self.gave_up { b"" } else { passphrase }))
+        let _ = send_answer(writer, if self.gave_up { b"" } else { passphrase });
+        None
     }
 }
 
