@@ -248,24 +248,23 @@ nothing had asked the prior one.
 So membership is its own function, `isAgentPane(facts)`, and `agentRows(facts)`
 is the rule and the projection in one call.
 
-### Three arms, and why none of them is redundant
+### Three arms, and the second and third differ in *who is claiming*
 
 ```ts
 export function isAgentPane(facts: PaneFacts): boolean {
   if (facts.orch !== null) return true;
-  if (facts.harness !== null) return true;
-  const program = markProgram(facts.mark);
-  return program !== null && LAUNCHABLE_AGENT_PROGRAMS.has(program);
+  if (declaresAnAgent(facts.harness)) return true;
+  return namesLaunchableCli(markProgram(facts.mark));
 }
 ```
 
 1. **`orch`** — an orchestration pane is an agent whatever it was launched
    with, and a manager pane (which arrives through the repo's workflow file)
    can carry no harness at all.
-2. **`harness`** — the session-store CLI. It is set for a *remote* pane off the
-   SSH profile's declared far-end CLI, where no local launch line names the
-   agent, so it is the only arm that answers there.
-3. **the launch line, against the launcher's own catalog.**
+2. **`harness`, on a remote pane, is a far-end CLI a HUMAN DECLARED**, and it
+   is held to the *badge's* answer — see *Who is claiming* below.
+3. **the launch line is loomux's own INFERENCE**, and it is held to the
+   launcher's own catalog.
 
 ### Arm 3 is the one the issue did not ask for, and it is load-bearing
 
@@ -289,6 +288,57 @@ carried on the facts since #2371 so the two surfaces cannot disagree — through
 `markProgram`, which is `agentMark`'s resolution order with the rendering taken
 off (extracted here rather than re-derived: knownCli beats the launch line, and
 a remote pane's transport is never read as its agent).
+
+### Who is claiming: a declaration is not an inference (review round 3, B1)
+
+Round 2 fixed a real bug — an SSH profile declaring `bash` made the pane a
+counted agent row whose own header read *"bash — a transport or shell, not an
+agent"* — by holding `harness` to the launcher's catalog. **That
+over-corrected**, and in the same class it was fixing.
+
+`setSshCli` (`src/launcher.ts`) round-trips a far-end CLI the catalog does not
+name, renders it as *"&lt;cli&gt; — not a CLI orrerix knows"*, and **warns**
+rather than refusing: declaring `aider` is a state the product supports. Its
+pane header draws *"Agent CLI: aider"* — a positive claim, since `aider` is not
+on the transport/shell denylist. So holding it to the catalog gave that pane a
+header saying *agent* and no row at all: the header-vs-row divergence again,
+pointing the other way.
+
+The two arms are therefore held to **different** standards, and the axis is who
+is making the claim:
+
+| the name comes from | who is claiming | held to |
+| --- | --- | --- |
+| the launch line (`markProgram`) | loomux, INFERRING from a local process | the launcher's catalog |
+| `harness` on a remote pane | a human, DECLARING a machine loomux cannot see | the badge's own answer |
+
+`declaresAnAgent` reads `namesAnAgent`, which is `agentMarkFor`'s unknown-tier
+decision **exported**, not a second denylist beside it — the drift a copy would
+have is exactly the failure this whole section is about, and
+`test/agenticons.test.ts` pins the biconditional over a corpus that answers
+both ways. `test/agentrows.test.ts` then pins the invariant itself: over a
+twelve-name corpus, a declared CLI is a row **if and only if** its badge is not
+the unknown tier. Round 2's bug broke that in one direction and round 2's fix
+broke it in the other; the biconditional is what neither could have passed.
+
+A profile declaring `bash` is still refused, because the badge refuses it too.
+
+**Residual: a declared name the badge cannot read.** A profile whose far-end CLI
+is a shell, a transport, or a name that cannot be badged at all (it starts with
+punctuation, or normalizes away) is not listed. That is the same trade as the
+wrapper below and it is deliberate — the alternative is a row whose own header
+says the pane is not an agent — and `updateSshWarning` already tells the human
+at launch that the value is not one orrerix knows.
+
+**This also closed the two-field join.** The Remote CLI select stores an agent
+**id**, so `sshDefaultCli` — and therefore `harness` — is an id, while
+`LAUNCHABLE_AGENT_PROGRAMS` is derived from a row's **command**. All nine rows
+have `id === command` today, so round 2's version worked by coincidence and a
+single `{ id: "claude-code", command: "claude" }` would have emptied the tab of
+every pane declaring it. The declared arm no longer consults the catalog at all,
+so the catalog is only ever asked about a program name taken from a launch
+line — the field it is derived from. A test pins the coincidence anyway, so a
+future divergence reddens rather than going quiet.
 
 ### The catalog, not the resolver
 
@@ -327,11 +377,18 @@ declaring `bash` therefore made the pane a counted agent row whose own header
 read *"bash — a transport or shell, not an agent"*: one pane, two answers, which
 is the divergence this module says it exists to prevent.
 
-`namesLaunchableCli` is now the single rule and both names go through it, so
-there are two arms rather than three: an orchestration identity, or a launchable
-CLI named by *either* field. It normalizes first, because only `markProgram`'s
-answer arrives normalized — a profile declaring `Claude.exe` is the same claim
-as one declaring `claude`.
+Round 2 fixed it by sending **both** names through `namesLaunchableCli`.
+**Round 3 kept the fix and moved the boundary**: a *declared* far-end CLI is
+held to the badge's answer rather than to the catalog, because holding a human's
+declaration to loomux's own catalog refused `aider` — see *Who is claiming*
+above, which supersedes this paragraph's shape while leaving its diagnosis
+intact. A profile declaring `bash` is still refused, by both versions and for
+the same reason.
+
+What survives unchanged is the **normalization**: whichever test a name is put
+to, it is normalized first, because only `markProgram`'s answer arrives that
+way — a profile declaring `Claude.exe` is the same claim as one declaring
+`claude`.
 
 ### The empty-state line was the fourth surface (review round 2, W1)
 
@@ -383,7 +440,11 @@ agent).
 eight names — so a later feature appending a user-configured or plugin CLI to
 `AGENTS` at runtime would widen the launcher and *not* this rule, with a green
 suite. `AGENTS` is therefore `readonly AgentDef[]`: the compiler refuses the
-push, which is a loud failure rather than a late one.
+push, which is a loud failure rather than a late one. `AgentDef`'s own fields
+are `readonly` too, because the array modifier is one level shallower than the
+claim — it refuses `AGENTS.push(…)` and still compiles
+`AGENTS[0].command = "…"`, which is the same widening one level down and just
+as invisible to a snapshot taken at import (review round 3, premortem 2).
 
 ### Two corrections to the issue's own text
 

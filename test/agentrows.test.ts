@@ -950,7 +950,7 @@ test("one catalog rule over BOTH names the facts carry (#2514 review round 2, W2
   // line — normalized. A profile declaring `Claude.exe` is the same claim as one
   // declaring `claude`, and only `markProgram`'s answer arrives pre-normalized.
   assert.equal(isAgentPane(shell({ harness: "C:\\tools\\Claude.exe" })), true);
-  assert.equal(isAgentPane(shell({ harness: "C:\\tools\\Make.exe" })), false);
+  assert.equal(isAgentPane(shell({ harness: "C:\\tools\\Bash.exe" })), false);
 });
 
 test("a knownCli that normalizes to nothing names no program (#2514 review round 2, R1)", () => {
@@ -1020,4 +1020,108 @@ test("the catalog cannot be widened at runtime behind the tab (#2514 review roun
     "the catalog changed — widen LAUNCHABLE_AGENT_PROGRAMS' pin above deliberately",
   );
   assert.equal(LAUNCHABLE_AGENT_PROGRAMS.size, snapshot.length - 1);
+});
+
+test("a declared far-end CLI the catalog does not name is still an agent row (#2514 review round 3, B1)", () => {
+  // Round 2 fixed a declared `bash` by holding `harness` to the LAUNCHER'S
+  // CATALOG, and that over-corrected: it also refused a declared CLI the badge
+  // positively identifies. `setSshCli` round-trips such a value on purpose,
+  // renders it as "<cli> — not a CLI orrerix knows", and WARNS rather than
+  // refusing — so it is a state the product supports, and the human who set it
+  // has asserted an agent runs there.
+  for (const declared of ["aider", "crush", "some-inhouse-cli"]) {
+    const pane = shell({
+      name: declared,
+      harness: declared,
+      mark: { command: "ssh box", argv: null, knownCli: declared, remote: true },
+    });
+    assert.equal(isAgentPane(pane), true, `a profile declaring ${declared}`);
+    // The negative control that makes this test discriminate: these really are
+    // outside the catalog, so only the DECLARED arm can be answering.
+    assert.equal(LAUNCHABLE_AGENT_PROGRAMS.has(declared), false, `${declared} is off-catalog`);
+  }
+});
+
+test("the row and the header never disagree about a declared far-end CLI (#2514 review round 3, B1)", () => {
+  // THE INVARIANT, rather than the two cases above and below it. Membership on
+  // the declared arm IS the badge's own unknown-tier decision, so this
+  // biconditional is the thing to pin: a corpus in which each side answers both
+  // ways, and no member on which they differ. Round 2's fix broke it in one
+  // direction (`aider`: header "Agent CLI: aider", no row) exactly as the bug
+  // it fixed broke it in the other (`bash`: header "not an agent", a row).
+  const CORPUS = ["claude", "copilot", "codex", "aider", "crush", "make", "bash", "pwsh", "fish", "ssh", "wsl", "1pass"];
+  let listed = 0;
+  for (const declared of CORPUS) {
+    const pane = shell({
+      harness: declared,
+      mark: { command: "ssh box", argv: null, knownCli: declared, remote: true },
+    });
+    const badgeSaysAgent = agentMark(pane.mark)?.kind !== "unknown";
+    assert.equal(isAgentPane(pane), badgeSaysAgent, `row and header disagree about a declared ${declared}`);
+    if (badgeSaysAgent) listed += 1;
+  }
+  // POSITIVE CONTROLS on the corpus itself: an agreement assertion passes
+  // vacuously on a corpus where one side never varies, so pin that BOTH answers
+  // are represented and by how much.
+  assert.equal(listed, 7, "claude, copilot, codex, aider, crush, make and 1pass are agents to the badge");
+  assert.equal(CORPUS.length - listed, 5, "bash, pwsh, fish, ssh and wsl are not — every one of them a shell or transport");
+});
+
+test("a declared shell or transport is still refused (#2514 review round 2, W2 — unchanged by round 3)", () => {
+  // The round-2 defect, re-pinned after round 3 widened the arm: widening it to
+  // the badge's answer must not let a declared `bash` back in. It does not,
+  // because the badge refuses it too.
+  for (const declared of ["bash", "pwsh", "fish", "ssh", "wsl", "cmd"]) {
+    const pane = shell({
+      harness: declared,
+      mark: { command: "ssh box", argv: null, knownCli: declared, remote: true },
+    });
+    assert.equal(isAgentPane(pane), false, `a profile declaring ${declared}`);
+    assert.match(agentMark(pane.mark)?.label ?? "", /not an agent/, "…and the header says why");
+  }
+});
+
+test("the two arms differ, and each is held to its own standard (#2514 review round 3, B1)", () => {
+  // The asymmetry, asserted rather than described: the SAME name is refused as
+  // an inferred launch line and accepted as a declared far-end CLI, because a
+  // launch line is loomux's guess and a declaration is the human's assertion.
+  const inferred = shell({ mark: { command: "aider --model x", argv: null, knownCli: null, remote: false } });
+  assert.equal(isAgentPane(inferred), false, "an off-catalog LOCAL launch line is loomux guessing");
+  const declared = shell({ harness: "aider", mark: { command: "ssh box", argv: null, knownCli: "aider", remote: true } });
+  assert.equal(isAgentPane(declared), true, "…the same name DECLARED is the human asserting");
+});
+
+test("the catalog is joined on the field the launch line carries (#2514 review round 3, premortem 1)", () => {
+  // The Remote CLI select stores an agent ID, while LAUNCHABLE_AGENT_PROGRAMS is
+  // derived from a.command — two fields that are equal on all nine rows today,
+  // so a membership rule joining them would work BY COINCIDENCE. Round 3 removed
+  // that join: the declared arm no longer consults the catalog at all, and the
+  // catalog is only ever asked about a program name taken from a launch line.
+  // This pins the coincidence so a future `{ id: "claude-code", command: "claude" }`
+  // reddens here rather than silently emptying the tab.
+  const divergent = AGENTS.filter((a) => a.command !== "" && a.id !== a.command).map((a) => a.id);
+  assert.deepEqual(divergent, [], "an AgentDef's id has diverged from its command — check every catalog join");
+  // POSITIVE CONTROL: the comparison is over a non-empty set, and the one row
+  // whose command IS empty is the `custom` row, which names no program.
+  assert.equal(AGENTS.filter((a) => a.command !== "").length, LAUNCHABLE_AGENT_PROGRAMS.size);
+  assert.deepEqual(AGENTS.filter((a) => a.command === "").map((a) => a.id), ["custom"]);
+});
+
+test("a catalog row cannot be rewritten in place either (#2514 review round 3, premortem 2)", () => {
+  // `readonly AgentDef[]` refuses a push; that is one level shallower than the
+  // claim, because `AGENTS[0].command = "…"` still compiled and the launchable
+  // set is a snapshot taken before it. `AgentDef`'s fields are `readonly` now
+  // too. `tsc` does not run over `test/`, so this pins the runtime half —
+  // it is the assignment itself that must not be expressible, and a
+  // `@ts-expect-error` here would assert the compiler's opinion in a file the
+  // compiler never reads.
+  const row = AGENTS[0];
+  const descriptors = Object.keys(row).map((k) => [k, typeof (row as unknown as Record<string, unknown>)[k]]);
+  assert.deepEqual(descriptors, [["id", "string"], ["label", "string"], ["command", "string"]]);
+  // And the derived set really is downstream of `command`, which is what makes
+  // an in-place rewrite a widening: every launchable program is some row's
+  // command, and every non-empty command is in the set.
+  for (const a of AGENTS) {
+    assert.equal(LAUNCHABLE_AGENT_PROGRAMS.has(a.command), a.command !== "", `${a.id}`);
+  }
 });

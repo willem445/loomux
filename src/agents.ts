@@ -10,10 +10,10 @@ import { mergeRecentDir } from "./recentdirs.ts";
 import { programFromRestore } from "./panerestore.ts";
 
 export interface AgentDef {
-  id: string;
-  label: string;
+  readonly id: string;
+  readonly label: string;
   /** Command line run through the default shell; "" means user-provided. */
-  command: string;
+  readonly command: string;
 }
 
 /** The catalog. `readonly` so a later feature cannot `push` a
@@ -22,7 +22,14 @@ export interface AgentDef {
  *  below is a snapshot taken at import — and the catalog test asserts the
  *  eight names, so it would stay green through it (#2514 review round 2,
  *  premortem 2). A compile error is the loud failure; a runtime freeze
- *  would only be a late one. */
+ *  would only be a late one.
+ *
+ *  `readonly` on the ARRAY refuses `push`; `readonly` on `AgentDef`'s own
+ *  fields refuses `AGENTS[0].command = "…"`, which is the same widening one
+ *  level down and which the array-level modifier alone still compiled
+ *  (#2514 review round 3, premortem 2). Both are needed: the set below is a
+ *  snapshot taken at import, so a row rewritten in place after it is built
+ *  widens the launcher and not the tab. */
 export const AGENTS: readonly AgentDef[] = [
   { id: "claude", label: "Claude Code", command: "claude" },
   { id: "copilot", label: "Copilot CLI", command: "copilot" },

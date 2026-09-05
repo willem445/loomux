@@ -29,6 +29,7 @@ import {
   agentLetter,
   agentMark,
   agentMarkFor,
+  namesAnAgent,
 } from "../src/agenticons.ts";
 import { buildSshArgv } from "../src/sshcommand.ts";
 import { ROLE_TOKEN } from "../src/icons.ts";
@@ -697,4 +698,33 @@ test("pi draws a P in its own dye, and the roster's letters stay distinguishable
   const glyph = (p: string) => agentMark({ command: p })!.svg.replace(/class="[^"]*"/, "");
   const sameShape = CLI_DYE_PROGRAMS.filter((p) => p !== "pi" && glyph(p) === glyph("pi"));
   assert.deepEqual(sameShape, [], `these CLIs draw pi's badge: ${sameShape.join(", ")}`);
+});
+
+test("namesAnAgent is agentMarkFor's own unknown tier, not a second denylist (#2514 review round 3)", () => {
+  // The membership rule for a DECLARED far-end CLI reads this predicate, so the
+  // row and the header cannot disagree about such a pane. A biconditional over a
+  // corpus, because "agrees on the cases I thought of" is what a second denylist
+  // also does right up until it drifts.
+  const CORPUS = [
+    ...MARK_PROGRAMS,
+    "claude", "codex", "opencode", "pi", "gemini", "hermes", "ante",
+    "aider", "crush", "make", "node", "z",
+    "bash", "sh", "zsh", "fish", "dash", "cmd", "powershell", "pwsh", "wsl", "tmux", "screen", "ssh", "mosh",
+    "", "-x", "?", "\u00e9diteur", "1pass",
+  ];
+  let agents = 0;
+  for (const p of CORPUS) {
+    const isAgent = namesAnAgent(p);
+    assert.equal(agentMarkFor(p).kind !== "unknown", isAgent, `namesAnAgent and the badge disagree about "${p}"`);
+    if (isAgent) agents += 1;
+  }
+  // POSITIVE CONTROLS: both answers are represented, so the biconditional is not
+  // passing on a corpus where one side never varies.
+  assert.ok(agents > 5, `only ${agents} of ${CORPUS.length} corpus entries are agents — the corpus is one-sided`);
+  assert.ok(CORPUS.length - agents > 5, "…and the same for the refusals");
+  // And the letter tier is reachable only past the refusal, which is what makes
+  // `agentMarkFor`'s tail total: every vendored mark's program must badge.
+  for (const p of MARK_PROGRAMS) {
+    assert.equal(agentLetter(p) === "?", false, `a vendored mark under an unbadgeable name: ${p}`);
+  }
 });

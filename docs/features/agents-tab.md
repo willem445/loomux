@@ -87,7 +87,9 @@ one of these is enough:
 
 - it belongs to an orchestration group — whatever it was started with;
 - orrerix already knows which agent CLI it runs, including a remote pane whose
-  SSH profile declares the agent on the far end;
+  SSH profile declares the agent on the far end — **any** agent, not only the
+  ones below: a profile may name a CLI orrerix does not know, and declaring one
+  is you telling orrerix what runs there;
 - it was launched with one of the agent CLIs orrerix itself offers — Claude
   Code, Copilot CLI, Codex, OpenCode, pi, Gemini CLI, Hermes, Ante.
 
@@ -114,6 +116,9 @@ button:
 - **an SSH pane whose profile names no far-end CLI.** The launch line describes
   the transport, not the agent. If you run an agent over that connection, set
   the profile's agent and the pane joins the list.
+- **an SSH pane whose profile names a *shell*** — `bash`, `fish`, `pwsh` — or a
+  name orrerix cannot read at all. Its pane header already says that is not an
+  agent, and the list agrees with the header rather than contradicting it.
 
 Being listed is decided once and used everywhere: the rows you see and the
 number on the button are the same set of panes, never two answers.

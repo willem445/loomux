@@ -13,7 +13,7 @@
 // where the facts come from, this module owns what they add up to.
 
 import { LAUNCHABLE_AGENT_PROGRAMS } from "./agents.ts";
-import { markProgram, type AgentMarkInput } from "./agenticons.ts";
+import { markProgram, namesAnAgent, type AgentMarkInput } from "./agenticons.ts";
 import { normalizeAgentProgram } from "./panerestore.ts";
 import { attentionPresentation, DECISION_REASONS, REPORT_REASONS } from "./attention.ts";
 import { ACTIVITY_FLOOR_BYTES, type ActivitySnapshot } from "./paneactivity.ts";
@@ -236,15 +236,14 @@ export function deriveAgentState(facts: PaneFacts): AgentState {
  *  was never the right one to ask. Membership is a separate question and gets a
  *  separate function (#2514).
  *
- *  THREE arms, each of which is the ONLY evidence for some real pane:
+ *  THREE arms, and the second and third differ in WHO IS CLAIMING:
  *
  *  1. `orch` — an orchestration pane is an agent whatever it was launched
  *     with, and a manager pane can carry no harness at all.
- *  2. either NAME the facts carry — `harness` (which is the SSH profile's
- *     declared far-end CLI on a remote pane, where no local launch line names
- *     the agent) or the launch line via `markProgram` — tested against the
- *     LAUNCHER'S OWN CATALOG. Both go through `namesLaunchableCli`, one
- *     rule; see its doc for the asymmetry that cost.
+ *  2. `harness` on a remote pane is a far-end CLI a HUMAN declared, and it is
+ *     held to the BADGE's answer — `declaresAnAgent`, below.
+ *  3. the launch line is loomux's own INFERENCE, and it is held to the
+ *     LAUNCHER'S OWN CATALOG — `namesLaunchableCli`, below.
  *
  *  ARM 3 IS NOT OPTIONAL AND ARM 2 CANNOT STAND IN FOR IT. `harness` is
  *  `sessionCliFromCommand`, a closed FOUR-name membership test built to match
@@ -264,10 +263,40 @@ export function deriveAgentState(facts: PaneFacts): AgentState {
  *  the launcher, which offers exactly these eight. */
 export function isAgentPane(facts: PaneFacts): boolean {
   if (facts.orch !== null) return true;
-  return namesLaunchableCli(facts.harness) || namesLaunchableCli(markProgram(facts.mark));
+  if (declaresAnAgent(facts.harness)) return true;
+  return namesLaunchableCli(markProgram(facts.mark));
 }
 
-/** The catalog test, applied to every name `isAgentPane` reads.
+/** A name a HUMAN declared for this pane — an SSH profile's far-end CLI, which is what
+ *  `harness` carries on a remote pane — tested against the BADGE's own answer.
+ *
+ *  Deliberately NOT the launcher's catalog, and the two arms differ on purpose (#2514
+ *  review round 3, B1). A launch line is loomux's own INFERENCE about a local process,
+ *  so it is held to the eight CLIs loomux offers. A declared far-end CLI is a human's
+ *  ASSERTION about a machine loomux cannot see, and the product supports asserting one
+ *  the catalog does not name: `setSshCli` round-trips such a value, renders it as
+ *  "<cli> — not a CLI orrerix knows", and warns rather than refusing. Holding that
+ *  assertion to the catalog listed a pane's header as "Agent CLI: aider" while the tab
+ *  had no row for it — the same header-vs-row divergence as the bug this arm was
+ *  narrowed to fix, pointing the other way.
+ *
+ *  So the test is exactly the badge's: `namesAnAgent`, which is `agentMarkFor`'s own
+ *  unknown-tier decision exported rather than a second denylist here. A profile
+ *  declaring `bash` is still refused — the header says "a transport or shell, not an
+ *  agent" and the row now agrees with it — and one declaring `aider` is listed, because
+ *  the header says "Agent CLI: aider" and the row agrees with that too. One pane, one
+ *  answer, whichever way it goes.
+ *
+ *  Normalized first, because `harness` is NOT pre-normalized the way `markProgram`'s
+ *  answer is: a profile declaring `Claude.exe` is the same claim as one declaring
+ *  `claude`. */
+function declaresAnAgent(name: string | null): boolean {
+  if (name === null) return false;
+  const program = normalizeAgentProgram(name);
+  return program !== "" && namesAnAgent(program);
+}
+
+/** The catalog test, applied to the name loomux INFERRED from the launch line.
  *
  *  ONE rule over BOTH inputs, and the asymmetry it removes was real (#2514
  *  review round 2, W2). An earlier draft tested `mark` against the catalog
