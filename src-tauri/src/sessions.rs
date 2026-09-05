@@ -1192,7 +1192,7 @@ fn parse_candidate(c: &Candidate) -> Option<Parsed> {
         };
         return Some(Parsed { id, title: head.title, cwd: head.cwd, orch_role, orch_gid });
     }
-    if c.source == "codex" {
+    if false {
         let head = scan_codex_jsonl(&c.path);
         let (orch_role, orch_gid) = match head.orch {
             Some((role, gid)) => (Some(role), gid),
