@@ -62566,6 +62566,48 @@ fn codex_approval_overlays_read_as_waiting_for_input() {
         );
     }
 
+    // **The two signals, isolated.** The three fixtures above carry BOTH a
+    // numbered menu and the footer, so they cannot tell which one is doing the
+    // work — and a version of this test that only used them stayed green when
+    // `"1. yes"` was removed from `NUMBERED_MENU_TOKENS` (round 16 of this
+    // slice's wave). Detection surviving is the right BEHAVIOUR and the wrong
+    // assertion: it made the test insensitive to losing either signal.
+    //
+    // So each half is fed on its own. That codex paints both is real robustness
+    // — the attention system keeps working if the vendor rewords one — but it is
+    // robustness only while BOTH still match, which is what these two pin.
+    // The numbered menu ALONE: codex's own option rows, with the selection
+    // pointer on none of them (in a real overlay it marks exactly one) and no
+    // footer. This is the fixture that reddens when `"1. yes"` leaves
+    // `NUMBERED_MENU_TOKENS`.
+    let menu_only = "  1. Yes, proceed (y)\n\
+                       2. No, and tell Codex what to do differently (esc)\n";
+    assert!(
+        prompt_wait_match(menu_only).is_some(),
+        "codex's numbered menu must be matched on its own, with neither the pointer nor the \
+         footer to carry it:\n{menu_only}"
+    );
+
+    // The selection pointer ALONE — the signal that made the first version of
+    // this isolation useless, so it is pinned rather than merely avoided.
+    let pointer_only = "  Would you like to run the following command?\n\
+                        \n› Yes, proceed\n";
+    assert!(
+        prompt_wait_match(pointer_only).is_some(),
+        "codex marks its highlighted option with a leading pointer, which is a signal in its \
+         own right:\n{pointer_only}"
+    );
+    // The footer ALONE. The title line is inert — no token list matches
+    // "would you like to run…", which is checkable and worth stating, because a
+    // fixture whose title carried a signal would prove nothing about the footer.
+    let footer_only = "  Would you like to run the following command?\n\
+                       \n  Press enter to confirm or esc to cancel\n";
+    assert!(
+        prompt_wait_match(footer_only).is_some(),
+        "codex's footer must be matched on its own, with no numbered menu to carry it:\n\
+         {footer_only}"
+    );
+
     // The negative control, and it is the half that makes the three above mean
     // something. A finished codex turn that merely TALKS about a command must
     // not read as a question — otherwise the detector would fire on ordinary
@@ -62623,13 +62665,28 @@ fn a_codex_profile_is_removed_with_its_agent_and_orphans_are_swept() {
         notes.exists()
     );
 
-    // Per-agent removal, which is the primary path — the sweep is the backstop.
+    // **Through `mark_dead`, which is the wiring that can actually go missing.**
+    // An earlier version of this test called `remove_codex_profile` directly and
+    // stayed green when the call site was deleted from `mark_dead` — it pinned
+    // the function and not the fact that anything invokes it. Caught by round 15
+    // of this slice's red-before-green wave, which is what that wave is for.
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let a = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let its_profile = home.join(format!("orrerix-{}.config.toml", a.id));
+    std::fs::write(&its_profile, "# fixture\n").unwrap();
+    reg.mark_dead(&a.id, Some(0)).expect("precondition: the agent really was alive");
+    assert!(
+        !its_profile.exists(),
+        "the profile must go with its agent — `mark_dead` is the one path every exit funnels \
+         through (kill, idle-reap, crash, pane close)"
+    );
+
+    // The function itself, and its idempotence: `mark_dead` calls it for EVERY
+    // agent whatever CLI it ran, so a second removal, a non-codex agent and an
+    // id that never had a profile must all be no-ops rather than errors.
     std::fs::write(&live, "# fixture\n").unwrap();
     reg.remove_codex_profile("w-1");
     assert!(!live.exists(), "the profile must go with its agent");
-    // Idempotent: a second removal, a non-codex agent, and an id that never
-    // had a profile are all no-ops rather than errors — `mark_dead` calls this
-    // for EVERY agent, whatever CLI it ran.
     reg.remove_codex_profile("w-1");
     reg.remove_codex_profile("orch-1");
 }
