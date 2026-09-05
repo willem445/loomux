@@ -2007,6 +2007,7 @@ pub fn kind_from_str(s: &str) -> Option<Role> {
         // roster: `spawn_agent` refuses it exactly as it refuses
         // `orchestrator`, and `builtin_roster` never synthesizes one.
         "manager" => Some(Role::Manager),
+        "lead" => Some(Role::Lead),
         // NO `lead` ARM, AND THAT IS THE ENFORCEMENT (#2519), not an omission.
         // `Role::Lead` is minted by one path only — the launcher toggle the
         // human themselves flipped — and its absence from this vocabulary is
