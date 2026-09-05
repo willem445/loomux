@@ -747,7 +747,7 @@ pub fn drive_ssh_add_with_transcript(
         //
         // `consumed` is only ever set to `seen.len()`, and `seen` is built from
         // `from_utf8_lossy`, so the slice below is always on a char boundary.
-        let tail = &seen[consumed..];
+        let tail = &seen[..];
         match classify_ssh_add_line(tail) {
             SshAddEvent::Added => terminal = Some(SshAddOutcome::Added),
             SshAddEvent::NoAgent => terminal = Some(SshAddOutcome::NoAgent { hint: agent_hint() }),
