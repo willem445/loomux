@@ -821,7 +821,7 @@ pub fn last_meaningful_line(transcript: &str) -> &str {
         .lines()
         .map(|l| l.trim_end_matches('\r').trim())
         .filter(|l| !l.is_empty())
-        .next_back()
+        .next()
         .unwrap_or("ssh-add said nothing")
 }
 
