@@ -46168,23 +46168,45 @@ fn a_bare_resume_of_a_removed_blocks_session_is_refused_by_the_new_roster() {
     assert!(text.contains("w-b"), "and the roster it CAN spawn from: {text}");
 }
 
+// The plan's open unknown, answered in `doc/design/workflows.md`:
+// `set_advanced_orchestrator` writes no instruction files at all, and the
+// per-spawn render (#1187) never REMOVES one. Only `write_instruction_files`
+// reconciles the group dir against the manifest (#423) — so an apply has to
+// call it.
+//
+// TWO tests, not one, and the split is the point. A single test asserting the
+// write and then the sweep stops at whichever fails FIRST, so a mutation that
+// removes the call reddens on the WRITE and never reaches the sweep — and a red
+// evidences only the assertion it moved (CLAUDE.md). Split, the same mutation
+// moves both, separately.
+
 #[test]
-fn a_switch_reconciles_the_group_dirs_instruction_files() {
-    // The plan's open unknown, answered in `doc/design/workflows.md` and pinned
-    // here: `set_advanced_orchestrator` writes no instruction files at all, and
-    // the per-spawn render (#1187) never REMOVES one. Only
-    // `write_instruction_files` sweeps a removed block's stale `<id>.md`
-    // against the manifest (#423) — so an apply has to call it.
+fn a_switch_writes_the_new_blocks_instruction_files() {
     let (reg, _d) = test_registry();
     let repo = two_workflow_repo();
     let g = switchable_group(&reg, &repo);
     let dir = reg.state_root().join(g.id.as_str());
-    assert!(dir.join("w-a.md").is_file(), "the launch wrote the old roster's files");
+    assert!(!dir.join("w-b.md").is_file(), "precondition: b's files are not there yet");
 
     reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
 
     assert!(dir.join("w-b.md").is_file(), "the new block's instructions must exist before its first spawn");
     assert!(dir.join("rev-b.md").is_file());
+}
+
+#[test]
+fn a_switch_sweeps_a_removed_blocks_instruction_file() {
+    let (reg, _d) = test_registry();
+    let repo = two_workflow_repo();
+    let g = switchable_group(&reg, &repo);
+    let dir = reg.state_root().join(g.id.as_str());
+    // Positive control: the file this test is about really is on disk first, so
+    // an absence assertion cannot pass against a group dir that never had it.
+    assert!(dir.join("w-a.md").is_file(), "the launch wrote the old roster's files");
+    assert!(dir.join("rev-a.md").is_file());
+
+    reg.apply_workflow(&g.id, &wf("b"), "human").unwrap();
+
     assert!(!dir.join("w-a.md").is_file(), "the removed block's file must be SWEPT, not left stale");
     assert!(!dir.join("rev-a.md").is_file());
 }
