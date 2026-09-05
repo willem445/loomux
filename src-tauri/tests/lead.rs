@@ -1605,8 +1605,15 @@ fn an_ordinary_group_reusing_a_dead_leads_id_is_not_a_lead_group() {
 /// that never became a lead group: the same false-refusal state, reached from the
 /// other side. It is now written below every step that can fail.
 ///
-/// Driven through the reachable failure: `write_mcp_config` refuses when the MCP
-/// server has no port, which is the state a registry is in before `set_port`.
+/// Driven through the reachable failure: `write_mcp_config` refuses while the
+/// MCP server is not running, which it decides by `port == 0` — so the fixture
+/// puts the registry in exactly that state rather than assuming a constructor
+/// leaves it there. It does not, and the first version of this test learned it
+/// the expensive way: `relaunch_registry` sets a port, so "just do not call
+/// `set_port`" asserted an error from a prepare that had SUCCEEDED. The premise
+/// is asserted in the body now, so a fixture that stops driving its own failure
+/// fails on the premise rather than passing for the wrong reason.
+///
 /// The control is the same call on a registry that HAS a port — without it this
 /// would pass against a build where `lead_prepare` never marks anything.
 #[test]
@@ -1619,6 +1626,13 @@ fn a_failed_lead_prepare_leaves_no_marker() {
     // SUCCEEDED. `write_mcp_config` refuses on `port == 0`, and it is the first
     // `?` below where the marker used to be written.
     reg.set_port(0);
+    assert_eq!(
+        reg.port(),
+        0,
+        "the premise, asserted rather than assumed: the registry really is in the state the \
+         refusal below reads — without this the fixture can stop driving its own failure and \
+         nothing says so"
+    );
     let repo = real_repo();
     let err = reg
         .lead_prepare("claude", &repo.path(), "l", 4, false, 5, 0, 5)
