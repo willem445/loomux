@@ -37560,14 +37560,7 @@ impl OrchRegistry {
         // is never given a worktree) and no persona: a lead group has no
         // workflow file, so no block in it can carry one.
         let kickoff = self.kickoff_prompt(&a, &g, "", None);
-        if let Err(e) = self.deliver_prompt(agent_id, &kickoff, brand::AUDIT_ACTOR, Delivery::FreshKickoff) {
-            self.audit(&group_id, brand::AUDIT_ACTOR, "error", json!({
-                "what": "lead kickoff not delivered", "agent": agent_id, "err": e,
-                "detail": "the pane is bound and usable; it did not receive its contract. See \
-                           OrchRegistry::lead_bind for why this is not a launch failure.",
-            }));
-        }
-        Ok(())
+        self.deliver_prompt(agent_id, &kickoff, brand::AUDIT_ACTOR, Delivery::FreshKickoff)
     }
 
     /// Every live delegate in a dead lead's group, ended (#2519).
