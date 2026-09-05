@@ -37104,7 +37104,6 @@ impl OrchRegistry {
         // written still runs. What is lost is the resume refusal below, which
         // then falls through to the ordinary "no recorded orchestration"
         // failures rather than to a permissive path.
-        let _ = fs::write(self.group_dir(&group.id).join(LEAD_MARKER), b"1");
 
         let seq = self.mint_agent_seq(&group.id);
         let agent_id = format!("lead-{seq}");
