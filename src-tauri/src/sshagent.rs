@@ -72,7 +72,7 @@ use std::time::{Duration, Instant};
 /// paths to enumerate — every path is setup-then-conversation — which is what
 /// makes this total true by construction rather than by a list that the next
 /// person to add a step will forget to update.
-pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(25);
+pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(30);
 
 /// One deadline shared by **everything before the conversation** — the first
 /// probe, the start attempt, and the re-probe together.
