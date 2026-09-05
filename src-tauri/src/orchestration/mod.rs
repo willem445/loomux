@@ -53215,7 +53215,15 @@ impl OrchRegistry {
     ///
     /// The stamp goes on before anything is touched (`kill_agent_as`'s reason:
     /// the pty waiter can be in `on_pty_exit` before this returns), then
-    /// `mark_dead`, then the pty. `mark_dead` is what frees the slot — the
+    /// `mark_dead`, then the pty. **The window that ordering leaves is stated
+    /// rather than traded away**: a pane that crashes between the idle check and
+    /// `mark_dead` loses the live→dead race, this returns `Err`, and the crash it
+    /// did not cause is nonetheless attributed to `driver-release` — so that exit
+    /// routes `AuditOnly` instead of prompting. It is the same window
+    /// `kill_agent_as` has had since #533-B, on a pane this one has already
+    /// established is idle, and closing it by stamping after `mark_dead` would
+    /// cost the persisted roster row its initiator (the snapshot is taken inside
+    /// `mark_dead`), which a restart reads and the live map does not survive. `mark_dead` is what frees the slot — the
     /// live-delegate cap counts agents whose status is not `Dead`, so a released
     /// pane stops counting at that instant rather than whenever its process
     /// finishes exiting, which is what "a released pane frees a slot
