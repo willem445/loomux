@@ -2038,11 +2038,23 @@ fn the_lane_brief_names_the_round_scope_on_every_round_mode() {
         // the exact premise `a_verification_brief_announces_itself_on_every_
         // path_that_grants_it` documents for the same reason.
         let repo = Repo::with(WORKFLOW_BODY_UNCHANGED);
+        const REVIEWED: &str = "the body every lane passed";
+        const EDITED: &str = "the body somebody edited afterwards";
         let gh = FakeGh::green(HEAD_A);
+        // **The body override is set BEFORE the pass is recorded** — the same
+        // premise case C of
+        // `a_verification_brief_announces_itself_on_every_path_that_grants_it`
+        // builds on. `review_verdict` reads the body it passes against through
+        // this seam, so a pass recorded without it carries no digest at all;
+        // `body_changed` reads a missing digest as "cannot tell", never as
+        // drift, and a pass that never went stale is never re-briefed — the
+        // drive would sit at `gate-check` refusing a pass it cannot compare.
+        gh.set_body(REVIEWED);
+        reg.set_pr_head_override(Some(HEAD_A.to_string()));
+        reg.set_pr_body_override(Some(REVIEWED.to_string()));
         let (group, _s) = driven(&reg, &repo, &gh);
         let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
         with_pane(&reg, &orch.id, 7001);
-        reg.set_pr_head_override(Some(HEAD_A.to_string()));
         reg.rd_drive_group_with(&group, &gh, 10_000);
         let first = reg.rd_drive_group_with(&group, &gh, 20_000);
         let (_pr, _b, lane) = first.lanes_opened.first().cloned().expect("lane 0 opens");
@@ -2076,10 +2088,15 @@ fn the_lane_brief_names_the_round_scope_on_every_round_mode() {
                 "outcome": "approved", "note": "nothing blocking", "ref": "#1758" } }),
         )
         .expect("the lane reports, which ends its turn");
+        assert!(
+            reg.agent(&lane).expect("the lane is on the roster").idle_since_ms.is_some(),
+            "the fixture's premise — that pane has finished its turn, so a re-brief is not \
+             refused as a duplicate"
+        );
         // A body-only edit at the unchanged head: every lane has passed the
         // code, so `decide_review_wait` grants `verify` — the body-only round.
-        gh.set_body("the body somebody edited afterwards");
-        reg.set_pr_body_override(Some("the body somebody edited afterwards".to_string()));
+        gh.set_body(EDITED);
+        reg.set_pr_body_override(Some(EDITED.to_string()));
         let opened = tick_until_lane(&reg, &gh, &group, 30_000);
         let agent = opened.unwrap_or_else(|| panic!("the verification round must re-brief"));
         let text = lane_brief(&reg, &agent);
