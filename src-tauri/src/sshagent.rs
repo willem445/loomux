@@ -318,7 +318,8 @@ fn starts_a_line(hay: &str, needle: &str, at_line_start: bool) -> bool {
         let at = from + offset;
         let anchored = match at {
             0 => at_line_start,
-            _ => matches!(hay.as_bytes()[at - 1], b'\n' | b'\r'),
+            // [scratch #2594 R6] \n only.
+            _ => matches!(hay.as_bytes()[at - 1], b'\n'),
         };
         if anchored {
             return true;
