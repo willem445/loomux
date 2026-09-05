@@ -401,7 +401,11 @@ pub fn list_workflows(repo: &str) -> WorkflowListing {
             // The directory's own answer, never `workflow_path_named`'s — see
             // `workflows_dir_file`.
             let rel = workflows_dir_file(repo, &name);
-            seen.insert(name.as_str().to_string(), read_entry(&path, name, rel));
+            let entry = read_entry(&path, name, rel);
+            if !entry.errors.is_empty() {
+                continue;
+            }
+            seen.insert(entry.name.as_str().to_string(), entry);
         }
     }
 
@@ -414,8 +418,7 @@ pub fn list_workflows(repo: &str) -> WorkflowListing {
     if plain.is_file() {
         if let Some(shadowed) = seen.remove(DEFAULT_WORKFLOW_NAME) {
             listing.findings.push(format!(
-                "both {plain_rel} and {shadowed} declare the workflow named \
-                 '{DEFAULT_WORKFLOW_NAME}' — {plain_rel} is the one that is read",
+                "both {plain_rel} and {shadowed} declare the workflow named '{DEFAULT_WORKFLOW_NAME}' —                  {plain_rel} is the one that is read",
                 shadowed = shadowed.path
             ));
         }
@@ -425,7 +428,7 @@ pub fn list_workflows(repo: &str) -> WorkflowListing {
         );
     }
 
-    listing.workflows = seen.into_values().collect();
+    listing.workflows = seen.into_values().rev().collect();
     listing
 }
 
