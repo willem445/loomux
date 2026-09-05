@@ -19,13 +19,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   deriveAgentState,
+  groupRows,
   toAgentRow,
   matchesFilter,
   sortRows,
   needsYouCount,
+  type AgentOrder,
   type AgentRow,
   type AgentState,
   type PaneFacts,
+  type TabRef,
 } from "../src/agentrows.ts";
 import { ACTIVITY_FLOOR_BYTES } from "../src/paneactivity.ts";
 
@@ -43,7 +46,12 @@ function facts(patch: FactsPatch = {}): PaneFacts {
     key: "pane-1",
     name: "w-1",
     kind: "orch",
+    tab: { id: "ws-1", title: "loomux", index: 0 },
     harness: "claude",
+    // The launch line the header resolves its own mark from, carried on the
+    // facts so the row and the header share one resolution (#2371 review round
+    // 2, W1). Built from a COMMAND, the way `Pane.agentMarkInput` builds it.
+    mark: { command: "claude", argv: null, knownCli: null, remote: false },
     orch: { group: "g", agentId: "w-1", role: "worker" },
     sessionId: "s-1",
     alive: true,
@@ -363,7 +371,34 @@ test("toAgentRow carries the identity fields through and derives the state", () 
     role: "worker",
     state: "question",
     notes: 3,
+    tab: { id: "ws-1", title: "loomux", index: 0 },
+    mark: { command: "claude", argv: null, knownCli: null, remote: false },
   });
+});
+
+test("the mark input is carried onto the row untouched (#2371 review W1)", () => {
+  // The row must hand the resolver exactly what the pane header hands it —
+  // untouched, not re-derived — or the two surfaces can answer differently
+  // about one pane. `harness` is deliberately NOT it: a `codex` pane is a real
+  // agent pane that no session store covers, so `harness` is null while its
+  // launch line names the program perfectly well.
+  const codex = facts({
+    harness: null,
+    mark: { command: "codex --resume", argv: null, knownCli: null, remote: false },
+  });
+  const projected = toAgentRow(codex);
+  assert.deepEqual(projected.mark, codex.mark);
+  assert.equal(projected.harness, null, "a codex pane is outside the session-store set, and that is correct");
+  assert.notEqual(projected.mark.command, null, "…while its launch line still names the program");
+});
+
+test("the tab a reading named is carried onto the row, and so is its absence", () => {
+  // #2371. `PaneFacts.tab` is supplied by the caller (a `Pane` does not know
+  // its workspace), so both halves are real cases: the Agents view names one,
+  // and the notes rows / focus walk name none.
+  const named = toAgentRow(facts({ tab: { id: "ws-9", title: "docs", index: 4 } }));
+  assert.deepEqual(named.tab, { id: "ws-9", title: "docs", index: 4 });
+  assert.equal(toAgentRow(facts({ tab: null })).tab, null);
 });
 
 test("a pane with no orchestration identity flattens to nulls, not to undefined", () => {
@@ -375,8 +410,19 @@ test("a pane with no orchestration identity flattens to nulls, not to undefined"
   assert.equal(row.notes, null, "notes default to 'not loaded', which is not 0");
 });
 
-function row(name: string, state: AgentState): AgentRow {
-  return { key: `k-${name}`, name, harness: "claude", group: "g", agentId: name, role: "worker", state, notes: null };
+function row(name: string, state: AgentState, tab: TabRef | null = null): AgentRow {
+  return {
+    key: `k-${name}`,
+    name,
+    harness: "claude",
+    group: "g",
+    agentId: name,
+    role: "worker",
+    state,
+    notes: null,
+    tab,
+    mark: { command: "claude", argv: null, knownCli: null, remote: false },
+  };
 }
 
 test("matchesFilter passes everything on 'all' and exactly one state otherwise", () => {
@@ -433,4 +479,217 @@ test("needsYouCount counts the two states a person must act on", () => {
   assert.equal(needsYouCount([row("i", "reported"), row("b", "question")]), 1);
   assert.equal(needsYouCount([]), 0);
   assert.equal(needsYouCount([row("a", "working")]), 0);
+});
+
+// --- #2371: grouping by tab ---------------------------------------------------
+
+// THE STRIP ORDER IS DELIBERATELY NOT THE ALPHABETICAL ONE. Every fixture below
+// draws from this table, whose titles sort into the exact REVERSE of the strip
+// positions the human dragged them into — so a `groupRows` that sorted by title
+// (or that fell back to arrival order after a shuffled input) produces a
+// different answer from the correct one on every one of these tests, rather than
+// only on the one written to catch it.
+const WS: Record<string, TabRef> = {
+  // strip order: zulu, mike, alpha.  alphabetical: alpha, mike, zulu.
+  zulu: { id: "ws-z", title: "zulu", index: 0 },
+  mike: { id: "ws-m", title: "mike", index: 1 },
+  alpha: { id: "ws-a", title: "alpha", index: 2 },
+};
+
+/** Read a grouping as `[[tab title | null, ...row names]]` — the shape every
+ *  assertion below is written against. */
+const shape = (rows: readonly AgentRow[], order: AgentOrder): (string | null)[][] =>
+  groupRows(rows, order).map((g) => [g.tab?.title ?? null, ...g.rows.map((r) => r.name)]);
+
+test("the group order follows the tab strip, not the alphabet", () => {
+  // The negative control is the whole test: `WS` is built so the two orders
+  // DISAGREE, and the wrong answer is spelled out so the assertion cannot be
+  // read as "some order came back".
+  const rows = [
+    row("a1", "working", WS.alpha),
+    row("m1", "working", WS.mike),
+    row("z1", "working", WS.zulu),
+  ];
+  const byStrip = [["zulu", "z1"], ["mike", "m1"], ["alpha", "a1"]];
+  const byAlphabet = [["alpha", "a1"], ["mike", "m1"], ["zulu", "z1"]];
+  assert.deepEqual(shape(rows, "tab"), byStrip);
+  assert.notDeepEqual(
+    shape(rows, "tab"),
+    byAlphabet,
+    "sorting groups by title would pass every other assertion here",
+  );
+  // And it is the STRIP position that decides, not the order the rows arrived
+  // in: the same three rows fed in a third arrangement land the same way.
+  assert.deepEqual(shape([rows[2], rows[0], rows[1]], "tab"), byStrip);
+});
+
+test("a tab with no agent rows produces no group", () => {
+  // Two of the three tabs in `WS` have no rows here. They are absent from the
+  // result rather than present-and-empty, which is what makes "a tab with no
+  // agent rows shows no header" true of the view without the view filtering
+  // anything.
+  const groups = groupRows([row("m1", "working", WS.mike)], "tab");
+  assert.deepEqual(groups.map((g) => g.tab?.id), ["ws-m"]);
+  // Non-vacuous: the same call over rows from all three tabs DOES return three,
+  // so the assertion above is about the missing rows and not about `groupRows`
+  // returning a short list whatever it is fed.
+  const all = groupRows(
+    [row("m1", "working", WS.mike), row("z1", "working", WS.zulu), row("a1", "working", WS.alpha)],
+    "tab",
+  );
+  assert.equal(all.length, 3);
+});
+
+test("the state sort still applies inside a group, in both orders", () => {
+  // Rows are handed in deliberately mis-ordered within each tab. `sortRows`'
+  // own rule — state urgency, then name — must survive grouping unchanged,
+  // whichever GROUP order is selected: `order` decides which tab you read
+  // first and nothing else.
+  const rows = [
+    row("zoe", "working", WS.mike),
+    row("amy", "attention", WS.mike),
+    row("bob", "working", WS.mike),
+    row("carl", "question", WS.zulu),
+    row("dan", "dead", WS.zulu),
+  ];
+  const inMike = ["amy", "bob", "zoe"];
+  const inZulu = ["carl", "dan"];
+  assert.deepEqual(shape(rows, "tab"), [["zulu", ...inZulu], ["mike", ...inMike]]);
+  // `state` order puts mike first (its worst row is `attention`, zulu's is
+  // `question`) — and the rows INSIDE each group are identical to the line
+  // above, which is the property this test exists for.
+  assert.deepEqual(shape(rows, "state"), [["mike", ...inMike], ["zulu", ...inZulu]]);
+});
+
+test("under 'most wants you' the group holding the most urgent row comes first", () => {
+  // The reading that makes `state` a group order rather than an accident. Strip
+  // order here is zulu, mike, alpha — and the answer inverts it completely, so
+  // a `groupRows` that ignored `order` and always sorted by strip fails.
+  const rows = [
+    row("z1", "idle", WS.zulu),
+    row("m1", "working", WS.mike),
+    row("a1", "attention", WS.alpha),
+  ];
+  assert.deepEqual(shape(rows, "state"), [["alpha", "a1"], ["mike", "m1"], ["zulu", "z1"]]);
+  assert.deepEqual(shape(rows, "tab"), [["zulu", "z1"], ["mike", "m1"], ["alpha", "a1"]]);
+});
+
+test("groups whose worst row ties fall back to strip order, never to arrival order", () => {
+  // Two tabs whose most urgent row is the same state. Fed alpha-first, so a
+  // tie-break that kept arrival order would put alpha first — and the human's
+  // own arrangement says zulu.
+  const rows = [row("a1", "working", WS.alpha), row("z1", "working", WS.zulu)];
+  assert.deepEqual(shape(rows, "state"), [["zulu", "z1"], ["alpha", "a1"]]);
+});
+
+test("rows naming no tab share one headerless group, which sorts last only where it has no position", () => {
+  // `PaneFacts.tab` is null for any reading that did not name one. Such rows are
+  // still listed — dropping them would hide panes — but they carry no title, so
+  // the view renders no header.
+  //
+  // The two orders answer differently ON PURPOSE, and the fixture is built so
+  // they DIVERGE rather than agreeing under both readings:
+  //  - `tab` is strip order, and a group with no tab has no strip position, so
+  //    it goes last;
+  //  - `state` ranks by the worst row, and a headerless group holding a wedged
+  //    pane is still a wedged pane — burying it under a tab whose worst row is
+  //    `idle` would hide urgency for tidiness.
+  const rows = [row("untabbed", "attention", null), row("m1", "idle", WS.mike)];
+  assert.deepEqual(shape(rows, "state"), [[null, "untabbed"], ["mike", "m1"]]);
+  assert.deepEqual(shape(rows, "tab"), [["mike", "m1"], [null, "untabbed"]]);
+  assert.notDeepEqual(
+    shape(rows, "state"),
+    shape(rows, "tab"),
+    "the fixture must distinguish the two orders, or neither is pinned",
+  );
+  // The tie-break half: with the states equal, `state` has nothing to rank on
+  // and falls through to the same answer `tab` gives.
+  const tied = [row("untabbed", "idle", null), row("m1", "idle", WS.mike)];
+  assert.deepEqual(shape(tied, "state"), [["mike", "m1"], [null, "untabbed"]]);
+});
+
+test("renaming a tab re-labels its group without splitting it", () => {
+  // A rename changes `title` and not `id`, and the group is keyed on `id`. So
+  // the two rows stay in ONE group wearing the new name — the failure this
+  // guards is a title-keyed grouping, which would show two headers for one tab
+  // during the tick where a rename has reached one pane's reading and not the
+  // other's.
+  const before = [row("m1", "working", WS.mike), row("m2", "working", WS.mike)];
+  assert.deepEqual(shape(before, "tab"), [["mike", "m1", "m2"]]);
+  const renamed: TabRef = { ...WS.mike, title: "MIKE renamed" };
+  const after = [row("m1", "working", renamed), row("m2", "working", renamed)];
+  assert.deepEqual(shape(after, "tab"), [["MIKE renamed", "m1", "m2"]]);
+  // A hypothetical tick where two rows of one tab carry DIFFERENT titles. Still
+  // ONE group — that is the property this test is for, and it holds whichever
+  // label wins.
+  //
+  // WHICH label wins is LAST IN INPUT ORDER, and nothing here is "fresher"
+  // (#2371 review round 2, R2 — an earlier version of this comment claimed the
+  // group "wears the fresher label", which the code cannot do: there is no
+  // timestamp on a `TabRef`, so the tie is decided by argument order and this
+  // fixture merely happens to put the renamed reading last). Both orders are
+  // asserted, so the rule is pinned rather than illustrated by one lucky
+  // arrangement.
+  const midway = [row("m1", "working", WS.mike), row("m2", "working", renamed)];
+  assert.deepEqual(shape(midway, "tab"), [["MIKE renamed", "m1", "m2"]]);
+  const reversed = [row("m1", "working", renamed), row("m2", "working", WS.mike)];
+  assert.deepEqual(
+    shape(reversed, "tab"),
+    [["mike", "m1", "m2"]],
+    "the label is the LAST reading in input order — reverse the input and the other title wins",
+  );
+  // In production this case cannot arise at all: `main.ts`'s walk reads one
+  // title per tab and hands the same `TabRef` to every pane in it. The rule is
+  // stated so the tie is decided somewhere rather than by bucket-insertion
+  // luck, not because a caller is expected to produce a split reading.
+});
+
+test("two tabs sharing a name stay two groups", () => {
+  // The other half of keying on `id`: the human may legally name two tabs the
+  // same thing, and merging them would hide a pane's real home.
+  const twin: TabRef = { id: "ws-a", title: "mike", index: 2 };
+  const rows = [row("m1", "working", WS.mike), row("a1", "working", twin)];
+  const groups = groupRows(rows, "tab");
+  assert.deepEqual(groups.map((g) => g.tab?.id), ["ws-m", "ws-a"]);
+  assert.deepEqual(groups.map((g) => g.tab?.title), ["mike", "mike"]);
+});
+
+test("groupRows returns fresh arrays and does not reorder its input", () => {
+  const rows = [row("zoe", "working", WS.mike), row("amy", "attention", WS.mike)];
+  const before = rows.map((r) => r.name);
+  const groups = groupRows(rows, "tab");
+  assert.deepEqual(groups[0].rows.map((r) => r.name), ["amy", "zoe"]);
+  assert.deepEqual(rows.map((r) => r.name), before, "groupRows must not reorder the caller's array");
+});
+
+test("the needs-you badge is unchanged by grouping, in either order", () => {
+  // The badge counts LADDER states over the whole window (`agentsview.ts`
+  // derives it from the ungrouped rows, before any grouping runs). This pins
+  // that grouping is a pure re-arrangement: the same rows, redistributed.
+  const rows = [
+    row("a1", "attention", WS.alpha),
+    row("a2", "question", WS.alpha),
+    row("m1", "working", WS.mike),
+    row("m2", "question", WS.mike),
+    row("z1", "held", WS.zulu),
+    row("u1", "reported", null),
+  ];
+  const flat = needsYouCount(rows);
+  // Positive control for the count itself: it is 3 and not 0, so the equalities
+  // below are comparing a real number rather than agreeing on nothing. A
+  // `question` row DOES count — the corpus holds two, plus one `attention`.
+  assert.equal(flat, 3);
+  assert.equal(needsYouCount([row("q", "question", WS.mike)]), 1, "a question row counts");
+  for (const order of ["state", "tab"] as AgentOrder[]) {
+    const groups = groupRows(rows, order);
+    const regrouped = groups.reduce((n, g) => n + needsYouCount(g.rows), 0);
+    assert.equal(regrouped, flat, `grouping in ${order} order changed the badge`);
+    // And no row was dropped or duplicated on the way, which is the property
+    // the count alone cannot see: a lost `working` row would leave it at 3.
+    assert.deepEqual(
+      groups.flatMap((g) => g.rows.map((r) => r.key)).sort(),
+      rows.map((r) => r.key).sort(),
+      `grouping in ${order} order did not preserve the row set`,
+    );
+  }
 });

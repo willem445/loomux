@@ -16,15 +16,29 @@
 // in as many words. Only a pane appearing, disappearing or moving in the sort
 // order touches the list's child order.
 
+import { getAgentOrder, setAgentOrder } from "./agentorder";
 import {
   needsYouCount,
   toAgentRow,
   type AgentFilter,
+  type AgentGroup,
+  type AgentOrder,
   type AgentRow,
   type AgentState,
   type PaneFacts,
 } from "./agentrows";
-import { AGENT_STATE_LABEL, agentIdentityLine, filterChips, visibleRows } from "./agentsviewmodel";
+import {
+  AGENT_ORDER_LABEL,
+  AGENT_STATE_LABEL,
+  ORDER_CHOICES,
+  agentIdentityLine,
+  agentRowMark,
+  markKey,
+  sweep,
+  listSlots,
+  filterChips,
+  visibleGroups,
+} from "./agentsviewmodel";
 import { PollGate } from "./pollgate";
 import { spinnerSvg } from "./spinner";
 
@@ -54,18 +68,49 @@ export interface AgentsViewDeps {
 /** The elements of one row, held so a refresh can update them in place. */
 interface RowEls {
   el: HTMLButtonElement;
+  mark: HTMLElement;
+  /** `markKey` of the inputs the mark currently on screen was painted from —
+   *  the cache key for that one `innerHTML` write. Held beside the element
+   *  rather than recomputed from `row`, so the comparison is against what was
+   *  actually PAINTED and not against what the previous reading happened to
+   *  say (#2371 review round 3, finding 1). */
+  markKey: string;
   name: HTMLElement;
   identity: HTMLElement;
   state: HTMLElement;
   row: AgentRow;
 }
 
+/** The header element for one tab's group, plus the title it currently shows —
+ *  so a rename rewrites the text and a re-order moves the element, and neither
+ *  rebuilds it. */
+interface GroupEls {
+  el: HTMLElement;
+  title: string;
+}
+
+/** The key a group's header element is held under: the tab's own id. Only a
+ *  group that HAS a tab gets an entry, so this map never needs a sentinel for
+ *  the headerless one — it has no header to hold. */
+type GroupKey = string;
+
 export class AgentsView {
   private filter: AgentFilter = "all";
+  /** The human's group order, read back from storage at construction so an
+   *  open-panel boot shows the order they left it in rather than the default
+   *  for a frame. `getAgentOrder` never throws and answers the default when
+   *  storage is unavailable. */
+  private order: AgentOrder = getAgentOrder();
   private chipsEl: HTMLElement;
   private listEl: HTMLElement;
   private emptyEl: HTMLElement;
   private rows = new Map<string, RowEls>();
+  /** One header per tab that currently has rows, keyed so it outlives a refresh
+   *  — the same reason the chips and rows are keyed: rebuilding a subtree the
+   *  keyboard is standing in drops focus to `<body>`. */
+  private groups = new Map<GroupKey, GroupEls>();
+  /** One button per order choice, keyed for the same reason. */
+  private orderBtns = new Map<AgentOrder, HTMLButtonElement>();
   /** One button per filter, keyed so it outlives a refresh — see
    *  `renderChips`, which is why this is a map and not a rebuild. */
   private chips = new Map<AgentFilter, HTMLButtonElement>();
@@ -95,7 +140,36 @@ export class AgentsView {
     head.className = "sessions-head";
     const title = document.createElement("h2");
     title.textContent = "Agents";
-    head.append(title);
+    // The order control sits in the head rather than among the filter chips
+    // because it answers a different question: the chips say WHICH rows, this
+    // says in what order their groups come. Built once — the choices are a
+    // fixed pair, so unlike the chips nothing here ever appears or disappears.
+    // A local, not a field: nothing after construction reads the container —
+    // `renderOrder` writes the pressed state on the BUTTONS, which are keyed in
+    // `orderBtns`.
+    const orderEl = document.createElement("div");
+    orderEl.className = "agents-order";
+    orderEl.setAttribute("role", "group");
+    orderEl.setAttribute("aria-label", "Group order");
+    for (const choice of ORDER_CHOICES) {
+      const btn = document.createElement("button");
+      btn.className = "agents-order-btn";
+      btn.type = "button";
+      btn.textContent = AGENT_ORDER_LABEL[choice];
+      btn.title = `Order groups: ${AGENT_ORDER_LABEL[choice]}`;
+      btn.addEventListener("click", () => {
+        if (this.order === choice) return;
+        this.order = choice;
+        // Persisted on the GESTURE, not on a debounce: the value is one word
+        // and the human just made the decision, so there is nothing to
+        // coalesce and nothing that could be lost by closing the panel.
+        setAgentOrder(choice);
+        this.refresh();
+      });
+      this.orderBtns.set(choice, btn);
+      orderEl.append(btn);
+    }
+    head.append(title, orderEl);
 
     this.chipsEl = document.createElement("div");
     this.chipsEl.className = "agents-chips";
@@ -153,7 +227,20 @@ export class AgentsView {
     this.deps.onCountChanged(needsYouCount(rows));
     if (!this.open) return;
     this.renderChips(rows);
-    this.renderRows(visibleRows(rows, this.filter));
+    this.renderOrder();
+    this.renderGroups(visibleGroups(rows, this.filter, this.order));
+  }
+
+  /** Mark the selected order. The buttons themselves are built once and never
+   *  removed, so this only ever writes the pressed state — there is no element
+   *  churn here to lose focus to. */
+  private renderOrder(): void {
+    for (const [choice, btn] of this.orderBtns) {
+      const on = choice === this.order;
+      btn.classList.toggle("active", on);
+      const pressed = String(on);
+      if (btn.getAttribute("aria-pressed") !== pressed) btn.setAttribute("aria-pressed", pressed);
+    }
   }
 
   /** Reconcile the chip strip, keyed by filter — NOT rebuilt.
@@ -220,34 +307,82 @@ export class AgentsView {
     }
   }
 
-  private renderRows(rows: readonly AgentRow[]): void {
-    const seen = new Set<string>();
+  /** Reconcile the list: a header per tab, its rows under it (#2371).
+   *
+   *  ONE FLAT WALK over the sequence the groups spell out — header, its rows,
+   *  next header — placing each element after the previous one only when it is
+   *  not already there. That is the same rule the ungrouped list followed and
+   *  it is what keeps a re-order cheap: a group whose rows did not move inside
+   *  it costs one `insertBefore` for the header and none for the rows, and a
+   *  row that never moved is never touched, so the working spinner's CSS
+   *  animation is not taken back to frame 0.
+   *
+   *  Headers are keyed by TAB ID and rows by pane key, in two maps, because
+   *  they have different lifetimes: a row survives its tab's header
+   *  disappearing (the human moved the pane), and a header survives every one
+   *  of its rows being replaced. */
+  private renderGroups(groups: readonly AgentGroup[]): void {
+    const seenGroups = new Set<GroupKey>();
+    const seenRows = new Set<string>();
     let prev: HTMLElement | null = null;
-    for (const row of rows) {
-      seen.add(row.key);
-      const els = this.rows.get(row.key) ?? this.createRow(row);
-      this.rows.set(row.key, els);
-      this.updateRow(els, row);
-      // Place it after the previous row only if it is not already there —
-      // `insertBefore` on an element that is already in position still counts
-      // as a move, and a move inside an animating subtree restarts it.
+    let rowCount = 0;
+    const place = (el: HTMLElement): void => {
       const want: ChildNode | null = prev === null ? this.listEl.firstChild : prev.nextSibling;
-      if (want !== els.el) this.listEl.insertBefore(els.el, want);
-      prev = els.el;
+      if (want !== el) this.listEl.insertBefore(el, want);
+      prev = el;
+    };
+    // WHAT to place, and under which key, is a pure projection — `listSlots`,
+    // pinned in `test/agentsviewmodel.test.ts` (#2371 review round 2,
+    // premortem). What is left here is the placement and the sweep, which is
+    // the part this repo validates by hand.
+    for (const slot of listSlots(groups)) {
+      if (slot.kind === "header") {
+        seenGroups.add(slot.key);
+        const header = this.groups.get(slot.key) ?? this.createGroup();
+        this.groups.set(slot.key, header);
+        // A rename re-labels the header in place. Guarded, so the common case
+        // (nothing renamed) writes no text at all.
+        if (header.title !== slot.title) {
+          header.title = slot.title;
+          header.el.textContent = slot.title;
+        }
+        place(header.el);
+      } else {
+        seenRows.add(slot.key);
+        rowCount += 1;
+        const els = this.rows.get(slot.key) ?? this.createRow(slot.row);
+        this.rows.set(slot.key, els);
+        this.updateRow(els, slot.row);
+        place(els.el);
+      }
     }
-    for (const [key, els] of [...this.rows]) {
-      if (seen.has(key)) continue;
-      els.el.remove();
-      this.rows.delete(key);
-    }
-    // The empty line lives at the end and is unhidden rather than created, so
-    // it is never in the way of the diff above.
-    this.emptyEl.hidden = rows.length > 0;
+    sweep(this.groups, seenGroups);
+    sweep(this.rows, seenRows);
+    this.renderEmpty(rowCount);
+  }
+
+  /** The "nothing to show" line. Unhidden rather than created, and re-appended
+   *  last, so it is never in the way of the placement walk above. */
+  private renderEmpty(rowCount: number): void {
+    this.emptyEl.hidden = rowCount > 0;
     this.emptyEl.textContent =
       this.filter === "all"
         ? "No panes open in this window."
         : `No panes are ${AGENT_STATE_LABEL[this.filter]}.`;
     if (!this.emptyEl.hidden) this.listEl.appendChild(this.emptyEl);
+  }
+
+  private createGroup(): GroupEls {
+    const el = document.createElement("div");
+    el.className = "agents-group";
+    // A heading, not a decoration: a screen reader walking the list gets the
+    // same "which workspace am I in" the sighted reader gets from the rule.
+    el.setAttribute("role", "heading");
+    el.setAttribute("aria-level", "3");
+    // Seeded empty and filled by the caller's guarded write, so `title` below
+    // ("") and the element's text agree from the first paint — the seed and the
+    // pristine check are one question asked twice.
+    return { el, title: "" };
   }
 
   private createRow(row: AgentRow): RowEls {
@@ -256,16 +391,42 @@ export class AgentsView {
     el.type = "button";
     const top = document.createElement("div");
     top.className = "agents-top";
+    const mark = document.createElement("span");
+    mark.className = "agents-mark";
     const name = document.createElement("span");
     name.className = "agents-name";
     const state = document.createElement("span");
     state.className = "agents-state";
-    top.append(name, state);
+    top.append(mark, name, state);
     const identity = document.createElement("div");
     identity.className = "agents-identity";
     el.append(top, identity);
     el.addEventListener("click", () => this.deps.focus(row.key));
-    return { el, name, identity, state, row };
+    // Seeded to a key no `markKey` can produce, so the first `updateRow` always
+    // paints. `""` is not a candidate — `markKey` always emits a JSON array —
+    // and the `was === row` arm covers it too; belt and braces on the one path
+    // where an unpainted element must not be mistaken for a current one.
+    return { el, mark, markKey: "", name, identity, state, row };
+  }
+
+  /** Paint the agent-type mark (#2371).
+   *
+   *  Guarded on the harness because the write is `innerHTML`: a pane's CLI
+   *  changes only on a respawn, so writing it every tick would be a subtree
+   *  rebuild once a second for a glyph that never moves — the same reason the
+   *  state cell is guarded.
+   *
+   *  `view.svg` is the module's own markup and is documented safe for
+   *  `innerHTML`; `view.label` is TEXT and is assigned to `title`, never
+   *  interpolated (`agenticons.ts` §Safety). */
+  private paintMark(el: HTMLElement, row: AgentRow): void {
+    const view = agentRowMark(row);
+    el.innerHTML = view?.svg ?? "";
+    // Hidden rather than empty-but-present: an empty inline element still takes
+    // the flex gap, so a shell pane's name would sit indented from an agent's.
+    el.hidden = view === null;
+    if (view === null) el.removeAttribute("title");
+    else el.title = view.label;
   }
 
   /** Write only what changed. The state cell is guarded on the previous
@@ -276,6 +437,20 @@ export class AgentsView {
     const was = els.row;
     els.row = row;
     if (els.name.textContent !== row.name) els.name.textContent = row.name;
+    // `was === row` is the freshly-created row — see the state cell below.
+    //
+    // KEYED ON THE MARK'S OWN INPUTS, never on `harness` (#2371 review round 3,
+    // finding 1). `Pane.key` is `readonly` and survives `respawnFresh`, so this
+    // element outlives a respawn that rewrites the launch line — and `harness`
+    // is `sessionCliFromCommand`, which answers null for half of `AGENTS`. A
+    // `codex` pane promoted in place to a `gemini` orchestrator therefore moved
+    // the header's badge and left the row's alone, forever: the W1 divergence
+    // reappearing in the paint cache instead of in the derivation.
+    const markKeyNow = markKey(row.mark);
+    if (was === row || els.markKey !== markKeyNow) {
+      els.markKey = markKeyNow;
+      this.paintMark(els.mark, row);
+    }
     const identity = agentIdentityLine(row);
     if (els.identity.textContent !== identity) els.identity.textContent = identity;
     // `was === row` is the freshly-created row: `createRow` seeds `row` with

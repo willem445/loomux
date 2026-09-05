@@ -34,9 +34,20 @@ resized by changing tabs. `Ctrl+Shift+P` still opens the Sessions tab.
 
 ## A row
 
-Each row carries the pane's name, its state, and a quiet line naming whichever
-of these the pane has: the agent CLI it is running, its orchestration role or
-workflow block, and its group.
+Each row carries the agent CLI's mark, the pane's name, its state, and a quiet
+line naming whichever of these the pane has: the agent CLI it is running, its
+orchestration role or workflow block, and its group.
+
+The mark is the same one the pane header wears, resolved from the same reading —
+GitHub's Copilot glyph where a vendor publishes a licensed one, a lettered badge
+otherwise, and for a remote pane whose profile does not say which agent runs on
+the far end, a neutral badge that says orrerix does not know.
+
+A pane that is not an agent is never given a guess. A pane with no launch line at
+all — one you opened and typed into yourself — carries no mark; a pane launched
+with a shell or a transport (`bash`, `pwsh`, `ssh`) carries the same neutral
+badge its header does, because naming it "Agent CLI: bash" would be a confident
+wrong answer.
 
 **Click a row to go to that pane** — it switches to the pane's project tab,
 makes it the active pane there, and focuses the terminal.
@@ -46,6 +57,24 @@ somewhere you can see. If the pane is parked in the dock, it comes back into
 the grid; if another pane is filling the window, that fullscreen drops first.
 Clicking the row of the pane that is *already* fullscreen leaves it
 fullscreen — you are looking at it, so there is nothing to reveal.
+
+## Groups, and the order
+
+Rows are grouped under the project tab they live in, with the tab's name as the
+header. A tab with no panes in the list shows no header — including a tab whose
+rows have all been filtered out by a chip.
+
+The pair of buttons beside the **Agents** heading chooses which group comes
+first:
+
+| Order | Groups come in this order |
+| --- | --- |
+| **most wants you** | The tab holding the most urgent pane first. Two tabs whose worst pane is in the same state stay in your tab-strip order. |
+| **by tab** | Your tab-strip order — the arrangement you dragged the tabs into. Never alphabetical, so renaming a tab does not reshuffle the list. |
+
+Inside a group the order is the same either way: most wants you first, then by
+name. Your choice is remembered on this machine, and changing it does not resize
+anything.
 
 ## The states
 
@@ -124,7 +153,8 @@ not change.
   starts a background poll of its own, or sends a keystroke to find out what a
   pane is doing.
 - **No resize.** Opening and closing the panel resizes the panes exactly as it
-  always did; switching between its two tabs does not resize anything.
+  always did; switching between its two tabs, filtering, and changing the group
+  order do not resize anything.
 - **This window only.** A pane in another orrerix window, or an agent with no
   pane open, is not listed. The [session browser](session-browser.html) is where
   work you are not currently looking at lives.

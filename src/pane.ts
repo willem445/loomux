@@ -106,7 +106,7 @@ import {
 import { FileEditView } from "./fileedit";
 import { FileExplorerView } from "./fileexplorer";
 import { icon } from "./icons.ts";
-import { agentMark } from "./agenticons.ts";
+import { agentMark, type AgentMarkInput } from "./agenticons.ts";
 import { WorkflowView } from "./workflowview";
 import { WORKFLOW_FILE } from "./workflowmodel";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
@@ -117,7 +117,7 @@ import { adoptableSessionId, hasForkSession, sessionCliFromCommand } from "./pan
 // name the same CLIs by construction (#722).
 import type { Cli } from "./sessionreconcile";
 import { PaneActivity } from "./paneactivity.ts";
-import type { PaneFacts } from "./agentrows.ts";
+import type { PaneFacts, TabRef } from "./agentrows.ts";
 import { notesApplyToPane } from "./notesmodel.ts";
 
 // The header's icons, from the registry (#879 slice K). They were hand-drawn
@@ -3272,13 +3272,36 @@ export class Pane implements VoiceTargetPane {
    *  pane runs, so unlike the app's decorative icons it needs an accessible name. The
    *  `<svg>` inside stays `aria-hidden` — it is the labelled element's artwork, and
    *  announcing both would read the name twice. */
-  private refreshAgentMark(): void {
-    const view = agentMark({
+  /** Everything `agenticons.ts` is allowed to know about this pane, as ONE
+   *  reading — the single source for every surface that draws this pane's
+   *  agent mark.
+   *
+   *  It exists because there were two (#2371 review round 2, W1). The header
+   *  resolved its mark from the launch line through `programFromRestore`, which
+   *  reads any program name; the Agents row resolved from `facts().harness`,
+   *  which is `agentCli` — `sessionCliFromCommand`, a CLOSED four-name
+   *  membership test that exists for SESSION-STORE ADOPTION and answers `null`
+   *  for `codex`, `gemini`, `hermes` and `ante`. So a local `codex` pane wore
+   *  "Agent CLI: codex" in its header and NOTHING in its row, and an SSH
+   *  profile declaring `defaultCli: "codex"` drew a mark where its local twin
+   *  drew none. Widening the row's whitelist would have fixed today's four
+   *  names and left the divergence in place for the fifth; one derivation
+   *  cannot diverge at all.
+   *
+   *  `harness` is deliberately NOT this and is not being replaced: it answers
+   *  "which session store covers this pane", which is a different question with
+   *  a legitimately narrower answer. See `PaneFacts.harness`. */
+  get agentMarkInput(): AgentMarkInput {
+    return {
       command: this.spawnCommand,
       argv: this.spawnArgv,
       knownCli: this.sshDefaultCli,
       remote: this.isSshPane,
-    });
+    };
+  }
+
+  private refreshAgentMark(): void {
+    const view = agentMark(this.agentMarkInput);
     this.agentMarkEl.hidden = !view;
     this.agentMarkEl.innerHTML = view?.svg ?? "";
     if (view) {
@@ -5195,8 +5218,17 @@ export class Pane implements VoiceTargetPane {
    *
    *  Same contract as `tabPaneInfo()` below and for the same reason: it reads
    *  no geometry, starts no IPC and touches no timer, so it is safe to call on
-   *  a hidden tab, on every row of a list, once a second. */
-  facts(): PaneFacts {
+   *  a hidden tab, on every row of a list, once a second.
+   *
+   *  @param tab which tab this reading is being taken from (#2371), or `null`
+   *  when the caller is not grouping and has nothing to name. Supplied rather
+   *  than derived because a `Pane` holds no back-reference to its `Workspace`
+   *  — see `TabRef` in `agentrows.ts`. (Folded into this block rather than
+   *  given its own: two consecutive doc comments leave TypeScript attaching
+   *  only the second, so the paragraphs above reached no hover and no generated
+   *  doc — #1229's doc-splice signature in its TypeScript form, found in
+   *  #2371 review round 2, W4.) */
+  facts(tab: TabRef | null = null): PaneFacts {
     // ONE reading of `tabPaneInfo()`, for `kind` and for `alive` both. `alive`
     // is deliberately NOT `ptyId !== null && !exited`: a CONTENT pane (files,
     // editor, git, workflow) has no PTY by design and is fully functional the
@@ -5208,12 +5240,20 @@ export class Pane implements VoiceTargetPane {
       key: this.key,
       name: this.name,
       kind: info.kind,
+      tab,
       // Read off the launch line, never branched on a CLI name to produce a
       // name (#722/#841): `agentCli` is the shared first-token parse, and the
       // SSH profile's declared far-end CLI is the only answer available for a
       // pane whose local argv is an ssh client. A CLI neither knows shows up
       // as null rather than inheriting some other CLI's identity.
+      //
+      // This is the SESSION-STORE question and answers only the four CLIs
+      // loomux can scan sessions for. It is not what decides the icon — `mark`
+      // below is, and reading this one instead is #2371 review round 2's W1.
       harness: this.agentCli ?? this.sshDefaultCli ?? null,
+      // ONE reading, shared with the pane header (`refreshAgentMark`), so the
+      // two surfaces cannot disagree about which program a pane is running.
+      mark: this.agentMarkInput,
       orch: this.orchGroup
         ? { group: this.orchGroup, agentId: this.orchAgent, role: this.orchRoleName }
         : null,

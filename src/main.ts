@@ -2556,7 +2556,17 @@ const sessions = new SessionBrowser(
 // selected) transition, which is what the view's poll gate needs — component
 // scope and window visibility are different questions and it answers both.
 agentsView = new AgentsView(leftPanel.agentsBody, {
-  facts: () => tabs.tabs.flatMap((ws) => ws.grid.allPanes().map((pane) => pane.facts())),
+  // The tab is passed IN rather than looked up (#2371): this walk already
+  // holds it — `ws` is the workspace and its position in `tabs.tabs` IS the
+  // strip order the human dragged the tabs into — and a `Pane` carries no
+  // back-reference to its `Workspace` to look it up from. `index` comes from
+  // the walk rather than from a per-pane `indexOf`, which would be O(tabs) per
+  // pane for an answer the enumeration already has.
+  facts: () =>
+    tabs.tabs.flatMap((ws, index) => {
+      const tab = { id: ws.id, title: ws.name, index };
+      return ws.grid.allPanes().map((pane) => pane.facts(tab));
+    }),
   focus: (key) => {
     // Through `facts()`, not through `Pane.key` directly: slice A's contract is
     // that the key is READ THROUGH THE PROJECTION, so the view and the lookup
