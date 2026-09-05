@@ -14,6 +14,7 @@
 
 import { LAUNCHABLE_AGENT_PROGRAMS } from "./agents.ts";
 import { markProgram, type AgentMarkInput } from "./agenticons.ts";
+import { normalizeAgentProgram } from "./panerestore.ts";
 import { attentionPresentation, DECISION_REASONS, REPORT_REASONS } from "./attention.ts";
 import { ACTIVITY_FLOOR_BYTES, type ActivitySnapshot } from "./paneactivity.ts";
 
@@ -222,6 +223,12 @@ export function deriveAgentState(facts: PaneFacts): AgentState {
 /** Is this pane an AGENT pane at all? The Agents tab's MEMBERSHIP rule, and
  *  the one place it is decided (#2514).
  *
+ *  NOT `Pane.isAgentPane`, which shares the name and answers a different
+ *  question — "was this pane launched with a command", true for a hand-typed
+ *  `make` pane, which this is false for. That one gates the adopt-on-connect
+ *  gesture; this one decides the list. Neither is a substitute for the other
+ *  (#2514 review round 1, finding 1).
+ *
  *  The ladder below has no rung for this, by design: `deriveAgentState`
  *  answers "what is this pane doing" and its default rung is `working` —
  *  honestly read as "no evidence of a prompt". Asked about a shell the human
@@ -233,11 +240,11 @@ export function deriveAgentState(facts: PaneFacts): AgentState {
  *
  *  1. `orch` — an orchestration pane is an agent whatever it was launched
  *     with, and a manager pane can carry no harness at all.
- *  2. `harness` — the session-store CLI. Kept because it is set for a remote
- *     pane off the SSH profile's declared far-end CLI, where there is no local
- *     launch line naming the agent.
- *  3. the launch line, against the LAUNCHER'S OWN CATALOG
- *     (`LAUNCHABLE_AGENT_PROGRAMS`).
+ *  2. either NAME the facts carry — `harness` (which is the SSH profile's
+ *     declared far-end CLI on a remote pane, where no local launch line names
+ *     the agent) or the launch line via `markProgram` — tested against the
+ *     LAUNCHER'S OWN CATALOG. Both go through `namesLaunchableCli`, one
+ *     rule; see its doc for the asymmetry that cost.
  *
  *  ARM 3 IS NOT OPTIONAL AND ARM 2 CANNOT STAND IN FOR IT. `harness` is
  *  `sessionCliFromCommand`, a closed FOUR-name membership test built to match
@@ -257,9 +264,29 @@ export function deriveAgentState(facts: PaneFacts): AgentState {
  *  the launcher, which offers exactly these eight. */
 export function isAgentPane(facts: PaneFacts): boolean {
   if (facts.orch !== null) return true;
-  if (facts.harness !== null) return true;
-  const program = markProgram(facts.mark);
-  return program !== null && LAUNCHABLE_AGENT_PROGRAMS.has(program);
+  return namesLaunchableCli(facts.harness) || namesLaunchableCli(markProgram(facts.mark));
+}
+
+/** The catalog test, applied to every name `isAgentPane` reads.
+ *
+ *  ONE rule over BOTH inputs, and the asymmetry it removes was real (#2514
+ *  review round 2, W2). An earlier draft tested `mark` against the catalog
+ *  and accepted `harness` on sight. `harness` is `agentCli ?? sshDefaultCli`,
+ *  and only the first half is the closed four-name set: `sshDefaultCli` is
+ *  free text a human types into an SSH profile — `normalizeSshProfile` only
+ *  trims it, and the launcher deliberately APPENDS a select option for a
+ *  value its catalog does not offer. So a profile declaring `bash` walked in
+ *  through the very door the other arm exists to close, and the pane was a
+ *  counted agent row whose own header read "bash — a transport or shell, not
+ *  an agent". One pane, two answers: the divergence this module says it
+ *  exists to prevent (CLAUDE.md: a guard reads every one of its inputs by
+ *  one rule).
+ *
+ *  Normalized first, because `harness` is NOT pre-normalized on the
+ *  `sshDefaultCli` path the way `markProgram`'s answer is. */
+function namesLaunchableCli(name: string | null): boolean {
+  if (name === null) return false;
+  return LAUNCHABLE_AGENT_PROGRAMS.has(normalizeAgentProgram(name));
 }
 
 /** One row as the two views render it. `notes` is the count slot #2116 fills;

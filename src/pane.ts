@@ -4966,7 +4966,14 @@ export class Pane implements VoiceTargetPane {
    *  opposed to a plain interactive shell — the same distinction
    *  `liveKind()` makes internally. #271 W3 addendum, part A3: the
    *  adopt-on-connect gesture is offered for agent panes with no channel
-   *  identity yet; a plain terminal stays not-capable regardless. */
+   *  identity yet; a plain terminal stays not-capable regardless.
+   *
+   *  NOT the Agents tab's membership rule, which shares this name: see
+   *  `agentrows.ts`'s exported `isAgentPane(facts)`. This getter is true for
+   *  a hand-typed `make` pane — any launch command counts — and that one is
+   *  false for it, because being in the tab is a claim about which CLI is
+   *  running. Same name, disjoint consumers, different questions (#2514
+   *  review round 1, finding 1). */
   get isAgentPane(): boolean {
     return this.launchedCommand;
   }

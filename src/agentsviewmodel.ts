@@ -117,6 +117,25 @@ export function visibleGroups(
   return groupRows(rows.filter((r) => matchesFilter(r, filter)), order);
 }
 
+/** The line the list shows when it has no rows to show.
+ *
+ *  Pure, and here rather than in the view, because it is a CLAIM about the
+ *  window and it went false the moment membership arrived (#2514 review
+ *  round 2, W1). It used to read "No panes open in this window." and was true
+ *  by construction: the view projected every pane, so no rows MEANT no panes.
+ *  `agentRows` filters, so a window holding four shells and a git view would
+ *  have told a human staring at five panes that none were open — the same
+ *  class of false statement this whole change exists to stop, on the one
+ *  surface the human actually reads. It was pinned by no test, which is why a
+ *  green suite said nothing about it; it is pinned by one now.
+ *
+ *  The filtered branch was and stays correct: a chip is offered only for a
+ *  state something is in, so "No panes are X" is reachable mid-refresh and
+ *  says nothing about how many panes exist. */
+export function emptyMessage(filter: AgentFilter): string {
+  return filter === "all" ? "No agent panes in this window." : `No panes are ${AGENT_STATE_LABEL[filter]}.`;
+}
+
 /** One element the Agents list renders, in the order it renders them. `key` is
  *  the map key its element is held under — a tab id for a header, a pane key
  *  for a row — and the two kinds are keyed in SEPARATE maps, so a tab and a

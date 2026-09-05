@@ -392,7 +392,17 @@ export interface AgentMarkInput {
  */
 export function markProgram(input: AgentMarkInput): string | null {
   const known = input.knownCli?.trim();
-  if (known) return normalizeAgentProgram(known);
+  // `|| null` and not a bare return: `normalizeAgentProgram` strips a path
+  // prefix and an `.exe`/`.cmd`/`.bat` suffix, so a `knownCli` of `".exe"`
+  // or `"C:/bin/"` normalizes to the EMPTY string. Handing that on would make
+  // every caller depend on `""` being falsy, and `isAgentPane` would then ask
+  // the catalog about a name nobody wrote. This is the one input class where
+  // `agentMark` below answers differently than it did before the extraction
+  // (#2514 review round 2, R1): a remote pane there now reads "agent CLI
+  // unknown" rather than "Agent CLI not identified" -- both the unknown tier,
+  // and the remote wording is the truer of the two. No vendor or letter mark
+  // moves, and membership is unaffected: neither string is in the catalog.
+  if (known) return normalizeAgentProgram(known) || null;
   if (input.remote) return null;
   return programFromRestore(input.command ?? null, input.argv ?? null);
 }

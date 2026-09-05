@@ -30,6 +30,7 @@ import {
 import {
   AGENT_ORDER_LABEL,
   AGENT_STATE_LABEL,
+  emptyMessage,
   ORDER_CHOICES,
   agentIdentityLine,
   agentRowMark,
@@ -369,10 +370,7 @@ export class AgentsView {
    *  last, so it is never in the way of the placement walk above. */
   private renderEmpty(rowCount: number): void {
     this.emptyEl.hidden = rowCount > 0;
-    this.emptyEl.textContent =
-      this.filter === "all"
-        ? "No panes open in this window."
-        : `No panes are ${AGENT_STATE_LABEL[this.filter]}.`;
+    this.emptyEl.textContent = emptyMessage(this.filter);
     if (!this.emptyEl.hidden) this.listEl.appendChild(this.emptyEl);
   }
 

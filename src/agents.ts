@@ -16,7 +16,14 @@ export interface AgentDef {
   command: string;
 }
 
-export const AGENTS: AgentDef[] = [
+/** The catalog. `readonly` so a later feature cannot `push` a
+ *  user-configured or plugin CLI onto it at runtime: that would widen the
+ *  launcher and NOT the Agents tab, because `LAUNCHABLE_AGENT_PROGRAMS`
+ *  below is a snapshot taken at import — and the catalog test asserts the
+ *  eight names, so it would stay green through it (#2514 review round 2,
+ *  premortem 2). A compile error is the loud failure; a runtime freeze
+ *  would only be a late one. */
+export const AGENTS: readonly AgentDef[] = [
   { id: "claude", label: "Claude Code", command: "claude" },
   { id: "copilot", label: "Copilot CLI", command: "copilot" },
   { id: "codex", label: "Codex", command: "codex" },

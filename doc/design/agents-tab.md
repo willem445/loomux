@@ -315,6 +315,76 @@ no caller in `src/` outside `agentrows.ts` — decided on the module's own
 exported symbol, which cannot be renamed away without renaming the export, per
 CLAUDE.md's source-scanning-guard rule.
 
+### One catalog rule, over both names (review round 2, W2)
+
+The first draft tested `mark` against the catalog and accepted `harness` on
+sight. That was a bypass exactly the width of the asymmetry. `harness` is
+`agentCli ?? sshDefaultCli` (`src/pane.ts`), and only the first half is the
+closed four-name set: `sshDefaultCli` is **free text** a human types into an SSH
+profile — `normalizeSshProfile` only trims it, and the launcher deliberately
+*appends* a select option for a value its catalog does not offer. A profile
+declaring `bash` therefore made the pane a counted agent row whose own header
+read *"bash — a transport or shell, not an agent"*: one pane, two answers, which
+is the divergence this module says it exists to prevent.
+
+`namesLaunchableCli` is now the single rule and both names go through it, so
+there are two arms rather than three: an orchestration identity, or a launchable
+CLI named by *either* field. It normalizes first, because only `markProgram`'s
+answer arrives normalized — a profile declaring `Claude.exe` is the same claim
+as one declaring `claude`.
+
+### The empty-state line was the fourth surface (review round 2, W1)
+
+`AgentsView` used to print **"No panes open in this window."** whenever it had
+no rows and no filter was set. That sentence was true *by construction* while
+the view projected every pane: no rows meant no panes. Membership makes it
+false — a window holding four shells and a git view would have said it to a
+human looking at five panes — and it is the one surface a human actually reads,
+while the change's own argument (that the tab must not say a false thing about a
+pane) had been applied to the user doc, this note and the view's comment.
+
+It is now `emptyMessage(filter)` in `agentsviewmodel.ts`, pure and pinned. The
+filtered branch is unchanged and was always correct: it claims something about
+one state, not about the window.
+
+### `markProgram`'s one behavioural divergence (review round 2, R1)
+
+Extracting `markProgram` out of `agentMark` is behaviour-preserving on every
+input **except** a `knownCli` that normalizes to the empty string — `".exe"`,
+`"C:/bin/"` and the like, since `normalizeAgentProgram` strips a path prefix and
+an executable suffix. Before, that reached `agentMarkFor("")` and drew the
+unknown tier captioned *"Agent CLI not identified"*; now `markProgram` returns
+`null` explicitly and a remote pane draws *"Remote pane — agent CLI unknown"*.
+Both are the unknown tier, the remote wording is the truer of the two, no vendor
+or letter mark moves, and membership is untouched — neither string is in the
+catalog. Returning `null` rather than `""` is the load-bearing half: otherwise
+every caller depends on `""` being falsy, and `isAgentPane` asks the catalog
+about a name nobody wrote.
+
+### Residual: a wrapped launch line
+
+Membership reads the launch line's **first token**, so `bash -lc "claude"`,
+`npx claude` or a renamed shim names the wrapper and the pane is not a row.
+The cost is not only the row: it is outside `needsYouCount` too, and on a
+**closed** panel that badge is the only signal that an agent asked the human
+something — so the failure is silent and unbounded in time. It is pinned by a
+test rather than only described, badge half included.
+
+Parsing the wrapper was rejected. `bash -lc` is a shell whose argument is an
+arbitrary program; recovering the agent from it means a second, weaker parse
+beside `programFromRestore`, and it would answer confidently and sometimes
+wrongly — the failure mode `agenticons.ts` exists to refuse. Both docs name the
+case and the two ways out (launch the CLI itself; declare a remote profile's
+agent).
+
+### The catalog cannot widen behind the tab
+
+`LAUNCHABLE_AGENT_PROGRAMS` is a snapshot taken at import, and the test pins the
+eight names — so a later feature appending a user-configured or plugin CLI to
+`AGENTS` at runtime would widen the launcher and *not* this rule, with a green
+suite. `AGENTS` is therefore `readonly AgentDef[]`: the compiler refuses the
+push, which is a loud failure rather than a late one.
+
 ### Two corrections to the issue's own text
 
 Recorded because both were transcribed onto permanent surfaces before being

@@ -105,6 +105,12 @@ button:
   basis for calling it an agent, so it is not listed. Its pane header still
   wears a lettered badge — a badge is a fallback, and being listed here is a
   claim.
+- **a wrapped launch line**, for the same reason. Orrerix reads the *first*
+  word of the command, so `bash -lc "claude"`, `npx claude` or a shim under
+  another name names the wrapper, not the agent. The pane is not listed **and
+  is not counted**, so with the panel closed the button will not light up for
+  it. Launch it as the CLI itself, or — for a remote one — set the profile's
+  agent.
 - **an SSH pane whose profile names no far-end CLI.** The launch line describes
   the transport, not the agent. If you run an agent over that connection, set
   the profile's agent and the pane joins the list.

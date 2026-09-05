@@ -35,8 +35,9 @@ import {
 } from "../src/agentrows.ts";
 import { ACTIVITY_FLOOR_BYTES } from "../src/paneactivity.ts";
 import { AGENTS, LAUNCHABLE_AGENT_PROGRAMS } from "../src/agents.ts";
-import { agentMark } from "../src/agenticons.ts";
+import { agentMark, markProgram } from "../src/agenticons.ts";
 import { sessionCliFromCommand } from "../src/panerestore.ts";
+import { AGENT_STATE_LABEL, emptyMessage } from "../src/agentsviewmodel.ts";
 
 const T0 = 1_000_000;
 
@@ -864,7 +865,25 @@ test("nothing in src/ projects an agent row outside the membership rule (#2514)"
   // the "one rule, not two" the issue asks for. Decided on the SYMBOL — the
   // module's own API, which cannot be renamed away without renaming the export
   // — not on any binding's name (CLAUDE.md's source-scanning-guard rule).
-  const all = readdirSync(new URL("../src/", import.meta.url)).filter((f) => f.endsWith(".ts"));
+  // RECURSIVE, and that is finding 2 of review round 1: an earlier draft read
+  // only `readdirSync("../src/")` filtered on `.ts`, so a future `src/sub/`
+  // module could call `toAgentRow` and escape a guard whose own name claims
+  // "nothing in src/". `vendor/` is excluded BY NAME with a reason: it is
+  // third-party source this repo may not edit in place (`THIRD_PARTY_NOTICES`),
+  // so a hit there would be unfixable rather than a finding — and the walk
+  // asserts below that it really did descend, so the exclusion cannot quietly
+  // become the whole answer.
+  const walk = (rel: string): string[] =>
+    readdirSync(new URL(`../src/${rel}`, import.meta.url), { withFileTypes: true }).flatMap((e) =>
+      e.isDirectory()
+        ? e.name === "vendor"
+          ? []
+          : walk(`${rel}${e.name}/`)
+        : e.name.endsWith(".ts")
+          ? [`${rel}${e.name}`]
+          : [],
+    );
+  const all = walk("");
   const hits = (files: string[]) =>
     files.flatMap((f) =>
       readFileSync(new URL(`../src/${f}`, import.meta.url), "utf8")
@@ -882,4 +901,123 @@ test("nothing in src/ projects an agent row outside the membership rule (#2514)"
   // nothing at all would report zero denials and pass. `agentrows.ts` really
   // does carry the symbol — its declaration and `agentRows`' own call.
   assert.equal(hits(["agentrows.ts"]).length, 2, "the scan cannot see toAgentRow where it is defined and used");
+  // ...and that the walk really DESCENDS, so "recursive" is not a claim about
+  // a loop that only ever saw the top level. `src/` has exactly one
+  // subdirectory today and it is the excluded one, so the subject is a
+  // directory the walk is asked to skip: assert it was SEEN and skipped,
+  // which is the only observable a correct walk and a top-level-only loop
+  // differ on here.
+  const dirs = readdirSync(new URL("../src/", import.meta.url), { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name);
+  assert.deepEqual(dirs, ["vendor"], "src/ gained a subdirectory — check the scan still reaches it");
+  assert.equal(
+    all.some((f) => f.startsWith("vendor/")),
+    false,
+    "vendor/ is third-party and deliberately outside this guard",
+  );
+});
+
+test("one catalog rule over BOTH names the facts carry (#2514 review round 2, W2)", () => {
+  // `harness` is `agentCli ?? sshDefaultCli`, and `sshDefaultCli` is FREE TEXT:
+  // `normalizeSshProfile` only trims it, and the launcher appends a select option
+  // for a value its catalog does not offer. An earlier draft tested `mark`
+  // against the catalog and accepted `harness` on sight, so this profile walked
+  // in through the door the other arm exists to close.
+  const declaredShell = shell({
+    name: "prod",
+    harness: "bash",
+    mark: { command: "ssh prod", argv: null, knownCli: "bash", remote: true },
+  });
+  assert.equal(isAgentPane(declaredShell), false);
+  // The divergence that made it a defect rather than a preference: the very same
+  // pane's header says, in so many words, that it is not an agent. One pane must
+  // not get two answers.
+  assert.equal(agentMark(declaredShell.mark)?.kind, "unknown");
+  assert.match(agentMark(declaredShell.mark)?.label ?? "", /not an agent/);
+
+  // POSITIVE CONTROL on the same door: a profile declaring a real CLI still
+  // opens it, so the fix is a catalog test and not a blanket refusal of
+  // `harness`.
+  const declaredAgent = shell({
+    name: "prod",
+    harness: "claude",
+    mark: { command: "ssh prod", argv: null, knownCli: "claude", remote: true },
+  });
+  assert.equal(isAgentPane(declaredAgent), true);
+
+  // And the rule is applied to `harness` in the same SHAPE as to the launch
+  // line — normalized. A profile declaring `Claude.exe` is the same claim as one
+  // declaring `claude`, and only `markProgram`'s answer arrives pre-normalized.
+  assert.equal(isAgentPane(shell({ harness: "C:\\tools\\Claude.exe" })), true);
+  assert.equal(isAgentPane(shell({ harness: "C:\\tools\\Make.exe" })), false);
+});
+
+test("a knownCli that normalizes to nothing names no program (#2514 review round 2, R1)", () => {
+  // `normalizeAgentProgram` strips a path prefix and an `.exe`/`.cmd`/`.bat`
+  // suffix, so these normalize to the EMPTY string. `markProgram` returns null
+  // rather than `""`, so no caller depends on `""` being falsy and the catalog is
+  // never asked about a name nobody wrote.
+  for (const knownCli of [".exe", ".cmd", "C:/bin/"]) {
+    assert.equal(markProgram({ knownCli, remote: true }), null, `${knownCli} names no program`);
+    assert.equal(isAgentPane(shell({ harness: knownCli, mark: { knownCli, remote: true } })), false);
+    // The mark still DRAWS, on the unknown tier — the pane is remote and orrerix
+    // says so rather than saying nothing.
+    assert.equal(agentMark({ knownCli, remote: true })?.kind, "unknown");
+  }
+  // POSITIVE CONTROL: the same function on a name that survives normalization.
+  assert.equal(markProgram({ knownCli: "C:/bin/Claude.exe", remote: true }), "claude");
+});
+
+test("the empty-state line does not claim the window is empty (#2514 review round 2, W1)", () => {
+  // It used to read "No panes open in this window.", true by construction while
+  // the view projected every pane and FALSE the moment membership arrived: a
+  // window of shells and a git view would have said that to a human looking at
+  // them. No test pinned the string, which is why a green suite said nothing.
+  assert.equal(emptyMessage("all"), "No agent panes in this window.");
+  assert.doesNotMatch(emptyMessage("all"), /panes open/);
+  // The filtered branch was correct and stays correct — it is a claim about one
+  // state, not about the window.
+  assert.equal(emptyMessage("turn-done"), "No panes are turn done.", "the LABEL, not the state key");
+  for (const state of Object.keys(AGENT_STATE_LABEL) as AgentState[]) {
+    assert.match(emptyMessage(state), /^No panes are .+\.$/, `the ${state} chip's empty line`);
+  }
+});
+
+test("a wrapper launch line is not an agent row, and that is the stated residual (#2514)", () => {
+  // RESIDUAL, pinned rather than described (CLAUDE.md: a documented blind spot
+  // is a counterfactual, and only a test that performs it pins it). Membership
+  // reads the FIRST token, so a shell wrapper around a real agent names the
+  // wrapper. Both docs say so.
+  for (const command of ['bash -lc "claude"', "npx claude", "my-claude-shim"]) {
+    assert.equal(isAgentPane(shell({ mark: { command, argv: null, knownCli: null, remote: false } })), false, command);
+  }
+  // The cost is not only the row: the pane is outside `needsYouCount` too, and
+  // on a closed panel that badge is the only signal that an agent asked
+  // something. This asserts the residual's real size rather than its comfortable
+  // half.
+  const wrapped = shell({
+    mark: { command: 'bash -lc "claude"', argv: null, knownCli: null, remote: false },
+    attention: { reason: "gate", detail: null },
+  });
+  assert.equal(deriveAgentState(wrapped), "question", "positive control: it IS a pane wanting the human");
+  assert.equal(needsYouCount(agentRows([wrapped])), 0, "…and membership costs the badge, not just the row");
+  // The way out is the one the docs name — declare it, or launch it unwrapped.
+  assert.equal(isAgentPane(shell({ mark: { command: "claude", argv: null, knownCli: null, remote: false } })), true);
+});
+
+test("the catalog cannot be widened at runtime behind the tab (#2514 review round 2, premortem 2)", () => {
+  // `LAUNCHABLE_AGENT_PROGRAMS` is a snapshot taken at import, and the catalog
+  // test above asserts the eight names — so a runtime `AGENTS.push` would widen
+  // the launcher, not the tab, with a green suite. `AGENTS` is `readonly`, which
+  // makes that a compile error; this pins the runtime half of the same claim,
+  // since `tsc` does not run over `test/`.
+  assert.equal(Array.isArray(AGENTS), true);
+  const snapshot = AGENTS.map((a) => a.id);
+  assert.deepEqual(
+    snapshot,
+    ["claude", "copilot", "codex", "opencode", "pi", "gemini", "hermes", "ante", "custom"],
+    "the catalog changed — widen LAUNCHABLE_AGENT_PROGRAMS' pin above deliberately",
+  );
+  assert.equal(LAUNCHABLE_AGENT_PROGRAMS.size, snapshot.length - 1);
 });
