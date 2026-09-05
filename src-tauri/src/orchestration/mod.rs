@@ -40705,6 +40705,11 @@ impl OrchRegistry {
             let mut groups = self.groups.lock_safe();
             let g = groups.get_mut(group).ok_or("unknown group")?;
             g.guardrails.blocks = guardrails.blocks.clone();
+            // The vocabulary moves with the roster it was resolved beside — the
+            // in-memory half of the same fix. `persist_roster` above already wrote
+            // it, so omitting it here is the worst shape: group.json and the live
+            // guardrails disagreeing about which `hold` label the group answers to.
+            g.guardrails.intake = guardrails.intake.clone();
             g.guardrails.advanced_orchestrator = on;
         }
         // Only now that the persist succeeded — see `loaded_audit`'s doc above.

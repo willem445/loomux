@@ -46498,12 +46498,18 @@ fn the_toggle_off_restores_the_builtin_intake_vocabulary() {
 
 /// `f.yml`: the same roster as `default`, with the orchestrator block given
 /// knobs a RUNNING pane cannot pick up until it is resumed.
+///
+/// `model: sonnet` and not `opus`, deliberately: an orchestrator block's
+/// resolved default on claude IS `opus`, so declaring it would be the value the
+/// group already runs and `roster_diff` would — correctly — report no `model`
+/// change at all. The first cut of this fixture did exactly that and the test
+/// asserted a key the diff had no reason to carry.
 fn write_workflow_f(repo: &std::path::Path) {
     fs::write(
         repo.join(".orrerix").join("workflows").join("f.yml"),
         "version: 1\nname: knobs\n\
          blocks:\n\
-         \x20 - id: orchestrator\n    kind: orchestrator\n    model: opus\n    effort: high\n\
+         \x20 - id: orchestrator\n    kind: orchestrator\n    model: sonnet\n    effort: high\n\
          \x20 - id: w-a\n    kind: worker\n\
          \x20 - id: rev-a\n    kind: reviewer\n    prompt: Everything.\n\
          gates:\n  merge:\n    reviewers: [rev-a]\n",
