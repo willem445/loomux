@@ -37295,15 +37295,6 @@ impl OrchRegistry {
         // is refused for them here as well as being hidden for them in the
         // launcher. Naming the follow-up in the message matters: this is a
         // missing seam, not a policy, and whoever reads it should know which.
-        if !cli_caps(cli).is_some_and(|c| c.mcp_argv_seam) {
-            return Err(format!(
-                "{cli} cannot host a lead pane yet: its MCP config is delivered through the \
-                 pane's environment or a config file, not as flags on the command line the \
-                 launcher builds, and a lead with no orrerix MCP server holds none of the \
-                 tools this toggle grants. See doc/design/lead-pane.md — widening the prepare \
-                 seam to carry environment pairs is the follow-up that lifts this."
-            ));
-        }
         validate_group_repo(cwd)?;
 
         // Every roster loomux synthesizes on a group's behalf pins no model
