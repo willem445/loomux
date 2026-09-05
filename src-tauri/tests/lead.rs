@@ -1613,8 +1613,12 @@ fn an_ordinary_group_reusing_a_dead_leads_id_is_not_a_lead_group() {
 fn a_failed_lead_prepare_leaves_no_marker() {
     let dir = tempfile::tempdir().unwrap();
     let reg = Arc::new(relaunch_registry(dir.path()));
-    // Deliberately NO `set_port`: `write_mcp_config` refuses, which is the first
+    // The port is zeroed, not merely left unset: `relaunch_registry` above sets
+    // one, so "just do not call `set_port`" does NOT produce a failing prepare —
+    // the first version of this test asserted exactly that and the prepare
+    // SUCCEEDED. `write_mcp_config` refuses on `port == 0`, and it is the first
     // `?` below where the marker used to be written.
+    reg.set_port(0);
     let repo = real_repo();
     let err = reg
         .lead_prepare("claude", &repo.path(), "l", 4, false, 5, 0, 5)
