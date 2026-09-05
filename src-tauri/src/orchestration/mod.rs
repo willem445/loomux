@@ -33473,7 +33473,6 @@ impl OrchRegistry {
         // Best-effort like the `paused` remove it mirrors: a marker that could
         // not be deleted leaves the pre-existing refusal standing, which is the
         // direction this fails in either way.
-        let _ = fs::remove_file(dir.join(LEAD_MARKER));
 
         // #407: a PROMOTE reattaching a dormant group brings the promote
         // modal's defaults with it — a right-click is not the launcher, and
