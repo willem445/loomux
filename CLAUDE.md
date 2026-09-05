@@ -274,10 +274,10 @@ compiles.
 - Backend: unit tests inline under `#[cfg(test)]` only if they don't link the
   full lib; otherwise integration tests (constraint 4). Orchestration logic is
   covered in `src-tauri/tests/orchestration.rs`.
-- **An edit to a role template (`orchestrator|worker|reviewer|planner.md` under
-  `src-tauri/src/orchestration/templates/`) re-blesses
+- **An edit to a role template (`orchestrator|worker|reviewer|planner|manager|lead.md`
+  under `src-tauri/src/orchestration/templates/`) re-blesses
   `src-tauri/tests/fixtures/pre222/` in the same commit** — the fixtures pin those
-  four templates byte-for-byte modulo registered placeholders
+  six templates byte-for-byte modulo registered placeholders
   (`block.md`/`workflow.md` are deliberately not fixture-pinned; an edit whose
   only change is a `{{...}}` placeholder registered in LIVE needs no re-bless —
   the pin strips registered keys before comparing, precedent #859). Signature: `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares`

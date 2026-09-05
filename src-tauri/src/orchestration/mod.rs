@@ -804,16 +804,16 @@ pub const MANAGER_TPL: &str = include_str!("templates/manager.md");
 /// nobody turned on. It is written by the block loop, for the roster the
 /// launcher's toggle mints.
 ///
-/// **Unlike `manager.md` it is NOT golden-pinned in this slice**, and that is a
-/// decision rather than an oversight. The pin (`tests/fixtures/pre222/` + the
-/// `LIVE` pairing in `tests/workflow.rs`) exists to make an accidental edit to
-/// bytes a shipped pane already reads fail loudly; nothing delivers this file
-/// yet — slice A ships the CLASS, and the launch path that pastes a kickoff is
-/// slice B — so there is no shipped reading to regress. `block.md` and
-/// `workflow.md` are unpinned on the same terms. It joins the pin in the slice
-/// that delivers it, when its per-CLI content is settled, rather than being
-/// blessed once here and re-blessed there — a fixture re-blessed per slice is
-/// one chance per slice to bless a mistake.
+/// **Golden-pinned since slice B**, and the timing was the decision. The pin
+/// (`tests/fixtures/pre222/` + the `LIVE` pairing in `tests/workflow.rs`)
+/// exists to make an accidental edit to bytes a shipped pane already reads
+/// fail loudly. Slice A shipped the CLASS and delivered nothing, so there was
+/// no shipped reading to regress and pinning then would have meant a re-bless
+/// in slice B — one chance per slice to bless a mistake. Slice B ships the
+/// launch path that pastes this file's kickoff, so it is pinned here, in
+/// `GOLDENS` and `LIVE` but NOT in `PRE222`: a default group has no lead block,
+/// so no `lead.md` is written into its dir. `block.md` and `workflow.md` stay
+/// unpinned, on the terms this paragraph used to state for all three.
 ///
 /// It carries `{{GROUP_ID}}` and `{{REPO}}` and no other placeholder: a lead
 /// may never carry a repo persona (`workflow::persona_allowed` is false for
@@ -870,7 +870,7 @@ pub(crate) fn role_template(role: Role) -> &'static str {
         // block loop renders every block in a roster, so it runs the moment a
         // lead block exists — which is before any lead pane is opened, and in a
         // function whose failure mode would be a process abort rather than an
-        // error. See [`LEAD_TPL`] for why it is not golden-pinned in this slice.
+        // error. See [`LEAD_TPL`] for when it joined the golden pin, and why.
         Role::Lead => LEAD_TPL,
     }
 }
@@ -4856,26 +4856,44 @@ fn human_pane_entry(
 /// harness's own in-process subagents will use them, because they are one call
 /// away and `spawn_agent` is three.
 ///
-/// # Per CLI, cited
+/// # Per CLI, cited to the vendor page as fetched
 ///
-/// - **claude — `--disallowedTools Agent`.** Claude Code's CLI reference on a
-///   bare tool name: "A bare tool name removes the matching tools from Claude's
-///   context." Its sub-agents page names the tool to deny: "To prevent Claude
-///   from delegating to any subagent, deny the `Agent` tool itself" (the tool
-///   was renamed from `Task` to `Agent` in 2.1.63). `CLAUDE_CODE_DISABLE_
-///   EXPLORE_PLAN_AGENTS` is narrower — it covers the built-in explore/plan
-///   agents only — and is not used here.
-/// - **copilot — nothing, and the gap is documented rather than papered over.**
-///   Copilot's custom-agents page confirms it HAS subagents ("the main Copilot
-///   agent can run them as subagents with a separate context window"), but the
-///   documented `--deny-tool`/`--excluded-tools` value shapes are `shell(...)`,
-///   `write` and `MCP(tool)` (already recorded at `KNOWN_COPILOT_DENY_
-///   CATEGORIES`), and no subagent tool NAME is documented. So a copilot lead
-///   is instruction-only: `templates/lead.md` asks it to prefer `spawn_agent`
-///   and nothing structurally stops it doing otherwise. Inventing a flag value
-///   the vendor does not document would be a claim, not a denial.
-/// - **pi — nothing to deny.** Its usage docs: pi "intentionally does not
-///   include built-in MCP, sub-agents, …" — there is no mechanism to disable.
+/// - **claude — `--disallowedTools Agent`.** Two documented facts composed,
+///   and the composition is stated because neither page states it alone. The
+///   sub-agents page names the TOOL and the deny: "To prevent Claude from
+///   delegating to any subagent, deny the `Agent` tool itself with
+///   `permissions.deny`" (and, in a note: "In version 2.1.63, the Task tool was
+///   renamed to Agent. Existing `Task(...)` references in settings and agent
+///   definitions still work as aliases"). The CLI reference gives the flag that
+///   spells a deny rule on a command line: `--disallowedTools` is "Deny rules. A
+///   bare tool name removes the matching tools from Claude's context: `\"Edit\"`
+///   removes Edit, `\"*\"` removes every tool". So a bare `Agent` on that flag is
+///   the argv spelling of the deny the sub-agents page prescribes.
+///   `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` is narrower — the built-in
+///   explore/plan agents only — and is not used here.
+/// - **copilot — nothing, and the reason is the FLAG, not the tool.** The plan
+///   this slice was written from recorded copilot as documenting no subagent
+///   tool name at all; re-fetching says otherwise, so the premise is corrected
+///   here rather than transcribed. `custom-agents-configuration` does name one
+///   — the `agent` tool (aliases `custom-agent`, `Task`), "Allows a different
+///   custom agent to be invoked to accomplish a task" — but it names it as a key
+///   in a custom agent's own `tools:` list, which is a FILE orrerix would have to
+///   hand the pane with `--agent`, replacing whatever agent the human chose.
+///   The flag seam this function writes into cannot express it: the CLI
+///   configuration guide says "To use the --deny-tool and --allow-tool options,
+///   you must specify what type of tool you want to allow or deny" and lists
+///   exactly three — shell commands, `write`, and MCP server tools (the same
+///   enumeration `KNOWN_COPILOT_DENY_CATEGORIES` is pinned against). A bare tool
+///   name is not among them. So a copilot lead is instruction-only:
+///   `templates/lead.md` asks it to prefer `spawn_agent` and nothing
+///   structurally stops it doing otherwise. Inventing a `--deny-tool agent`
+///   value the vendor does not document would be a claim, not a denial; the
+///   follow-up is the generated-custom-agent route, which is a product decision
+///   about overriding the human's own `--agent` choice and not this slice's.
+/// - **pi — nothing to deny.** `docs/usage.md` at the pinned tag: pi "intentionally
+///   does not include built-in MCP, sub-agents, permission popups, plan mode,
+///   to-dos, or background bash", and no delegation tool appears in its toolset
+///   (`read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`).
 ///
 /// The absent CLIs (opencode, codex, gemini) never reach here:
 /// `lead_prepare` refuses any CLI without an argv MCP seam before calling this.

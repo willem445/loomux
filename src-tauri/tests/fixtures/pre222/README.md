@@ -1288,3 +1288,38 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   Nothing else in the template moved: `withdraw_question` stays exactly as it was, because an
   agent still cannot dismiss and taking your own question back is still the verb for a question
   the fleet no longer needs.
+
+- **#2519 slice B, `lead.md` JOINS this directory** — nothing already here changed.
+  `orchestrator.md`, `worker.md`, `reviewer.md`, `planner.md`, `manager.md` and
+  `orchestrator-playbook.md` are byte-identical to their previous blessed copies; the only
+  new file is `lead.md`, and it is a byte copy of the live template with no edit at all.
+
+  **Why it was not blessed in slice A, and why it is now.** The pin exists to make an
+  accidental edit to bytes a shipped pane already reads fail loudly. Slice A shipped the
+  `Role::Lead` capability class and delivered nothing — `orch_lead_prepare` did not exist —
+  so there was no shipped reading to regress, and blessing then would have meant blessing
+  again in slice B when the per-CLI content settled. `doc/design/lead-pane.md` recorded that
+  choice as "it joins the pin in the slice that delivers it". Slice B is that slice: it mints
+  the group, writes this file into its dir, and types its kickoff.
+
+  **`GOLDENS` and `LIVE`, but NOT `PRE222`** — `manager.md`'s split, for `manager.md`'s
+  reason. `PRE222` answers "what does a DEFAULT group read?", and a default group declares no
+  lead block, so `write_instruction_files` writes no `lead.md` into its dir; adding it there
+  would make the two default-group pins look for something correctly absent. `GOLDENS` asks
+  "has a template drifted from what a human last blessed?", which is a question about the
+  template and is asked of all six role files equally.
+
+  **Its `LIVE` key list is EMPTY, and that is a statement rather than a gap.** `lead.md`
+  carries no workflow-conditional prose: a lead may never hold a repo persona
+  (`workflow::persona_allowed` is false for every `Role::is_fixture` class), it holds no
+  locks, and a lead group has no workflow file for a `{{WORKFLOW}}` fragment to describe. So
+  nothing is stripped and the golden is the live template byte for byte. The
+  `{{GROUP_ID}}`/`{{REPO}}` it does carry are per-group VALUE variables — `HOLD_LABEL`'s
+  class, not `LIVE`'s — so the golden keeps them literal and the pin bites on the prose
+  around them.
+
+  The set is named on two surfaces besides this directory and both moved with it:
+  `CLAUDE.md`'s re-bless bullet and `.github/agents/qr-constraints.md`'s check-5 grep.
+  Both also gained `manager.md`, which is a CORRECTION rather than part of this slice — it
+  has been in `GOLDENS` since #1161 and neither surface named it, so an edit to it read as
+  needing no re-bless on both.
