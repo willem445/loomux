@@ -94,7 +94,7 @@ use std::time::{Duration, Instant};
 /// the deadline falls. That is what keeps this a construction rather than a
 /// count — a fourth setup step tomorrow costs budget, not another 2 s, and
 /// `a_fourth_setup_step_costs_no_more_than_the_third` pins it.
-pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(29);
+pub const WORST_CASE_TOTAL: Duration = Duration::from_secs(27); // [scratch #2594 R3]
 
 /// How far past [`AGENT_SETUP_BUDGET`] the setup phase can run: one bounded
 /// capture's own post-kill reap, which happens after the timeout that capture
