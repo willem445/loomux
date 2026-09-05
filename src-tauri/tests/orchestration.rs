@@ -17159,14 +17159,34 @@ fn rename_agent_updates_roster_and_audits() {
     assert!(log.contains("agent-rename"), "rename must be audited");
 }
 
+/// A worker cannot rename a pane — and since #2519 the refusal names BOTH
+/// classes that can, because "orchestrator-only" stopped being true of it.
+///
+/// The test is renamed with the property rather than repinned to whatever the
+/// new message happens to share with the old: its old name asserted the claim
+/// in the one place an assertion cannot reach it. `rename_agent` moved from
+/// `require_orchestrator` to `require_spawner`, so a worker told this tool is
+/// orchestrator-only would be learning something untrue about the system it is
+/// in — the same correction `workers_cannot_use_privileged_tools_even_if_they_try`
+/// makes for the other five fleet tools, and the reason both had to move
+/// together is that they are one gate.
 #[test]
-fn rename_agent_is_orchestrator_only() {
+fn rename_agent_is_for_a_spawner_only() {
     let (reg, _d, _co, cw) = setup_mcp();
     let denied = dispatch(&reg, &cw, "tools/call",
         &json!({ "name": "rename_agent", "arguments": { "agent_id": cw.agent_id, "name": "x" } }))
         .unwrap();
     assert_eq!(denied["isError"], true, "workers must not rename");
-    assert!(denied["content"][0]["text"].as_str().unwrap().contains("orchestrator-only"));
+    let text = denied["content"][0]["text"].as_str().unwrap();
+    // Flattened, because the gate's message is one paragraph produced by a
+    // `\`-continued Rust literal: pinning the wrap position would be pinning
+    // the source layout rather than the sentence.
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("for an orchestrator, or a lead pane"),
+        "the refusal must name the classes that DO hold it, not a class that no longer \
+         exclusively does: {flat}"
+    );
 }
 
 #[test]
