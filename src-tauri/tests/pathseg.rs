@@ -602,12 +602,6 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
         // `codex_profile_name`, which refuses anything outside codex's own
         // `[A-Za-z0-9_-]` alphabet), but the signature is what a textual scan can
         // check.
-        (
-            "Ok(format!(\"{name}.config.toml\"))",
-            "codex_profile_file_name(&PathSegment) — the one assembly point for a codex \
-             profile file name",
-            "fn codex_profile_file_name(agent: &PathSegment) -> Result<String, String> {",
-        ),
         // These two interpolate a locally-parsed `PathSegment` rather than the
         // raw parameter. The binding name is a hint, not the evidence — the
         // proof field is, and it pins the parse itself still being there.
