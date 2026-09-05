@@ -278,10 +278,27 @@ pub fn workflow_file_named(repo: &str, name: &WorkflowName) -> std::path::PathBu
 /// message, audit line and preview must name, so "this group runs `…`" points
 /// at the file that was really read. [`workflow_path`]'s named sibling.
 pub fn workflow_path_named(repo: &str, name: &WorkflowName) -> String {
-    if name.is_default() && Path::new(repo).join(workflow_path(repo)).is_file() {
-        return workflow_path(repo).to_string();
+    if !name.is_default() {
+        return workflows_dir_file(repo, name);
     }
-    workflows_dir_file(repo, name)
+    // `default` IS `.orrerix/workflow.yml` — the file that has always been
+    // there, and the file to CREATE when a repo has none. `workflows/default.yml`
+    // is tolerated when somebody made one and there is no plain file, but it is
+    // never the answer for a repo that declares NEITHER: every refusal and
+    // every "add the file" message names this path, and pointing a human at
+    // `workflows/default.yml` would send them somewhere they have no reason to
+    // go. Three arms, one `pick_repo_path`-shaped rule: prefer the plain file,
+    // fall back to the directory only when it really holds one, else name the
+    // canonical home.
+    let plain = workflow_path(repo);
+    if Path::new(repo).join(plain).is_file() {
+        return plain.to_string();
+    }
+    let under_dir = workflows_dir_file(repo, name);
+    if Path::new(repo).join(&under_dir).is_file() {
+        return under_dir;
+    }
+    plain.to_string()
 }
 
 /// One name's path UNDER [`workflows_dir`], asked without the `default` special
@@ -4966,6 +4983,47 @@ mod tests {
         for good in ["default", "review-heavy", "solo_fast", "a", "wf2"] {
             assert!(WorkflowName::parse(good).is_ok(), "{good:?} must be accepted");
         }
+    }
+
+    /// A repo that declares NOTHING still resolves `default` to
+    /// `.orrerix/workflow.yml`, never to the `workflows/` spelling.
+    ///
+    /// Not cosmetic: every "this repo declares no workflow" message names this
+    /// path, and the live workflow-mode toggle's refusal says *add the file*.
+    /// Naming `.orrerix/workflows/default.yml` there sends a human to a
+    /// directory they have no reason to create. Caught by
+    /// `advanced_orchestrator_toggle_on_refuses_when_the_repo_declares_no_workflow_file`
+    /// (`src-tauri/tests/orchestration.rs`), which is the surface that says so.
+    #[test]
+    fn a_repo_declaring_nothing_still_names_the_plain_file_as_default() {
+        let root = temp_repo("declares-nothing");
+        let repo = root.to_str().unwrap();
+        let default = WorkflowName::default_name();
+
+        assert_eq!(workflow_path_named(repo, &default), ".orrerix/workflow.yml");
+        assert!(!workflow_file_named(repo, &default).is_file(), "and it is not there");
+        assert_eq!(load_workflow_named(repo, &default), Ok(None), "absence, not an error");
+        assert!(list_workflows(repo).workflows.is_empty());
+
+        // The `workflows/` spelling becomes the answer only once a file really
+        // sits there — the middle arm, which the two assertions above and below
+        // it would both pass without.
+        write_at(&root, ".orrerix/workflows/default.yml", &wf_doc("Only under the dir"));
+        assert_eq!(workflow_path_named(repo, &default), ".orrerix/workflows/default.yml");
+        assert_eq!(
+            load_workflow_named(repo, &default).unwrap().unwrap().name,
+            "Only under the dir"
+        );
+
+        // …and the plain file, once it exists, takes the name back.
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("The plain one"));
+        assert_eq!(workflow_path_named(repo, &default), ".orrerix/workflow.yml");
+
+        // A NON-default name is unconditional: it names its file whether or not
+        // one is there, because there is no other place it could live.
+        let nope = WorkflowName::parse("nope").unwrap();
+        assert_eq!(workflow_path_named(repo, &nope), ".orrerix/workflows/nope.yml");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The listing: named files under `workflows/`, sorted, plus the plain file
