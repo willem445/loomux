@@ -7735,6 +7735,7 @@ pub fn codex_profile_toml(
     // approve it. The profile layer wins over the user layer, so stating it
     // here is what makes the pane's tool surface independent of their setting.
     s.push_str("default_tools_approval_mode = \"auto\"\n");
+    s.push_str("tool_timeout_sec = 30.0\n");
     let header = brand::AGENT_TOKEN_HEADER;
     match auth {
         CodexMcpAuth::EnvVar(var) => {
