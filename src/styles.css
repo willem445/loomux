@@ -1757,12 +1757,28 @@ button.orch-item:active { transform: translateX(2px) scale(0.995); }
   margin-top: 3px; padding-left: 2px; font-size: 11px; color: var(--ink-dim);
   line-height: 1.4;
 }
-/* A live group cannot be brought back — it is already here — so the ROW stays
+/* A live group cannot be brought back — it is already here — so its COPY stays
    quieter than the rows that can resume. Its one offer, Focus (#2365), is
-   deliberately exempt from the dimming: the whole point of the button is that
-   the human has lost the pane and needs to see the way back to it. */
-.orch-item.live { opacity: 0.7; }
-.orch-item.live .orch-focus { opacity: 1; }
+   exempt: the whole point of the button is that the human has lost the pane
+   and needs to see the way back to it.
+
+   The dimming is applied to the row's two CONTENT children rather than to the
+   row, and that is the whole of the exemption — it is not a style preference.
+   `opacity` below 1 makes an element a compositing group: the subtree is
+   painted first and the GROUP is then blended at that alpha, so a descendant's
+   `opacity: 1` is its share WITHIN the group and can never exceed it. An
+   `.orch-item.live { opacity: 0.7 }` with an `.orch-focus { opacity: 1 }`
+   inside it therefore dims the button exactly like everything else while
+   reading, in source and in `getComputedStyle`, as though it does not — which
+   is what shipped in #2365 review round 3 and was caught by rendering it, not
+   by reading it. `.orch-focus` is a SIBLING of these two selectors, so it is
+   outside the dimmed groups and genuinely paints at full strength.
+
+   Naming the two children also keeps what was dimmed before dimmed: `.orch-top`
+   carries the CLI badge and the title, `.orch-detail` the explanation, and
+   those are the row's whole content apart from the button. */
+.orch-item.live > .orch-top,
+.orch-item.live > .orch-detail { opacity: 0.7; }
 .orch-focus {
   margin-top: 6px; padding: 2px 9px;
   font-size: 11px; line-height: 1.6;
