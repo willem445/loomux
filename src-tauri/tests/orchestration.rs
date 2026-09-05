@@ -7268,13 +7268,21 @@ fn single_pane_autopilot_flags_per_cli() {
     );
     assert_eq!(single_pane_autopilot_flags("OpenCode"), opencode);
 
-    // CLIs with no known unattended surface get no flags (the toggle is inert),
-    // rather than inventing flags that may not exist. `opencode` left this
-    // class in #722 — replaced by `custom`, the placeholder this function's own
-    // doc names, so the specimen count and the property both survive.
+    // No flags on the LINE. `opencode` left this class in #722 — replaced by
+    // `custom`, the placeholder this function's own doc names, so the specimen
+    // count and the property both survive.
+    //
+    // **`codex` is in this loop for a different reason from the other three,
+    // and since #2515 C1 the difference matters.** `custom`, `aider` and `""`
+    // are here because nothing is known about their unattended surface, so
+    // inventing flags would be guessing. codex has a real approval policy and
+    // loomux really does set it — as `approval_policy` in the generated
+    // profile — so its empty answer is a statement about WHERE the posture
+    // lives, not about whether it exists. Reaching for `-a/--ask-for-approval`
+    // here would give a pane a posture its own profile disagrees with.
     for other in ["codex", "custom", "aider", ""] {
         assert_eq!(single_pane_autopilot_flags(other), "",
-            "{other:?} has no unattended flag surface — must return empty");
+            "{other:?} puts no unattended flag on the command line — must return empty");
     }
 }
 
@@ -8462,7 +8470,12 @@ fn supported_clis_match_the_capability_table() {
 /// is `sandbox_mode`, whose `read-only` rung also blocks running commands and
 /// network access (no tests, no `gh`) and whose `workspace-write` rung denies
 /// nothing at all. So it tops out at `Containment::None` — fine for a worker or
-/// an orchestrator, structurally disqualified for a reviewer or a planner.
+/// an orchestrator, structurally disqualified for every class orrerix denies
+/// the editing tools to — a reviewer, a planner, and a MANAGER, which sits at
+/// the reviewer's tier for the same purpose (#1161: it reads the codebase to
+/// ground its questioning and must not write it). Three classes, and none of
+/// them had to be remembered: `cli_can_host` is one comparison against an
+/// ordered ladder.
 #[test]
 fn a_cli_may_not_host_a_class_whose_containment_it_cannot_enforce() {
     // The uncontained classes are open to every evaluated CLI.
@@ -8471,8 +8484,9 @@ fn a_cli_may_not_host_a_class_whose_containment_it_cannot_enforce() {
             assert!(cli_can_host(cli, role).is_ok(), "{cli} must be able to host a {role:?}");
         }
     }
-    // The contained ones are not.
-    for role in [Role::Reviewer, Role::Planner] {
+    // The contained ones are not. `Role::Manager` joins them here rather than
+    // by anyone noticing: it is `NoEdits`, so the ladder puts it on this side.
+    for role in [Role::Reviewer, Role::Planner, Role::Manager] {
         for cli in ["claude", "copilot", "gemini"] {
             assert!(
                 cli_can_host(cli, role).is_ok(),
@@ -8638,13 +8652,22 @@ fn a_gemini_panes_env_carries_its_settings_path_and_no_other_clis_does() {
     // environment. Per CLAUDE.md the specimen is relocated rather than the
     // assertion relaxed — the loop below keeps the witnesses that are still
     // inside the class, and codex gets its own assertions.
-    for other in ["claude", "copilot", "pi", ""] {
+    for other in ["claude", "copilot", ""] {
         assert!(
             cli_extra_env(other, cfg, "tok-abc").is_empty(),
-            "{other} carries no part of its identity in the pane environment — it must get no \
-             extra env"
+            "{other} names its config on argv and carries nothing in the pane environment"
         );
     }
+    // pi is deliberately NOT in that loop, and was not before #2515 C1
+    // either: it gets exactly one variable, and the point is that the
+    // variable is not IDENTITY. Asserted rather than omitted, so "pi's env
+    // carries no token" is a checked claim rather than an absence.
+    let pi = cli_extra_env("pi", cfg, "tok-abc");
+    assert_eq!(pi.len(), 1, "pi gets the boot-time version-check skip and nothing else: {pi:?}");
+    assert!(
+        !pi.iter().any(|(_, v)| v.contains("tok-abc")),
+        "pi names its config on argv — its one variable must not carry the token: {pi:?}"
+    );
 }
 
 /// A codex GROUP pane's token rides the environment, and the variable is the
@@ -45150,9 +45173,17 @@ fn solo_prepare_builds_the_exact_per_cli_flag_strings_and_delivery_only_falls_ba
     assert!(cargs.contains("--additional-mcp-config \"@"), "got: {cargs}");
     assert!(cargs.contains("--allow-tool orrerix"), "got: {cargs}");
 
-    // No config seam today (A2): AgentEntry still exists (a valid
-    // deliver_prompt target once connected), but no token is ever minted.
-    for cli in ["codex", "gemini", "opencode", "custom"] {
+    // No config seam (A2): AgentEntry still exists (a valid deliver_prompt
+    // target once connected), but no token is ever minted.
+    //
+    // **codex left this class in #2515 C1** and is asserted below instead.
+    // Its seam is one indirection further out than claude's — `-p <profile>`
+    // SELECTS a config file rather than naming one — but it is still a flag
+    // string appended to a command line the human owns, which is the whole of
+    // what `CliCaps::mcp_argv_seam` asks. Relocated rather than relaxed
+    // (CLAUDE.md): gemini, opencode and custom are still squarely in the
+    // class, so the loop keeps its discriminating power.
+    for cli in ["gemini", "opencode", "custom"] {
         let prepared = reg.solo_prepare(cli, "C:/tmp/solo", "x").unwrap();
         assert_eq!(prepared["delivery_only"], json!(true), "{cli} has no config seam");
         assert_eq!(prepared["mcp_args"], json!(""), "{cli} must get no flags");
@@ -45160,6 +45191,20 @@ fn solo_prepare_builds_the_exact_per_cli_flag_strings_and_delivery_only_falls_ba
         assert!(reg.agent(id).is_some());
         assert!(reg.agent(id).unwrap().token.is_empty());
     }
+
+    // codex's new POSITIVE membership, so the widening is pinned in BOTH
+    // directions — without this, moving codex out of the loop above would be
+    // indistinguishable from forgetting to test it.
+    let codex = reg.solo_prepare("codex", "C:/tmp/solo", "cx").unwrap();
+    assert_eq!(codex["delivery_only"], json!(false), "codex mints a real token since #2515 C1");
+    let xargs = codex["mcp_args"].as_str().unwrap();
+    assert!(xargs.starts_with("-p orrerix-solo-"), "got: {xargs}");
+    // The NAME, never the path: `-p` resolves against CODEX_HOME itself, so a
+    // line carrying the file path would send codex looking for a profile
+    // under a directory it would then join onto.
+    assert!(!xargs.contains(".config.toml"), "got: {xargs}");
+    let cid = codex["agent_id"].as_str().unwrap();
+    assert!(!reg.agent(cid).unwrap().token.is_empty(), "a full member carries a token");
 }
 
 #[test]
@@ -45259,8 +45304,12 @@ fn delivery_only_solo_pane_receives_but_can_never_send_or_become_sender() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let cw = reg.resolve_token(&w.token).unwrap();
 
-    // codex has no MCP-config seam today -> delivery-only, no token minted.
-    let prepared = reg.solo_prepare("codex", "C:/tmp/solo", "solo codex").unwrap();
+    // gemini has no MCP-config seam -> delivery-only, no token minted. This
+    // was codex until #2515 C1 gave it one; gemini is the right replacement
+    // rather than the nearest, because its seam is absent for a REASON that
+    // is not going away — its config is a file named by an environment
+    // variable, and a solo launch sets no environment at all.
+    let prepared = reg.solo_prepare("gemini", "C:/tmp/solo", "solo gemini").unwrap();
     assert_eq!(prepared["delivery_only"], json!(true));
     let solo_id = prepared["agent_id"].as_str().unwrap().to_string();
     reg.solo_bind(&solo_id, 701).unwrap();
@@ -45481,7 +45530,9 @@ fn set_sender_rejects_a_delivery_only_candidate_and_leaves_the_sender_unchanged(
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
-    let prepared = reg.solo_prepare("codex", "C:/tmp/solo", "solo").unwrap();
+    // gemini, not codex: codex mints a real token since #2515 C1, and this
+    // test needs a candidate that genuinely has none.
+    let prepared = reg.solo_prepare("gemini", "C:/tmp/solo", "solo").unwrap();
     let solo_id = prepared["agent_id"].as_str().unwrap().to_string();
     reg.solo_bind(&solo_id, 802).unwrap();
     let ch = reg.connect_agents(&g.id, &w.id, solo_group_id(), &solo_id, &w.id).unwrap();
