@@ -306,6 +306,14 @@ calls with the pty spawn between them, exactly as a solo pane's is:
 3. **`orch_lead_bind(agent_id, pty_id)`** — records the pty and types the lead's
    `FreshKickoff`.
 
+A kickoff that cannot be delivered does **not** fail step 3. By then the pane is
+open and the human is looking at it, so an `Err` would report a launch failure
+for a launch that plainly happened, and there is nothing for the caller to retry
+or undo — `open_manager_pane_at_launch`'s argument, and its review-N3 correction
+with it: the delivery OUTCOME is audited rather than discarded, because a lead
+that never learned it is one is a pane whose behaviour nobody can explain from
+the outside.
+
 The guardrail arguments are the launcher's own fields, passed through rather than
 defaulted: a group whose `idle_kill_minutes` arrived as `0` would have the reaper
 switched off for the lead's helpers, which is the opposite of the guardrails

@@ -37429,6 +37429,16 @@ impl OrchRegistry {
     /// rather than from `lead_prepare` because there is no pane to type into
     /// until the bind: `deliver_prompt` is keyed on `pty_id`.
     ///
+    /// **A kickoff that cannot be delivered does NOT fail the bind**, and the
+    /// outcome is audited rather than discarded — `open_manager_pane_at_launch`
+    /// review N3, which is the same shape. By the time this runs the pane is
+    /// open, the pty is spawned and the human is looking at it; returning `Err`
+    /// would report a launch failure for a launch that plainly happened, and
+    /// there is nothing for the caller to retry or undo. What a dropped kickoff
+    /// must not be is INVISIBLE — a lead that never learned it is one is a pane
+    /// whose behaviour nobody can explain from the outside — so the delivery's
+    /// own error is written to the audit log with the agent named.
+    ///
     /// A second bind of the same lead is REFUSED rather than tolerated,
     /// because the kickoff is not idempotent — it would type a second one into
     /// a conversation already under way.
@@ -37466,7 +37476,14 @@ impl OrchRegistry {
         // is never given a worktree) and no persona: a lead group has no
         // workflow file, so no block in it can carry one.
         let kickoff = self.kickoff_prompt(&a, &g, "", None);
-        self.deliver_prompt(agent_id, &kickoff, brand::AUDIT_ACTOR, Delivery::FreshKickoff)
+        if let Err(e) = self.deliver_prompt(agent_id, &kickoff, brand::AUDIT_ACTOR, Delivery::FreshKickoff) {
+            self.audit(&group_id, brand::AUDIT_ACTOR, "error", json!({
+                "what": "lead kickoff not delivered", "agent": agent_id, "err": e,
+                "detail": "the pane is bound and usable; it did not receive its contract. See \
+                           OrchRegistry::lead_bind for why this is not a launch failure.",
+            }));
+        }
+        Ok(())
     }
 
     /// Every live delegate in a dead lead's group, ended (#2519).
