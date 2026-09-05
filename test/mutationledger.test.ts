@@ -40,6 +40,7 @@ type Finding = { severity: string; line: number; message: string; detail: string
 type CheckResult = { findings: Finding[]; counts: Record<string, number>; rows: number };
 
 const suitesOf = (name: string): Suite[] => ml.readSuites(log(name)) as Suite[];
+const suitesOf_ = (text: string): Suite[] => ml.readSuites(text) as Suite[];
 const LF = String.fromCharCode(10);
 const CRLF = String.fromCharCode(13, 10);
 const RUN_ROUND1 = '33928049423';
@@ -159,6 +160,46 @@ test('two suites that share a target stem are told apart by `what`, not collapse
   );
   const lib = ml.selectSuite(ubuntu, { target: 'loomux_server', job: 'build (ubuntu-22.04)', what: 'src/lib.rs' }) as Suite;
   assert.equal(lib.passed, 25);
+});
+
+// Cargo prints the `Running` banner on STDERR and the test binary prints its own output on
+// STDOUT, and GitHub's log is the two streams interleaved by arrival. This fixture is the
+// real shape that produces: two banners land back to back while the FIRST binary's result is
+// still in flight. Read as "the last banner wins", `loomux_lib` gets 25 instead of 280 and
+// `loomux_server`'s bin target is lost entirely, with nothing to say so.
+test('a result is attributed to the OLDEST unresolved banner, not the last one seen', () => {
+  const s = suitesOf('interleaved');
+  assert.deepEqual(s.map((x) => [x.target, x.what, x.total]), [
+    ['loomux_server', 'unittests src/lib.rs', 25],
+    ['loomux_server', 'unittests src/main.rs', 0],
+    ['loomux_lib', 'unittests src/lib.rs', 280],
+  ]);
+});
+
+test('the fixture really does interleave, or the pin above is about nothing', () => {
+  // The discriminating property, asserted rather than assumed: two `Running` banners with no
+  // `test result:` between them. A fixture whose banners and results alternate cleanly is
+  // satisfied by the defective reader too.
+  const rows = ml.parseRunLog(log('interleaved')).map((e: any) => e.text.trim());
+  const marks = rows.filter((t: string) => /Running .*\(target/.test(t) || /^test result:/.test(t))
+    .map((t: string) => (/^test result:/.test(t) ? 'R' : 'B'));
+  assert.ok(marks.join('').includes('BB'), `banners never collide in this fixture: ${marks.join('')}`);
+});
+
+test('`running N tests` is queued the same way, so the arithmetic is checkable', () => {
+  const s = suitesOf('interleaved');
+  assert.deepEqual(s.map((x: any) => x.announced), [25, 0, 280]);
+  for (const x of s as any[]) {
+    assert.equal(x.countsReconcile, true, `${x.target} announced ${x.announced} but reported ${x.passed}+${x.failed}+${x.ignored}`);
+  }
+});
+
+test('a result with no banner left to attribute it to is named, never folded into a neighbour', () => {
+  const orphan = log('interleaved').split(LF).filter((l) => !/Running/.test(l)).join(LF);
+  const s = suitesOf_(orphan);
+  assert.equal(s.length, 3, 'the three results are still read');
+  assert.deepEqual([...new Set(s.map((x) => x.target))], ['(unattributed)']);
+  assert.throws(() => ml.selectSuite(s, { target: 'loomux_lib' }), /no test totals parsed/);
 });
 
 test('the reddened set is the log’s, with each name’s own failure line beside it', () => {

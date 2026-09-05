@@ -50,8 +50,9 @@ Attribution is therefore three-part and all three are load-bearing:
 
 - **the job**, from the log's own `<job>\t<step>\t<timestamp>` prefix — two legs both carry a
   `loomux_engine` suite, and picking one silently dates a figure to the wrong platform;
-- **the target**, from the `Running … (target/debug/deps/<stem>-<hash>)` line above the
-  result, with the build hash stripped;
+- **the target**, from a `Running … (target/debug/deps/<stem>-<hash>)` banner, with the build
+  hash stripped. Not the banner *above* the result — the oldest banner not yet resolved,
+  which is §3.1 and is the difference between 280 and a plausible 25;
 - **`what` the target is** — `unittests src/lib.rs` against `unittests src/main.rs`. A
   crate's lib and bin unittests build to the same `deps/<crate>-<hash>` stem and differ only
   here: `loomux_server` is 25 tests as the lib and 0 as the bin in the same job of the same
@@ -68,7 +69,32 @@ the `not ok N - <name>` lines, and the count still comes from `# fail`.
 never executed — which is exactly the set a reader would otherwise assume "passed in the same
 run".
 
-### 3.1 Two spellings of ESC, and why the failure is silence
+### 3.1 A `Running` banner is a QUEUE entry, not a cursor
+
+Cargo prints the `Running` banner on **stderr** while the test binary prints its own output
+on **stdout**, and a CI log is the two streams interleaved by arrival. So two banners land
+back to back while the first binary’s trailing lines are still in flight. Measured on run
+33937535584’s ubuntu leg: `Running … loomux_server-…/main.rs` and `Running …
+loomux_lib-…/lib.rs` are adjacent, and the `test result: ok. 25 passed` after them belongs
+to `loomux_server`’s LIB, two banners back.
+
+A reader that treats the banner as "the target of the lines that follow it" therefore
+reports `loomux_lib` at 25 instead of 280 and drops a target entirely — 51 targets read as
+49 — and nothing says so, because every individual figure it prints is a figure the log
+contains. That is the worst shape available: not an error, not a blank, a plausible wrong
+number.
+
+Banners are queued instead, and each `test result:` pops the oldest unresolved one. Cargo
+runs test binaries sequentially, so banner order **is** result order — interleaving reorders
+lines across the two streams, never within one. Failure blocks accumulate the same way: they
+are stdout, ahead of their own binary’s result, so the ones seen since the last result belong
+to the suite that result closes even when another binary’s banner arrived in between. Each
+binary’s own `running N tests` is queued alongside and carried per suite, which makes the
+attribution checkable rather than merely argued: it must equal `passed + failed + ignored`,
+and a round where it does not is reported as a note rather than printed as a figure. A
+result with an empty queue is named `(unattributed)`, never folded into a neighbour.
+
+### 3.2 Two spellings of ESC, and why the failure is silence
 
 GitHub's stored log colours the `Running` and `error` lines, so nothing matches a pattern
 anchored on the bare word until the escapes are stripped. The stored form is the real 0x1B
@@ -134,6 +160,12 @@ output is a CHECK or an error rather than a confident row.
   any severity. It is bounded by the table rows, which are re-read whatever the prose says;
   widening it would be a parser for English, which is the thing that cannot be right about
   intent. The residual is pinned in the suite rather than only described here.
+- **A runner that executes test binaries in parallel.** §3.1’s queue rests on cargo running
+  them sequentially, so that banner order is result order. Nothing in this repo does
+  otherwise, and the per-suite `running N tests` cross-check is what would notice if
+  something did — the counts stop reconciling, and the round is reported as a note rather
+  than printed as a figure. It is a check, not a fix: interleaved parallel output would need
+  a different reader.
 - **Whether the round was cut from the right base.** "Cut from" is a git fact about a commit,
   not a fact in the log. The script carries whatever the rows file declares and prints it;
   `ci-validate`'s `git rev-parse <round-commit>:<file>` check against head is still a

@@ -134,6 +134,7 @@ const RUNNING_RE = /^\s*Running\s+(.*?)\s+\((.+)\)\s*$/;
 const RESULT_RE = /^test result:\s+(ok|FAILED)\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored;\s+(\d+)\s+measured;\s+(\d+)\s+filtered out/;
 const STDOUT_RE = /^----\s+(\S+)\s+stdout\s+----\s*$/;
 const PANICKED_RE = /^thread '.*' (?:\([0-9]+\) )?panicked at .+:$/;
+const RUNNING_COUNT_RE = /^running (\d+) tests?$/;
 const DOCTESTS_RE = /^\s*Doc-tests\s+(\S+)\s*$/;
 
 // Read every cargo test target out of one job's lines, in the order they ran.
@@ -147,40 +148,69 @@ const DOCTESTS_RE = /^\s*Doc-tests\s+(\S+)\s*$/;
 // at the first failing test binary (`ci-validate`): a round that reddens the engine lib
 // means the src-tauri integration binaries never executed at all, and a reader who assumed
 // "the rest of the suite passed in the same run" would be wrong. The list is the answer.
+// A `Running` banner is NOT "the target of the lines that follow it", and reading it that way
+// is a silent mis-attribution. Cargo prints the banner on STDERR while the test binary prints
+// its own output on STDOUT, and GitHub's log is the two streams interleaved by arrival. Two
+// banners therefore land back to back while the FIRST binary's trailing lines are still in
+// flight — measured on run 33937535584's ubuntu leg, where `Running … loomux_server-…/main.rs`
+// and `Running … loomux_lib-…/lib.rs` are adjacent and the `test result: ok. 25 passed` that
+// follows them belongs to `loomux_server`'s LIB, two banners back. Read as "the last banner
+// wins" that run reports `loomux_lib` at 25 instead of 280 and loses a target entirely, with
+// nothing to say so: 49 targets against the same tree's 50.
+//
+// So the banners are a QUEUE, not a cursor. Cargo runs test binaries sequentially, so banner
+// order is result order — interleaving reorders lines ACROSS the two streams, never within
+// one — and each `test result:` pops the oldest banner that has not been resolved yet.
+// Failure blocks accumulate the same way: they are stdout, in order, ahead of their own
+// binary's result, so the ones seen since the last result belong to the suite this result
+// closes even when another binary's banner arrived in between.
+//
+// `running N tests` is queued too, and carried per suite as `announced`, so the arithmetic is
+// checkable: it counts passed + failed + ignored. A result whose queue is EMPTY is not
+// attributed to a neighbour — it gets the target `(unattributed)`, which `selectSuite` will
+// name rather than fold into a real one.
+//
+// `ranTargets` (assembled by the caller) is reported alongside because `cargo test` STOPS
+// at the first failing test binary (`ci-validate`): a round that reddens the engine lib
+// means the src-tauri integration binaries never executed at all, and a reader who assumed
+// "the rest of the suite passed in the same run" would be wrong. The list is the answer.
 function readCargoSuites(entries) {
   const suites = [];
-  let current = null;
+  const announced = [];
+  const counts = [];
+  let failures = [];
   let pendingName = null;
   let awaitingMessage = false;
   for (const e of entries) {
     const line = e.text;
     const run = line.match(RUNNING_RE);
     if (run) {
-      current = { kind: 'cargo', job: e.job, target: targetStem(run[2]), what: run[1], failures: [] };
+      announced.push({ target: targetStem(run[2]), what: run[1] });
       pendingName = null;
       awaitingMessage = false;
       continue;
     }
     const doc = line.match(DOCTESTS_RE);
     if (doc) {
-      current = { kind: 'cargo', job: e.job, target: `doc-tests ${doc[1]}`, what: 'doc-tests', failures: [] };
+      announced.push({ target: `doc-tests ${doc[1]}`, what: 'doc-tests' });
       pendingName = null;
       awaitingMessage = false;
       continue;
     }
-    if (!current) continue;
+    const count = line.match(RUNNING_COUNT_RE);
+    if (count) { counts.push(Number(count[1])); continue; }
 
     const stdout = line.match(STDOUT_RE);
     if (stdout) {
       pendingName = stdout[1];
       awaitingMessage = false;
-      current.failures.push({ name: pendingName, message: null });
+      failures.push({ name: pendingName, message: null });
       continue;
     }
     if (pendingName) {
       if (PANICKED_RE.test(line)) { awaitingMessage = true; continue; }
       if (awaitingMessage && line.trim() !== '') {
-        current.failures[current.failures.length - 1].message = line.trim();
+        failures[failures.length - 1].message = line.trim();
         pendingName = null;
         awaitingMessage = false;
         continue;
@@ -188,7 +218,7 @@ function readCargoSuites(entries) {
       // A failure that never panics (a test returning `Err`) prints its reason directly,
       // with no `panicked at` header to key on.
       if (!awaitingMessage && /^(Error|error):/.test(line.trim())) {
-        current.failures[current.failures.length - 1].message = line.trim();
+        failures[failures.length - 1].message = line.trim();
         pendingName = null;
         continue;
       }
@@ -196,14 +226,26 @@ function readCargoSuites(entries) {
 
     const res = line.match(RESULT_RE);
     if (res) {
-      suites.push(Object.assign(current, {
+      const who = announced.shift() || { target: '(unattributed)', what: 'no Running banner preceded this result' };
+      const passed = Number(res[2]);
+      const failed = Number(res[3]);
+      const ignored = Number(res[4]);
+      const announcedCount = counts.length ? counts.shift() : null;
+      suites.push({
+        kind: 'cargo',
+        job: e.job,
+        target: who.target,
+        what: who.what,
+        failures,
         ok: res[1] === 'ok',
-        passed: Number(res[2]),
-        failed: Number(res[3]),
-        ignored: Number(res[4]),
-        total: Number(res[2]) + Number(res[3]),
-      }));
-      current = null;
+        passed,
+        failed,
+        ignored,
+        total: passed + failed,
+        announced: announcedCount,
+        countsReconcile: announcedCount === null ? null : announcedCount === passed + failed + ignored,
+      });
+      failures = [];
       pendingName = null;
       awaitingMessage = false;
     }
@@ -357,6 +399,13 @@ function buildLedger(spec, logs) {
     }
     if (base && suite.total !== base.suite.total) {
       notes.push(`round ${r.n}: total ${suite.total} does not reconcile with the banked green's ${base.suite.total} — the red is not attributable to this round's behaviour until you can say why (ci-validate, "Reconcile every round's test count against the banked green's")`);
+    }
+    // The binary's own `running N tests` against the summary it printed. These disagree when
+    // the banner queue has been mis-fed — a log whose two streams interleaved in a shape this
+    // reader does not model — which is a fact about the ATTRIBUTION rather than about the
+    // round, and the one figure that would otherwise be wrong with nothing to say so.
+    if (suite.countsReconcile === false) {
+      notes.push(`round ${r.n}: \`${suite.target}\` announced ${suite.announced} tests but its summary reports ${suite.passed + suite.failed + suite.ignored} — the figures may be attributed to the wrong target; read the log around its \`Running\` banner`);
     }
 
     const firstMessage = suite.failures.map((f) => f.message).find((m) => m) || null;

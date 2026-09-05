@@ -1,0 +1,9 @@
+build (ubuntu-22.04)	Test backend	2026-09-05T01:57:39.5447255Z ^[[1m^[[92m     Running^[[0m unittests src/lib.rs (target/debug/deps/loomux_server-5ec6e81004f5cbd2)
+build (ubuntu-22.04)	Test backend	2026-09-05T01:57:39.5504617Z running 25 tests
+build (ubuntu-22.04)	Test backend	2026-09-05T01:57:39.5602425Z ^[[1m^[[92m     Running^[[0m unittests src/main.rs (target/debug/deps/loomux_server-5ca5ec575132d5d8)
+build (ubuntu-22.04)	Test backend	2026-09-05T01:57:39.5603651Z ^[[1m^[[92m     Running^[[0m unittests src/lib.rs (target/debug/deps/loomux_lib-dca13802011e4e3e)
+build (ubuntu-22.04)	Test backend	2026-09-05T01:57:39.5619321Z test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+build (ubuntu-22.04)	Test backend	2026-09-05T01:57:39.5619798Z running 0 tests
+build (ubuntu-22.04)	Test backend	2026-09-05T01:57:39.5620305Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+build (ubuntu-22.04)	Test backend	2026-09-05T01:57:39.5673951Z running 280 tests
+build (ubuntu-22.04)	Test backend	2026-09-05T01:57:50.1301196Z test result: ok. 280 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.56s
