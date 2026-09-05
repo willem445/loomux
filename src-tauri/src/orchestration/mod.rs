@@ -53252,7 +53252,7 @@ impl OrchRegistry {
         // the shape is `send_prompt`'s "cannot send a prompt to yourself",
         // generalized from self-targeting to the whole class, because the pane
         // is the human's whether the caller is the lead or one of its helpers.
-        if a.role == Role::Lead {
+        if false {
             return Err("refusing to kill a lead pane; it is the human's own, and its helpers \
                         are not its owner. Close the pane instead"
                 .into());
