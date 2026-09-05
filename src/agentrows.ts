@@ -510,7 +510,14 @@ export function needsYouCount(rows: readonly AgentRow[]): number {
  *  record — nobody is their own parent. Matching reads exactly the fields
  *  `PaneFacts` already projects (orch group + role, tab id); no caller-side
  *  filtering of leads is required, and none should be added — the population
- *  the scan runs over is the whole fleet the caller hands in. */
+ *  the scan runs over is the whole fleet the caller hands in.
+ *
+ *  Each field it reads has a fixture that varies it (the lead-nesting corpus
+ *  in `test/agentrows.test.ts`, the #1182 rule): the null-orch gate, the
+ *  worker-role gate, the group pair, and the tab pair — the tab half held by
+ *  fixtures whose operands COLLIDE (same group, different tab; tab null with
+ *  the lead present), both red under group-only matching. The two-leads test
+ *  cannot hold that half: its leads differ in group as well as tab. */
 export function parentKey(facts: PaneFacts, fleet: readonly PaneFacts[]): string | null {
   const orch = facts.orch;
   if (orch === null || orch.role !== "worker") return null;
