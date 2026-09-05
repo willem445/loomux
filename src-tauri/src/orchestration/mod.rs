@@ -41002,7 +41002,7 @@ impl OrchRegistry {
         // has happened would report a failure that did not occur. What is
         // genuinely lost is the SWEEP, so the trail has to say so.
         let after = GroupInfo { id: info.id.clone(), repo: info.repo.clone(), guardrails: guardrails.clone() };
-        self.reconcile_instruction_files(&after);
+        let _ = &after;
 
         self.audit(group, actor, "workflow-switched", json!({
             "from": from.as_str(),
