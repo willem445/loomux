@@ -265,3 +265,47 @@ test("a codex pane adopts a codex session, and never one of another CLI's (#2515
     []
   );
 });
+
+test("an unknown workspace never matches a pane, on either side (#2515 C2 review premortem 1)", () => {
+  // A session whose transcript records no cwd carries `cwd: ""` — a torn
+  // header, and, since C2, EVERY codex rollout older than a week, whose
+  // `.jsonl.zst` this project deliberately does not decompress. `normalizeCwd`
+  // maps that to `""`, which would equal a pane whose own cwd is `""`.
+  //
+  // The fixture COLLIDES on purpose: same cli, same (empty) cwd, eligible,
+  // unclaimed — every field the matcher reads agrees, so this fails against any
+  // implementation that does not special-case the empty string, and holds only
+  // for one that refuses it.
+  assert.deepEqual(
+    planSessionAdoption(
+      [pane({ cli: "codex", cwd: "" })],
+      [session({ id: "cx-unknown", cli: "codex", cwd: "" })],
+      new Set()
+    ),
+    [],
+    "an unknown workspace on both sides is two unknowns, not a match"
+  );
+
+  // Either side alone is equally refused — the guard reads the SESSION's cwd,
+  // so this pins that a real pane cannot adopt an unknown-workspace row.
+  assert.deepEqual(
+    planSessionAdoption(
+      [pane({ cli: "codex", cwd: "C:\\repo" })],
+      [session({ id: "cx-unknown", cli: "codex", cwd: "" })],
+      new Set()
+    ),
+    []
+  );
+
+  // POSITIVE CONTROL, and the reason the two empties above are not vacuous: the
+  // SAME pane and the SAME session adopt normally once the session records a
+  // real directory. Without this, a matcher that refused everything would pass.
+  assert.deepEqual(
+    planSessionAdoption(
+      [pane({ cli: "codex", cwd: "C:\\repo" })],
+      [session({ id: "cx-known", cli: "codex", cwd: "C:\\repo" })],
+      new Set()
+    ),
+    [{ key: "p1", sessionId: "cx-known" }]
+  );
+});

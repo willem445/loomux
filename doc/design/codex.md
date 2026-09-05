@@ -17,10 +17,15 @@ Every Codex fact in this file is read out of `openai/codex` at tag
 through the GitHub blob API, and is quoted rather than paraphrased wherever the
 quote is short enough to be checkable. Paths below are relative to `codex-rs/`.
 
-**No `codex` process was ever run as an agent** (CLAUDE.md constraint 3). Three
+**No `codex` process was ever run as an agent** (CLAUDE.md constraint 3). Four
 commands were run, and only these: `codex --version`, `codex --help`,
 `codex resume --help`, `codex migrate-rollouts --help`. Their output is quoted
 where it is used.
+
+One vendor behaviour is pinned here rather than only cited in place, because
+nothing on this side can detect its loss: **compression preserves the rollout's
+mtime** (`rollout/src/compression.rs:105`, `:746`), and every row's sort
+position depends on it. See §Compression preserves the mtime below.
 
 The machine this was written on has `codex-cli 0.153.4` at
 `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe` — the desktop app's bundled
@@ -187,7 +192,29 @@ metadata. So a compressed rollout lands on the answers this module already has
 for a file that exists and does not say: `Ok(Some(""))` from the by-id lookup,
 and a browser row whose title is `(no prompt)` and whose workspace is blank.
 
+### Compression preserves the mtime, and the row order rests on that
+
+A pin rather than a note, because its loss would be **silent** (review round 1,
+W1). Every codex row's sort position and its survival past `LIST_LIMIT` is the
+rollout file's mtime: `candidate_meta` reads it, then `scan_sessions` sorts
+newest-first and truncates to 300. Compression **rewrites the file**, so that
+mtime survives only because codex deliberately restores it —
+`rollout/src/compression.rs`:
+
+```rust
+output.set_times(std::fs::FileTimes::new().set_modified(metadata.modified()?))?;   // :105
+file.set_times(FileTimes::new().set_modified(modified))?;                          // :746
+```
+
+Verified holding at `rust-v0.153.4`. If a future codex stopped restoring it,
+every session older than a week would acquire a fresh mtime, sort to the TOP of
+the Sessions tab, and push genuinely recent rows out of the 300 — with no error
+and no red test anywhere, because nothing on this side reads the vendor's
+intent. That is why it is written down: the next reader needs to know the order
+rests on someone else's code.
+
 **Residual, stated plainly:** a compressed rollout lists with no title and no
+folder.
 folder. That is strictly better than the alternative — not listing a week-old
 session at all — and it is pinned by a test
 (`a_compressed_rollout_lists_with_an_unknown_workspace_rather_than_vanishing`)

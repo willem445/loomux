@@ -389,10 +389,31 @@ const PI_SESSION_FLAG_NAMES = [...SESSION_FLAG_NAMES, "--session"];
 const CODEX_RESUME_SUBCOMMAND = "resume";
 
 /** True when `raw` — the RAW slice of one token — is a token `resume` consumes
- *  as its argument: a session id (any non-flag token) or the `--last` switch.
- *  A quoted token's raw slice starts with `"`, so it is neither. */
+ *  as its argument: a session id, or the `--last` switch.
+ *
+ *  **A FLAG is anything starting with `-`, not with `--`** (#2515 C2 review
+ *  round 1, W2). The first version tested `--`, and codex has seven SHORT root
+ *  options that a `--` test counts as a session id — `codex --help` at 0.153.4:
+ *  `-c/--config`, `-i/--image`, `-m/--model`, `-p/--profile`, `-s/--sandbox`,
+ *  `-C/--cd`, `-a/--ask-for-approval`. Restoring a hand-typed
+ *  `codex -C /repo resume -c model=o3 old-id` therefore ATE the `-c`, emitting
+ *  `codex -C /repo model=o3 old-id resume new-id`.
+ *
+ *  `--last` is the one `-`-prefixed token that IS consumed, because it is
+ *  `resume`'s own no-id switch rather than a flag with a value.
+ *
+ *  A quoted token's raw slice starts with `"`, so it is neither a flag nor an
+ *  id — the same immunity that protects a quoted `--resume`.
+ *
+ *  **Residual, narrowed but not closed.** On a hand-typed
+ *  `codex resume -c model=o3 old-id` the `resume` token is now dropped ALONE,
+ *  leaving `old-id` as a stray root positional — clap rejects the line. That is
+ *  a LOUD failure and never a wrong-session resume, which is the property that
+ *  matters; closing it would mean modelling every codex flag's arity here, and
+ *  guessing that wrong is how a flag's VALUE gets eaten instead. No line loomux
+ *  emits is affected: it writes `resume <id>` and nothing else after it. */
 function isCodexResumeArgument(raw: string): boolean {
-  return raw === "--last" || !raw.startsWith("--");
+  return raw === "--last" || !raw.startsWith("-");
 }
 
 /** Excise every `resume [<id>|--last]` occurrence from a codex command STRING,

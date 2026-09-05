@@ -1248,6 +1248,44 @@ pub fn bounded_first_line(path: &Path, cap: u64) -> Option<String> {
 /// already gets.
 pub const CODEX_SESSION_HEADER_MAX_BYTES: u64 = 64 * 1024;
 
+/// How much of a codex rollout [`scan_codex_jsonl`] will read in total while
+/// looking for a title, a cwd and an orchestration signature.
+///
+/// **A LINE BUDGET IS NOT A SIZE BUDGET** (#2515 C2 review round 1, premortem
+/// 2). The scan below reads the first 60 lines, and 60 was the whole of the
+/// bound: nothing capped how BIG a line could be. Codex's own `ContentItem`
+/// has `InputImage` and `InputAudio` variants, so ONE `response_item` line
+/// can carry a base64 payload of arbitrary size — and `list_sessions` parses
+/// up to `LIST_LIMIT` rows per cold scan. Time was never the exposed axis;
+/// what the process holds while parsing was, and nothing measured it.
+///
+/// This is the line cap the by-id route already had
+/// ([`CODEX_SESSION_HEADER_MAX_BYTES`], via [`bounded_first_line`]) times the
+/// line budget — so the two routes are bounded by the same figure rather than
+/// by two numbers that can drift, and the derivation is written as a product
+/// instead of a literal so it stays true if the cap moves.
+///
+/// Generous on purpose (constraint 8 — nothing here is tuned to this repo's
+/// own transcripts). It fails toward a MISSING field rather than a wrong one:
+/// a line the budget truncates cannot parse as JSON, so it is skipped exactly
+/// as a torn line already is, and the row still lists with whatever the lines
+/// before it said.
+///
+/// The claude (`scan_claude_jsonl`) and pi (`scan_pi_jsonl`) scanners have the
+/// same unbounded shape and are deliberately NOT changed here: that is a
+/// pre-existing property of two other CLIs' readers, and widening this slice
+/// to them would put two untested edits in a diff about codex. Codex is the
+/// source where it is most likely to matter, because its own format documents
+/// the image variant.
+const CODEX_HEAD_MAX_BYTES: u64 = CODEX_SESSION_HEADER_MAX_BYTES * CODEX_HEAD_MAX_LINES;
+
+/// How many lines of a codex rollout [`scan_codex_jsonl`] reads.
+///
+/// Named rather than inlined because [`CODEX_HEAD_MAX_BYTES`] is derived from
+/// it: the two are one decision, and a literal `60` in the loop beside a
+/// product that used a different number would be the drift this avoids.
+const CODEX_HEAD_MAX_LINES: u64 = 60;
+
 /// The `session_meta` header of one codex rollout, parsed -- `None` when the
 /// file is compressed, unreadable, empty, or its first line is not a
 /// `session_meta` object.
@@ -1413,7 +1451,11 @@ pub fn scan_codex_jsonl(path: &Path) -> CodexSessionHead {
     let Ok(file) = fs::File::open(path) else {
         return CodexSessionHead { id, title: "(no prompt)".to_string(), cwd, orch };
     };
-    for line in BufReader::new(file).lines().take(60).map_while(Result::ok) {
+    // Bounded on BOTH axes — see `CODEX_HEAD_MAX_BYTES`. The `take` is what
+    // makes the line budget a size budget too: without it one base64 image
+    // line is read whole, however big it is.
+    let reader = BufReader::new(file.take(CODEX_HEAD_MAX_BYTES));
+    for line in reader.lines().take(CODEX_HEAD_MAX_LINES as usize).map_while(Result::ok) {
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };

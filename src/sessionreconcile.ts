@@ -138,6 +138,21 @@ export function planSessionAdoption(
     sessions.filter(
       (s) =>
         s.cli === pane.cli &&
+        // An UNKNOWN workspace is never a match, on either side (#2515 C2
+        // review round 1, premortem 1). `cwd` is the empty string for a
+        // session whose transcript records none — a torn header, and, since
+        // C2, EVERY codex rollout older than a week, whose `.jsonl.zst` this
+        // crate deliberately does not decompress. Without this guard those
+        // rows normalize to `""` and match any pane whose own `cwd` is `""`,
+        // so a pane would adopt an unrelated session's id — silently, and
+        // with the adoption machinery working exactly as designed.
+        //
+        // Refused rather than made to work: "" means "nobody recorded a
+        // directory", so the two sides are not known to be equal — they are
+        // both unknown, which is the one case equality must not claim. The
+        // pane simply stays unadopted, which is what it already does for a
+        // session in another folder.
+        normalizeCwd(s.cwd) !== "" &&
         normalizeCwd(s.cwd) === normalizeCwd(pane.cwd) &&
         s.modifiedMs >= pane.eligibleSinceMs &&
         !claimed.has(s.id)

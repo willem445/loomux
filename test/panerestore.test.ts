@@ -1756,7 +1756,21 @@ test("`resume --last` is excised as one unit, not left behind as a stray flag", 
   assert.deepEqual(agentResumeCommand("codex resume", null, "cx-a"), {
     command: "codex resume cx-a",
   });
-  // ...nor a real flag that follows it, which belongs to the subcommand.
+  // ...nor a flag that follows it. `--search` is a ROOT option — it is in
+  // `codex --help`, not in `codex resume --help` — and codex's root options are
+  // inherited BY the subcommand, so moving it ahead of `resume` is a valid
+  // rewrite of a valid line, which is why this expectation is what it is.
+  //
+  // The comment here used to say `--search` "belongs to the subcommand", which
+  // is backwards, and a wrong rationale on a correct assertion is how a later
+  // round "fixes" the assertion instead (review round 1, W3 — and the round
+  // that proposed exactly that fix, R1).
+  //
+  // The case the old comment was reaching for is `--all`, which really IS
+  // resume-only. This rule relocates it to root too, where clap rejects it —
+  // a loud failure on a hand-typed line, never a wrong-session resume, and the
+  // residual `isCodexResumeArgument` documents rather than a case to assert as
+  // desired output.
   assert.deepEqual(agentResumeCommand("codex resume --search", null, "cx-a"), {
     command: "codex --search resume cx-a",
   });
@@ -1838,4 +1852,49 @@ test("a solo codex pane's minted profile is excised, and a human's own -p is not
   // short form among them), so a brand-prefixed value on a non-codex line is
   // not proof of whose flag it is.
   assert.equal(stripSoloMcpFlags("claude -p orrerix-solo-1", null).cli, null);
+});
+
+
+test("a short root flag after `resume` is a flag, not a session id (#2515 C2 review W2)", () => {
+  // THE DEFECT THIS PINS. `isCodexResumeArgument` tested `--`, and codex has
+  // SEVEN short root options — `codex --help` at 0.153.4: `-c/--config`,
+  // `-i/--image`, `-m/--model`, `-p/--profile`, `-s/--sandbox`, `-C/--cd`,
+  // `-a/--ask-for-approval`. Each was consumed as a session id.
+  //
+  // The reported instance, exactly: `-c` was eaten, so the rebuilt line put
+  // `model=o3` where codex reads the root `[PROMPT]` positional.
+  assert.deepEqual(agentResumeCommand("codex -C /repo resume -c model=o3", null, "new-id"), {
+    command: "codex -C /repo -c model=o3 resume new-id",
+  });
+
+  // Every one of the seven, so the fix is pinned against the FLAG SET rather
+  // than against the one example a review happened to name. A loop, because
+  // seven hand-written assertions is seven chances to leave one out — and each
+  // asserts the flag AND its value both survive.
+  for (const flag of ["-c", "-i", "-m", "-p", "-s", "-C", "-a"]) {
+    assert.deepEqual(
+      agentResumeCommand(`codex resume ${flag} value`, null, "cx"),
+      { command: `codex ${flag} value resume cx` },
+      `${flag} must not be consumed as a session id`
+    );
+  }
+
+  // NEGATIVE CONTROL, and it is what stops the fix from being "never consume
+  // anything": a real id still IS consumed, so the excision has not simply
+  // stopped working. Without this the loop above passes against a predicate
+  // that returns false unconditionally.
+  assert.deepEqual(agentResumeCommand("codex resume old-id", null, "new-id"), {
+    command: "codex resume new-id",
+  });
+  // …and `--last`, the one `-`-prefixed token that IS resume's own argument,
+  // is still consumed — the case a blanket "anything with a dash is a flag"
+  // would have broken.
+  assert.deepEqual(agentResumeCommand("codex resume --last", null, "new-id"), {
+    command: "codex resume new-id",
+  });
+
+  // The argv form takes the same rule, since it shares the predicate.
+  assert.deepEqual(agentResumeCommand(null, ["codex", "resume", "-m", "gpt-5"], "cx"), {
+    argv: ["codex", "-m", "gpt-5", "resume", "cx"],
+  });
 });
