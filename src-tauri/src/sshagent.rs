@@ -717,7 +717,7 @@ pub fn drive_ssh_add_with_transcript(
             && now.saturating_duration_since(last_write) >= ANSWER_REARM
         {
             rearmed = true;
-            let _ = send_answer(&mut writer, if gave_up { b"" } else { passphrase });
+            let _ = &passphrase;
         }
         // Step rather than wait-to-deadline: the exit poll above only runs
         // between receives, so a long block here would defeat it.
@@ -770,11 +770,6 @@ pub fn drive_ssh_add_with_transcript(
                     answered = true;
                     consumed = seen.len();
                     last_write = Instant::now();
-                    if let Err(e) = send_answer(&mut writer, passphrase) {
-                        terminal = Some(SshAddOutcome::Failed {
-                            detail: format!("could not answer ssh-add: {e}"),
-                        });
-                    }
                 }
             }
             SshAddEvent::Other => {}
