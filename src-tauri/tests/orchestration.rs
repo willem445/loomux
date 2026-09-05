@@ -46670,6 +46670,17 @@ fn an_unknown_group_offers_no_workflows_rather_than_the_process_working_director
     // whatever directory the PROCESS happens to be running in, so the answer was
     // about the wrong machine entirely. Read-only and bounded, but an answer
     // about the wrong tree is worse than no answer.
+    //
+    // WHAT THIS TEST CANNOT SEE, and it is not a small caveat: the answer under
+    // the OLD code depends on the process working directory, and a cargo
+    // integration test runs with that set to `src-tauri/`, which declares no
+    // workflow file. So the defective code answers `[]` here too, and the
+    // round-2 mutation that restored it came back GREEN (#2725, run 33974519428)
+    // — this assertion pins the intended answer, not the guard. What actually
+    // stops the empty string reaching a relative join is `scan_workflows`'
+    // own empty-root guard, and nothing in this harness can redden that either:
+    // proving it needs a CWD that declares a workflow, which means mutating a
+    // process-global from a parallel test suite. Stated rather than papered over.
     let (reg, _d) = test_registry();
     let status = reg.workflow_status(&parse_gid("no-such-group"));
     assert_eq!(status["available"], json!(Vec::<String>::new()), "{status}");

@@ -400,6 +400,20 @@ fn scan_workflows(repo: &str) -> (BTreeMap<String, ScannedWorkflow>, Vec<String>
     let mut seen: BTreeMap<String, ScannedWorkflow> = BTreeMap::new();
     let mut findings: Vec<String> = Vec::new();
 
+    // An empty root is NOT a root, and this is the one place that can say so
+    // (#2659 review round 1, rev-std 3). Every path below is built with
+    // `Path::new(repo).join(..)`, and joining onto `""` yields a RELATIVE path
+    // — so an empty string does not read "nothing", it reads "whatever directory
+    // this process happens to be running in". A caller that has no repo must
+    // get no listing, not a listing about the wrong machine.
+    //
+    // The call site was fixed too (`workflow_status_within` passes an `Option`
+    // rather than `unwrap_or_default()`), and that is the enforcement; this is
+    // the structural half, so the next caller cannot reintroduce it.
+    if repo.trim().is_empty() {
+        return (seen, findings);
+    }
+
     let dir_rel = workflows_dir(repo);
     let dir = Path::new(repo).join(dir_rel);
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -5664,6 +5678,33 @@ mod tests {
             listing.findings
         );
         assert_eq!(list_workflow_names(repo).len(), WORKFLOWS_MAX, "the names-only walk is bounded too");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_empty_root_lists_nothing_rather_than_the_working_directory() {
+        // #2659 review round 1, rev-std 3. Every path in `scan_workflows` is
+        // `Path::new(repo).join(..)`, and joining onto `""` yields a RELATIVE
+        // path — so an empty string does not mean "nothing", it means "wherever
+        // this process is running".
+        //
+        // DELIBERATELY WEAK, and labelled: with the guard this holds for every
+        // CWD, and without it, it holds for every CWD that happens to declare no
+        // workflow — which includes the one this suite runs in. So it pins the
+        // answer, not the guard; nothing in this harness can redden the guard,
+        // because proving it needs a CWD that DOES declare a workflow, i.e.
+        // mutating a process-global from a parallel test suite.
+        let listing = list_workflows("");
+        assert!(listing.workflows.is_empty(), "{:?}", listing.workflows);
+        assert!(listing.findings.is_empty(), "{:?}", listing.findings);
+        assert!(list_workflow_names("").is_empty());
+        assert!(list_workflows("   ").workflows.is_empty(), "whitespace is not a root either");
+
+        // Positive control: the walk is not simply switched off — a real root
+        // with a real file still lists it, in this same process.
+        let root = temp_repo("empty-root-control");
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("Plain"));
+        assert_eq!(list_workflow_names(root.to_str().unwrap()), vec!["default".to_string()]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
