@@ -30,8 +30,9 @@
 use loomux_lib::orchestration::mcp::{dispatch, every_tool_name};
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
-    counts_against_max_agents, spawn_opens_minimized, AgentEntry, Caller, Delivery, GroupId,
-    Guardrails, OrchRegistry, Role,
+    counts_against_max_agents, is_live_cap_refusal, mechanics_core, resume_recorded_session,
+    spawn_opens_minimized, AgentEntry, Caller, Delivery, GroupId, Guardrails, OrchRegistry,
+    Role, CLI_CAPS,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -799,4 +800,762 @@ fn no_agent_may_kill_a_lead_pane() {
         "a worker must get past the lead-pane guard: {}",
         q_text(&w)
     );
+}
+
+// ── slice B: the launch path ────────────────────────────────────────────────
+//
+// Slice A's header says what it could not cover: there was no way to MINT a
+// lead, so the launcher's refusals and the one-root invariant had no code to
+// test. This half is that code. The fixtures below therefore stop building a
+// roster by hand and go through `lead_prepare`, which is the only path a lead
+// group is ever created by.
+
+/// A minimal real git repo (one commit on the default branch), one level below
+/// a private temp root.
+///
+/// The nesting is not cosmetic and is `orchestration.rs`'s `RealRepo` verbatim
+/// in intent (#464): `git_worktree_add` cuts a spawned worker's worktree to a
+/// directory SIBLING to the repo, so a repo AT the temp root leaks that sibling
+/// into `%TEMP%` on every passing run. One level down puts both the sibling and
+/// the `.git/worktrees/<name>` registration inside the `TempDir`, so its `Drop`
+/// reclaims everything with no git teardown a call site could forget.
+///
+/// Copied rather than shared because Rust compiles each integration test as its
+/// own crate — the same reason `relaunch_registry` above is duplicated.
+struct RealRepo {
+    _root: tempfile::TempDir,
+    repo: std::path::PathBuf,
+}
+
+impl RealRepo {
+    fn path(&self) -> String {
+        self.repo.to_string_lossy().into_owned()
+    }
+}
+
+fn real_repo() -> RealRepo {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .expect("git must be installed for this test");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(repo.join("f.txt"), "hi").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+    RealRepo { _root: root, repo }
+}
+
+/// A lead group minted the way the launcher mints one: `lead_prepare` against a
+/// real repo, then `lead_bind` onto a fake pty.
+///
+/// Returns the prepare payload too, because several tests below assert on it
+/// and re-deriving it would be a second construction of the thing under test.
+fn prepared_lead(
+    cli: &str,
+    max_agents: u32,
+) -> (Arc<OrchRegistry>, tempfile::TempDir, RealRepo, GroupId, String, Value) {
+    let (reg, d) = test_registry();
+    let repo = real_repo();
+    let out = reg
+        .lead_prepare(cli, &repo.path(), "my lead", max_agents, false, 5, 0, 5)
+        .unwrap_or_else(|e| panic!("lead_prepare({cli}) must succeed: {e}"));
+    let gid = GroupId::parse(out["group_id"].as_str().expect("group_id")).expect("a valid group id");
+    let agent_id = out["agent_id"].as_str().expect("agent_id").to_string();
+    (reg, d, repo, gid, agent_id, out)
+}
+
+/// **A `"role": "lead"` row can never reach an `unreachable!`** — the residual
+/// slice A shipped, closed.
+///
+/// Slice A made `Role`'s serde form carry the wire string `"lead"`, so an
+/// `agents.json` row reading `"role": "lead"` PARSES; what it left was two
+/// panicking arms (`mechanics_core`, `kickoff_body`) reachable the moment such
+/// a row meets a public path. Under CLAUDE.md constraint 10 an unwind out of a
+/// synchronous `#[tauri::command]` is a process ABORT, not a degrade, so
+/// "unreachable today" was not a safe place to leave them.
+///
+/// Both are exercised through the public entry points their private callers use
+/// — `mechanics_core` directly (it is what `render_block_instructions`'s
+/// replace-mode arm and `copilot_agent_body` both call) and `kickoff_prompt`,
+/// which wraps `kickoff_body`.
+///
+/// The worker rows are the control: without them every assertion here would
+/// hold against a build that returned one shared string for every class.
+#[test]
+fn a_lead_role_never_reaches_a_panicking_arm() {
+    let core = mechanics_core(Role::Lead, None);
+    assert!(!core.trim().is_empty(), "a lead's mechanics core must be real text");
+    assert!(
+        core.contains("root of this group") || core.contains("ROOT of this group"),
+        "…and must say the thing that makes the class what it is: {core}"
+    );
+    assert!(
+        core.contains("no `report`") || core.contains("hold no `report`"),
+        "…including the tool it does NOT have, which is the manager's own lesson: {core}"
+    );
+    assert_ne!(
+        core,
+        mechanics_core(Role::Worker, None),
+        "the control: a lead's mechanics are not the worker's, so the assertions above are \
+         about this arm rather than about one shared string"
+    );
+
+    let (reg, _d, _repo, gid, agent_id, _out) = prepared_lead("claude", 4);
+    let a = reg.agent(&agent_id).expect("the lead entry");
+    let g = reg.group(&gid).expect("the lead group");
+    assert_eq!(a.role, Role::Lead, "precondition: this really is a lead row");
+    let kickoff = reg.kickoff_prompt(&a, &g, "", None);
+    assert!(kickoff.contains("LEAD of orrerix group"), "the lead's own kickoff: {kickoff}");
+    assert!(
+        kickoff.contains(&gid.to_string()) && kickoff.contains(&agent_id),
+        "…naming the group and the pane it is addressed to: {kickoff}"
+    );
+    assert!(
+        kickoff.contains("lead.md"),
+        "…and pointing at the instructions file `write_instruction_files` wrote: {kickoff}"
+    );
+}
+
+/// **`lead_prepare` mints a group with the built-in roster and no
+/// orchestrator.**
+///
+/// Four properties, each one a different way the mint could be wrong:
+/// the group exists and is real; it runs the BUILT-IN roster (no workflow file
+/// was read); its only live agent is the lead, so nothing spawned an
+/// orchestrator; and the lead is a member of it rather than of `__solo__`.
+///
+/// The orchestrator BLOCK is asserted to be present on purpose — `clamped`
+/// prepends one to any roster declaring none, and slice A's note flags exactly
+/// that as the tripwire this function must not turn into a pane. Pinning "the
+/// block is there AND no agent holds it" is what makes the distinction
+/// reviewable rather than implied.
+#[test]
+fn lead_prepare_mints_a_group_with_the_builtin_roster_and_no_orchestrator() {
+    let (reg, _d, repo, gid, agent_id, out) = prepared_lead("claude", 3);
+    let g = reg.group(&gid).expect("the group must exist in the registry");
+    assert_eq!(g.repo, repo.path(), "the group is on the repo the toggle was flipped in");
+    assert_eq!(g.guardrails.max_agents, 3, "the launcher's cap is the group's cap");
+    assert!(
+        !g.guardrails.advanced_orchestrator,
+        "a lead group never reads the repo's workflow file — that is the consent argument"
+    );
+
+    let kinds: Vec<Role> = g.guardrails.blocks.iter().map(|b| b.kind).collect();
+    for want in [Role::Lead, Role::Worker, Role::Reviewer, Role::Planner] {
+        assert!(kinds.contains(&want), "the built-in roster must declare {want:?}: {kinds:?}");
+    }
+    assert!(
+        g.guardrails.block_for(Role::Orchestrator).is_some(),
+        "`Guardrails::clamped` step 4 prepends an orchestrator BLOCK to a roster with none — if \
+         that ever stops being true this test's real assertion below stops meaning anything"
+    );
+
+    let live: Vec<(String, String)> = reg
+        .list_agents(&gid)
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| {
+            (
+                a["id"].as_str().unwrap_or_default().to_string(),
+                a["role"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        live,
+        vec![(agent_id.clone(), "lead".to_string())],
+        "…and NO agent holds it: the lead is the group's only pane, and the one root"
+    );
+
+    let a = reg.agent(&agent_id).expect("the lead entry");
+    assert_eq!(a.group, gid, "the lead belongs to its own group, never `__solo__`");
+    assert_eq!(a.block, "lead", "…on the lead block the roster declares");
+    assert!(a.role.is_root(), "…and it is the group's root");
+    assert!(a.solo_cli.is_none(), "a non-solo agent's CLI comes from its block, not this field");
+    assert!(
+        !out["mcp_args"].as_str().unwrap_or_default().is_empty(),
+        "the launcher needs flags to append, or the pane boots with no MCP server at all: {out}"
+    );
+
+    // The durable marker, which is what every post-restart reader asks (the
+    // roster cannot answer: `read_blocks` drops a `kind: "lead"` row).
+    assert!(reg.is_lead_group(&gid), "the group must record that it is a lead group");
+}
+
+/// **The marker is load-bearing, because the ROSTER cannot answer after a
+/// restart.**
+///
+/// This is the fact `lead_prepare`'s marker comment claims, asserted rather
+/// than asserted-in-prose: reload the group from disk exactly as a relaunched
+/// app does, and the lead block is GONE — `read_blocks` resolves every
+/// persisted `kind` through `workflow::kind_from_str`, which has no `lead` arm
+/// by design. Anything that asked the reloaded roster "is this a lead group?"
+/// would answer no for every lead group there has ever been.
+#[test]
+fn a_reloaded_lead_group_loses_its_lead_block_but_keeps_its_marker() {
+    let (reg, _d, _repo, gid, _agent_id, _out) = prepared_lead("claude", 4);
+    assert!(
+        reg.group(&gid).unwrap().guardrails.block_for(Role::Lead).is_some(),
+        "the control: in memory the roster DOES carry the lead block"
+    );
+
+    let (_repo_path, reloaded) = reg.load_group_file(&gid).expect("group.json must be on disk");
+    assert!(
+        reloaded.block_for(Role::Lead).is_none(),
+        "a persisted `kind: \"lead\"` row is dropped on reload — if this ever starts passing, \
+         `kind_from_str` has grown a `lead` arm and a workflow file can declare one"
+    );
+    assert!(
+        reloaded.block_for(Role::Worker).is_some(),
+        "…and the control: the rest of the roster survives, so the line above is about `lead` \
+         rather than about a broken load"
+    );
+    assert!(reg.is_lead_group(&gid), "which is why the marker, not the roster, carries the fact");
+}
+
+/// **A CLI whose MCP config cannot ride on its command line is refused**, and
+/// the refusal names the follow-up rather than reading as a policy.
+///
+/// `solo_prepare` degrades such a CLI to delivery-only, which is still a useful
+/// pane. A lead cannot: the flags ARE the capability the toggle grants, so a
+/// pane that launched anyway would be a lead in name only.
+#[test]
+fn lead_prepare_refuses_a_non_argv_seam_cli() {
+    let (reg, _d) = test_registry();
+    let repo = real_repo();
+
+    let no_seam: Vec<&str> = CLI_CAPS
+        .iter()
+        .filter(|c| c.orchestration && !c.mcp_argv_seam)
+        .map(|c| c.cli)
+        .collect();
+    assert!(
+        no_seam.contains(&"opencode"),
+        "this test is vacuous unless the table really has opencode as a non-seam CLI: {no_seam:?}"
+    );
+    for cli in &no_seam {
+        let err = reg
+            .lead_prepare(cli, &repo.path(), "l", 4, false, 5, 0, 5)
+            .expect_err("a non-seam CLI must be refused");
+        assert!(
+            err.contains("cannot host a lead pane yet"),
+            "{cli}: the refusal must be the seam one: {err}"
+        );
+        assert!(
+            err.contains("follow-up") && err.contains("lead-pane.md"),
+            "{cli}: …and must name the follow-up, so it reads as a missing seam rather than a \
+             policy: {err}"
+        );
+    }
+
+    // THE CONTROL, and it is what stops this passing against a build that
+    // refuses every CLI: a seam CLI is accepted, on the same repo.
+    reg.lead_prepare("claude", &repo.path(), "l", 4, false, 5, 0, 5)
+        .expect("an argv-seam CLI must be accepted");
+}
+
+/// **Every argv-seam CLI has a lead arm**, and the arm really carries the MCP
+/// wiring.
+///
+/// `every_argv_seam_cli_has_a_solo_mcp_arm`'s shape, with the failure mode
+/// inverted: an empty string is a refusal here rather than a degraded pane, so
+/// what this pins is that no seam CLI takes that path today.
+#[test]
+fn every_argv_seam_cli_has_a_lead_mcp_arm() {
+    let seam: Vec<&str> =
+        CLI_CAPS.iter().filter(|c| c.orchestration && c.mcp_argv_seam).map(|c| c.cli).collect();
+    assert!(
+        seam.contains(&"pi") && seam.contains(&"copilot"),
+        "this test is vacuous unless the table really has more than claude as a seam CLI: {seam:?}"
+    );
+    for cli in seam {
+        let (reg, _d, _repo, _gid, _agent_id, out) = prepared_lead(cli, 4);
+        let args = out["mcp_args"].as_str().unwrap_or_default();
+        assert!(
+            args.contains("mcp"),
+            "{cli} is declared argv-seam, so lead_prepare must produce its MCP flags: {out}"
+        );
+        drop(reg);
+    }
+}
+
+/// **Claude's lead command line denies the `Agent` tool, and no other CLI's
+/// pretends to.**
+///
+/// The denial is what makes the toggle mean what it says: a lead that can still
+/// reach its harness's own in-process subagents will use them, because they are
+/// one call away and `spawn_agent` is three. The flag is cited to the vendor
+/// docs in `lead_mcp_args`' own doc comment.
+///
+/// The other two arms are the honest half. Copilot HAS subagents and documents
+/// no tool name to deny (`--deny-tool`'s documented value shapes are
+/// `shell(...)`, `write` and `MCP(tool)`), so it is instruction-only; pi
+/// documents having none at all. Asserting that neither carries an invented
+/// denial is what stops a later edit shipping a flag value the vendor does not
+/// have.
+#[test]
+fn the_lead_command_line_denies_claudes_agent_tool_and_nothing_elses() {
+    let (_r1, _d1, _repo1, _g1, _a1, claude) = prepared_lead("claude", 4);
+    let line = claude["mcp_args"].as_str().unwrap_or_default().to_string();
+    assert!(
+        line.contains("--disallowedTools Agent"),
+        "claude's lead line must deny the Agent tool: {line}"
+    );
+
+    // The solo line is the BASELINE: a lead's flags are a solo pane's plus the
+    // denial, so diffing them is what shows the denial is the only addition.
+    let (reg, _d) = test_registry();
+    let repo = real_repo();
+    let solo = reg.solo_prepare("claude", &repo.path(), "s").expect("a solo claude pane");
+    let solo_line = solo["mcp_args"].as_str().unwrap_or_default();
+    let solo_flags: Vec<&str> = solo_line.split_whitespace().filter(|t| t.starts_with("--")).collect();
+    let lead_flags: Vec<&str> = line.split_whitespace().filter(|t| t.starts_with("--")).collect();
+    let added: Vec<&&str> = lead_flags.iter().filter(|f| !solo_flags.contains(f)).collect();
+    assert_eq!(
+        added,
+        vec![&"--disallowedTools"],
+        "the lead line is the solo line plus exactly one flag: solo={solo_flags:?} \
+         lead={lead_flags:?}"
+    );
+
+    for cli in ["copilot", "pi"] {
+        let (_r, _d, _repo, _g, _a, out) = prepared_lead(cli, 4);
+        let l = out["mcp_args"].as_str().unwrap_or_default();
+        assert!(
+            !l.contains("disallow") && !l.contains("deny") && !l.contains("exclude"),
+            "{cli} documents no subagent tool name to deny, so its line must not invent one — \
+             see `lead_mcp_args` for the citation: {l}"
+        );
+    }
+}
+
+/// **`lead_bind` types the lead's kickoff, exactly once.**
+///
+/// Delivery is observed through the pause queue, for
+/// `a_child_report_is_typed_into_the_lead_pane_and_refused_into_a_manager`'s
+/// reason: test mode has no real PTY, so an ACCEPTED delivery is a queued one.
+///
+/// The second bind is refused rather than tolerated, and that matters more than
+/// it looks: the kickoff is not idempotent, so a tolerated re-bind would type a
+/// second contract into a conversation already under way.
+#[test]
+fn lead_bind_delivers_the_lead_kickoff_once() {
+    let (reg, _d, _repo, gid, agent_id, _out) = prepared_lead("claude", 4);
+    reg.pause_group(&gid).unwrap();
+
+    assert_eq!(reg.queue_depth(9101), 0, "the control: nothing is queued before the bind");
+    reg.lead_bind(&agent_id, 9101).expect("the first bind must succeed");
+    assert_eq!(reg.queue_depth(9101), 1, "the bind must type exactly one kickoff");
+
+    let texts: Vec<String> = reg
+        .audit_log(&gid)
+        .into_iter()
+        .filter(|e| e.action == "prompt" && e.detail["to"] == json!(agent_id))
+        .filter_map(|e| e.detail["text"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(texts.len(), 1, "one delivery, recorded against the lead: {texts:?}");
+    assert!(
+        texts[0].contains("LEAD of orrerix group"),
+        "…and it is the lead's kickoff rather than something else: {}",
+        texts[0]
+    );
+
+    let err = reg.lead_bind(&agent_id, 9102).expect_err("a second bind must be refused");
+    assert!(err.contains("already bound"), "{err}");
+    assert_eq!(reg.queue_depth(9101), 1, "…and must not have typed a second kickoff");
+    assert_eq!(reg.queue_depth(9102), 0, "…nor into the pty it named");
+
+    // The class guard: `lead_bind` is not a general bind.
+    let worker = reg.spawn_agent(&gid, Role::Worker, "w", "", false, None).unwrap();
+    let werr = reg.lead_bind(&worker.id, 9103).expect_err("a worker must not take this path");
+    assert!(werr.contains("only for lead panes"), "{werr}");
+}
+
+/// **A dead lead takes its children with it**, and a dead worker takes nothing.
+///
+/// One test, both poles, because the asymmetry IS the property: the arm added
+/// to `on_pty_exit` keys on `Role::Lead`, and a build that ended a group's
+/// delegates on ANY pane's exit would pass a lead-only test.
+///
+/// Driven through `on_pty_exit`, which is the real entry point every ending
+/// funnels through — a close, a kill, or the CLI dying on its own — rather than
+/// through `end_lead_children` directly, so the routing is part of what is
+/// pinned.
+#[test]
+fn a_dead_lead_takes_its_children_with_it() {
+    let (reg, _d, _repo, gid, agent_id, _out) = prepared_lead("claude", 4);
+    reg.lead_bind(&agent_id, 9201).unwrap();
+    let w1 = reg.spawn_agent(&gid, Role::Worker, "w1", "t", false, None).unwrap();
+    let w2 = reg.spawn_agent(&gid, Role::Worker, "w2", "t", false, None).unwrap();
+    reg.set_pty_for_test(&w1.id, 9202);
+    reg.set_pty_for_test(&w2.id, 9203);
+
+    // THE POSITIVE CONTROL, first: one worker dying ends that worker and
+    // nothing else. Without it, every assertion below would hold against a
+    // build that tore the group down on any exit at all.
+    reg.on_pty_exit(9202, Some(0), "", 0, true);
+    let after_worker = reg.list_agents(&gid);
+    let live_ids: Vec<String> = after_worker
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["status"] != json!("dead"))
+        .map(|a| a["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        live_ids.contains(&agent_id) && live_ids.contains(&w2.id),
+        "a dead worker takes nothing with it: {live_ids:?}"
+    );
+    assert!(!live_ids.contains(&w1.id), "…and it is itself dead — the control's own control");
+
+    // Now the lead.
+    reg.on_pty_exit(9201, Some(1), "", 0, false);
+    let live_after: Vec<String> = reg
+        .list_agents(&gid)
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["status"] != json!("dead"))
+        .map(|a| a["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        live_after.is_empty(),
+        "a lead that dies ends its helpers: nothing may outlive the pane it reports to — \
+         still live: {live_after:?}"
+    );
+
+    let row = reg
+        .audit_log(&gid)
+        .into_iter()
+        .find(|e| e.action == "lead-children-ended")
+        .expect("the teardown must be recorded, or an operator cannot tell it from a crash");
+    assert_eq!(row.detail["lead"], json!(agent_id), "{:?}", row.detail);
+    assert_eq!(
+        row.detail["ended"],
+        json!([w2.id]),
+        "exactly the ones that were still alive — the already-dead worker is not re-killed: {:?}",
+        row.detail
+    );
+}
+
+/// **The cap and the spawn-rate backstop apply to a lead's children.**
+///
+/// Q6's row, in code: what is EXEMPT is the lead's own seat, not the helpers.
+/// A cap of 1 must therefore admit one helper and refuse the second — and the
+/// refusal must be the CAP's, which is why `is_live_cap_refusal` is asked
+/// rather than the text being re-spelled here.
+///
+/// The lead is deliberately live throughout: if the lead counted, a cap of 1
+/// would refuse the FIRST helper, and this test's first assertion is what says
+/// it does not.
+#[test]
+fn lead_group_cap_and_spawn_rate_apply_to_children() {
+    let (reg, _d, repo, gid, agent_id, _out) = prepared_lead("claude", 1);
+    reg.lead_bind(&agent_id, 9301).unwrap();
+    assert_eq!(reg.group(&gid).unwrap().guardrails.max_agents, 1, "precondition: a cap of one");
+
+    let first = reg
+        .spawn_agent(&gid, Role::Worker, "w1", "t", false, None)
+        .expect("the lead's seat is exempt, so a cap of 1 still admits one helper");
+    let err = reg
+        .spawn_agent(&gid, Role::Worker, "w2", "t", false, None)
+        .expect_err("…and the helpers are counted, so the second is refused");
+    assert!(
+        is_live_cap_refusal(&err),
+        "the refusal must be the live-agent cap's, not a bad block or the rate backstop: {err}"
+    );
+    assert!(err.contains(&first.id), "…and must name what is holding the slot: {err}");
+
+    // The spawn-rate backstop, on its own group so the cap cannot be what
+    // refuses. A limit of 1 per hour with the lead's own mint not counted.
+    let (reg2, _d2) = test_registry();
+    let out2 = reg2
+        .lead_prepare("claude", &repo.path(), "l2", 8, false, 5, 1, 5)
+        .expect("a second lead group, on a repo that already has one");
+    let gid2 = GroupId::parse(out2["group_id"].as_str().unwrap()).unwrap();
+    assert_ne!(gid2, gid, "a live group is never reattached to — this is a fresh id");
+    reg2.spawn_agent(&gid2, Role::Worker, "w1", "t", false, None).expect("the first is admitted");
+    let rate = reg2
+        .spawn_agent(&gid2, Role::Worker, "w2", "t", false, None)
+        .expect_err("the second exceeds one spawn per hour");
+    assert!(rate.contains("spawn-rate limit reached"), "{rate}");
+}
+
+/// **A lead's `spawn_agent` really opens a worker — end to end.**
+///
+/// Slice A could only assert that a worker gets PAST the class check, because
+/// its fixture had no git under it. This one has a real repo, so the spawn runs
+/// the whole way through `spawn_agent_ex`: the worktree is cut, the branch is
+/// created, and the pane request is built. That is the difference between "the
+/// refusal does not fire" and "the feature works".
+///
+/// Dispatched through the MCP surface rather than the Rust API, because the
+/// worktree default is a property of that surface (#338/#359) and it is the
+/// only surface a lead can actually reach.
+#[test]
+fn a_lead_really_opens_a_worker_in_its_own_worktree() {
+    let (reg, _d, repo, gid, agent_id, _out) = prepared_lead("claude", 4);
+    reg.lead_bind(&agent_id, 9401).unwrap();
+    let lead = reg.agent(&agent_id).expect("the lead entry");
+    let c = caller_for(&reg, &lead);
+
+    let out = q_call(
+        &reg,
+        &c,
+        "spawn_agent",
+        json!({ "kind": "worker", "name": "helper", "task": "read the tests and report back" }),
+    );
+    assert_eq!(out["isError"], json!(false), "a lead's worker spawn must succeed: {out:?}");
+
+    let worker = reg
+        .list_agents(&gid)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["role"] == json!("worker"))
+        .map(|a| a["id"].as_str().unwrap_or_default().to_string())
+        .expect("the group must now hold a worker");
+    let w = reg.agent(&worker).expect("the worker entry");
+    assert_eq!(w.group, gid, "the helper joins the lead's group, not `__solo__`");
+    assert_eq!(w.task, "read the tests and report back", "…carrying the brief the lead wrote");
+
+    let branch = w.branch.clone().expect("a worker gets its own branch (#338), not the lead's");
+    assert_ne!(w.cwd, repo.path(), "…and its own worktree, never the human's checkout");
+    assert!(
+        std::path::Path::new(&w.cwd).is_dir(),
+        "the worktree must really be on disk at {} — this is the assertion slice A could not \
+         make",
+        w.cwd
+    );
+    let branches = std::process::Command::new("git")
+        .current_dir(&repo.repo)
+        .args(["branch", "--list", &branch])
+        .output()
+        .expect("git");
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).contains(&branch),
+        "…and the branch must exist in the repo: {branch}"
+    );
+
+    // The helper is an ordinary worker, which is what makes the guardrail table
+    // true: it counts, and it is reapable.
+    assert!(counts_against_max_agents(w.role), "a helper spends a cap slot");
+    assert!(!w.role.is_root(), "…and is nobody's root");
+}
+
+/// **A lead cannot open a lead by naming the lead block** — and this slice is
+/// what made the case reachable.
+///
+/// Slice A's design note argued the property from the VOCABULARY: "no block can
+/// have kind `Lead` while `kind_from_str` cannot name one". That sentence was
+/// true while nothing minted a lead block, and `lead_prepare` is what makes it
+/// false — a real group on disk now has one. So the property moves onto the
+/// EFFECTIVE-class check, which reads the resolved block rather than the `kind`
+/// argument, and this is where it is pinned.
+///
+/// The `kind: "worker"` argument is what makes this a real case rather than a
+/// restating of `a_lead_may_spawn_a_worker_and_nothing_else`: the argument says
+/// worker and only the resolved block says otherwise, and a block's kind WINS
+/// at `spawn_agent_ex`.
+#[test]
+fn a_lead_cannot_open_a_lead_by_naming_its_own_block() {
+    let (reg, _d, _repo, gid, agent_id, _out) = prepared_lead("claude", 4);
+    let lead = reg.agent(&agent_id).expect("the lead entry");
+    assert_eq!(
+        reg.group(&gid).unwrap().guardrails.block("lead").map(|b| b.kind),
+        Some(Role::Lead),
+        "the premise: a MINTED group really does hold a block whose kind is Lead — slice A's \
+         note said none could exist, and this function is what changed that"
+    );
+    let c = caller_for(&reg, &lead);
+    let before = reg.list_agents(&gid).as_array().unwrap().len();
+
+    let out = q_call(&reg, &c, "spawn_agent", json!({ "kind": "worker", "block": "lead", "task": "t" }));
+    assert_eq!(out["isError"], json!(true), "no recursion: {out:?}");
+    assert!(
+        q_text(&out).contains("kind must be worker"),
+        "…refused by the effective-class check, which reads the resolved BLOCK: {}",
+        q_text(&out)
+    );
+    assert!(
+        q_text(&out).contains("kind \"lead\""),
+        "…and the refusal must say what it resolved to, so the next reader can see WHICH check \
+         said no: {}",
+        q_text(&out)
+    );
+    assert_eq!(
+        reg.list_agents(&gid).as_array().unwrap().len(),
+        before,
+        "a refused spawn must leave the roster exactly as it was"
+    );
+}
+
+/// **A group never ends up with two roots** — and this pins WHICH mechanism
+/// keeps that true, because there are two and only one of them fires.
+///
+/// The invariant matters because `deliver_relayed_to_root` is a `find` over a
+/// `HashMap`, whose iteration order is not stable: a group holding two
+/// `is_root()` agents would deliver a child's report to whichever came back,
+/// with no error on either side and possibly a different answer between runs.
+/// Slice A's note names it as the tripwire this slice's mint must close.
+///
+/// What actually refuses today is `next_group_id`, which picks the first
+/// candidate id with no LIVE agent — so a second toggle on a repo whose lead is
+/// running opens a SECOND group rather than a second root in one. The explicit
+/// check in `lead_prepare` sits under the same `creation` lock as a BACKSTOP
+/// and, stated plainly because it is the kind of claim that rots: **no test
+/// here can drive it**, since the liveness scan reaches first on every public
+/// path. It is defence against a future caller that names an id (the
+/// `expect_group` shape `create_orchestration_group` already has) rather than
+/// letting the id be chosen.
+///
+/// So this asserts the PROPERTY, over both groups, rather than a refusal
+/// string — and the dead-lead case below is the discriminating half: once the
+/// first lead is gone the id IS reused, and the property must still hold.
+#[test]
+fn a_group_never_ends_up_with_two_roots() {
+    let (reg, _d, repo, gid, agent_id, _out) = prepared_lead("claude", 4);
+    reg.lead_bind(&agent_id, 9501).unwrap();
+
+    let second = reg
+        .lead_prepare("claude", &repo.path(), "l2", 4, false, 5, 0, 5)
+        .expect("a second toggle on a live repo opens its own group rather than failing");
+    let gid2 = GroupId::parse(second["group_id"].as_str().unwrap()).unwrap();
+    assert_ne!(gid2, gid, "…in a DIFFERENT group, which is how the invariant is kept");
+
+    let roots_of = |g: &GroupId| -> Vec<String> {
+        reg.list_agents(g)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["role"] == json!("lead") || a["role"] == json!("orchestrator"))
+            .filter(|a| a["status"] != json!("dead"))
+            .map(|a| a["id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    for g in [&gid, &gid2] {
+        assert_eq!(roots_of(g).len(), 1, "group {g} must hold exactly one live root");
+    }
+
+    // THE DISCRIMINATING HALF. Kill the first lead, then toggle again: the id
+    // is now free, so this mint REATTACHES to `gid` rather than taking a third.
+    // A build whose mint left the dead root behind — or added a second live one
+    // — fails here, and only here.
+    reg.on_pty_exit(9501, Some(0), "", 0, true);
+    let third = reg
+        .lead_prepare("claude", &repo.path(), "l3", 4, false, 5, 0, 5)
+        .expect("a dead lead's group id is free again");
+    let gid3 = GroupId::parse(third["group_id"].as_str().unwrap()).unwrap();
+    assert_eq!(gid3, gid, "the control: a dead group's id really is reused, or nothing above is \
+                           testing reattachment");
+    assert_eq!(
+        roots_of(&gid),
+        vec![third["agent_id"].as_str().unwrap().to_string()],
+        "…and the reattached group holds exactly the NEW lead: the dead one is not a root, and \
+         no second live one was minted beside it"
+    );
+}
+
+/// **A lead group cannot be resumed.**
+///
+/// The lead's own pane is a human-launched CLI orrerix never opened and cannot
+/// relaunch; its helpers, rejoined into a group whose root is gone, would have
+/// no pane to report into at all. That is the restore residual
+/// `doc/design/lead-pane.md` records, and the refusal is what the session
+/// browser shows in its place.
+///
+/// **A helper's session is the only one this can be driven with**, and that is
+/// a fact about the slice rather than a shortcut: orrerix never learns a lead
+/// pane's own session id, because it does not build that pane's command line.
+/// So the row here is a dead helper's — which is exactly the row a human would
+/// click on in the session browser after their lead pane went away.
+///
+/// The session is put on the record through `set_session_for_test` plus a real
+/// `mark_dead`, which is what persists it: `session_roles` reads `agents.json`,
+/// not the in-memory map.
+#[test]
+fn a_lead_group_cannot_be_resumed() {
+    let (reg, _d, _repo, gid, agent_id, _out) = prepared_lead("claude", 4);
+    reg.lead_bind(&agent_id, 9601).unwrap();
+    let worker = reg.spawn_agent(&gid, Role::Worker, "w", "t", false, None).unwrap();
+    let sid = "aaaabbbb-cccc-4ddd-8eee-ffff00001111";
+    reg.set_session_for_test(&worker.id, sid);
+    reg.mark_dead(&worker.id, Some(0));
+    assert!(
+        reg.session_roles().iter().any(|r| r.session_id == sid),
+        "precondition: the helper's session must be on the persisted record, or the resume below \
+         fails for a reason that has nothing to do with lead groups"
+    );
+
+    let err = resume_recorded_session(&reg, sid, None, false)
+        .expect_err("a lead group's helper must not be rejoined");
+    assert!(
+        err.starts_with("resume-lead-group:"),
+        "…tagged so the frontend can report it specifically: {err}"
+    );
+    assert!(
+        err.contains("no lead to report to"),
+        "…and saying why, in terms of what the human would get back: {err}"
+    );
+    assert!(
+        resumeerror_tag_is_known(&err),
+        "…and the tag must be one the frontend maps, or the human sees the generic fallback"
+    );
+
+    // THE CONTROL. An ordinary orchestration group's helper, built exactly the
+    // same way, reaches a DIFFERENT refusal — so the assertions above are about
+    // lead groups rather than about a resume path that refuses everything.
+    let (reg2, _d2) = test_registry();
+    let repo2 = real_repo();
+    let og = reg2
+        .create_group(
+            &repo2.path(),
+            Guardrails {
+                max_agents: 4,
+                agent_cli: "claude".into(),
+                blocks: workflow::default_roster(&[
+                    (Role::Orchestrator, "claude", ""),
+                    (Role::Worker, "claude", ""),
+                ]),
+                ..Guardrails::default()
+            },
+        )
+        .unwrap();
+    assert!(!reg2.is_lead_group(&og.id), "the control group must not be a lead group");
+    let ow = reg2.spawn_agent(&og.id, Role::Worker, "w", "t", false, None).unwrap();
+    let osid = "22223333-4444-4555-8666-777788889999";
+    reg2.set_session_for_test(&ow.id, osid);
+    reg2.mark_dead(&ow.id, Some(0));
+    let control = resume_recorded_session(&reg2, osid, None, false).err().unwrap_or_default();
+    assert!(
+        !control.starts_with("resume-lead-group:"),
+        "an ordinary group's helper must not hit the lead refusal: {control}"
+    );
+}
+
+/// The frontend half of the `resume-<tag>:` contract, asserted from the backend
+/// side: `src/resumeerror.ts`'s `TAG_KIND` must map the tag this slice adds, or
+/// `resumeFailureKind` returns `null` and the human gets "It could not be
+/// resumed." instead of the message above.
+///
+/// A source read rather than a shared constant because the two halves are in
+/// different languages; `test/resumeerror.test.ts` pins the mapping's behaviour
+/// on the frontend side, and this pins that the two files agree on the string.
+fn resumeerror_tag_is_known(err: &str) -> bool {
+    let tag = err.split(':').next().unwrap_or_default();
+    let src = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("src").join("resumeerror.ts"),
+    )
+    .expect("src/resumeerror.ts must be readable from the test");
+    src.contains(&format!("\"{tag}\":"))
 }

@@ -36,6 +36,13 @@ test("recognizes every backend tag", () => {
     "group-unknown",
     "#485 review f1: 'cannot be verified' is its own kind — distinct from being contradicted"
   );
+  assert.equal(
+    resumeFailureKind(
+      "resume-lead-group: session abc belongs to g-1, a group opened by the orrerix-subagents toggle"
+    ),
+    "lead-group",
+    "#2519: a lead group's helper has nothing to rejoin into — the refusal must be classifiable"
+  );
 });
 
 test("an untagged or unrelated error is null, not misclassified", () => {
@@ -62,6 +69,11 @@ test("only the two provably-unresolvable kinds offer a start-fresh affordance", 
     offersStartFresh("group-unknown"),
     false,
     "#485 review f1: a fresh session would join the same unverified group — the refusal exists to prevent that"
+  );
+  assert.equal(
+    offersStartFresh("lead-group"),
+    false,
+    "#2519: a fresh session would join the same rootless group — there is no lead to report to"
   );
   assert.equal(offersStartFresh(null), false);
 });
@@ -113,6 +125,23 @@ test("the group-unknown guidance names a route that exists, never the circular o
   // sessions HAVE a record, so that route resolves for them. This test must not
   // be read as "no message may ever mention the browser".
   assert.match(resumeFailureReason("not-found"), /session history/i);
+});
+
+test("the lead-group refusal explains what to do instead (#2519)", () => {
+  // The human clicked a helper of a lead pane that is gone. The route back is
+  // a NEW lead pane, not a resume — and saying so is the whole value of the
+  // tag: without it this falls through to "It could not be resumed."
+  const lead = resumeFailureReason("lead-group");
+  assert.notEqual(lead, resumeFailureReason(null), "not the generic fallback");
+  assert.doesNotMatch(lead, /resume-[a-z-]+:/, "no wire tag leaks into the sentence");
+  assert.match(lead, /orrerix-subagents toggle/, "names what kind of group it was");
+  assert.match(lead, /no lead to report to/i, "…and why a rejoin would be useless");
+  assert.match(lead, /fresh pane/i, "…and the route that does work");
+  assert.match(
+    lead,
+    /outside orchestration/i,
+    "…and where the conversation itself is still reachable, as `group-unknown` does"
+  );
 });
 
 test("reason text is specific per kind, not a generic placeholder", () => {
