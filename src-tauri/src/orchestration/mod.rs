@@ -37039,9 +37039,6 @@ impl OrchRegistry {
         // the CLI they launched.
         let blocks = workflow::default_roster(&[
             (Role::Lead, cli, ""),
-            (Role::Worker, cli, ""),
-            (Role::Reviewer, cli, ""),
-            (Role::Planner, cli, ""),
         ]);
         let rails = Guardrails {
             max_agents,
