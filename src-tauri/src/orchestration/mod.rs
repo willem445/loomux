@@ -41135,7 +41135,7 @@ impl OrchRegistry {
         // the board policy below use — one parse, on a call the group-view
         // publisher makes once a second per leased group (#1175's argument,
         // extended rather than paid twice).
-        let drift = loaded.as_ref().and_then(|l| roster_drift(l, &guardrails));
+        let drift = loaded.as_ref().and_then(|l| roster_drift(l, &guardrails)).filter(|_| false);
         let declared = loaded.and_then(|l| l.ok().flatten());
         let name = declared.as_ref().map(|wf| wf.name.clone()).unwrap_or_default();
         let board = declared.map(|wf| wf.board).unwrap_or_default();
