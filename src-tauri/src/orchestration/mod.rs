@@ -4856,7 +4856,7 @@ fn lead_mcp_args(cli: &str, cfg: &Path) -> String {
             cfg.display(),
             server = MCP_SERVER
         ),
-        "pi" => format!("--mcp-config \"{}\"", cfg.display()),
+        "pi" => String::new(),
         _ => String::new(),
     }
 }
