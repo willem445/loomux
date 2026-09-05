@@ -33,6 +33,8 @@ import {
   ORDER_CHOICES,
   agentIdentityLine,
   agentRowMark,
+  markKey,
+  sweep,
   listSlots,
   filterChips,
   visibleGroups,
@@ -67,6 +69,12 @@ export interface AgentsViewDeps {
 interface RowEls {
   el: HTMLButtonElement;
   mark: HTMLElement;
+  /** `markKey` of the inputs the mark currently on screen was painted from —
+   *  the cache key for that one `innerHTML` write. Held beside the element
+   *  rather than recomputed from `row`, so the comparison is against what was
+   *  actually PAINTED and not against what the previous reading happened to
+   *  say (#2371 review round 3, finding 1). */
+  markKey: string;
   name: HTMLElement;
   identity: HTMLElement;
   state: HTMLElement;
@@ -348,18 +356,14 @@ export class AgentsView {
         place(els.el);
       }
     }
-    for (const [key, header] of [...this.groups]) {
-      if (seenGroups.has(key)) continue;
-      header.el.remove();
-      this.groups.delete(key);
-    }
-    for (const [key, els] of [...this.rows]) {
-      if (seenRows.has(key)) continue;
-      els.el.remove();
-      this.rows.delete(key);
-    }
-    // The empty line lives at the end and is unhidden rather than created, so
-    // it is never in the way of the diff above.
+    sweep(this.groups, seenGroups);
+    sweep(this.rows, seenRows);
+    this.renderEmpty(rowCount);
+  }
+
+  /** The "nothing to show" line. Unhidden rather than created, and re-appended
+   *  last, so it is never in the way of the placement walk above. */
+  private renderEmpty(rowCount: number): void {
     this.emptyEl.hidden = rowCount > 0;
     this.emptyEl.textContent =
       this.filter === "all"
@@ -398,7 +402,11 @@ export class AgentsView {
     identity.className = "agents-identity";
     el.append(top, identity);
     el.addEventListener("click", () => this.deps.focus(row.key));
-    return { el, mark, name, identity, state, row };
+    // Seeded to a key no `markKey` can produce, so the first `updateRow` always
+    // paints. `""` is not a candidate — `markKey` always emits a JSON array —
+    // and the `was === row` arm covers it too; belt and braces on the one path
+    // where an unpainted element must not be mistaken for a current one.
+    return { el, mark, markKey: "", name, identity, state, row };
   }
 
   /** Paint the agent-type mark (#2371).
@@ -430,7 +438,19 @@ export class AgentsView {
     els.row = row;
     if (els.name.textContent !== row.name) els.name.textContent = row.name;
     // `was === row` is the freshly-created row — see the state cell below.
-    if (was === row || was.harness !== row.harness) this.paintMark(els.mark, row);
+    //
+    // KEYED ON THE MARK'S OWN INPUTS, never on `harness` (#2371 review round 3,
+    // finding 1). `Pane.key` is `readonly` and survives `respawnFresh`, so this
+    // element outlives a respawn that rewrites the launch line — and `harness`
+    // is `sessionCliFromCommand`, which answers null for half of `AGENTS`. A
+    // `codex` pane promoted in place to a `gemini` orchestrator therefore moved
+    // the header's badge and left the row's alone, forever: the W1 divergence
+    // reappearing in the paint cache instead of in the derivation.
+    const markKeyNow = markKey(row.mark);
+    if (was === row || els.markKey !== markKeyNow) {
+      els.markKey = markKeyNow;
+      this.paintMark(els.mark, row);
+    }
     const identity = agentIdentityLine(row);
     if (els.identity.textContent !== identity) els.identity.textContent = identity;
     // `was === row` is the freshly-created row: `createRow` seeds `row` with

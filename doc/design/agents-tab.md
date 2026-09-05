@@ -379,14 +379,48 @@ store covers this pane", which is a real question with a legitimately narrower
 answer — it feeds `agentIdentityLine` and `notesApplyToPane`. What changed is
 that it no longer decides what a pane *is*. Its doc comment now says so.
 
-**Pinned from three sides**, because a shared derivation is only shared while
-someone keeps it that way: `test/agentsviewmodel.test.ts` walks `AGENTS` and
-builds each fixture from that entry's own `command` (not from a `harness` naming
-it — the fixture that hid this), asserts the row's answer equals the header's
-input's answer for every one, and covers the remote/local twin;
-`test/agenticons.test.ts` scans `Pane.agentMarkInput` for the three inputs and
-scans `refreshAgentMark` and `facts` for the fact that both resolve *from that
-getter*, since a correct getter nothing calls is the same failure in a new spot.
+**Pinned from four sides**, because a shared derivation is only shared while
+someone keeps it that way:
+
+1. `test/agentsviewmodel.test.ts` walks `AGENTS` and builds each fixture from
+   that entry's own `command` — not from a `harness` naming it, which is the
+   fixture shape that hid this — asserts the row's answer equals the answer the
+   header's input gives for every one, and covers the remote/local twin.
+2. `test/agenticons.test.ts` scans `Pane.agentMarkInput` for its three inputs,
+   and scans `refreshAgentMark` and `facts` for the fact that both resolve
+   *from that getter* — a correct getter nothing calls is the same failure in a
+   new spot.
+3. The same file carries a **default-deny scan** over every `agentMark(` call
+   site in `src/`, keyed on the ARGUMENT SHAPE rather than on any binding name,
+   with an allowlist whose two rows (the pane-setup preview, which draws a mark
+   for a pane that does not exist yet) each state their reason and are each
+   required to match. The named scans above pin exactly two consumers, so a
+   *third* surface added later would be invisible to them; this one denies it
+   by default.
+4. **The paint cache is keyed on the mark's own inputs**, via `markKey`. This
+   was a real regression and not a hypothetical: `AgentsView.updateRow` repaints
+   the mark only when its cached reading changed, and that guard was still keyed
+   on `harness` after the source of truth moved. `Pane.key` is `readonly` and
+   survives `respawnFresh` — which rewrites `spawnCommand`/`spawnArgv` in place
+   and repaints the *header* — so promoting a `codex` pane to a `gemini`
+   orchestrator (#407's door) left `harness` null→null, the header showing the
+   new badge and the row showing the old one indefinitely. The divergence
+   reappearing in a cache rather than in a derivation.
+
+### The list's stale-element sweep
+
+`sweep(held, seen)` drops every entry the last render did not place, for both
+the header map and the row map. It lives in `agentsviewmodel.ts` rather than in
+the view, and is generic over `{ el: Removable }` rather than `HTMLElement`, for
+the reason `listSlots` is: what it decides is pure, and the view is where this
+repo deliberately does not write tests. That placement is load-bearing rather
+than tidy — while it sat in `agentsview.ts`, disabling its body reddened nothing
+and `tsc` stayed silent.
+
+One helper for both maps, because the two must stay identical: a sweep that ran
+on one and not the other would leave orphaned elements exactly where the two
+lifetimes differ — a row survives its tab's header going away, and a header
+survives all of its rows being replaced.
 
 ## Slice B: the tab, the view, and the two things it is wired to
 

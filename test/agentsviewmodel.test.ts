@@ -5,6 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { agentMark } from "../src/agenticons.ts";
 import { AGENTS } from "../src/agents.ts";
@@ -18,6 +19,8 @@ import {
   agentRowMark,
   filterChips,
   listSlots,
+  markKey,
+  sweep,
   visibleGroups,
 } from "../src/agentsviewmodel.ts";
 
@@ -335,6 +338,122 @@ test("a remote pane and its local twin draw the same mark for the same CLI", () 
   assert.equal(unknown?.kind, "unknown");
   assert.equal(unknown?.program, null);
   assert.doesNotMatch(unknown?.label ?? "", /ssh/, "the transport's own name was read as the agent");
+});
+
+test("the mark's cache key moves whenever the resolver's answer would (#2371 review round 3, finding 1)", () => {
+  // THE SCENARIO THE FINDING NAMES, first and by itself: a `codex` pane promoted
+  // in place to a `gemini` orchestrator. `Pane.key` is readonly and survives
+  // `respawnFresh`, so the row element outlives it — and `harness` is
+  // `sessionCliFromCommand`, which answers null for BOTH, so the old guard saw
+  // no change and the row kept `codex`'s badge while the header drew `gemini`'s.
+  const codex = localPane("codex");
+  const gemini = localPane("gemini");
+  assert.equal(sessionCliFromCommand("codex"), null);
+  assert.equal(sessionCliFromCommand("gemini"), null, "both sides are outside the session-store set — that IS the bug");
+  assert.notEqual(markKey(codex), markKey(gemini), "the key must move where `harness` did not");
+  // And the answers really do differ, so the key is tracking something visible
+  // rather than moving for its own sake.
+  assert.notEqual(agentMark(codex)?.program, agentMark(gemini)?.program);
+
+  // Every input the resolver reads moves the key, one at a time from one base —
+  // disjoint fixtures would hold under an implementation that ignored a field.
+  const base = { command: "claude", argv: null, knownCli: null, remote: false };
+  const moved = [
+    { what: "command", mark: { ...base, command: "copilot" } },
+    { what: "command → null", mark: { ...base, command: null } },
+    { what: "argv", mark: { ...base, argv: ["copilot"] } },
+    { what: "argv contents", mark: { ...base, argv: ["claude", "--resume"] } },
+    { what: "knownCli", mark: { ...base, knownCli: "opencode" } },
+    { what: "remote", mark: { ...base, remote: true } },
+  ];
+  for (const m of moved) assert.notEqual(markKey(m.mark), markKey(base), `${m.what} did not move the key`);
+  // A distinct key per variant, so no two of them collide either.
+  const keys = new Set([markKey(base), ...moved.map((m) => markKey(m.mark))]);
+  assert.equal(keys.size, moved.length + 1, "two different mark inputs share one key");
+
+  // The other direction: equal inputs in a DIFFERENT object share a key. This is
+  // what stops the guard repainting once a second — `Pane.agentMarkInput` builds
+  // a fresh object on every call, so identity comparison would never match.
+  assert.equal(markKey({ ...base }), markKey(base));
+  assert.equal(markKey({ ...base, argv: [] }), markKey({ ...base, argv: [] }));
+  // `undefined` and `null` collapse deliberately: `agentMark` cannot tell them
+  // apart, so a key that did would repaint for no visible change.
+  //
+  // ALL FOUR FIELDS, not just the ones that happen to be absent in a convenient
+  // fixture. A first version of this assertion was `markKey({ command: "claude" })`
+  // — which leaves `command` DEFINED, so a mutation that separated undefined from
+  // null on that very field was invisible to it (the F6 row of round 3's matrix,
+  // caught by running the matrix rather than by reading the test).
+  assert.equal(markKey({}), markKey({ command: null, argv: null, knownCli: null, remote: false }));
+  assert.equal(markKey({ command: undefined }), markKey({ command: null }));
+  assert.equal(markKey({ argv: undefined }), markKey({ argv: null }));
+  assert.equal(markKey({ knownCli: undefined }), markKey({ knownCli: null }));
+  assert.equal(markKey({ remote: undefined }), markKey({ remote: false }));
+  // Non-vacuity for the block above: the resolver really does treat the two the
+  // same, so the collapse is tracking `agentMark` rather than asserting a habit.
+  assert.equal(agentMark({}), agentMark({ command: null, argv: null, knownCli: null, remote: false }));
+});
+
+test("the stale-element sweep drops exactly what the render did not place", () => {
+  // `sweep` lives in this module rather than in the view precisely so it can be
+  // tested (#2371 review round 3): it needs nothing from the DOM but `remove()`,
+  // and leaving it in `agentsview.ts` left it invisible — disabling its body
+  // reddened nothing and `tsc` stayed silent, measured in the F9 row of round
+  // 3's matrix.
+  // The counter is a closure variable, not a field: inside `el.remove()`, `this`
+  // is `el` rather than the entry, so `this.removed += 1` would count on the
+  // wrong object and leave every assertion below reading 0. (It did, on the
+  // first run — the fixture's own bug, caught because these assertions are not
+  // vacuous.)
+  const made = (id: string) => {
+    const entry = { id, removed: 0, el: { remove: () => void (entry.removed += 1) } };
+    return entry;
+  };
+  const a = made("a");
+  const b = made("b");
+  const c = made("c");
+  const held = new Map([["a", a], ["b", b], ["c", c]]);
+
+  sweep(held, new Set(["a", "c"]));
+
+  assert.deepEqual([...held.keys()], ["a", "c"], "the sweep kept the wrong entries");
+  assert.equal(b.removed, 1, "the unplaced entry's element was not removed");
+  assert.equal(a.removed, 0, "a placed entry was removed");
+  assert.equal(c.removed, 0, "a placed entry was removed");
+  // Insertion order survives — the view re-places every element it kept, but a
+  // sweep that rebuilt the map would churn iteration order for no reason.
+  assert.deepEqual([...held.values()].map((e) => e.id), ["a", "c"]);
+
+  // The two ends. Nothing seen removes everything; everything seen removes
+  // nothing — so the test cannot pass under a sweep that is a no-op OR under one
+  // that clears the map outright.
+  const all = new Map([["x", made("x")], ["y", made("y")]]);
+  sweep(all, new Set());
+  assert.equal(all.size, 0);
+  const none = new Map([["x", made("x")], ["y", made("y")]]);
+  sweep(none, new Set(["x", "y"]));
+  assert.equal(none.size, 2);
+  assert.deepEqual([...none.values()].map((e) => e.removed), [0, 0]);
+});
+
+test("the row's mark guard reads the mark inputs, not `harness`", () => {
+  // A source scan, because the guard itself is DOM wiring and this repo does not
+  // simulate a DOM — but WHICH FIELD it keys on is exactly what round 3's
+  // finding 1 was, and it is checkable as text. Scoped to `updateRow`'s body so
+  // an unrelated mention of `harness` elsewhere in the file cannot satisfy it.
+  const src = readFileSync(new URL("../src/agentsview.ts", import.meta.url), "utf8");
+  const m = src.match(/private updateRow\(els: RowEls, row: AgentRow\): void \{[\s\S]*?\n {2}\}/);
+  assert.ok(m, "AgentsView.updateRow is gone or no longer matches the expected shape");
+  const body = m[0];
+  assert.match(body, /markKey\(row\.mark\)/, "updateRow no longer keys the mark on its own inputs");
+  assert.doesNotMatch(
+    body,
+    /was\.harness !== row\.harness/,
+    "updateRow is keying the mark on `harness` again — a respawn that changes the launch line without " +
+      "changing the session-store CLI leaves the row's badge stale while the header repaints (round 3, finding 1)"
+  );
+  // Non-vacuity: the scan really found the guard, not an empty string.
+  assert.ok(body.includes("paintMark"), "the scanned body is not updateRow");
 });
 
 test("every group order has a word for it, and the control offers each exactly once", () => {

@@ -41,9 +41,13 @@ orchestration role or workflow block, and its group.
 The mark is the same one the pane header wears, resolved from the same reading —
 GitHub's Copilot glyph where a vendor publishes a licensed one, a lettered badge
 otherwise, and for a remote pane whose profile does not say which agent runs on
-the far end, a neutral badge that says orrerix does not know. A pane running no
-agent at all — a plain shell, or a launch line naming no program — carries no
-mark rather than a guess.
+the far end, a neutral badge that says orrerix does not know.
+
+A pane that is not an agent is never given a guess. A pane with no launch line at
+all — one you opened and typed into yourself — carries no mark; a pane launched
+with a shell or a transport (`bash`, `pwsh`, `ssh`) carries the same neutral
+badge its header does, because naming it "Agent CLI: bash" would be a confident
+wrong answer.
 
 **Click a row to go to that pane** — it switches to the pane's project tab,
 makes it the active pane there, and focuses the terminal.

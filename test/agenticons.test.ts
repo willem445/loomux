@@ -17,7 +17,7 @@
 // Run `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import {
   AGENT_VIEWBOX,
   CLI_DYE_PROGRAMS,
@@ -607,6 +607,78 @@ test("both mark surfaces resolve from that one getter, so neither can answer alo
   // Non-vacuity: the two bodies really are different regions of the file, so a broken
   // `paneMemberBody` that returned the same slab twice cannot pass both assertions above.
   assert.notEqual(header, facts, "the member scan returned one body for two members");
+});
+
+test("no surface resolves a live pane's mark outside the shared derivation", () => {
+  // DEFAULT-DENY over every `agentMark(` call site in `src/`, because the two tests above
+  // pin exactly two consumers BY NAME and a third added later would be invisible to them
+  // (#2371 review round 3, premortem). CLAUDE.md's rule for a source-scanning guard: decide
+  // on a name-independent axis — here the ARGUMENT SHAPE, which cannot be renamed away —
+  // and carry an allowlist whose every row states a reason and is required, so a row that
+  // goes stale fails loudly instead of watching nothing.
+  const files = readdirSync(new URL("../src/", import.meta.url))
+    .filter((f) => f.endsWith(".ts") && f !== "agenticons.ts");
+
+  /** Argument shapes that ARE the shared derivation. Anything else is denied. */
+  const SHARED = [
+    // `Pane.agentMarkInput` — the getter both the header and `facts()` read.
+    /agentMark\(this\.agentMarkInput\)/,
+    // A `PaneFacts.mark` carried through to a view; that field IS `agentMarkInput`.
+    /agentMark\((?:row|facts)\.mark\)/,
+  ];
+
+  /** Sites allowed to build their own input, each with the reason it cannot use the
+   *  getter. Every row must match at least once — a stale row is a failure. */
+  const ALLOW: { file: string; pattern: RegExp; why: string }[] = [
+    {
+      file: "setuppreview.ts",
+      pattern: /agentMark\(\{ knownCli: cli, remote: true \}, size\)/,
+      why: "the pane-SETUP preview draws a mark for a pane that does not exist yet, from the form's own " +
+        "declared far-end CLI — there is no Pane to hold an agentMarkInput",
+    },
+    {
+      file: "setuppreview.ts",
+      pattern: /agentMark\(\{ command \}, size\)/,
+      why: "same preview, the local arm: the command is the one the human is typing into the form",
+    },
+  ];
+
+  const denied: string[] = [];
+  const allowHits = new Map(ALLOW.map((a) => [a.why, 0]));
+  for (const f of files) {
+    const src = readFileSync(new URL(`../src/${f}`, import.meta.url), "utf8");
+    for (const line of src.split(/\r?\n/)) {
+      if (!line.includes("agentMark(")) continue;
+      if (SHARED.some((p) => p.test(line))) continue;
+      const allowed = ALLOW.find((a) => a.file === f && a.pattern.test(line));
+      if (allowed) {
+        allowHits.set(allowed.why, (allowHits.get(allowed.why) ?? 0) + 1);
+        continue;
+      }
+      denied.push(`${f}: ${line.trim()}`);
+    }
+  }
+
+  assert.deepEqual(
+    denied,
+    [],
+    "a surface resolves a pane's agent mark from its own inputs instead of Pane.agentMarkInput. That is " +
+      "how the row and the header came to disagree (#2371 W1). Either route it through the shared getter, " +
+      "or add an allowlist row here saying why it cannot:\n  " + denied.join("\n  ")
+  );
+  for (const [why, n] of allowHits) {
+    assert.ok(n > 0, `an allowlist row matches nothing and is watching no code — remove or repoint it: ${why}`);
+  }
+  // POSITIVE CONTROL. A scan that found no call sites at all would report zero denials and
+  // pass, which is byte-identical to a broken walk — so assert it really saw the shared
+  // ones, and that the file list is not empty.
+  const shared = files.flatMap((f) =>
+    readFileSync(new URL(`../src/${f}`, import.meta.url), "utf8")
+      .split(/\r?\n/)
+      .filter((l) => l.includes("agentMark(") && SHARED.some((p) => p.test(l)))
+  );
+  assert.ok(files.length > 10, `only ${files.length} source files scanned — the walk is broken`);
+  assert.equal(shared.length, 2, `expected the header and the row to be the two shared sites, saw ${shared.length}`);
 });
 test("pi draws a P in its own dye, and the roster's letters stay distinguishable (#2126)", () => {
   const view = agentMark({ command: "pi --session-id abc" });

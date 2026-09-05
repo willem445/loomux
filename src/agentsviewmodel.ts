@@ -19,7 +19,7 @@ import {
   type AgentRow,
   type AgentState,
 } from "./agentrows.ts";
-import { agentMark, type AgentMarkView } from "./agenticons.ts";
+import { agentMark, type AgentMarkInput, type AgentMarkView } from "./agenticons.ts";
 
 /** What each state is called in the UI. `Record<AgentState, string>` is TOTAL,
  *  so a rung added to the ladder without a word for it fails to compile rather
@@ -146,6 +146,36 @@ export function listSlots(groups: readonly AgentGroup[]): ListSlot[] {
   return slots;
 }
 
+/** The least a `sweep` entry has to be: something removable. Structural, not
+ *  `HTMLElement`, so this module stays free of the DOM and the sweep below is
+ *  testable with a two-line fake instead of a simulated document. */
+export interface Removable {
+  remove(): void;
+}
+
+/** Drop every entry the last render did not place, removing its element.
+ *
+ *  One helper for the header map and the row map, because it was the same six
+ *  lines twice (#2371 review round 3, finding 2) — and because the two must
+ *  stay the same: a sweep that ran on one map and not the other would leave
+ *  orphaned elements behind exactly where the two lifetimes differ (a row
+ *  survives its tab's header going away; a header survives all of its rows).
+ *
+ *  It lives HERE rather than in the view for the reason `listSlots` does: what
+ *  it decides is pure, and the view is where this repo deliberately does not
+ *  write tests. Leaving it in `agentsview.ts` left it invisible to the suite —
+ *  measured, not assumed: disabling its body reddened nothing and `tsc` stayed
+ *  silent.
+ *
+ *  Iterated over a COPY of the entries, since it deletes as it goes. */
+export function sweep<T extends { el: Removable }>(held: Map<string, T>, seen: ReadonlySet<string>): void {
+  for (const [key, entry] of [...held]) {
+    if (seen.has(key)) continue;
+    entry.el.remove();
+    held.delete(key);
+  }
+}
+
 /** The agent-type mark for a row (#2371), or `null` when there is nothing to
  *  draw.
  *
@@ -169,6 +199,33 @@ export function listSlots(groups: readonly AgentGroup[]): ListSlot[] {
  *  shows up as itself" true rather than merely claimed. */
 export function agentRowMark(row: AgentRow): AgentMarkView | null {
   return agentMark(row.mark);
+}
+
+/** A comparable key for a mark input: equal exactly when `agentMark` would give
+ *  the same answer, so a view can cache a painted mark against it.
+ *
+ *  IT EXISTS BECAUSE THE PAINT CACHE OUTLIVED ITS KEY (#2371 review round 3,
+ *  finding 1). `AgentsView.updateRow` repaints the mark only when its cached
+ *  reading changed, and that guard was still keyed on `harness` after round 2
+ *  moved the mark's SOURCE to the wider `agentMarkInput`. `Pane.key` is
+ *  `readonly` and survives `respawnFresh`, which rewrites `spawnCommand` and
+ *  `spawnArgv` in place and repaints the HEADER — so promoting a `codex` pane
+ *  to a `gemini` orchestrator (#407's door, `orchestration.ts` →
+ *  `respawnFresh(promotePaneOptions(...))`) left `harness` null→null, the header
+ *  showing the new badge and the row showing the old one indefinitely. That is
+ *  W1's divergence again, surviving in a cache rather than in a derivation.
+ *
+ *  A STRING, not a field-by-field compare, because `argv` is an array: identity
+ *  comparison would depend on whether a respawn happened to reuse the array,
+ *  which is a fact about `pane.ts`'s internals rather than about the mark.
+ *
+ *  `undefined` and `null` deliberately collapse to the same key. Every field of
+ *  `AgentMarkInput` is optional and `agentMark` reads them with `??`/truthiness,
+ *  so the two are indistinguishable TO THE RESOLVER — and this key's contract is
+ *  "equal when the answer would be equal", not "equal when the inputs are
+ *  identical". A key that separated them would repaint for no visible change. */
+export function markKey(mark: AgentMarkInput): string {
+  return JSON.stringify([mark.command ?? null, mark.argv ?? null, mark.knownCli ?? null, mark.remote ?? false]);
 }
 
 /** The quiet line under a row's name: which CLI, which role/block, which group
