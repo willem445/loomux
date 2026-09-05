@@ -282,11 +282,22 @@ reachable as a plain login shell (**Remote CLI = None**). If it turns out to
 matter, the honest fix is a declared field, the way `remoteShell` already is.
 
 **What has actually been exercised.** `test/sshcommand.test.ts` runs the built
-string through a real local shell on every CI platform, so the wrapped form is
-known to parse and to source an interactive-only rc file under **dash**
-(ubuntu-22.04's `/bin/sh`), **bash in sh-mode** (macos-latest) and **bash**
-(windows-latest, via Git Bash). zsh and fish are covered by the declaration
-model, not by a run.
+string through a real local shell on every CI platform, and gives **each flag
+its own startup-file witness**, because the two select disjoint classes: `-l`
+sources `~/.profile` (login only) and `-i` sources `$ENV` (interactive only).
+The test points `HOME` at a scratch directory and `ENV` at a scratch file, then
+asserts both markers appear *and* that what each file exported reaches the
+program the remote command finally `exec`s — which is the property the bug is
+actually about, one variable over from `PATH`. So "both flags are load-bearing"
+is measured rather than asserted: dropping `-l` reddens that test, dropping
+`-i` reddens it and three others.
+
+That holds under **dash** (ubuntu-22.04's `/bin/sh`), **bash in sh-mode**
+(macos-latest) and **bash** (windows-latest, via Git Bash). zsh and fish are
+covered by the declaration model, not by a run — as is the specific claim that
+nvm's export sits below `~/.bashrc`'s interactive early-return, which is an
+argument about a stock Ubuntu account's files rather than something a test here
+reproduces.
 
 **`buildCmdRemoteCommand` is deliberately untouched.** cmd.exe has no
 login/non-login distinction and no per-user rc file that sshd's `-c` invocation

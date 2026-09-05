@@ -638,32 +638,62 @@ if (!SH_AVAILABLE) {
  *
  *  Note `-i` makes bash complain about job control on stderr when stdin is not a
  *  tty ("cannot set terminal process group"); assertions below read stdout. */
-function runRemoteStringInSh(cmdString: string, rcFile?: string): ReturnType<typeof spawnSync> {
+function runRemoteStringInSh(cmdString: string, files?: StartupFiles): ReturnType<typeof spawnSync> {
   const env: Record<string, string | undefined> = { ...process.env, SHELL: "/bin/sh" };
-  // POSIX `ENV`: the file an INTERACTIVE POSIX shell sources at startup — the
-  // one lever that lets a test observe "did an rc file run?" without touching
-  // the runner's HOME. `delete` rather than leave inherited, so a run that
-  // passes no rcFile cannot accidentally source the developer's own.
-  if (rcFile) env.ENV = rcFile.split(path.sep).join("/");
-  else delete env.ENV;
+  // Two startup-file levers, one per flag the wrap emits, so each flag has a
+  // BEHAVIOURAL witness instead of only a string-literal pin:
+  //
+  //  - `ENV` is the file an INTERACTIVE POSIX shell sources  -> witnesses `-i`.
+  //  - `HOME`/.profile is the file a LOGIN shell sources     -> witnesses `-l`.
+  //
+  // Pointing HOME at a scratch directory rather than writing into the runner's
+  // real home is what makes the second one safe to run anywhere. Both are
+  // `delete`d rather than left inherited when no files are passed, so a run
+  // that asks for neither cannot accidentally source the developer's own.
+  if (files) {
+    env.ENV = files.rc.split(path.sep).join("/");
+    env.HOME = files.home.split(path.sep).join("/");
+  } else {
+    delete env.ENV;
+    delete env.HOME;
+  }
   return spawnSync("sh", ["-c", cmdString], { encoding: "utf8", env });
 }
 
-const RC_FILES: string[] = [];
+interface StartupFiles {
+  /** The interactive-only file, via POSIX `ENV` — the witness for `-i`. */
+  rc: string;
+  /** A scratch HOME holding a `.profile` — the login-only witness, for `-l`. */
+  home: string;
+}
+
+const SCRATCH_PATHS: string[] = [];
 process.on("exit", () => {
-  for (const f of RC_FILES) if (existsSync(f)) rmSync(f, { force: true });
+  for (const f of SCRATCH_PATHS) if (existsSync(f)) rmSync(f, { recursive: true, force: true });
 });
 
-/** Writes the rc file `runRemoteStringInSh`'s `ENV` points at. It both prints a
- *  marker and EXPORTS one, because those are two different claims: that the rc
- *  file ran at all, and that what it exported reaches the environment of the
- *  program the remote command finally `exec`s — which is the shape of the actual
- *  #2395 bug, where the missing export is `PATH`. */
-function writeRcFile(name: string): string {
-  const file = path.join(SCRATCH_DIR, `rc-${process.pid}-${name}.sh`);
-  writeFileSync(file, "echo RC-2395-SOURCED\nLOOMUX_2395_FROM_RC=on\nexport LOOMUX_2395_FROM_RC\n");
-  RC_FILES.push(file);
-  return file;
+/** Writes both startup files `runRemoteStringInSh` points a child shell at.
+ *
+ *  Each one prints a marker and EXPORTS one, because those are two different
+ *  claims: that the file ran at all, and that what it exported reaches the
+ *  environment of the program the remote command finally `exec`s — which is the
+ *  shape of the actual #2395 bug, where the missing export is `PATH`.
+ *
+ *  The two files are sourced by disjoint shell modes, which is what lets a test
+ *  attribute an effect to ONE flag: `~/.profile` runs for a login shell (`-l`)
+ *  and `$ENV` for an interactive one (`-i`), so dropping either flag from the
+ *  wrap silences exactly its own marker. */
+function writeStartupFiles(name: string): StartupFiles {
+  const rc = path.join(SCRATCH_DIR, `rc-${process.pid}-${name}.sh`);
+  writeFileSync(rc, "echo RC-2395-SOURCED\nLOOMUX_2395_FROM_RC=on\nexport LOOMUX_2395_FROM_RC\n");
+  const home = path.join(SCRATCH_DIR, `home-${process.pid}-${name}`);
+  mkdirSync(home, { recursive: true });
+  writeFileSync(
+    path.join(home, ".profile"),
+    "echo PROFILE-2395-SOURCED\nLOOMUX_2395_FROM_PROFILE=on\nexport LOOMUX_2395_FROM_PROFILE\n",
+  );
+  SCRATCH_PATHS.push(rc, home);
+  return { rc, home };
 }
 
 /** The pre-#2395 single-layer posix shape, reimplemented here on purpose: it is
@@ -741,7 +771,7 @@ test("real sh: benign command's literal output is observable (positive control)"
 //    comparison written by the same hand that wrote the builder.
 
 test("#2395 real sh: an rc file the pre-fix shape never sourced now reaches the exec'd program", { skip: !SH_AVAILABLE }, () => {
-  const rc = writeRcFile("reaches-env");
+  const files = writeStartupFiles("reaches-env");
   const legacyInner = legacyPosixRemoteCommand(undefined, ["sh", "-c", "echo cli-sees:$LOOMUX_2395_FROM_RC"]);
   const argv = buildSshArgv(FAKE_SSH, {
     destination: "h",
@@ -749,7 +779,7 @@ test("#2395 real sh: an rc file the pre-fix shape never sourced now reaches the 
     remoteCommand: ["sh", "-c", "echo cli-sees:$LOOMUX_2395_FROM_RC"],
   });
 
-  const fixed = runRemoteStringInSh(argv[argv.length - 1], rc);
+  const fixed = runRemoteStringInSh(argv[argv.length - 1], files);
   assert.equal(fixed.status, 0, `remote string did not parse: stderr=${fixed.stderr}`);
   assert.match(fixed.stdout, /RC-2395-SOURCED/, `the rc file did not run: stdout=${fixed.stdout}`);
   assert.match(fixed.stdout, /cli-sees:on/, `the rc file's export did not reach the exec'd program: stdout=${fixed.stdout}`);
@@ -758,24 +788,62 @@ test("#2395 real sh: an rc file the pre-fix shape never sourced now reaches the 
   // rc file, the SAME probe, under the pre-#2395 single-layer shape — the
   // program still runs, and sees neither. So what changed is the shell the
   // command runs under, not the harness.
-  const legacy = runRemoteStringInSh(legacyInner, rc);
+  const legacy = runRemoteStringInSh(legacyInner, files);
   assert.equal(legacy.status, 0, `control did not parse: stderr=${legacy.stderr}`);
   assert.doesNotMatch(legacy.stdout, /RC-2395-SOURCED/);
   assert.match(legacy.stdout, /cli-sees:$/m, `control probe did not run at all: stdout=${legacy.stdout}`);
+});
+
+test("#2395 real sh: BOTH flags are load-bearing — each one's own startup-file class runs", { skip: !SH_AVAILABLE }, () => {
+  // The claim "both flags are load-bearing, and neither alone fixes it"
+  // (src/sshcommand.ts, doc/design/ssh-panes.md) is the reason this emits
+  // `-l -i` rather than one of them, and the argv-string pins above cannot
+  // witness it: they would pass just as well if the emitted flags were wrong,
+  // as long as they matched the literal. So it is measured here, against the
+  // two startup-file classes the flags actually select:
+  //
+  //   `-l`  ->  ~/.profile           (login shell only)
+  //   `-i`  ->  $ENV                 (interactive shell only)
+  //
+  // Both markers present means both flags reached a real shell and did what
+  // they are emitted for. Dropping either from the wrap silences exactly its
+  // own marker and reddens exactly this test's corresponding assertion — the
+  // mutation table is in the PR body.
+  const files = writeStartupFiles("both-flags");
+  const probe = ["sh", "-c", "echo login:$LOOMUX_2395_FROM_PROFILE interactive:$LOOMUX_2395_FROM_RC"];
+  const argv = buildSshArgv(FAKE_SSH, { destination: "h", remoteShell: "posix", remoteCommand: probe });
+
+  const result = runRemoteStringInSh(argv[argv.length - 1], files);
+  assert.equal(result.status, 0, `remote string did not parse: stderr=${result.stderr}`);
+  // Each file RAN...
+  assert.match(result.stdout, /PROFILE-2395-SOURCED/, `-l did not source ~/.profile: stdout=${result.stdout}`);
+  assert.match(result.stdout, /RC-2395-SOURCED/, `-i did not source $ENV: stdout=${result.stdout}`);
+  // ...and what each EXPORTED reached the program the remote command exec'd,
+  // which is the property the real bug is about (there the export is PATH).
+  assert.match(result.stdout, /login:on interactive:on/, `an export did not reach the CLI: stdout=${result.stdout}`);
+
+  // Control: the pre-#2395 single-layer shape, same files, same probe. sshd's
+  // shell is neither login nor interactive, so NEITHER class runs and the
+  // program sees both variables empty — the bug, with both halves visible.
+  const legacy = runRemoteStringInSh(legacyPosixRemoteCommand(undefined, probe), files);
+  assert.equal(legacy.status, 0, `control did not parse: stderr=${legacy.stderr}`);
+  assert.doesNotMatch(legacy.stdout, /PROFILE-2395-SOURCED/);
+  assert.doesNotMatch(legacy.stdout, /RC-2395-SOURCED/);
+  assert.match(legacy.stdout, /login: interactive:$/m, `control probe did not run at all: stdout=${legacy.stdout}`);
 });
 
 test("#2395 real sh: the inner command is quoted exactly once — a quote/space/$ payload arrives verbatim", { skip: !SH_AVAILABLE }, () => {
   // `'` proves the escape/reopen ran at both layers, `$NOT_EXPANDED_2395`
   // proves nothing was left unquoted for a shell to expand, and the double
   // space proves no word-splitting happened on the way through.
-  const rc = writeRcFile("verbatim");
+  const files = writeStartupFiles("verbatim");
   const payload = "a'b  $NOT_EXPANDED_2395 c";
   const argv = buildSshArgv(FAKE_SSH, {
     destination: "h",
     remoteShell: "posix",
     remoteCommand: ["echo", payload],
   });
-  const result = runRemoteStringInSh(argv[argv.length - 1], rc);
+  const result = runRemoteStringInSh(argv[argv.length - 1], files);
   assert.equal(result.status, 0, `remote string did not parse: stderr=${result.stderr}`);
   // The rc marker pins that this ran through the wrap, so the verbatim
   // assertion below is a statement about TWO quoting layers, not one.
@@ -789,7 +857,7 @@ test("#2395 real sh: a cwd with a quote, a space and a $ survives both layers", 
   // same SCRATCH_DIR the injection markers use, so no temp-dir symlink (macOS's
   // /var -> /private/var) can make the created path and the `cd` argument
   // differ for a reason unrelated to quoting.
-  const rc = writeRcFile("hostile-cwd");
+  const files = writeStartupFiles("hostile-cwd");
   const dir = path.join(SCRATCH_DIR, "loomux-2395 o'brien $HOME");
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
@@ -800,7 +868,7 @@ test("#2395 real sh: a cwd with a quote, a space and a $ survives both layers", 
       remoteCwd: dir,
       remoteCommand: ["echo", "CWD-2395-OK"],
     });
-    const result = runRemoteStringInSh(argv[argv.length - 1], rc);
+    const result = runRemoteStringInSh(argv[argv.length - 1], files);
     assert.match(result.stdout, /RC-2395-SOURCED/, `not running under the wrap: stdout=${result.stdout}`);
     assert.match(
       result.stdout,
@@ -813,7 +881,7 @@ test("#2395 real sh: a cwd with a quote, a space and a $ survives both layers", 
     // no rc). Both shapes delivering the same directory is what makes this a
     // statement about the added layer being inert to the payload, rather than a
     // re-measurement of quoting that already worked.
-    const legacy = runRemoteStringInSh(legacyPosixRemoteCommand(dir, ["echo", "CWD-2395-LEGACY"]), rc);
+    const legacy = runRemoteStringInSh(legacyPosixRemoteCommand(dir, ["echo", "CWD-2395-LEGACY"]), files);
     assert.doesNotMatch(legacy.stdout, /RC-2395-SOURCED/);
     assert.match(
       legacy.stdout,

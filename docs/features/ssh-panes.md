@@ -209,6 +209,22 @@ remote TUI needs one, so this lands in the scrollback above the CLI and is
 harmless; if it bothers you, the usual `~/.hushlogin` and quieting your own rc
 files work exactly as they do on a normal login.
 
+**One rc pattern is not just noise, though.** If your `~/.bashrc` or `~/.zshrc`
+ends in a line that *replaces* the shell for interactive sessions — the common
+`exec tmux new-session -A …`, `exec screen -RR`, or `exec fish` — then that line
+now runs, and it never returns. The pane lands in tmux (or screen, or fish) and
+your remote CLI never starts. Nothing is lost and nothing is corrupted, but the
+pane is not the pane you asked for. Two ways out: guard that line on `$SSH_TTY`
+or on tmux not already running, the way such lines are usually written; or run
+this connection as **Remote CLI = None** and start the CLI yourself inside the
+session you land in.
+
+**Startup cost is paid on every connect, including reconnects.** A login shell
+runs your profile every time, and a heavy one — `nvm.sh`, or an
+`/etc/profile.d` script that does a network lookup — adds that delay before the
+CLI appears. Reconnect rebuilds the same command, so a flapping link pays it per
+attempt.
+
 This applies to the **POSIX** scheme only. **cmd.exe** has no login/non-login
 distinction and no per-user rc file that sshd's invocation skips, so its remote
 command is unchanged.

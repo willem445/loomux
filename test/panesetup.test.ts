@@ -573,9 +573,19 @@ test("a saved connection off disk is never bounced by that refusal", () => {
 test("a remote folder with no remote CLI warns — the value is kept, not dropped in silence", () => {
   // `remoteCwd` is a prefix to the REMOTE COMMAND, so with no CLI there is
   // nothing to prefix and it cannot apply (S2's builder has always worked this
-  // way). Honouring it would mean guessing the remote's login shell — the exact
-  // guess `remoteShell` exists to refuse — and refusing to save it would throw
-  // away a setting that becomes correct the moment a CLI is picked. So: warn.
+  // way). Honouring it would mean synthesizing a remote command whose whole job
+  // is a `cd`, and ANY remote command changes what the pane is: with none, ssh
+  // asks sshd for an interactive session and sshd starts the account's login
+  // shell itself; with one, ssh forces a pty and sshd runs `<shell> -c
+  // <string>`. Refusing to save it would throw away a setting that becomes
+  // correct the moment a CLI is picked. So: warn.
+  //
+  // This comment used to give the reason as "guessing the remote's login
+  // shell". #2395 retired that reason — `$SHELL` comes from the environment
+  // sshd built from the account, and the POSIX builder now emits
+  // `exec "$SHELL" -l -i -c` around every remote command it builds — without
+  // changing this behaviour. See `sshRemoteCwdWarning`'s doc block in
+  // src/panesetup.ts and doc/design/ssh-panes.md.
   assert.match(sshRemoteCwdWarning(null, "/srv/app"), /only when a remote CLI is set/i);
   assert.match(sshRemoteCwdWarning(null, "/srv/app"), /stays saved/i);
   // Silent in every case where it does apply, or where there is nothing to say.
@@ -802,8 +812,11 @@ test("a profile edited to a NON-minting CLI never receives the recorded claude i
 test("a profile edited down to a plain login shell reconnects as a login shell", () => {
   // No remote command at all — so no `-t`, no `--`, and certainly no session
   // flag. The recorded id is simply not applicable any more, and inventing a
-  // remote command to hang it on would be the guess `remoteShell` exists to
-  // refuse.
+  // remote command to hang it on would turn a login-shell pane into a command
+  // session with a forced pty — a different session shape, not the same pane
+  // with an id attached. (The reason used to be given as "the guess
+  // `remoteShell` exists to refuse"; #2395 retired that phrasing, not this
+  // decision — see src/panesetup.ts's `sshRemoteCwdWarning`.)
   const { argv, sessionId, mode } = sshReconnectArgv("ssh", sshProfile({ defaultCli: null }), "remote-sess-1", MINT);
   assert.equal(mode, "fresh");
   assert.equal(sessionId, null);
