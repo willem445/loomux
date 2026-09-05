@@ -28,8 +28,6 @@ pub const APP_COMMANDS: &[&str] = &[
     "change_dir",
     "discover_git_bash",
     "discover_ssh",
-    // sshagent (1)
-    "ssh_add_identity",
     // sessions (3)
     "list_sessions",
     "record_copilot_launch_posture",
