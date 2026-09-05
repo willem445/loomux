@@ -10174,7 +10174,7 @@ const PERMISSION_PHRASES: &[&str] = &[
 /// structured tier above is untouched.
 const PROSE_PERMISSION_PHRASES: &[&str] =
     &["yes/no", "waiting for your", "press enter to continue"];
-const NUMBERED_MENU_TOKENS: &[&str] = &["1. yes", "❯ 1."];
+const NUMBERED_MENU_TOKENS: &[&str] = &["❯ 1."];
 const MENU_FOOTER_TOKENS: &[&str] =
     &["enter to select", "enter to confirm", "use arrow", "arrow keys", "↑↓", "↑/↓"];
 
