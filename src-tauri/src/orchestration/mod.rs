@@ -976,24 +976,82 @@ pub fn workflow_mode_notice(on: bool, name: &str, gate: Option<&workflow::Gate>)
                 spawn/review strategy."
             .to_string();
     }
-    let gate_clause = match gate {
-        Some(g) => {
-            let require = match g.require {
-                workflow::GateRequire::AllPass => "all of".to_string(),
-                workflow::GateRequire::Threshold(n) => format!("{n} of"),
-            };
-            let mut clause =
-                format!("merge gate requires {require} [{}]", g.reviewers.join(", "));
-            if !g.also.is_empty() {
-                clause.push_str(&format!(" · {}", g.also.join(", ")));
-            }
-            clause
-        }
-        None => "no merge gate declared".to_string(),
-    };
+    let gate_clause = gate_clause(gate);
     format!(
         "[orrerix] workflow mode changed: '{name}' active, {gate_clause} — re-plan your \
          spawn/review strategy."
+    )
+}
+
+/// The gate half of a workflow notice, in one place (#1689 slice B).
+///
+/// Extracted from [`workflow_mode_notice`] rather than re-spelled in
+/// [`workflow_switched_notice`]: two renderings of one gate are two chances to
+/// describe the same clause differently, and the orchestrator reads both
+/// notices as statements about the same file.
+fn gate_clause(gate: Option<&workflow::Gate>) -> String {
+    let Some(g) = gate else { return "no merge gate declared".to_string() };
+    let require = match g.require {
+        workflow::GateRequire::AllPass => "all of".to_string(),
+        workflow::GateRequire::Threshold(n) => format!("{n} of"),
+    };
+    let mut clause = format!("merge gate requires {require} [{}]", g.reviewers.join(", "));
+    if !g.also.is_empty() {
+        clause.push_str(&format!(" · {}", g.also.join(", ")));
+    }
+    clause
+}
+
+/// One-line notice delivered to the orchestrator when the human applies a
+/// different workflow to a LIVE group (#1689 slice B), so it re-plans its
+/// spawn/review strategy without waiting to re-read its kickoff config.
+///
+/// Deliberately says the two things a switch changes about the orchestrator's
+/// own next move and nothing else: **which ids it may spawn by from now on**,
+/// and **what happens to a pane already running under an id the new roster
+/// dropped** — it keeps running, and a bare `resume_session` of it is refused
+/// by `spawn_agent_bound`'s unknown-block path. Neither is discoverable from
+/// the pane, and getting either wrong costs a spawn attempt.
+///
+/// `blocks` is the roster AFTER the swap (already `clamped()`), `agent_cli` the
+/// group default the empty `cli:`/`model:` keys inherit, and `removed` the ids
+/// the diff reports gone.
+///
+/// One paragraph, like every notice loomux types into a pane: no newline and no
+/// ten-space run (CLAUDE.md's shape rule — a `\` continuation that collapsed
+/// leaves the second without the first).
+pub fn workflow_switched_notice(
+    from: &str,
+    to: &str,
+    agent_cli: &str,
+    blocks: &[workflow::Block],
+    removed: &[String],
+    gate: Option<&workflow::Gate>,
+) -> String {
+    let roster = blocks
+        .iter()
+        .map(|b| {
+            let mut row = format!(
+                "{} ({}, {}, {}",
+                b.id,
+                b.kind.as_str(),
+                workflow::cli_of(b, agent_cli),
+                workflow::model_of(b, agent_cli)
+            );
+            if b.has_persona() {
+                row.push_str(", persona");
+            }
+            row.push(')');
+            row
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let gone = if removed.is_empty() { "none".to_string() } else { removed.join(", ") };
+    format!(
+        "[orrerix] workflow switched: '{from}' → '{to}' — blocks now: {roster}; removed: {gone}; \
+         {} — spawn by these ids from now on; a pane already running under a removed block keeps \
+         running, but a bare resume of its session will be refused.",
+        gate_clause(gate)
     )
 }
 
@@ -4840,6 +4898,215 @@ pub fn load_active_workflow(
     rails: &Guardrails,
 ) -> Result<Option<workflow::Workflow>, Vec<String>> {
     workflow::load_workflow_named(repo, &rails.workflow)
+}
+
+/// The armed-gate payload, shared by `workflow_status` and the switch preview
+/// (#1689 slice B).
+///
+/// `satisfiable`/`missing_blocks` are recomputed against whichever roster is
+/// passed — the live one for a status, the roster the switch WOULD produce for a
+/// preview. That is what lets the confirmation say "this gate names a reviewer
+/// the new roster cannot spawn" before the human clicks, rather than leaving it
+/// to `merge-gate-unsatisfiable` in the trail afterwards (#316's stance).
+fn gate_json(g: &workflow::Gate, blocks: &[workflow::Block]) -> Value {
+    let missing = workflow::gate_missing_blocks(g, blocks);
+    json!({
+        "require": match g.require {
+            workflow::GateRequire::AllPass => "all-pass".to_string(),
+            workflow::GateRequire::Threshold(n) => format!("threshold {n}"),
+        },
+        "reviewers": g.reviewers,
+        "also": g.also,
+        // #1174. `null` when undeclared — the pane keeps "no limit" apart from
+        // any number, so the chip never announces a clause this repo did not
+        // write.
+        "max_diff_lines": g.max_diff_lines,
+        // #1176. The rules AS DECLARED — which of them fire is a per-PR fact and
+        // this payload has no PR to ask about. An empty list is "no routing",
+        // which the chip must keep apart from "routing that happened not to
+        // match", a sentence it cannot say here.
+        "routing": g.routing.iter().map(|r| json!({
+            "paths": r.paths,
+            "reviewers": r.reviewers,
+        })).collect::<Vec<_>>(),
+        "satisfiable": missing.is_empty(),
+        "missing_blocks": missing,
+    })
+}
+
+/// The roster rows every workflow payload publishes, in one shape (#1689 slice
+/// B): `workflow_status`'s live roster and a switch preview's proposed one.
+fn roster_json(blocks: &[workflow::Block]) -> Value {
+    json!(blocks
+        .iter()
+        .map(|b| json!({
+            "id": b.id,
+            "kind": b.kind.as_str(),
+            "cli": b.cli,
+            "model": b.model,
+            "persona": b.has_persona(),
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// A [`workflow::RosterDiff`] on the wire (#1689 slice B) — read by the audit
+/// row a switch writes and by the confirmation the human approves it from, so
+/// the trail records the same diff the human was shown.
+fn diff_json(d: &workflow::RosterDiff) -> Value {
+    json!({
+        "added": d.added,
+        "removed": d.removed,
+        "changed": d.changed.iter().map(|c| json!({ "id": c.id, "fields": c.fields }))
+            .collect::<Vec<_>>(),
+        "gate_changed": d.gate_changed,
+        "intake_changed": d.intake_changed,
+        "orchestrator_cli_changed": d.orchestrator_cli_changed,
+    })
+}
+
+/// Everything `apply_workflow(name)` would do, resolved once (#1689 slice B).
+///
+/// Built by `OrchRegistry::plan_workflow_switch` and consumed by both the
+/// preview and the apply, which is the point: the diff a human confirms is the
+/// diff that gets applied and audited, because there is only one.
+struct SwitchPlan {
+    /// The guardrails the group would run, already `clamped()`.
+    guardrails: Guardrails,
+    /// The `gates.merge` clause the target file declares, if any.
+    gate: Option<workflow::Gate>,
+    /// The target file's own `name:` field — human prose for the modal's title,
+    /// never an identifier.
+    display_name: String,
+    /// The repo-relative path the name resolved to.
+    path: String,
+    /// A digest of the file this plan was resolved FROM, so an apply can refuse
+    /// to act on a confirmation the human gave about different bytes. `None`
+    /// means the digest could not be taken, which is "cannot confirm".
+    digest: Option<String>,
+    diff: workflow::RosterDiff,
+    /// Set when the switch cannot be applied to a LIVE group however the human
+    /// answers the confirmation — today, only an orchestrator-CLI change. The
+    /// preview carries it BESIDE the diff so the modal can explain rather than
+    /// just refuse.
+    refusal: Option<String>,
+    /// Keys on the orchestrator block that the apply writes to `group.json` but
+    /// that the RUNNING pane will not pick up until it is resumed (`model`,
+    /// `effort`, `context`). Empty is the common case.
+    next_resume: Vec<String>,
+}
+
+impl SwitchPlan {
+    /// The preview payload, and the source of `orch_workflow_switch_preview`'s
+    /// wire shape.
+    fn to_json(&self, info: &GroupInfo) -> Value {
+        json!({
+            "name": self.guardrails.workflow.as_str(),
+            "from": info.guardrails.workflow.as_str(),
+            "path": self.path,
+            // Hand this straight back to `apply_workflow`: it is what binds the
+            // confirmation the human gives to the bytes they were shown.
+            "digest": self.digest,
+            "display_name": self.display_name,
+            // "Nothing would change" is a real answer and the modal has to be
+            // able to say it, rather than presenting an empty confirmation.
+            "empty": self.diff.is_empty(),
+            "refusal": self.refusal,
+            "next_resume": self.next_resume,
+            "diff": diff_json(&self.diff),
+            "blocks": roster_json(&self.guardrails.blocks),
+            "gate": self.gate.as_ref().map(|g| gate_json(g, &self.guardrails.blocks)),
+        })
+    }
+}
+
+/// A group's pinned roster no longer matches what its ACTIVE workflow file now
+/// says (#222 rev-11 F2; lifted out of the resume-only audit in #1689 slice B,
+/// so the audit trail and the live badge cannot disagree about what drift is).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RosterDrift {
+    /// Which kind of drift, in the words the audit row and the badge share.
+    pub note: &'static str,
+    /// The block ids the file resolves to NOW. Empty when the file is gone or
+    /// no longer validates — the group is running blocks its repo no longer
+    /// declares, which is exactly the thing worth being able to see.
+    pub on_disk: Vec<String>,
+    /// The intake profile the file resolves to now; `None` in those same two
+    /// arms, mirroring an empty `on_disk`.
+    pub intake_on_disk: Option<workflow::IntakeProfile>,
+}
+
+/// Compare a group's pinned roster and intake against an ALREADY-LOADED read of
+/// its active workflow file (#1689 slice B). `None` is "no drift".
+///
+/// **Takes the loaded `Result` rather than reading the file**, for the reason
+/// `OrchRegistry::wip_rows` takes a resolved policy: both callers already have
+/// one in hand, and `workflow_status` runs on the group-view publisher's
+/// one-second cadence per leased group, where a second YAML parse of the same
+/// file is a real cost. `audit_workflow_drift` passes its own load in;
+/// `workflow_status_within` passes the load it already makes for the display
+/// name and the board policy.
+///
+/// The comparison is against the roster the file *would resolve to* — the same
+/// `clamped()` a launch applies — not against its raw blocks, so an inherited
+/// model filled in at launch does not read as drift. A file that has since been
+/// deleted or broken is drift too.
+pub fn roster_drift(
+    loaded: &Result<Option<workflow::Workflow>, Vec<String>>,
+    g: &Guardrails,
+) -> Option<RosterDrift> {
+    let ids = |bs: &[workflow::Block]| -> Vec<String> { bs.iter().map(|b| b.id.clone()).collect() };
+    // #382 NB2: intake drifts independently of the roster — a repo can rename
+    // its label vocabulary without touching a single block, and that must be as
+    // visible as a roster change. `roster_is_custom(&g.blocks)` alone still
+    // gates every arm below correctly even though it only inspects blocks:
+    // `blocks` and `intake` are ALWAYS resolved together, from the same `wf`, in
+    // the same `Launch::Fresh` branch (`create_group_ex`) — a group's roster is
+    // custom iff its intake profile could be too, so there is no case where
+    // blocks reads "built-in" while intake is quietly running something declared.
+    // The three paths that resolve a roster all set both: `create_group_ex`'s
+    // Fresh arm, `apply_workflow`, and `set_advanced_orchestrator`'s two arms —
+    // the last of which only became true at #2659 review round 1, and until then
+    // was the one way a group could hold a declared roster beside a built-in
+    // vocabulary and read as permanently drifted.
+    match loaded {
+        Ok(Some(wf)) => {
+            let resolved_intake = wf.intake.clone();
+            let resolved = Guardrails {
+                agent_cli: g.agent_cli.clone(),
+                blocks: wf.blocks.clone(),
+                workflow: g.workflow.clone(),
+                ..Guardrails::default()
+            }
+            .clamped()
+            .blocks;
+            if resolved == g.blocks && resolved_intake == g.intake {
+                return None; // the file still says what the group is running — roster AND intake
+            }
+            // "Appeared" and "changed" are different events to a human reading
+            // the trail, and only one of them means "somebody edited the file
+            // you approved". A group whose running roster is the built-in four
+            // was launched without a workflow in play at all — so the repo has
+            // *gained* one since, and this group is simply not running it.
+            let note = if workflow::roster_is_custom(&g.blocks) {
+                "the file has changed since this group was launched"
+            } else {
+                "the repo has gained a workflow file since this group was launched"
+            };
+            Some(RosterDrift { note, on_disk: ids(&resolved), intake_on_disk: Some(resolved_intake) })
+        }
+        // No file, no workflow: nothing to drift from.
+        Ok(None) if !workflow::roster_is_custom(&g.blocks) => None,
+        Ok(None) => Some(RosterDrift {
+            note: "the file the group was launched from is gone",
+            on_disk: Vec::new(),
+            intake_on_disk: None,
+        }),
+        Err(_) => Some(RosterDrift {
+            note: "the file no longer validates",
+            on_disk: Vec::new(),
+            intake_on_disk: None,
+        }),
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -32792,66 +33059,26 @@ impl OrchRegistry {
     /// repo's workflow file now says (#222, rev-11 F2). Audit only — the pinned
     /// roster is what runs, deliberately.
     ///
-    /// The comparison is against the roster the file *would resolve to* (same
-    /// `clamped()` a launch applies), not against its raw blocks, so an inherited
-    /// model filled in at launch doesn't read as drift. A file that has since been
-    /// deleted or broken is drift too: the group is running blocks its repo no
-    /// longer declares, which is exactly the thing worth being able to see.
+    /// The comparison itself is [`roster_drift`], shared with the live `drift`
+    /// field `workflow_status` publishes (#1689 slice B): a badge and an audit
+    /// row that disagreed about whether a group had drifted would be two
+    /// answers to one question, and the human would have no way to tell which
+    /// was stale.
     fn audit_workflow_drift(&self, id: &GroupId, repo: &str, g: &Guardrails) {
-        let ids = |bs: &[workflow::Block]| -> Vec<String> { bs.iter().map(|b| b.id.clone()).collect() };
-        // #382 NB2: intake drifts independently of the roster — a repo can
-        // rename its label vocabulary without touching a single block, and
-        // that must be as visible as a roster change. `roster_is_custom(&g.
-        // blocks)` alone still gates every arm below correctly even though it
-        // only inspects blocks: `blocks` and `intake` are ALWAYS resolved
-        // together, from the same `wf`, in the same `Launch::Fresh` branch
-        // (`create_group_ex`) — a group's roster is custom iff its intake
-        // profile could be too, so there is no case where blocks reads
-        // "built-in" while intake is quietly running something declared.
-        let (now, now_intake, note) = match load_active_workflow(repo, g) {
-            Ok(Some(wf)) => {
-                let resolved_intake = wf.intake.clone();
-                let resolved = Guardrails {
-                    agent_cli: g.agent_cli.clone(),
-                    blocks: wf.blocks,
-                    workflow: g.workflow.clone(),
-                    ..Guardrails::default()
-                }
-                .clamped()
-                .blocks;
-                if resolved == g.blocks && resolved_intake == g.intake {
-                    return; // the file still says what the group is running — roster AND intake
-                }
-                // "Appeared" and "changed" are different events to a human reading
-                // the trail, and only one of them means "somebody edited the file
-                // you approved". A group whose running roster is the built-in four
-                // was launched without a workflow in play at all — so the repo has
-                // *gained* one since, and this group is simply not running it.
-                let note = if workflow::roster_is_custom(&g.blocks) {
-                    "the file has changed since this group was launched"
-                } else {
-                    "the repo has gained a workflow file since this group was launched"
-                };
-                (ids(&resolved), Some(resolved_intake), note)
-            }
-            Ok(None) if !workflow::roster_is_custom(&g.blocks) => return, // no file, no workflow: nothing to drift from
-            Ok(None) => (Vec::new(), None, "the file the group was launched from is gone"),
-            Err(_) => (Vec::new(), None, "the file no longer validates"),
-        };
+        let Some(drift) = roster_drift(&load_active_workflow(repo, g), g) else { return };
         self.audit(id, brand::AUDIT_ACTOR, "workflow-changed-since-launch", json!({
             "path": active_workflow_path(repo, g),
-            "note": note,
-            "running": ids(&g.blocks),
-            "on_disk": now,
+            "note": drift.note,
+            "running": g.blocks.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
+            "on_disk": drift.on_disk,
             // Mirrors `running`/`on_disk` for the intake profile — null
             // `intake_on_disk` means the file is gone/broken, same as an
             // empty `on_disk` for blocks in those arms.
             "intake_running": intake_json(&g.intake),
-            "intake_on_disk": now_intake.as_ref().map(intake_json),
+            "intake_on_disk": drift.intake_on_disk.as_ref().map(intake_json),
             "action": "keeping the roster this group was launched with — relaunch to pick up the new one",
         }));
     }
-
     /// Create (or reattach to) the group for `repo`. State and audit history
     /// persist under the repo-derived group id; guardrails are refreshed from
     /// the new launch.
@@ -39826,7 +40053,7 @@ impl OrchRegistry {
             }
         }
         // Crash-safe write, exactly as `persist_max_agents` and
-        // `persist_advanced_orchestrator` do it — this was the one `group.json`
+        // `persist_roster` do it — this was the one `group.json`
         // writer still hand-rolling a temp-and-rename against a FIXED sibling
         // name (`group.json.tmp`) and without an fsync. Both mattered once
         // these setters left the webview thread (#762): a shared temp name is
@@ -40293,20 +40520,39 @@ impl OrchRegistry {
         Ok(())
     }
 
-    /// Rewrite `guardrails.advanced_orchestrator` and `guardrails.blocks` in
-    /// group.json in place, preserving every other stored field — the same
+    /// Rewrite the four `guardrails` keys that make up a group's ROSTER —
+    /// `advanced_orchestrator`, `workflow`, `blocks` and `intake` — in
+    /// group.json in place, preserving every other stored field: the same
     /// crash-safe, additive patch `persist_max_agents` uses (#316's live
-    /// counterpart to the launch-time-only toggle). The two fields are patched
-    /// together in one atomic write because they change together on a live
-    /// toggle (a new roster arms a new gate; toggle-off restores the built-in
-    /// one) — a caller not changing the roster passes back its own current
-    /// `blocks`, which round-trips byte-for-byte, so the field is effectively
-    /// preserved on a flag-only change.
-    fn persist_advanced_orchestrator(
+    /// counterpart to the launch-time-only toggle, generalised by #1689 slice B).
+    ///
+    /// **One write, because they are one fact.** A live toggle changes the flag
+    /// and the roster together (a new roster arms a new gate; toggle-off
+    /// restores the built-in one), and an apply changes all four: the name of
+    /// the file, the blocks it declared, and the intake vocabulary resolved
+    /// from the same document. A name persisted apart from the roster it
+    /// produced could disagree with it after a crash, and then nothing on disk
+    /// would say which of the two the human consented to — the argument
+    /// `Guardrails::workflow` states, enforced here by there being no second
+    /// writer.
+    ///
+    /// A caller not changing one of the four passes back its own current value,
+    /// which round-trips byte-for-byte, so the field is effectively preserved.
+    /// That is what `set_advanced_orchestrator` does with `workflow`: a toggle
+    /// changes which roster is in force, never which FILE the group is pinned to,
+    /// so the name it passes back is the one it read. `intake` is not in that
+    /// category and an earlier version of this doc wrongly said it was (#2659
+    /// review round 1, rev-final 1): the toggle adopts the file's intake on the
+    /// way ON and restores the built-in profile on the way OFF, so that value
+    /// really does move — it is passed in because it changed, not because it
+    /// round-trips.
+    fn persist_roster(
         &self,
         group: &GroupId,
         on: bool,
+        name: &workflow::WorkflowName,
         blocks: &[workflow::Block],
+        intake: &workflow::IntakeProfile,
     ) -> Result<(), String> {
         let dir = self.group_dir(group);
         let path = dir.join("group.json");
@@ -40315,16 +40561,18 @@ impl OrchRegistry {
         // Guard the indexing so a corrupt-but-valid-JSON file (e.g. a `null`
         // root) fails soft instead of panicking on assignment.
         let obj = v.as_object_mut().ok_or("group.json root is not a JSON object")?;
+        let patch = |guard: &mut serde_json::Map<String, Value>| {
+            guard.insert("advanced_orchestrator".into(), json!(on));
+            guard.insert("workflow".into(), json!(name.as_str()));
+            guard.insert("blocks".into(), blocks_json(blocks));
+            guard.insert("intake".into(), intake_json(intake));
+        };
         match obj.get_mut("guardrails").and_then(Value::as_object_mut) {
-            Some(guard) => {
-                guard.insert("advanced_orchestrator".into(), json!(on));
-                guard.insert("blocks".into(), blocks_json(blocks));
-            }
+            Some(guard) => patch(guard),
             None => {
-                obj.insert("guardrails".into(), json!({
-                    "advanced_orchestrator": on,
-                    "blocks": blocks_json(blocks),
-                }));
+                let mut guard = serde_json::Map::new();
+                patch(&mut guard);
+                obj.insert("guardrails".into(), Value::Object(guard));
             }
         }
         // Crash-safe write: group.json is identity-critical — a half-written
@@ -40334,7 +40582,6 @@ impl OrchRegistry {
         atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
         Ok(())
     }
-
     /// Live setter for the advanced-orchestrator toggle (#316), modeled EXACTLY
     /// on `set_max_agents`/`set_autonomous`: persist-first group.json patch,
     /// in-memory swap, audit, and an `[orrerix] workflow mode changed …` notice to
@@ -40388,7 +40635,7 @@ impl OrchRegistry {
         // Captured at load time, emitted only once the persist below actually
         // succeeds (rev-24 N2) — auditing "workflow-loaded" before the write
         // that makes it stick would leave a stray audit line claiming a load
-        // that never took effect if `persist_advanced_orchestrator` then fails.
+        // that never took effect if `persist_roster` then fails.
         let mut loaded_audit: Option<Value> = None;
 
         if on {
@@ -40403,6 +40650,15 @@ impl OrchRegistry {
                     name = wf.name.clone();
                     gate = wf.gates.get("merge").cloned();
                     guardrails.blocks = wf.blocks;
+                    // #2659 review round 1 (rev-final 1): the intake profile comes
+                    // from the SAME document as the roster and is adopted with it,
+                    // exactly as `create_group_ex`'s Fresh arm and `apply_workflow`
+                    // do. Taking `blocks` alone left every live-toggled group running
+                    // the built-in label vocabulary under a declared roster — which
+                    // `roster_drift` reads, correctly, as permanent drift against a
+                    // file nobody had edited, and which #778 makes load-bearing: the
+                    // human's `hold` veto is a live label, not decoration.
+                    guardrails.intake = wf.intake;
                     guardrails = guardrails.clamped();
                 }
                 Ok(None) => {
@@ -40430,6 +40686,13 @@ impl OrchRegistry {
             // are not separately persisted today, so this restores the
             // default-CLI roster, not necessarily the group's original one.
             guardrails.blocks = Vec::new();
+            // The intake vocabulary goes back with it. Restoring the roster and
+            // KEEPING the file's labels is the ON arm's defect in reverse — a
+            // group running the built-in four while the intake poller and the
+            // human's veto still answer to a `hold` spelling only the repo file
+            // ever named. Off means the file is not obeyed, and that has to
+            // include the half of it that is not blocks.
+            guardrails.intake = workflow::builtin_intake_profile();
             guardrails = guardrails.clamped();
         }
         guardrails.advanced_orchestrator = on;
@@ -40437,11 +40700,16 @@ impl OrchRegistry {
         // Persist first: a failed disk write must leave the in-memory
         // roster/flag (what enforcement reads) unchanged, so the two never
         // disagree — same discipline as `set_max_agents`.
-        self.persist_advanced_orchestrator(group, on, &guardrails.blocks)?;
+        self.persist_roster(group, on, &guardrails.workflow, &guardrails.blocks, &guardrails.intake)?;
         {
             let mut groups = self.groups.lock_safe();
             let g = groups.get_mut(group).ok_or("unknown group")?;
             g.guardrails.blocks = guardrails.blocks.clone();
+            // The vocabulary moves with the roster it was resolved beside — the
+            // in-memory half of the same fix. `persist_roster` above already wrote
+            // it, so omitting it here is the worst shape: group.json and the live
+            // guardrails disagreeing about which `hold` label the group answers to.
+            g.guardrails.intake = guardrails.intake.clone();
             g.guardrails.advanced_orchestrator = on;
         }
         // Only now that the persist succeeded — see `loaded_audit`'s doc above.
@@ -40476,6 +40744,298 @@ impl OrchRegistry {
         let _ =
             self.deliver_to_orchestrator(group, &workflow_mode_notice(on, &name, gate.as_ref()), brand::AUDIT_ACTOR);
 
+        Ok(self.workflow_status(group))
+    }
+
+    /// What applying a named workflow to THIS group would do (#1689 slice B) —
+    /// the one resolution behind both [`Self::workflow_switch_preview`] and
+    /// [`Self::apply_workflow`].
+    ///
+    /// Shared rather than computed twice on purpose: a preview that resolved
+    /// the file, the roster or the diff even slightly differently from the
+    /// apply would be a confirmation about something other than what happens,
+    /// which is the whole of what "consent-preserving" means here. It is the
+    /// same argument `orch_workflow_preview` makes for being the engine rather
+    /// than a second opinion.
+    ///
+    /// **`Err` is a refusal that no confirmation can clear**: workflow mode is
+    /// off, the file is absent, the file will not parse. `Ok` with
+    /// [`SwitchPlan::refusal`] set is a refusal the human can act on by editing
+    /// the file, so the diff is returned WITH it — the preview shows what the
+    /// switch would change and why it cannot be applied, rather than a bare
+    /// error naming neither.
+    fn plan_workflow_switch(
+        &self,
+        info: &GroupInfo,
+        name: &workflow::WorkflowName,
+    ) -> Result<SwitchPlan, String> {
+        // Workflow mode OFF refuses BEFORE the file is even resolved, and the
+        // refusal names the fix. The toggle is this group's one consent surface
+        // for "does this group obey repo-authored workflow files" (`Guardrails::
+        // advanced_orchestrator`: off means the file "is not read, not validated
+        // and not obeyed"); an apply answers only the narrower question of WHICH
+        // file. Arming the toggle from a picker instead would be the app
+        // granting itself the consent that toggle exists to ask for — and every
+        // reader gated on the flag (`board_policy`, `workflow_status`'s declared
+        // load, the drift audit) would start reading a file nobody switched on.
+        if !info.guardrails.advanced_orchestrator {
+            return Err(format!(
+                "workflow mode is off for this group, so there is no active workflow to switch \
+                 away from — turn it on first, which arms '{}', then apply '{name}'.",
+                info.guardrails.workflow
+            ));
+        }
+        // Resolved through the SAME pair every group-scoped reader uses, against
+        // a copy of the guardrails carrying the TARGET name — never a second
+        // spelling of "which file does this name mean".
+        let target = Guardrails { workflow: name.clone(), ..info.guardrails.clone() };
+        let path = active_workflow_path(&info.repo, &target);
+        let wf = match load_active_workflow(&info.repo, &target) {
+            Ok(Some(wf)) => wf,
+            Ok(None) => {
+                return Err(format!(
+                    "{} declares no {path} — there is no workflow named '{name}' to apply.",
+                    info.repo
+                ))
+            }
+            Err(errors) => {
+                return Err(format!(
+                    "{}'s {path} is invalid, so applying '{name}' would swap in a roster that \
+                     could not be loaded: {}",
+                    info.repo,
+                    errors.join("; ")
+                ))
+            }
+        };
+
+        let display_name = wf.name.clone();
+        let gate = wf.gates.get("merge").cloned();
+        let guardrails = Guardrails {
+            workflow: name.clone(),
+            blocks: wf.blocks,
+            intake: wf.intake,
+            ..info.guardrails.clone()
+        }
+        .clamped();
+
+        // The OLD side is what the group is ACTUALLY running: the pinned roster
+        // and intake, and the gate file that is armed right now — not whatever
+        // the old file says today, which is a different question (that one is
+        // `drift`).
+        let armed = self.merge_gate(&info.id);
+        let diff = workflow::roster_diff(
+            &info.guardrails.agent_cli,
+            workflow::RosterSide {
+                blocks: &info.guardrails.blocks,
+                gate: armed.as_ref(),
+                intake: &info.guardrails.intake,
+            },
+            workflow::RosterSide {
+                blocks: &guardrails.blocks,
+                gate: gate.as_ref(),
+                intake: &guardrails.intake,
+            },
+        );
+
+        // The one change an apply cannot make to a LIVE group. The orchestrator's
+        // pane is already running a program and a session cannot change program
+        // mid-flight — the same reason `promote_orchestrator_cli` refuses it —
+        // and re-opening that pane is a relaunch, not a switch.
+        let refusal = diff.orchestrator_cli_changed.then(|| {
+            format!(
+                "'{name}' runs the orchestrator on a different CLI, and a live session cannot \
+                 change the program it is running — relaunch the group on '{name}' instead, or \
+                 leave the orchestrator block's cli: as this group's."
+            )
+        });
+
+        // A `model:`/`effort:`/`context:` change on the orchestrator block IS
+        // applied — to group.json — but the running pane keeps the model it was
+        // opened with, so the preview says when it takes effect rather than
+        // letting the human read the diff as a live change.
+        let next_resume = diff
+            .changed
+            .iter()
+            .find(|c| guardrails.block(&c.id).map(|b| b.kind == Role::Orchestrator).unwrap_or(false))
+            .map(|c| c.fields.iter().filter(|f| f.as_str() != "cli").cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let digest = workflow::workflow_digest(&info.repo, name);
+        Ok(SwitchPlan { guardrails, gate, display_name, path, digest, diff, refusal, next_resume })
+    }
+
+    /// What `apply_workflow(name)` would change, without changing anything
+    /// (#1689 slice B) — the payload the group header's **Review & apply**
+    /// modal is built from.
+    ///
+    /// Read-only, and it is the SAME resolution the apply runs
+    /// ([`Self::plan_workflow_switch`]), so the confirmation a human reads and
+    /// the action they authorize cannot describe different things.
+    #[doc(hidden)] // pub for integration tests
+    pub fn workflow_switch_preview(&self, group: &GroupId, name: &workflow::WorkflowName) -> Result<Value, String> {
+        let info = self.group(group).ok_or("unknown group")?;
+        let plan = self.plan_workflow_switch(&info, name)?;
+        Ok(plan.to_json(&info))
+    }
+
+    /// Bring the group dir's instruction files in line with `g`'s roster (#423),
+    /// auditing a failure rather than propagating it (#1689 slice B).
+    ///
+    /// **Not propagated**, because both callers run AFTER the switch is persisted
+    /// and live: turning a disk hiccup into an `Err` there would report a failure
+    /// that did not occur. What is genuinely lost is the SWEEP — the per-spawn
+    /// render writes a new block's file but never removes a departed one — so the
+    /// trail has to say so, and the no-op re-apply arm calls this too, which is
+    /// what gives a failed sweep a way to be retried at all.
+    fn reconcile_instruction_files(&self, g: &GroupInfo) {
+        if let Err(e) = self.write_instruction_files(g) {
+            self.audit(&g.id, brand::AUDIT_ACTOR, "instruction-files-failed", json!({
+                "error": e,
+                "note": "the roster is applied and live; a removed block's stale \
+                         instructions file may still be on disk — re-applying the same \
+                         workflow retries this",
+            }));
+        }
+    }
+
+    /// Apply a named workflow to a LIVE group (#1689 slice B) — the
+    /// consent-preserving roster switch, modelled on
+    /// [`Self::set_advanced_orchestrator`] step for step: persist first,
+    /// in-memory swap, instruction files, audit, gate sync, notice.
+    ///
+    /// **What it does NOT do is the consent model.** A pane already running
+    /// keeps the block it was spawned under — `AgentEntry.block` is recorded at
+    /// spawn and nothing re-reads it — so no delegate is re-personaed under a
+    /// human who already approved it. What the switch governs is FUTURE spawns:
+    /// `spawn_agent_bound` resolves against `guardrails.blocks`, so a b-only id
+    /// becomes spawnable immediately and an id the new roster dropped is refused
+    /// by that function's existing unknown-block path, naming the active roster.
+    /// A bare `resume_session` of a removed block's agent inherits the recorded
+    /// id and reaches the same refusal — which is the required behaviour, not a
+    /// new mechanism.
+    ///
+    /// **`write_instruction_files` runs, and `set_advanced_orchestrator` does
+    /// not call it.** That is the difference an apply forces: the live toggle
+    /// never introduces a block the group dir has not already seen, while a
+    /// switch both adds and REMOVES ids — and only this path reconciles the
+    /// group dir against the `.instruction-files-manifest`, sweeping a removed
+    /// block's stale `<id>.md` (#423). The per-spawn render
+    /// (`spawn_agent_bound`, #1187) would eventually write a NEW block's file,
+    /// but it never removes anything.
+    ///
+    /// Returns the resulting [`Self::workflow_status`], like the toggle, so an
+    /// apply's own confirm and a later status poll cannot disagree.
+    #[doc(hidden)] // pub for integration tests
+    pub fn apply_workflow(
+        &self,
+        group: &GroupId,
+        name: &workflow::WorkflowName,
+        expect_digest: Option<&str>,
+        actor: &str,
+    ) -> Result<Value, String> {
+        // `group_file_io` covers the whole decide-persist-publish window, for
+        // the reason `set_advanced_orchestrator`'s does: the roster this reads
+        // is the roster the write below patches. Released before
+        // `workflow_status` on either exit — that call can resolve a default
+        // branch through `git`, and no other group's guardrail write should wait
+        // behind a subprocess.
+        let _io = self.group_file_io.lock_safe();
+        let info = self.group(group).ok_or("unknown group")?;
+        let plan = self.plan_workflow_switch(&info, name)?;
+        if let Some(refusal) = plan.refusal {
+            return Err(refusal);
+        }
+        // The file may have been edited between the preview the human read and
+        // the confirmation they gave (#2659 review round 1, premortem 1). Without
+        // this the apply would silently install whatever the file says NOW, and
+        // the audit row would record a diff nobody had approved. `None` is a
+        // caller with no confirmation to honour — a test, a script — and is
+        // recorded as such in the trail rather than treated as a match.
+        if let Some(want) = expect_digest {
+            if plan.digest.as_deref() != Some(want) {
+                return Err(format!(
+                    "{} changed since the preview you confirmed — re-open the diff and \
+                     confirm the file as it stands now.",
+                    plan.path
+                ));
+            }
+        }
+        let from = info.guardrails.workflow.clone();
+        // Already-at-target: the same name AND a file nobody has edited since.
+        // Same shape as the toggle's own no-op — no audit row, no notice, no
+        // rewrite — and deliberately narrow: re-applying a name whose file HAS
+        // been edited is the #1566 apply-an-edit path and must go all the way
+        // through.
+        if from == *name && plan.diff.is_empty() {
+            // It still reconciles the group dir before returning (#2659 review
+            // round 1, premortem 2). `write_instruction_files` is audited rather
+            // than propagated below, so an apply whose write failed leaves the
+            // switch live with a stale `<id>.md` on disk — and the obvious human
+            // response, applying the same unedited file again, is exactly the
+            // call this arm used to answer without touching the disk. Nothing
+            // else self-heals it: the per-spawn render never REMOVES a file. The
+            // write is idempotent, and this arm is a human-gated action rather
+            // than a poll, so paying it here costs nothing worth saving.
+            self.reconcile_instruction_files(&info);
+            drop(_io);
+            return Ok(self.workflow_status(group));
+        }
+
+        let guardrails = plan.guardrails;
+        // Persist first: a failed disk write must leave the in-memory
+        // roster (what enforcement reads) unchanged, so the two never disagree —
+        // same discipline as `set_advanced_orchestrator`.
+        self.persist_roster(group, true, &guardrails.workflow, &guardrails.blocks, &guardrails.intake)?;
+        {
+            let mut groups = self.groups.lock_safe();
+            let g = groups.get_mut(group).ok_or("unknown group")?;
+            g.guardrails.workflow = guardrails.workflow.clone();
+            g.guardrails.blocks = guardrails.blocks.clone();
+            g.guardrails.intake = guardrails.intake.clone();
+        }
+
+        // The group dir reconciled against the new roster (#423) — see this
+        // function's doc for why the toggle does not need this and an apply
+        // does. A failure here is audited and NOT propagated: the roster is
+        // already persisted and live, the next spawn re-renders its own block's
+        // file anyway, and turning a disk hiccup into an `Err` after the switch
+        // has happened would report a failure that did not occur. What is
+        // genuinely lost is the SWEEP, so the trail has to say so.
+        let after = GroupInfo { id: info.id.clone(), repo: info.repo.clone(), guardrails: guardrails.clone() };
+        self.reconcile_instruction_files(&after);
+
+        self.audit(group, actor, "workflow-switched", json!({
+            "from": from.as_str(),
+            "to": guardrails.workflow.as_str(),
+            "path": plan.path,
+            "actor": actor,
+            // Both halves, so a later reader can tell "this is what the file said
+            // when it landed" from "this is what the human was shown". A null
+            // `confirmed_digest` is a caller that passed no confirmation, which is
+            // a different statement from the two agreeing.
+            "digest": plan.digest,
+            "confirmed_digest": expect_digest,
+            "diff": diff_json(&plan.diff),
+        }));
+        // Inside `group_file_io`, for the reason `set_advanced_orchestrator`
+        // states at its own call: the gate spec and the roster it belongs to are
+        // one decision, and two writers that commit them in opposite orders
+        // leave a gate armed for a roster that never declared it.
+        self.sync_merge_gate_locked(group, plan.gate.as_ref(), &guardrails.blocks);
+        drop(_io);
+
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &workflow_switched_notice(
+                from.as_str(),
+                guardrails.workflow.as_str(),
+                &guardrails.agent_cli,
+                &guardrails.blocks,
+                &plan.diff.removed,
+                plan.gate.as_ref(),
+            ),
+            brand::AUDIT_ACTOR,
+        );
         Ok(self.workflow_status(group))
     }
 
@@ -40560,41 +41120,26 @@ impl OrchRegistry {
         // to be two `load_workflow` calls, which is two YAML parses of the same
         // file on a call the publisher makes once a second for every group
         // holding a view lease (the group view's 2 s poll until #1608).
-        let declared = if guardrails.advanced_orchestrator {
-            info.as_ref().and_then(|g| load_active_workflow(&g.repo, &g.guardrails).ok().flatten())
+        let loaded = if guardrails.advanced_orchestrator {
+            info.as_ref().map(|g| load_active_workflow(&g.repo, &g.guardrails))
         } else {
             // The toggle being off is authoritative "this group declares
             // nothing", exactly as `board_policy`/`merge_queue_policy` read it
-            // — not an unread file.
+            // — not an unread file. `drift` is `null` here for the same reason,
+            // and not because nothing drifted: a group running the built-in
+            // roster has no declared file to have drifted from.
             None
         };
+        // #1689 slice B: the drift badge reads the SAME comparison the resume
+        // audit writes (`roster_drift`), off the SAME load the display name and
+        // the board policy below use — one parse, on a call the group-view
+        // publisher makes once a second per leased group (#1175's argument,
+        // extended rather than paid twice).
+        let drift = loaded.as_ref().and_then(|l| roster_drift(l, &guardrails));
+        let declared = loaded.and_then(|l| l.ok().flatten());
         let name = declared.as_ref().map(|wf| wf.name.clone()).unwrap_or_default();
         let board = declared.map(|wf| wf.board).unwrap_or_default();
-        let gate = self.merge_gate(group).map(|g| {
-            let missing = workflow::gate_missing_blocks(&g, &guardrails.blocks);
-            json!({
-                "require": match g.require {
-                    workflow::GateRequire::AllPass => "all-pass".to_string(),
-                    workflow::GateRequire::Threshold(n) => format!("threshold {n}"),
-                },
-                "reviewers": g.reviewers,
-                "also": g.also,
-                // #1174. `null` when undeclared — the pane keeps "no limit"
-                // apart from any number, so the chip never announces a clause
-                // this repo did not write.
-                "max_diff_lines": g.max_diff_lines,
-                // #1176. The rules AS DECLARED — which of them fire is a per-PR
-                // fact and this status has no PR to ask about. An empty list is
-                // "no routing", which the chip must keep apart from "routing
-                // that happened not to match", a sentence it cannot say here.
-                "routing": g.routing.iter().map(|r| serde_json::json!({
-                    "paths": r.paths,
-                    "reviewers": r.reviewers,
-                })).collect::<Vec<_>>(),
-                "satisfiable": missing.is_empty(),
-                "missing_blocks": missing,
-            })
-        });
+        let gate = self.merge_gate(group).map(|g| gate_json(&g, &guardrails.blocks));
         // The repo's default branch NAME (#581), so the board can tell a merge
         // into the gated default branch from a sub-PR into an integration
         // branch. `null` when it doesn't resolve — a real answer the frontend
@@ -40612,14 +41157,34 @@ impl OrchRegistry {
         json!({
             "advanced": guardrails.advanced_orchestrator,
             "name": name,
+            // #1689: which workflow this group RUNS, and which ones the repo
+            // offers. `workflow` is the pinned name — always present, `default`
+            // for every group that predates named workflows — where `name` above
+            // is the file's own cosmetic `name:` field and is empty whenever the
+            // toggle is off. `available` is a names-only directory walk
+            // (`list_workflow_names`), never the picker's full listing: this
+            // payload does not need to know why a file will not parse, and
+            // reading every one of them per publish tick is the unbounded read
+            // #2658 recorded.
+            "workflow": guardrails.workflow.as_str(),
+            // An UNKNOWN group has no repo to list, and `""` is not one: it would
+            // resolve `.orrerix/workflows` against the PROCESS working directory
+            // and answer with whatever that happens to hold (#2659 review round 1,
+            // rev-std 3). Read-only and bounded, but an answer about the wrong
+            // machine is worse than no answer.
+            "available": info
+                .as_ref()
+                .map(|g| workflow::list_workflow_names(&g.repo))
+                .unwrap_or_default(),
+            // `null` = the group is running what its file says (or declares
+            // none). Set = the pinned roster and the file have diverged; the
+            // pinned roster is what runs, deliberately (#222 rev-11 F2).
+            "drift": drift.map(|d| json!({
+                "note": d.note,
+                "on_disk_blocks": d.on_disk,
+            })),
             "default_branch": default_branch,
-            "blocks": guardrails.blocks.iter().map(|b| json!({
-                "id": b.id,
-                "kind": b.kind.as_str(),
-                "cli": b.cli,
-                "model": b.model,
-                "persona": b.has_persona(),
-            })).collect::<Vec<_>>(),
+            "blocks": roster_json(&guardrails.blocks),
             "gate": gate,
             "wip": self.wip_rows(group, &board),
         })
@@ -56126,6 +56691,91 @@ pub async fn orch_set_advanced_orchestrator(
         // #1608: republish this group before the command returns, so the
         // group view's own post-action reload — which is immediate, not on
         // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
+}
+
+/// Parse a raw workflow name at the COMMAND BOUNDARY (#1689), the way
+/// `command_group` parses a raw group id — so a `WorkflowName` is the only
+/// thing that travels inward and the compiler, not a scan, is what keeps a
+/// hand-typed `../../etc/x` out of a path join (CLAUDE.md constraint 6).
+///
+/// The raw string is **not** echoed back in the refusal: this reaches a toast,
+/// which is a display surface, and `orch_workflow_preview` already declines to
+/// echo one into `path` for the same reason.
+fn command_workflow_name(raw: &str) -> Result<workflow::WorkflowName, String> {
+    workflow::WorkflowName::parse(raw).map_err(|e| format!("that is not a usable workflow name: {e}"))
+}
+
+/// What applying a named workflow to this group would change (#1689 slice B) —
+/// the payload the group header's **Review & apply** modal is built from, and
+/// the same resolution [`orch_apply_workflow`] runs, so the confirmation and
+/// the action cannot describe different things.
+///
+/// Read-only. `Err` is a refusal no confirmation can clear (workflow mode off,
+/// the name is unusable, the file is absent or will not parse); an `Ok` whose
+/// `refusal` is set is a refusal the human can act on by editing the file, and
+/// carries the diff beside it so the modal can explain rather than just stop.
+///
+/// Off-thread (#762): it reads and parses a workflow file and the group's
+/// armed gate spec.
+///
+/// **Reentrancy.** Reads only — in-memory guardrails, the workflow file and the
+/// `merge_gate` spec file; it mutates nothing, so nothing here can be observed
+/// half-done.
+#[tauri::command]
+pub async fn orch_workflow_switch_preview(
+    app: AppHandle,
+    group_id: String,
+    name: String,
+) -> Result<Value, String> {
+    let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
+    let name = command_workflow_name(&name)?;
+    run_blocking(move || reg.workflow_switch_preview(&group_id, &name)).await
+}
+
+/// Apply a named workflow to a LIVE group (#1689 slice B) — human action from
+/// the group header, never agent-triggered, and gated behind the confirmation
+/// [`orch_workflow_switch_preview`] fills in.
+///
+/// Swaps the roster for FUTURE spawns, rewrites `group.json`, reconciles the
+/// group dir's instruction files and re-arms the merge gate; a pane already
+/// running keeps the block it was spawned under. See
+/// `OrchRegistry::apply_workflow` for the full contract. Returns the resulting
+/// workflow status — the same shape `orch_workflow_status` reads.
+///
+/// `expect_digest` is the `digest` the preview returned. Pass it: it is what
+/// binds this apply to the bytes the human actually read, and without it the
+/// apply installs whatever the file says at click time — which may not be the
+/// diff that was confirmed.
+///
+/// Off-thread (#762): it reads the repo's workflow file, patches `group.json`,
+/// writes the group dir's instruction files, syncs the merge-gate spec file and
+/// returns `workflow_status`.
+///
+/// **Reentrancy.** The `group.json` read-modify-write, the in-memory publish and
+/// the gate sync are one unit under `OrchRegistry::group_file_io`, exactly as
+/// `orch_set_advanced_orchestrator`'s are and for the same reason — and the
+/// other racer, `run_workflow_gate_reload`'s background pass, already re-reads
+/// the group's guardrails immediately before writing (#385).
+#[tauri::command]
+pub async fn orch_apply_workflow(
+    app: AppHandle,
+    group_id: String,
+    name: String,
+    expect_digest: Option<String>,
+) -> Result<Value, String> {
+    let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
+    let name = command_workflow_name(&name)?;
+    run_blocking(move || {
+        let out = reg.apply_workflow(&group_id, &name, expect_digest.as_deref(), "human");
+        // #1608: republish this group before the command returns, so the group
+        // view's own post-action reload — which is immediate, not on the next
+        // publish tick — cannot read the pre-write snapshot.
         reg.publish_group_now(&group_id);
         out
     })

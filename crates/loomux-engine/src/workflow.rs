@@ -363,18 +363,56 @@ pub struct WorkflowListing {
     pub findings: Vec<String>,
 }
 
-/// Every workflow this repo declares (#1689).
+/// The most workflow files one repo may declare (#1689 slice B, closing the
+/// unbounded-read residual #2658 raised on slice A).
 ///
-/// `.orrerix/workflow.yml` is listed as [`DEFAULT_WORKFLOW_NAME`]; every
-/// `<name>.yml` under [`workflows_dir`] is listed under its own stem. Sorted by
-/// name, because `read_dir` order is a filesystem accident (and on Windows not
-/// even a stable one), and a picker that reorders itself between reads is a
-/// picker nobody can point at.
-pub fn list_workflows(repo: &str) -> WorkflowListing {
-    let mut listing = WorkflowListing::default();
-    // Keyed by name and iterated in key order at the end: the sort is the map's,
-    // not a separate step that could be forgotten.
-    let mut seen: BTreeMap<String, WorkflowEntry> = BTreeMap::new();
+/// A ceiling, not a design limit: a repo with more than this is not a repo
+/// anybody picks a workflow out of by hand, and `read_dir` here is on a path
+/// the group-view publisher walks once a second per leased group. Exceeding it
+/// is a listing FINDING rather than an error, for the same reason every other
+/// listing problem is: a workflow file may never block a launch (#225).
+pub const WORKFLOWS_MAX: usize = 64;
+
+/// The largest workflow file this build will parse (#1689 slice B, #2658).
+///
+/// Same posture as [`WORKFLOWS_MAX`]: a file above it is carried as an entry
+/// with an error — visible in the picker, navigable back to — rather than read
+/// into memory to find out.
+pub const WORKFLOW_FILE_MAX_BYTES: u64 = 256 * 1024;
+
+/// One name the repo declares, resolved to the file it means.
+struct ScannedWorkflow {
+    name: WorkflowName,
+    /// Absolute, for reading.
+    abs: PathBuf,
+    /// Repo-relative, for display.
+    rel: String,
+}
+
+/// Which names this repo declares, and which files they resolve to — the ONE
+/// walk behind both [`list_workflows`] and [`list_workflow_names`], so the two
+/// cannot disagree about what a repo offers.
+///
+/// Sorted by name (it is a `BTreeMap`), because `read_dir` order is a
+/// filesystem accident — and on Windows not even a stable one — and a picker
+/// that reorders itself between reads is a picker nobody can point at.
+fn scan_workflows(repo: &str) -> (BTreeMap<String, ScannedWorkflow>, Vec<String>) {
+    let mut seen: BTreeMap<String, ScannedWorkflow> = BTreeMap::new();
+    let mut findings: Vec<String> = Vec::new();
+
+    // An empty root is NOT a root, and this is the one place that can say so
+    // (#2659 review round 1, rev-std 3). Every path below is built with
+    // `Path::new(repo).join(..)`, and joining onto `""` yields a RELATIVE path
+    // — so an empty string does not read "nothing", it reads "whatever directory
+    // this process happens to be running in". A caller that has no repo must
+    // get no listing, not a listing about the wrong machine.
+    //
+    // The call site was fixed too (`workflow_status_within` passes an `Option`
+    // rather than `unwrap_or_default()`), and that is the enforcement; this is
+    // the structural half, so the next caller cannot reintroduce it.
+    if repo.trim().is_empty() {
+        return (seen, findings);
+    }
 
     let dir_rel = workflows_dir(repo);
     let dir = Path::new(repo).join(dir_rel);
@@ -392,16 +430,29 @@ pub fn list_workflows(repo: &str) -> WorkflowListing {
                     // a path: the whole reason this row exists is that `stem` did
                     // NOT parse, so nothing here may be joined onto anything.
                     let file = path.file_name().and_then(|s| s.to_str()).unwrap_or(stem);
-                    listing
-                        .findings
-                        .push(format!("{dir_rel}/{file} is not offered: its {e}"));
+                    findings.push(format!("{dir_rel}/{file} is not offered: its {e}"));
                     continue;
                 }
             };
+            if seen.len() >= WORKFLOWS_MAX {
+                // Said once, not once per surplus file: the finding is about the
+                // directory, and a listing that scrolls its own truncation notice
+                // has buried it.
+                if !findings.iter().any(|f| f.contains("more than")) {
+                    findings.push(format!(
+                        "{dir_rel} declares more than {WORKFLOWS_MAX} workflow files — the \
+                         listing is capped at {WORKFLOWS_MAX} names"
+                    ));
+                }
+                break;
+            }
             // The directory's own answer, never `workflow_path_named`'s — see
             // `workflows_dir_file`.
             let rel = workflows_dir_file(repo, &name);
-            seen.insert(name.as_str().to_string(), read_entry(&path, name, rel));
+            seen.insert(
+                name.as_str().to_string(),
+                ScannedWorkflow { name, abs: path, rel },
+            );
         }
     }
 
@@ -413,24 +464,107 @@ pub fn list_workflows(repo: &str) -> WorkflowListing {
     let plain = Path::new(repo).join(plain_rel);
     if plain.is_file() {
         if let Some(shadowed) = seen.remove(DEFAULT_WORKFLOW_NAME) {
-            listing.findings.push(format!(
+            findings.push(format!(
                 "both {plain_rel} and {shadowed} declare the workflow named \
                  '{DEFAULT_WORKFLOW_NAME}' — {plain_rel} is the one that is read",
-                shadowed = shadowed.path
+                shadowed = shadowed.rel
             ));
         }
         seen.insert(
             DEFAULT_WORKFLOW_NAME.to_string(),
-            read_entry(&plain, WorkflowName::default_name(), plain_rel.to_string()),
+            ScannedWorkflow {
+                name: WorkflowName::default_name(),
+                abs: plain,
+                rel: plain_rel.to_string(),
+            },
         );
     }
 
-    listing.workflows = seen.into_values().collect();
-    listing
+    // The plain file is inserted AFTER the loop and WINS, so on a repo that
+    // already filled the ceiling from `workflows/` it would push the listing one
+    // over — 65 rows under a finding promising 64 (#2659 review round 1,
+    // rev-std 2). The ceiling bounds the LISTING, so trim here; and never trim
+    // the plain file, which the layout rule says is what the name `default`
+    // means. Sorted, so the row dropped is the last by name.
+    while seen.len() > WORKFLOWS_MAX {
+        let Some(victim) =
+            seen.keys().rev().find(|k| k.as_str() != DEFAULT_WORKFLOW_NAME).cloned()
+        else {
+            break;
+        };
+        seen.remove(&victim);
+    }
+
+    (seen, findings)
+}
+
+/// Every workflow this repo declares (#1689).
+///
+/// `.orrerix/workflow.yml` is listed as [`DEFAULT_WORKFLOW_NAME`]; every
+/// `<name>.yml` under [`workflows_dir`] is listed under its own stem. Sorted by
+/// name.
+///
+/// **Reads and parses every file it lists**, which is why it is bounded twice
+/// ([`WORKFLOWS_MAX`], [`WORKFLOW_FILE_MAX_BYTES`]) and why the group-view
+/// publisher uses [`list_workflow_names`] instead: a picker needs to know why a
+/// file will not parse, a status payload only needs the names (#2658).
+pub fn list_workflows(repo: &str) -> WorkflowListing {
+    let (seen, findings) = scan_workflows(repo);
+    WorkflowListing {
+        workflows: seen.into_values().map(|s| read_entry(&s.abs, s.name, s.rel)).collect(),
+        findings,
+    }
+}
+
+/// A content digest of the file `name` resolves to (#1689 slice B, review
+/// round 1 premortem 1) — what binds a confirmation to the bytes the human
+/// was actually shown.
+///
+/// `None` when the file is absent or unreadable, which a caller must treat as
+/// "cannot confirm" rather than "unchanged". Canonicalised by [`body_digest`],
+/// so a checkout that differs only in line endings is the same document —
+/// this tree is CRLF on disk and LF in the blob, and a digest that moved with
+/// that would refuse every apply on one of the two.
+///
+/// It reads the file a second time, after the parse. That is deliberate and
+/// cheap where it is used: a preview and an apply are human-gated actions, not
+/// a poll, and threading the raw text out of `load_workflow_named` would widen
+/// a signature every group-scoped reader shares to serve two callers.
+pub fn workflow_digest(repo: &str, name: &WorkflowName) -> Option<String> {
+    std::fs::read_to_string(workflow_file_named(repo, name)).ok().map(|t| body_digest(&t))
+}
+
+/// The names alone, sorted — no file is opened (#1689 slice B).
+///
+/// This is what `workflow_status` publishes as `available`, on a call the group
+/// view's publisher makes once a second per leased group. [`list_workflows`]
+/// would answer the same question by reading and YAML-parsing every declared
+/// file, which is the unbounded read #2658 recorded against slice A; a name is
+/// a directory-entry fact and needs none of it.
+pub fn list_workflow_names(repo: &str) -> Vec<String> {
+    scan_workflows(repo).0.into_keys().collect()
 }
 
 /// One [`WorkflowEntry`] off an absolute path already known to be a file.
 fn read_entry(path: &Path, name: WorkflowName, rel: String) -> WorkflowEntry {
+    // Size-checked BEFORE the read (#2658): a file above the ceiling is carried
+    // as an entry with an error, never read into memory to find out. A file
+    // whose size cannot be read at all falls through to the read below, which
+    // produces the unreadable-file error with the real reason.
+    if let Ok(md) = std::fs::metadata(path) {
+        if md.len() > WORKFLOW_FILE_MAX_BYTES {
+            return WorkflowEntry {
+                name,
+                path: rel,
+                display_name: String::new(),
+                errors: vec![format!(
+                    "the file is {} bytes, above the {WORKFLOW_FILE_MAX_BYTES}-byte ceiling a \
+                     workflow file is read under",
+                    md.len()
+                )],
+            };
+        }
+    }
     let parsed = std::fs::read_to_string(path)
         .map_err(|e| vec![format!("{} is unreadable: {e}", path.display())])
         .and_then(|text| parse_workflow(&text));
@@ -439,7 +573,6 @@ fn read_entry(path: &Path, name: WorkflowName, rel: String) -> WorkflowEntry {
         Err(errors) => WorkflowEntry { name, path: rel, display_name: String::new(), errors },
     }
 }
-
 /// Schema version this build understands. Recorded in the file so a future
 /// breaking change can be detected rather than mis-parsed.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -3587,6 +3720,204 @@ pub fn cli_of<'a>(block: &'a Block, agent_cli: &'a str) -> &'a str {
     }
 }
 
+// ── the roster diff a live workflow switch is confirmed against (#1689 slice B) ──
+
+/// What one block's row changed BETWEEN two rosters, as the list of keys that
+/// differ.
+///
+/// The keys are the workflow file's own spelling (`cli`, `model`, `prompt`,
+/// `effort`, …), sorted, so the confirmation a human reads names the thing they
+/// would edit rather than a Rust field path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockChange {
+    /// The block id, which is the same on both sides — a row whose id moved is
+    /// a removal plus an addition, never a change.
+    pub id: BlockId,
+    /// The differing keys, sorted.
+    pub fields: Vec<String>,
+}
+
+/// One side of a [`roster_diff`]: everything about a group that an apply
+/// replaces, as one value.
+///
+/// A struct rather than three positional arguments per side, so a call site
+/// cannot pair the old gate with the new intake.
+#[derive(Clone, Copy, Debug)]
+pub struct RosterSide<'a> {
+    pub blocks: &'a [Block],
+    pub gate: Option<&'a Gate>,
+    pub intake: &'a IntakeProfile,
+}
+
+/// The difference between the roster a group is running and the one a named
+/// workflow file would give it (#1689 slice B).
+///
+/// **Pure, and the only definition of "what would this switch change".** The
+/// preview a human confirms, the notice the orchestrator receives and the audit
+/// row all read this one value, so the three cannot disagree about what an
+/// apply did — the same reason the drift comparison is extracted once rather
+/// than written per consumer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RosterDiff {
+    /// Block ids the new roster declares and the old one did not, sorted.
+    pub added: Vec<BlockId>,
+    /// Block ids the old roster declared and the new one does not, sorted.
+    /// These are the ids a bare resume is refused under after the apply.
+    pub removed: Vec<BlockId>,
+    /// Ids present on both sides whose row differs, sorted by id.
+    pub changed: Vec<BlockChange>,
+    /// The merge gate differs. Either side may be `None` — gaining or losing a
+    /// gate is a change like any other.
+    pub gate_changed: bool,
+    /// The resolved intake profile differs. It drifts independently of the
+    /// roster (#382 NB2): a repo can rename its label vocabulary without
+    /// touching a single block.
+    pub intake_changed: bool,
+    /// The orchestrator block's EFFECTIVE CLI differs, which is the one change
+    /// an apply cannot make to a live group: that pane is already running a
+    /// program and a session cannot change program mid-flight — the same reason
+    /// `promote_orchestrator_cli` refuses it.
+    ///
+    /// Effective, not declared: see [`roster_diff`]'s note on `agent_cli`.
+    pub orchestrator_cli_changed: bool,
+}
+
+impl RosterDiff {
+    /// Nothing would change. Re-applying a file nobody edited lands here, and
+    /// the UI says so rather than offering a confirmation with an empty body.
+    ///
+    /// `orchestrator_cli_changed` is deliberately not read: it is a *reason to
+    /// refuse*, never a change on its own — it can only ever be set alongside
+    /// the `changed` row (or the add/remove pair) that carries the `cli` key it
+    /// was derived from.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && self.changed.is_empty()
+            && !self.gate_changed
+            && !self.intake_changed
+    }
+}
+
+/// Compare two rosters, gates and intake profiles (#1689 slice B).
+///
+/// `agent_cli` is the group's default CLI, and both sides' blocks are resolved
+/// through it ([`cli_of`], [`model_of`]) before comparison. That asymmetry with
+/// every other key is deliberate, and is the whole reason this takes the
+/// parameter: `cli:` and `model:` are the two keys whose EMPTY value means
+/// "inherit", so a file that spells out the CLI or model the group already runs
+/// would otherwise read as a change — and for `cli` on the orchestrator block
+/// that false positive is not cosmetic, it is a refused apply. Every other key
+/// is compared exactly as declared, because for every other key the declared
+/// value IS the effective one.
+///
+/// The per-block comparison destructures `Block` exhaustively, with no `..`, so
+/// a field ADDED to the schema is a compile error here rather than a key the
+/// diff silently stops reporting — the same field-inventory idiom the intake
+/// schema uses to keep a new key from arriving unnoticed.
+pub fn roster_diff(agent_cli: &str, old: RosterSide<'_>, new: RosterSide<'_>) -> RosterDiff {
+    // A nested fn, not a closure: a closure cannot express "the map borrows
+    // from the slice it was given", so its two elided lifetimes are unrelated
+    // and the collect does not compile.
+    fn by_id(bs: &[Block]) -> BTreeMap<&str, &Block> {
+        bs.iter().map(|b| (b.id.as_str(), b)).collect()
+    }
+    let (o, n) = (by_id(old.blocks), by_id(new.blocks));
+
+    let added: Vec<BlockId> =
+        n.keys().filter(|k| !o.contains_key(*k)).map(|k| k.to_string()).collect();
+    let removed: Vec<BlockId> =
+        o.keys().filter(|k| !n.contains_key(*k)).map(|k| k.to_string()).collect();
+    let mut changed = Vec::new();
+    for (id, ob) in &o {
+        let Some(nb) = n.get(id) else { continue };
+        let fields = changed_fields(agent_cli, ob, nb);
+        if !fields.is_empty() {
+            changed.push(BlockChange { id: id.to_string(), fields });
+        }
+    }
+
+    // Resolved by KIND, not read off `changed`: `changed`'s rows are keyed by an
+    // id present on BOTH sides, so a switch that renames the orchestrator block
+    // would have no row to carry the `cli` key at all. A roster carries exactly
+    // one orchestrator block (`clamped`), and `apply_workflow` runs `clamped()`
+    // before it calls this.
+    let orch = |side: &[Block]| -> Option<Block> {
+        side.iter().find(|b| b.kind == Role::Orchestrator).cloned()
+    };
+    let orchestrator_cli_changed = match (orch(old.blocks), orch(new.blocks)) {
+        (Some(a), Some(b)) => cli_of(&a, agent_cli) != cli_of(&b, agent_cli),
+        // No orchestrator block on one side: there is no CLI to have changed.
+        _ => false,
+    };
+
+    RosterDiff {
+        added,
+        removed,
+        changed,
+        gate_changed: old.gate != new.gate,
+        intake_changed: old.intake != new.intake,
+        orchestrator_cli_changed,
+    }
+}
+
+/// The workflow-file keys on which two rows for ONE block id differ, sorted.
+///
+/// See [`roster_diff`] for why `cli` and `model` are resolved through
+/// `agent_cli` and nothing else is.
+fn changed_fields(agent_cli: &str, a: &Block, b: &Block) -> Vec<String> {
+    // Exhaustive, no `..`: a field added to `Block` fails to compile here rather
+    // than becoming a key this diff silently stops reporting.
+    let Block {
+        id: a_id,
+        name: a_name,
+        kind: a_kind,
+        cli: _,
+        model: _,
+        prompt: a_prompt,
+        profile: a_profile,
+        allow: a_allow,
+        role_hint: a_role_hint,
+        effort: a_effort,
+        context: a_context,
+        remote: a_remote,
+    } = a;
+    let Block {
+        id: b_id,
+        name: b_name,
+        kind: b_kind,
+        cli: _,
+        model: _,
+        prompt: b_prompt,
+        profile: b_profile,
+        allow: b_allow,
+        role_hint: b_role_hint,
+        effort: b_effort,
+        context: b_context,
+        remote: b_remote,
+    } = b;
+    debug_assert_eq!(a_id, b_id, "changed_fields compares two rows for ONE block id");
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |cond: bool, key: &str| {
+        if cond {
+            out.push(key.to_string());
+        }
+    };
+    push(a_name != b_name, "name");
+    push(a_kind != b_kind, "kind");
+    push(cli_of(a, agent_cli) != cli_of(b, agent_cli), "cli");
+    push(model_of(a, agent_cli) != model_of(b, agent_cli), "model");
+    push(a_prompt != b_prompt, "prompt");
+    push(a_profile != b_profile, "profile");
+    push(a_allow != b_allow, "allow");
+    push(a_role_hint != b_role_hint, "role_hint");
+    push(a_effort != b_effort, "effort");
+    push(a_context != b_context, "context");
+    push(a_remote != b_remote, "remote");
+    out.sort();
+    out
+}
+
 // ── verdicts: the state a gate reads (#222 / #197) ──────────────────────────
 //
 // Before this, a review outcome was a *notification*: `report("done", "approved
@@ -5293,6 +5624,348 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+
+    // ── the listing's two bounds, and the names-only walk (#1689 slice B) ──
+    //
+    // #2658 recorded `list_workflows` as an unbounded read against slice A:
+    // `read_dir` plus a full YAML parse of every file, per call, with the
+    // group-view publisher about to call it once a second.
+
+    #[test]
+    fn the_names_only_walk_answers_exactly_what_the_full_listing_does() {
+        // The two share one scan on purpose — a second walk is a second answer
+        // to "what does this repo declare", and the first time they disagreed
+        // the picker and the status payload would be offering different rosters.
+        let root = temp_repo("names-agree");
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("Plain"));
+        write_at(&root, ".orrerix/workflows/b.yml", &wf_doc("B"));
+        // A file that will NOT parse is still a declared name, and both surfaces
+        // must say so — the full listing carries its errors, the names-only walk
+        // still offers it, because a workflow that vanishes the moment it breaks
+        // is one the human cannot navigate back to.
+        write_at(&root, ".orrerix/workflows/broken.yml", "version: 1\nblocks:\n  - id: m\n    kind: wizard\n");
+        let repo = root.to_str().unwrap();
+
+        let full = list_workflows(repo);
+        assert_eq!(names(&full), vec!["b", "broken", "default"], "{:?}", names(&full));
+        assert_eq!(list_workflow_names(repo), vec!["b", "broken", "default"]);
+        assert!(
+            full.workflows.iter().any(|e| e.name.as_str() == "broken" && !e.errors.is_empty()),
+            "positive control: the broken file must really be broken, or this proves nothing"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_listing_stops_at_the_file_ceiling_and_says_so() {
+        let root = temp_repo("too-many");
+        for i in 0..(WORKFLOWS_MAX + 3) {
+            // Zero-padded so the ordering the cap truncates is the SORTED one a
+            // reader can predict, not `read_dir`'s.
+            write_at(&root, &format!(".orrerix/workflows/w{i:03}.yml"), &wf_doc("W"));
+        }
+        let repo = root.to_str().unwrap();
+        let listing = list_workflows(repo);
+        assert_eq!(
+            listing.workflows.len(),
+            WORKFLOWS_MAX,
+            "the listing must stop at the ceiling, not read every file on disk"
+        );
+        assert_eq!(
+            listing.findings.iter().filter(|f| f.contains("more than")).count(),
+            1,
+            "said once, about the directory — not once per surplus file: {:?}",
+            listing.findings
+        );
+        assert_eq!(list_workflow_names(repo).len(), WORKFLOWS_MAX, "the names-only walk is bounded too");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_empty_root_lists_nothing_rather_than_the_working_directory() {
+        // #2659 review round 1, rev-std 3. Every path in `scan_workflows` is
+        // `Path::new(repo).join(..)`, and joining onto `""` yields a RELATIVE
+        // path — so an empty string does not mean "nothing", it means "wherever
+        // this process is running".
+        //
+        // DELIBERATELY WEAK, and labelled: with the guard this holds for every
+        // CWD, and without it, it holds for every CWD that happens to declare no
+        // workflow — which includes the one this suite runs in. So it pins the
+        // answer, not the guard; nothing in this harness can redden the guard,
+        // because proving it needs a CWD that DOES declare a workflow, i.e.
+        // mutating a process-global from a parallel test suite.
+        let listing = list_workflows("");
+        assert!(listing.workflows.is_empty(), "{:?}", listing.workflows);
+        assert!(listing.findings.is_empty(), "{:?}", listing.findings);
+        assert!(list_workflow_names("").is_empty());
+        assert!(list_workflows("   ").workflows.is_empty(), "whitespace is not a root either");
+
+        // Positive control: the walk is not simply switched off — a real root
+        // with a real file still lists it, in this same process.
+        let root = temp_repo("empty-root-control");
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("Plain"));
+        assert_eq!(list_workflow_names(root.to_str().unwrap()), vec!["default".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_ceiling_counts_the_plain_file_too() {
+        // #2659 review round 1, rev-std 2: the cap guarded only the `workflows/`
+        // loop, and the plain file is inserted AFTER it and WINS — so a repo that
+        // filled the ceiling from the directory listed 65 rows under a finding
+        // promising 64. The ceiling bounds the LISTING.
+        let root = temp_repo("ceiling-plus-plain");
+        for i in 0..WORKFLOWS_MAX {
+            write_at(&root, &format!(".orrerix/workflows/w{i:03}.yml"), &wf_doc("W"));
+        }
+        write_at(&root, ".orrerix/workflow.yml", &wf_doc("Plain"));
+        let repo = root.to_str().unwrap();
+
+        let listing = list_workflows(repo);
+        assert_eq!(listing.workflows.len(), WORKFLOWS_MAX, "the listing is capped, not the loop");
+        assert_eq!(list_workflow_names(repo).len(), WORKFLOWS_MAX, "and the names-only walk with it");
+        // The plain file is never the row dropped: the layout rule says it is what
+        // the name `default` means, so trimming it would answer the wrong question.
+        assert!(
+            names(&listing).contains(&"default"),
+            "the plain file survives the trim: {:?}",
+            names(&listing)
+        );
+        // The row that goes is the last by name — the directory rows are `w000`…,
+        // which sort after `default`, so `w063` is the one that loses.
+        assert!(
+            !names(&listing).contains(&format!("w{:03}", WORKFLOWS_MAX - 1).as_str()),
+            "{:?}",
+            names(&listing)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_oversized_file_is_an_entry_with_an_error_not_a_read() {
+        let root = temp_repo("oversize");
+        let mut fat = wf_doc("Fat");
+        // Comment padding: the file stays VALID YAML, so what the entry reports
+        // can only be the size ceiling and never a parse failure.
+        fat.push_str(&format!("# {}\n", "x".repeat(WORKFLOW_FILE_MAX_BYTES as usize + 1)));
+        write_at(&root, ".orrerix/workflows/fat.yml", &fat);
+        write_at(&root, ".orrerix/workflows/thin.yml", &wf_doc("Thin"));
+        let listing = list_workflows(root.to_str().unwrap());
+
+        let fat_entry = listing.workflows.iter().find(|e| e.name.as_str() == "fat").unwrap();
+        assert!(
+            fat_entry.errors.iter().any(|e| e.contains("ceiling")),
+            "the oversized file must be carried with the size reason: {:?}",
+            fat_entry.errors
+        );
+        assert!(fat_entry.display_name.is_empty(), "nothing was parsed out of it");
+        // Negative control: the ceiling refuses the fat file only. A cap that
+        // rejected everything would satisfy the assertion above just as well.
+        let thin = listing.workflows.iter().find(|e| e.name.as_str() == "thin").unwrap();
+        assert_eq!(thin.display_name, "Thin", "{:?}", thin.errors);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── the roster diff a switch is confirmed against (#1689 slice B) ────
+    //
+    // Unit tests, for the reason the discovery block above states: the
+    // comparison is pure and nothing here links the Tauri lib.
+
+    /// A workflow doc whose blocks are given as raw YAML rows, so a case can
+    /// vary exactly one key.
+    fn diff_doc(blocks: &str, extra: &str) -> String {
+        format!("version: 1\nname: d\nblocks:\n{blocks}{extra}")
+    }
+
+    /// The three-part side a diff takes, built from a parsed document.
+    fn side(wf: &Workflow) -> RosterSide<'_> {
+        RosterSide { blocks: &wf.blocks, gate: wf.gates.get("merge"), intake: &wf.intake }
+    }
+
+    const TWO: &str = "  - id: w\n    kind: worker\n  - id: r\n    kind: reviewer\n";
+
+    #[test]
+    fn an_unedited_file_reapplied_changes_nothing() {
+        let wf = parse_workflow(&diff_doc(TWO, "")).unwrap();
+        let d = roster_diff("claude", side(&wf), side(&wf));
+        assert_eq!(d, RosterDiff::default(), "a roster compared with itself must be empty");
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn a_model_only_edit_is_exactly_one_changed_row_naming_one_key() {
+        // AC 4: the one-row model swap is the same mechanism as a switch, and
+        // its diff must say so — one row, one key, nothing added or removed.
+        let old = parse_workflow(&diff_doc(TWO, "")).unwrap();
+        let new =
+            parse_workflow(&diff_doc("  - id: w\n    kind: worker\n    model: opus\n  - id: r\n    kind: reviewer\n", ""))
+                .unwrap();
+        let d = roster_diff("claude", side(&old), side(&new));
+        assert_eq!(d.changed, vec![BlockChange { id: "w".into(), fields: vec!["model".into()] }]);
+        assert!(d.added.is_empty() && d.removed.is_empty(), "{d:?}");
+        assert!(!d.gate_changed && !d.intake_changed, "{d:?}");
+        assert!(!d.is_empty(), "a real edit is not an empty diff");
+    }
+
+    #[test]
+    fn an_added_and_a_removed_block_are_not_a_change_row() {
+        let old = parse_workflow(&diff_doc(TWO, "")).unwrap();
+        let new = parse_workflow(&diff_doc(
+            "  - id: w\n    kind: worker\n  - id: rev-deep\n    kind: reviewer\n",
+            "",
+        ))
+        .unwrap();
+        let d = roster_diff("claude", side(&old), side(&new));
+        assert_eq!(d.added, vec!["rev-deep".to_string()]);
+        assert_eq!(d.removed, vec!["r".to_string()]);
+        assert!(d.changed.is_empty(), "a row whose id moved is an add plus a remove: {d:?}");
+    }
+
+    #[test]
+    fn every_declared_key_a_block_carries_is_reported_by_its_own_name() {
+        // The exhaustive destructure in `changed_fields` makes a NEW field a
+        // compile error; this makes each EXISTING one observable, so a `push`
+        // line deleted from that function is caught by a test rather than by
+        // nothing. `id` is the join key and `kind` is covered separately (a
+        // kind change on one id is a legal edit of a block's class).
+        // Each row is the WHOLE pair of extra key lines, not a delta against a
+        // shared base: `RawBlock` is `deny_unknown_fields` and serde refuses a
+        // DUPLICATE key outright, so a base that pre-declared `cli:` made the
+        // `cli` row an unparseable document rather than a comparison.
+        const CLAUDE: &str = "    cli: claude\n";
+        let rows: &[(&str, &str, &str)] = &[
+            ("name", "    name: Alpha\n", "    name: Beta\n"),
+            ("cli", "    cli: claude\n", "    cli: copilot\n"),
+            ("model", "    model: sonnet\n", "    model: opus\n"),
+            ("prompt", "    prompt: One.\n", "    prompt: Two.\n"),
+            ("profile", "", "    profile: .github/agents/w.md\n"),
+            ("allow", "", "    allow: [\"Bash(gh pr view)\"]\n"),
+            // effort:/context:/remote: are only legal on a CLI that can carry
+            // them, so both sides declare `cli: claude` and only the key under
+            // test moves.
+            ("effort", CLAUDE, "    cli: claude\n    effort: high\n"),
+            ("context", CLAUDE, "    cli: claude\n    context: 1m\n"),
+            ("remote", CLAUDE, "    cli: claude\n    remote: buildbox\n"),
+        ];
+        for &(key, a, b) in rows {
+            let base = "  - id: w\n    kind: worker\n";
+            let old = parse_workflow(&diff_doc(&format!("{base}{a}"), "")).unwrap();
+            let new = parse_workflow(&diff_doc(&format!("{base}{b}"), "")).unwrap();
+            let d = roster_diff("claude", side(&old), side(&new));
+            let fields: Vec<&str> =
+                d.changed.first().map(|c| c.fields.iter().map(String::as_str).collect()).unwrap_or_default();
+            assert!(
+                fields.contains(&key),
+                "editing {key:?} must be reported under that name, got {fields:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_role_hint_change_is_reported_under_its_own_key() {
+        // Split from the sweep above because `role_hint` is only legal paired
+        // with a specific `kind` (`advisor` needs `planner`), so its two sides
+        // cannot share the sweep's worker base row.
+        let old = parse_workflow(&diff_doc("  - id: p\n    kind: planner\n", "")).unwrap();
+        let new = parse_workflow(&diff_doc("  - id: p\n    kind: planner\n    role_hint: advisor\n", "")).unwrap();
+        let d = roster_diff("claude", side(&old), side(&new));
+        assert_eq!(d.changed, vec![BlockChange { id: "p".into(), fields: vec!["role_hint".into()] }]);
+    }
+
+    #[test]
+    fn a_kind_change_on_one_id_is_a_changed_row() {
+        let old = parse_workflow(&diff_doc("  - id: x\n    kind: worker\n", "")).unwrap();
+        let new = parse_workflow(&diff_doc("  - id: x\n    kind: reviewer\n", "")).unwrap();
+        let d = roster_diff("claude", side(&old), side(&new));
+        assert_eq!(d.changed, vec![BlockChange { id: "x".into(), fields: vec!["kind".into()] }]);
+    }
+
+    #[test]
+    fn spelling_out_the_inherited_cli_or_model_is_not_a_change() {
+        // The one asymmetry `roster_diff` documents: `cli:` and `model:` are
+        // compared EFFECTIVE, because empty means "inherit". A file that writes
+        // down what the group already runs changes nothing, and for `cli` on the
+        // orchestrator block a false positive here is a REFUSED apply, not a
+        // cosmetic row.
+        let bare = parse_workflow(&diff_doc("  - id: w\n    kind: worker\n", "")).unwrap();
+        let spelt = parse_workflow(&diff_doc(
+            &format!("  - id: w\n    kind: worker\n    cli: claude\n    model: {}\n", default_model("claude", Role::Worker)),
+            "",
+        ))
+        .unwrap();
+        let d = roster_diff("claude", side(&bare), side(&spelt));
+        assert!(d.is_empty(), "inherit vs the same value spelled out is not a change: {d:?}");
+
+        // Negative control: against a DIFFERENT group default, the same pair of
+        // documents does differ — so the assertion above is about the values,
+        // not about the comparison being switched off.
+        let d2 = roster_diff("copilot", side(&bare), side(&spelt));
+        assert!(!d2.is_empty(), "under a copilot default, spelling out claude IS a change");
+    }
+
+    #[test]
+    fn an_orchestrator_cli_change_is_flagged_and_a_worker_one_is_not() {
+        let base = "  - id: orchestrator\n    kind: orchestrator\n  - id: w\n    kind: worker\n";
+        let old = parse_workflow(&diff_doc(base, "")).unwrap();
+        let orch_moved = parse_workflow(&diff_doc(
+            "  - id: orchestrator\n    kind: orchestrator\n    cli: copilot\n  - id: w\n    kind: worker\n",
+            "",
+        ))
+        .unwrap();
+        let worker_moved = parse_workflow(&diff_doc(
+            "  - id: orchestrator\n    kind: orchestrator\n  - id: w\n    kind: worker\n    cli: copilot\n",
+            "",
+        ))
+        .unwrap();
+        assert!(roster_diff("claude", side(&old), side(&orch_moved)).orchestrator_cli_changed);
+        assert!(
+            !roster_diff("claude", side(&old), side(&worker_moved)).orchestrator_cli_changed,
+            "a delegate's CLI moves freely — only the running orchestrator pane cannot"
+        );
+        // Positive control: the worker case IS a change, just not that one.
+        assert!(!roster_diff("claude", side(&old), side(&worker_moved)).is_empty());
+    }
+
+    #[test]
+    fn a_renamed_orchestrator_block_still_has_its_cli_compared() {
+        // Read off `changed` instead of by kind, this case would report nothing:
+        // there is no id present on both sides to carry the `cli` key.
+        let old = parse_workflow(&diff_doc("  - id: orchestrator\n    kind: orchestrator\n", "")).unwrap();
+        let new = parse_workflow(&diff_doc(
+            "  - id: lead\n    kind: orchestrator\n    cli: copilot\n",
+            "",
+        ))
+        .unwrap();
+        let d = roster_diff("claude", side(&old), side(&new));
+        assert!(d.changed.is_empty(), "the id moved, so there is no changed row: {d:?}");
+        assert!(d.orchestrator_cli_changed, "and the CLI change must still be seen: {d:?}");
+    }
+
+    #[test]
+    fn gaining_losing_or_editing_a_gate_is_a_gate_change() {
+        let none = parse_workflow(&diff_doc(TWO, "")).unwrap();
+        let gated = parse_workflow(&diff_doc(TWO, "gates:\n  merge:\n    reviewers: [r]\n")).unwrap();
+        let gated2 =
+            parse_workflow(&diff_doc(TWO, "gates:\n  merge:\n    reviewers: [r]\n    also: [ci-green]\n")).unwrap();
+        assert!(roster_diff("claude", side(&none), side(&gated)).gate_changed, "gaining a gate");
+        assert!(roster_diff("claude", side(&gated), side(&none)).gate_changed, "losing a gate");
+        assert!(roster_diff("claude", side(&gated), side(&gated2)).gate_changed, "editing a gate");
+        assert!(!roster_diff("claude", side(&gated), side(&gated)).gate_changed, "an unedited gate");
+    }
+
+    #[test]
+    fn an_intake_rename_is_a_change_with_no_block_touched() {
+        // #382 NB2: intake drifts independently of the roster, and the diff has
+        // to say so or a switch that renames the human's veto label would be
+        // confirmed as "nothing changes".
+        let old = parse_workflow(&diff_doc(TWO, "")).unwrap();
+        let new =
+            parse_workflow(&diff_doc(TWO, "intake:\n  labels:\n    hold: do-not-touch\n")).unwrap();
+        let d = roster_diff("claude", side(&old), side(&new));
+        assert!(d.intake_changed, "{d:?}");
+        assert!(d.added.is_empty() && d.removed.is_empty() && d.changed.is_empty(), "{d:?}");
+        assert!(!d.is_empty(), "an intake-only change is still a change");
+    }
     /// One block, with whatever keys the case under test needs.
     fn remote_doc(keys: &[(&str, &str)]) -> String {
         let mut s = String::from("version: 1\nblocks:\n  - id: b\n");

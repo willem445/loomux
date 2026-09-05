@@ -2707,10 +2707,22 @@ fails when a row goes stale:
   one-click veto silently failing for exactly the group that renamed it, which
   is the failure #778 exists to prevent.
 
-  **Unreachable at this head**: nothing but a hand-edited `group.json` can pin a
-  non-`default` name (slice A ships no picker). Slice D1's picker is what makes
-  it reachable, so closing it is D1's, and the `RESIDUALS` row says so in those
-  words rather than leaving a future reader to re-derive it.
+  **Reachable as of slice B, and no longer closed by a picker that does not
+  exist.** Slice A could say "nothing but a hand-edited `group.json` pins a
+  name", and that sentence went false the moment `apply_workflow` shipped: an
+  apply pins a name AND rewrites `guardrails.intake` from the named file, so a
+  group that applies a workflow declaring `intake.labels.hold: do-not-touch` is
+  exactly the divergence above — its panel honours `do-not-touch` while
+  `allowed_labels` refuses it and `label_spec_for` will not create it. What
+  slice B did NOT change is who can do it: `orch_apply_workflow` is a command,
+  and no UI calls it until slice D2 wires **Review & apply**, so the reachable
+  path today is a caller of the command rather than a human gesture.
+
+  Closing it means giving the three `default`-resolving sites a group, which is
+  a change to `gh.rs`'s repo-scoped shape and not something an apply should have
+  smuggled in beside itself. It is **#2663**, a blocking prerequisite for slice
+  D2, and it stays a residual here — restated rather than left saying something
+  that is no longer true, with the `RESIDUALS` row carrying the same correction.
 
 The plan predicted two, and `orch_workflow_preview_sync` with no `name` was the
 second. It stopped being one in this same slice: gaining the optional `name`
@@ -2771,9 +2783,228 @@ sweep exists to stop.
   `Guardrails.workflow` is how a caller pins a name, and the launcher's picker
   is slice D1's. A `PromoteConfig` has no workflow field either — a fresh
   promote runs `default`, a reattaching one restores what is on disk.
-- **No switching.** Changing a live group's workflow is slice B
-  (`apply_workflow`), and it is a consent-preserving action with a diff and a
-  confirmation, not a side effect of this pin existing.
+- **No switching.** Changing a live group's workflow was slice B, which ships
+  `apply_workflow` — a consent-preserving action with a diff and a
+  confirmation, not a side effect of this pin existing. See *Applying a
+  workflow to a live group* below.
+
+## Applying a workflow to a live group (#1689 slice B)
+
+Slice A gave a group a workflow **name** and made every group-scoped reader
+resolve through it. This is how that name changes on a group that is already
+running — and it is a consent-preserving action with a diff and a
+confirmation, never a side effect of a file appearing or changing on disk.
+
+`apply_workflow(group, name, actor)` is `set_advanced_orchestrator`'s shape,
+step for step: load the named file, `clamped()`, compute the diff, **persist
+first**, swap in memory, write the instruction files, audit, sync the gate
+under `group_file_io`, drop the lock, deliver the notice, return
+`workflow_status`. There is no second loader, no second persister, no second
+gate writer and no second delivery path; the one thing an apply does that a
+toggle does not is `write_instruction_files`, and *Which path writes a new
+block's `<id>.md`* above is why.
+
+### The toggle is the consent surface; an apply answers only *which one*
+
+**An apply on a group whose advanced-orchestrator toggle is OFF is refused**,
+and the refusal names the fix: turn workflow mode on — which arms the name the
+group already has pinned — and then apply.
+
+The alternative, letting an apply turn the toggle on implicitly, was rejected.
+`Guardrails::advanced_orchestrator` documents OFF as "the repo's workflow file
+is not read, not validated and not obeyed", and every reader gated on that flag
+— `board_policy`, `workflow_status`'s declared load, the drift comparison —
+means it. A picker that armed the flag would be the app granting itself the
+consent that toggle exists to ask for, on behalf of a human who had turned it
+off, and it is the *irreversible* direction of the two: teaching an apply to arm
+the toggle later is additive, taking that back would break a contract somebody
+had come to rely on.
+
+It costs a human one extra gesture on a group that had workflow mode off, and
+nothing at all on a group that had it on. The name survives a toggle-off — a
+switch to `b`, then off, then on, arms `b` — so the two-step is a two-step and
+not a dead end (`the_toggle_after_a_switch_arms_the_switched_file`).
+
+### What a switch does NOT change, which is the consent model
+
+- **A pane already running keeps its block.** `AgentEntry.block` is recorded at
+  spawn and nothing re-reads it, so no delegate is re-personaed under a human
+  who already approved it. Same rule the live toggle states in *Going live*;
+  nothing was built for it, and the test is what keeps it true.
+- **A bare `resume_session` of a removed block is refused, by machinery that
+  already existed.** The resume inherits the recorded block id (#254) and
+  `spawn_agent_bound`'s unknown-block path refuses it against the roster that is
+  live now — `unknown block "w-a". Blocks in this group: …`, which names what the
+  group *can* spawn. That is the required behaviour, so slice B added no
+  mechanism for it and pinned it instead, with a positive control: the same
+  resume succeeds before the switch.
+- **The orchestrator's CLI cannot move.** A live session cannot change the
+  program it is running — the reason `promote_orchestrator_cli` refuses it — so a
+  file whose orchestrator block resolves to a different `cli:` is refused. It
+  still *previews*: the modal gets the diff and the refusal together, so it can
+  say what would change and why it cannot, rather than a bare error naming
+  neither. A `model:`/`effort:`/`context:` change on that block IS applied, to
+  `group.json`, and the preview's `next_resume` says the running pane picks it up
+  when it is resumed.
+
+### `roster_diff` is one comparison, and `cli`/`model` are compared *effective*
+
+`workflow::roster_diff(agent_cli, old, new)` takes two `RosterSide`s — blocks,
+gate, intake — and is the only definition of "what would this switch change".
+The preview a human confirms, the notice the orchestrator receives and the
+`workflow-switched` audit row all read that one value, so the three cannot
+describe different things.
+
+Every key is compared exactly as declared, with **one deliberate exception**:
+`cli:` and `model:` are resolved through the group's default `agent_cli`
+(`cli_of`/`model_of`) before comparison, because those are the two keys whose
+empty value means *inherit*. A file that spells out the CLI the group already
+runs must not read as a change — and on the orchestrator block that false
+positive would not be cosmetic, it would be a refused apply.
+
+`changed_fields` destructures `Block` exhaustively, with no `..`. A field added
+to the schema is a compile error there rather than a key the diff silently stops
+reporting — the same field-inventory idiom the intake schema uses.
+
+### The confirmation is bound to the bytes it was given for
+
+`workflow_switch_preview` returns a `digest` of the file it resolved, and
+`apply_workflow` takes it back as `expect_digest`. If the file has moved since,
+the apply **refuses** and says to re-open the diff.
+
+Without it the apply re-plans under `group_file_io` and installs whatever the
+file says at *click* time — which need not be the diff the human read. Nothing
+was wrong with the roster that landed; what was wrong is that the
+`workflow-switched` row recorded a diff nobody had approved, and the
+disagreement could not be reconstructed from the trail afterwards. The row now
+carries both `digest` (what landed) and `confirmed_digest` (what was shown), and
+a `null` `confirmed_digest` is a caller that passed no confirmation — a script, a
+test — which is a different statement from the two agreeing.
+
+The digest is [`workflow::body_digest`] over the file's text, so it is
+canonicalised the way every other stored digest here is: a checkout differing
+only in line endings is the same document. This tree is CRLF on disk and LF in
+the blob, and a digest that moved with that would refuse every apply on one of
+the two.
+
+### The no-op re-apply is the retry path
+
+Re-applying the ACTIVE name with a file nobody has edited returns early — no
+audit row, no notice, no rewrite of `group.json`. It does **not** skip the
+group dir: `reconcile_instruction_files` runs first.
+
+That is not tidiness. `write_instruction_files` is audited rather than
+propagated (below), so an apply whose write failed leaves the switch live with a
+stale or missing `<id>.md` — and the obvious human response, applying the same
+unedited file again, was exactly the call that used to answer without touching
+the disk. Nothing else self-heals it: the per-spawn render writes a *new* block's
+file and never removes a departed one. The write is idempotent and an apply is a
+human-gated action rather than a poll, so paying it on that arm costs nothing
+worth saving.
+
+### The live toggle adopts the file's intake, and gives it back
+
+`set_advanced_orchestrator` takes `blocks` **and** `intake` from the file on the
+way ON, and restores the built-in roster **and** the built-in vocabulary on the
+way OFF.
+
+It did not always. Taking `blocks` alone left a group that arrived in workflow
+mode by *toggle* rather than by launch running a declared roster beside the
+built-in label vocabulary — which `roster_drift` reads, correctly, as drift
+against a file nobody had edited. That was invisible until #1689 slice B
+published drift as a field, which is why the fix landed with it (#2659 review
+round 1). Two claims went with it: `persist_roster`'s doc said the toggle's
+`intake` round-trips "because the toggle re-reads the group's ACTIVE file", which
+was a true sentence about `blocks` offered as the reason for `intake`; and
+`roster_drift`'s comment said blocks and intake are "ALWAYS resolved together",
+which the toggle path had never done. Both are corrected where they sit.
+
+The OFF half is the same rule pointing the other way. Restoring the built-in
+roster while keeping the file's labels would leave the intake poller and the
+human's `hold` veto (#778) answering to a spelling only the repo file ever named,
+on a group that is no longer obeying that file. Off means the file is not obeyed,
+and that has to include the half of it that is not blocks.
+
+### The gate, the instruction files, and the trail
+
+The gate is re-armed through `sync_merge_gate_locked`, inside `group_file_io`
+for the reason the toggle states at its own call: the gate spec and the roster
+it belongs to are one decision, and two writers committing them in opposite
+orders leave a gate armed for a roster that never declared it. An apply MAY
+replace the gate with the new file's, including with none — #385's
+absence-never-clears rule is about a background *read*, and an apply is a
+discrete, attributed action the human confirmed.
+
+`write_instruction_files` runs after the in-memory swap. A failure there is
+audited (`instruction-files-failed`) and **not** propagated: the roster is
+already persisted and live, the next spawn re-renders its own block's file
+anyway, and turning a disk hiccup into an `Err` after the switch has happened
+would report a failure that did not occur. What is genuinely lost is the sweep,
+so the audit row says so.
+
+`persist_roster` generalises `persist_advanced_orchestrator` and patches all
+four roster keys — `advanced_orchestrator`, `workflow`, `blocks`, `intake` — in
+one atomic write, because they are one fact. The toggle passes back its own
+current name and intake, which round-trip byte for byte.
+
+### Drift became a badge as well as an audit row
+
+`roster_drift` is `audit_workflow_drift`'s comparison, lifted out and given the
+already-loaded workflow rather than reading the file itself. `workflow_status`
+publishes it as `drift: null | {note, on_disk_blocks}` off the load it already
+makes for the display name and the board policy, so the badge costs no extra
+parse on the group-view publisher's per-second cadence — and the badge and the
+trail cannot disagree about whether a group has drifted, because there is one
+comparison.
+
+The pinned roster is still what RUNS. Drift is a badge, and adopting the edit is
+an apply: `re_applying_the_active_name_after_a_model_edit_is_one_row_and_reaches_the_next_spawn`
+is #1566's apply-an-edit path and AC 4's one-row model swap, deliberately the
+same mechanism, because a second way to adopt an edit would be a second consent
+story.
+
+### Two commands, and what the notice does not say yet
+
+`orch_workflow_switch_preview(group_id, name)` and
+`orch_apply_workflow(group_id, name)`, both `async` — so neither joins the
+frame-mandatory sync-command class (CLAUDE.md constraint 10) — and both parsing
+their raw `name` at the boundary through `command_workflow_name`, so a
+`WorkflowName` is the only thing that travels inward.
+
+The switch notice tells the orchestrator which ids it may spawn by, which are
+gone, what the gate now requires, and that a bare resume of a removed block will
+be refused. It does **not** yet tell it to call `list_blocks` after a compact:
+that tool is slice C, and a notice naming a tool this build does not expose
+would be a false claim in the one place an agent cannot check it. Slice C adds
+the clause with the tool.
+
+### `list_workflows` got its bound here (#2658)
+
+Slice A left `list_workflows` as an unbounded `read_dir` plus a full YAML parse
+of every declared file, per call, harmless while nothing called it.
+`workflow_status.available` is the caller that made it matter, so slice B closed
+it: `WORKFLOWS_MAX` and `WORKFLOW_FILE_MAX_BYTES` bound the listing (reported as
+a finding and an entry error — a workflow file may never block a launch, #225),
+and `list_workflow_names` answers the status payload's question without opening
+anything. Both walk one `scan_workflows`, so the picker and the status cannot
+come to disagree about what a repo declares.
+
+`WORKFLOWS_MAX` bounds the **listing**, not the directory loop. The plain file is
+inserted after that loop and wins, so capping only the loop let a repo that had
+filled the ceiling from `workflows/` list one row over a finding that promised
+otherwise (#2659 review round 1). The trim never drops the plain file — the
+layout rule says that is what the name `default` means — so the row that goes is
+the last directory row by name.
+
+### What slice B deliberately did not do
+
+- **No UI.** The picker, the drift chip and the Review & apply modal are slice
+  D2's; slice B ships the payload they are built from
+  (`WorkflowSwitchPreview`) and the wrappers in `orchestration.ts`. D2 must
+  disable **Review & apply** while `workflow_status.advanced` is false and say
+  why, rather than offering an action the backend will refuse.
+- **No `list_blocks`.** The orchestrator's read-back of its own roster is slice
+  C, and the notice above is written to be extended by it.
 
 ## Still to come
 
