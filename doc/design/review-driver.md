@@ -630,16 +630,26 @@ the panes a group can have alive at once, which the live-delegate cap already
 limits — and a predicate that cannot answer keeps the pane, because "we could not
 check" is not "it is dead".
 
-**The driver kills none of them.** §3.1 item 5 already forbids killing a pane to
-make room, a worker mid-edit must not be killed, and "an idle reviewer lane"
-cannot be told from "a lane mid-review" without the LLM judgment §3 forbids. What
-was wrong was the SILENCE: a cancelled drive left two worker panes and a reviewer
-lane running with the worker panes on ONE worktree, and said nothing — so the
-orchestrator that owns the #338/#359 invariant had it broken by a mechanism it
-could not see. Every exit therefore NAMES the panes (§2.2, §6), and
-`cancel_review_drive` returns them in its result as well, since a notice whose
-delivery fails is lost (#1857) and a cancel is the one exit whose caller is
-holding a return value at the moment those panes stop being anyone's.
+**The drive kills none of the panes it still holds, and since #2501 that is a
+narrower sentence than "the driver kills nothing".** A pane the driver has
+RELEASED — §3.1 item 5's two states — is already gone by the time any exit runs,
+and is not in these lists at all. What makes that so is the ORDER, not a
+prohibition: the tick performs its releases before the arm that writes an exit
+notice, and a released pane leaves `owned_panes`, so every notice is assembled
+from what is actually left. `releasable`'s first condition is about the proposed
+STEP and does not on its own promise this — a tick whose step is live can still
+park when the arm refuses (rev-final W1). A worker mid-edit is still never killed, and "an idle
+reviewer lane" is still not told from "a lane mid-review" by any LLM judgment §3
+forbids: the release reads `idle_since_ms` and a recorded verdict, both of which
+orrerix already holds.
+
+What was wrong before any of that was the SILENCE: a cancelled drive left two
+worker panes and a reviewer lane running with the worker panes on ONE worktree,
+and said nothing — so the orchestrator that owns the #338/#359 invariant had it
+broken by a mechanism it could not see. Every exit therefore NAMES the panes
+(§2.2, §6), and `cancel_review_drive` returns them in its result as well, since a
+notice whose delivery fails is lost (#1857) and a cancel is the one exit whose
+caller is holding a return value at the moment those panes stop being anyone's.
 
 ### 3.1 What the driver may never do — the closed list, honestly labelled
 
@@ -701,11 +711,26 @@ this note first.
    **HALF ENFORCED — prescribed on S4.** §5.5's key-set assertion pins which
    placeholders exist; its goldens pin what surrounds them. Neither constrains
    the *values*, which is §5.5's sanitization mandate.
-5. **Kill a pane.** `reap_idle_agents` may; the driver may not. A lane that goes
-   quiet becomes `held(lane-stalled)` naming the pane, and a human or the
-   orchestrator decides.
-   **PROMISE. Prescribed on S3:** the same scan, denying `kill_agent` and the
-   reaper entry points to the driver's module.
+5. **Kill a pane — except the two states in "#2501 reopened this item" below.**
+   `reap_idle_agents` may; the driver may not, and the two exceptions are a
+   closed set spelled in code (`reviewdrive::ReleaseReason`) rather than in prose
+   here. A lane that goes quiet becomes `held(lane-stalled)` naming the pane, and
+   a human or the orchestrator decides; the orchestrator's own kill authority is
+   untouched everywhere.
+   **ENFORCED BY TEST.** The scan denies `kill_agent`, `kill_agent_as`,
+   `mark_dead` and the reaper entry points inside the driver's three files, and
+   permits exactly ONE call to `release_driven_pane` — the barrier, which lives
+   in `mod.rs` beside the primitives it wraps, never in a driver file. The COUNT
+   is the pin: a second call site is a second place the two-state rule can be
+   broken, so it fails until it is argued onto the row. What a scan cannot see is
+   *which* two states, and the note says so rather than implying otherwise: that
+   half is pinned behaviourally, by `releasable`'s unit tests and by
+   `tests/reviewdrive.rs`'s negative controls — a briefed-but-silent lane, a
+   stale verdict, a `blocked` worker and a drive whose STEP parks all keep their
+   panes. The positive counterpart is pinned too, and it is the one rev-final's
+   W1 asked for: a `fail`-route hand-back with the group at its cap, where the
+   answering lane IS released and the drive does not park —
+   `a_fail_route_hand_back_at_the_cap_is_fed_by_the_lane_it_releases`.
    **This item is UNCHANGED by #1960, and that is the reason it was fixed the
    way it was.** The driver was exhausting the group's live-delegate cap with
    its own idle panes — a new pane per resume, none released, five of the six
@@ -787,8 +812,10 @@ this note first.
    closing it means holding a per-pane lock across the whole reuse decision,
    which `rd_state_lock` already spans a delivery under; it is named so a later
    slice does not read "the brief will be read" as stronger than it is.
-   **#2109 re-asked this item, and the answer is again NO — with what releases
-   the cap named instead.** That issue found a drive starved for three hours by
+   **#2109 re-asked this item, and the answer was again NO — with what releases
+   the cap named instead. Read it with the #2501 paragraph below, which
+   supersedes its conclusion and keeps its reasoning:** what #2109 established is
+   what a narrowing may not be keyed on, and that still holds. That issue found a drive starved for three hours by
    released lanes from a FINISHED drive, and its third ask was to retire them
    "or, if killing is deliberately kept out of the driver, surface them". Two
    things settle it the same way #1960 was settled. The panes holding the cap in
@@ -812,6 +839,100 @@ this note first.
    those clocks at all. It is **not** enough if a later measurement shows
    drives starving on panes nothing frees — that is the change that reopens this
    item, and it changes this note first.
+   **#2501 IS that measurement, and this is the note changing first.** Twelve
+   driven PRs on the beta8 round, scored with `scripts/orch-scorecard.cjs` over
+   this group's audit: `rd-refused` 20 on one PR, 11 on the next, 6 and 4–5 on
+   the clean ones, with `held(cap-refused)` on five of them. Every one of those
+   was an orchestrator wake that ran `list_agents` and `list_verdicts`, killed
+   lanes whose verdict was already recorded at the drive head or workers idle
+   after `report`, and re-issued `drive_review` — about 25 such wakes in one
+   session, each a full context turn, which is the exact cost this feature
+   exists to remove. `held(cap-full)`'s SENTENCE was the right answer while the
+   remedy was a human's; it is the wrong one when the remedy is a fact orrerix
+   already holds.
+   So the item is **narrowed, not deleted**, and the narrowing is a closed set of
+   two rather than a principle:
+   - a **reviewer lane whose verdict is recorded at the drive's CURRENT head**
+     (`ReleaseReason::VerdictRecorded`), asked with `lane_verdict_is_current` —
+     the same function `review-wait` decides with, and word-blind for its
+     reasons: what finishes the pane is that it ANSWERED about this revision;
+   - the **worker pane whose `report` the drive has just consumed**
+     (`ReleaseReason::ReportConsumed`) — `fix-wait` plus `WorkerSignal::Done`,
+     and nothing else: `blocked` is INVARIANT 3 territory and parks the drive for
+     an orchestrator that is about to speak to that very pane.
+   Three conditions bound both, and each excludes a case the previous version of
+   this item was right to worry about. **The STEP must leave the drive live** —
+   the step `decide` proposed, which is not the same claim as "a drive that
+   parks releases nothing" and is deliberately not written as one (rev-final
+   W1). A tick whose step is live can still end parked, because the arm can
+   refuse on its own: an `Advance` into `fix-wait` whose hand-back cannot resume
+   the worker becomes `held(worker-unresumable)` or `held(cap-refused)`, and by
+   then the release has happened. What keeps §6's exit notices true is not that
+   condition but the ORDER — the tick releases before the arm runs, and a
+   released pane leaves `owned_panes`, so every notice is assembled from the
+   panes that are actually left. **The pane must be idle**
+   (`idle_since_ms`), which is `reap_idle_agents`' own signal, so "an idle
+   reviewer lane" is never told from "a lane mid-review" by judging a screen.
+   **The session must resolve**, through `rd_lane_session`'s three sources, and
+   the resolved id is written onto the record before the pane goes — a lane whose
+   conversation cannot be named is not released at all, because a release that
+   lost the conversation would cost the review rather than a slot.
+   **What makes these two safe is not that the pane is idle.** `IdleTimeout` is
+   demoted in `exit_notice_route` on the argument that an idle agent has nothing
+   in flight; these two add the half that argument does not have — the pane's
+   OUTPUT is already durable (a verdict file the gate re-reads, a report the
+   drive consumed and acted on) and the conversation survives, because lanes and
+   workers have been resumed by session since #2109. Nothing is lost, rather than
+   merely nothing being in progress. That is why the release is `AuditOnly` and
+   not a prompt: `rd-lane-released` / `rd-worker-released` name the pane, the
+   session and the reason (§5.4), the roster shows the liveness, and a turn spent
+   announcing each release would spend the saving on announcing it.
+   **What #1960's and #2109's answers said, and why neither is contradicted.**
+   #1960 declined "release the pane a new one supersedes" because it needed the
+   item narrowed to *never kills a pane it did not open* — a guarantee a reader
+   holds a second fact to evaluate — and because it would not have freed the
+   ORIGINAL worker pane, which such a rule may not touch. This narrowing is not
+   that one: it is keyed on the pane's STATE in the drive, not on who opened it,
+   so it reaches the orchestrator-opened worker pane the drive took over, and a
+   reader evaluates it from the drive's own record. #2109 declined "retire
+   released lanes" because the panes holding the cap belonged to a drive that had
+   already ENDED, so no live drive owned them; that is still true and still not
+   what this does — a drive releases only what it currently owns, and a finished
+   drive's panes remain the orchestrator's, named on the way out.
+   **The cost this trades, stated because it is real.** Releasing a pane between
+   rounds gives up #1960's reuse of it: the next round resumes the session into a
+   fresh pane rather than typing into the one that is already there, so a round
+   costs one spawn where it cost none. That is the trade the measurement asks
+   for — a spawn is cheap and a SLOT is what drives are starving on — and the
+   conversation is identical on both paths, which is what makes it a trade rather
+   than a loss.
+   **The residual, which is a pane that is not only this drive's.** Nothing stops
+   two `drive_review` calls on different PRs naming one worker session, and after
+   both hand back they name one pane. The `report(done)` is consumed by whichever
+   drive `rd_owner` matches, so exactly one releases it, and the other learns on
+   its next tick: `rd_pane_exit` reads the death, names the initiator (`ended by
+   driver-release`), and the drive parks `held(worker-unresumable)` — a truthful
+   line one tick after the fact, where before #2501 it sat out `fix-stalled`
+   waiting for a report it was never going to be handed. Disclosed rather than
+   guarded, because the guard would be a claim about another drive's intentions;
+   and a repo driving two PRs off one worker session is already the #338/#359
+   shape §6's notices warn about.
+   **A second residual, and it is the ordering one.** The tick releases BEFORE it
+   runs the step's own arm, which is what makes a freed slot available to the
+   hand-back that follows on the `fail` route — without that order, a drive whose
+   lane had just answered could be refused its hand-back at the live-delegate cap
+   and park `held(cap-refused)` on a notice asking for the slot the same tick was
+   about to free, which is an orchestrator wake this feature exists to remove
+   (rev-final W1). The price is that a release is not conditional on the drive
+   surviving the tick: where the arm itself refuses — a hand-back whose session
+   will not resume — the drive parks `held(worker-unresumable)` with its lane
+   already released. That is the right way round (the lane had answered; the hold
+   is about the worker) and it costs nothing, because the hold's notice is built
+   afterwards off the live record and so names only panes that are still there.
+   **What reopens this item again**, in the same spirit as the sentence above it:
+   a measurement showing a released pane cost a review — a reviewer that had more
+   to say, a worker that was not finished — or a drive that released a pane it
+   should have kept. Either changes this note first.
 6. **Decide a disposition.** INVARIANT 3 is the orchestrator's, and the
    gate-satisfied notice says so in as many words (§6).
    **PROMISE, and structurally unenforceable — say so rather than pretend.**
@@ -1460,6 +1581,21 @@ caller whose id failed to resolve. An unrecorded pane therefore owns nobody: its
 traffic reaches the orchestrator exactly as it always did, which is the wrong
 recipient and never a wrong *authority*.
 
+**A RELEASED pane clears its field, and that is the third way one goes empty**
+(#2501, §3.1 item 5). `DriveEntry::release_pane` writes the resolved session onto
+the record and then takes the pane id out of `agent` / `worker_agent` — it does
+not move it to the `prior_*` list beside it, and it does not mark it. The
+argument is `forget_dead_panes`', unchanged: a released pane is dead, and
+`resolve_token` refuses a `Dead` caller, so there is no traffic left for this
+drive to fail to own and §7 loses nothing by the field going empty. What clearing
+it BUYS is that three readers keep being right without a second field threaded
+through each — the exit notices stop naming a pane they would call "still
+running", `rd-lane-duplicate-refused` stops guarding a pane that is not there, and
+`rd-lane-reopened` stops reporting a deliberate release as a lane this drive LOST.
+A release therefore leaves a lane record carrying a `session` and no `agent`,
+which is exactly the shape a cross-drive reseed (#2153) produces, and the same
+code re-opens both.
+
 **`prior_worker_agents` and `prior_agents` are the same field, plural** (#1871
 B2). A hand-back or a re-brief SUPERSEDES a pane rather than retiring it: the old
 pane keeps running on the same session and the same worktree, and the drive still
@@ -1683,7 +1819,7 @@ like `mq-*` and the rest:
 `rd-verdict` · `rd-handback` · `rd-consumed` ·
 `rd-satisfied` · `rd-held` · `rd-resumed` · `rd-cancelled` · `rd-pruned` ·
 `rd-kickback` · `rd-recovered` · `rd-state-unreadable` · `rd-reuse-declined` ·
-`rd-lane-reopened`
+`rd-lane-reopened` · `rd-lane-released` · `rd-worker-released`
 
 Every state transition, every spawn or resume, and every consumed delegate event
 (§7) appears here, each carrying `on_behalf_of`. `rd-started` carries
@@ -1747,6 +1883,26 @@ beside it cannot: that the previous pane is gone, and whether the reader is the
 one who ended it. Written on the spawn SUCCEEDING, never on the intent: a
 re-open the cap refused has re-opened nothing, and that tick's record is
 `rd-refused` with `cap: true` as it always was.
+
+`rd-lane-released` and `rd-worker-released` (#2501) are the rows for §3.1 item
+5's two narrowed states: a pane the driver KILLED, with the conversation kept.
+Each carries `pr`, `agent`, the `session` the next round resumes, the `head` it
+was released at, and a `reason` from the closed set `verdict-recorded` |
+`report-consumed`; the lane row adds `block`. Two actions rather than one with a
+`role`, on `rd-ci-red`'s argument twice over: the two sides are recovered by
+different code (`rd_open_lane`, `rd_handback`), and a reader counting freed
+REVIEWER slots must not have to filter worker rows out of its answer. The count
+is the point of the rows — #2501 is a measurement and its follow-up will be
+another one — so they are written on the release SUCCEEDING, never on the intent:
+a pane the barrier refused (still working, already gone, never bound to a
+terminal) produces no row, because nothing happened.
+
+**A release is emphatically not an `rd-lane-reopened`.** That row means the drive
+LOST a pane and had to replace it, and its `killed_by` is what an orchestrator
+reads after killing an idle delegate to find out whether it caused the loss. A
+released lane's record no longer names the pane at all, so the re-brief that
+follows is an ordinary `rd-lane-spawned … resumed=true` and the two facts stay
+distinguishable.
 
 `rd-refused`'s lane row gains `starved_ms` beside #1960's `cap` boolean. `cap`
 says a slot was the problem on THIS tick; a reader chasing a drive that has
@@ -2069,7 +2225,7 @@ orchestrator recovers its drives) and the audit log.
 | Failure | Degrades to |
 | --- | --- |
 | A kickoff never lands in a spawned lane's pane | The delivery layer already re-delivers and audits it (`delivery-eaten`, `kickoff-redelivery-skipped`), and a CLI that declares a readiness marker waits for it (`CliCaps::ready_marker`, #1591). **The driver adds no re-send of its own** — a second sender is a supersession hazard, not a fix. It bounds instead: no verdict inside `lane_timeout_minutes` is `held(lane-stalled)`, naming the pane. |
-| The live-delegate cap refuses a lane spawn | A runner-class outcome: back off `RD_BACKOFF_MS` and retry on a later tick, with `cap: true` on the `rd-refused` row so a reader can tell a capped lane (which usually clears itself) from a broken one. **A run of refusals that outlasts `CAP_HOLD_MS` is `held(cap-full)`** (#2109) — the bound used to be `drive_timeout_minutes` alone, whose notice says nothing about slots, and the measured drive spent three hours below it emitting one of these rows per tick and no §2.2 exit at all. The driver **never kills a pane to make room** (§3.1 item 5) — since #1960 it does not need to: a lane whose reviewer is idle in a live pane is re-briefed IN that pane, so a round costs no new slot, and since #2109 a lane that is BUSY is not superseded either. A refusal that reaches a **hand-back** is `held(cap-refused)`, not `worker-unresumable` (§2.2). |
+| The live-delegate cap refuses a lane spawn | A runner-class outcome: back off `RD_BACKOFF_MS` and retry on a later tick, with `cap: true` on the `rd-refused` row so a reader can tell a capped lane (which usually clears itself) from a broken one. **A run of refusals that outlasts `CAP_HOLD_MS` is `held(cap-full)`** (#2109) — the bound used to be `drive_timeout_minutes` alone, whose notice says nothing about slots, and the measured drive spent three hours below it emitting one of these rows per tick and no §2.2 exit at all. The driver **still never kills a pane to make room** (§3.1 item 5), and #2501 does not change that: it releases panes it no longer NEEDS — a lane whose verdict is recorded at this head, a worker whose report it has consumed — on facts about those panes, never on how full the group is, so a starved drive cannot go looking for a victim. What it does change is how often the cap is reached at all: a drive that is between rounds now holds no reviewer slot. Since #1960 the driver also does not need a new slot per round (a lane whose reviewer is idle in a live pane is re-briefed IN that pane), and since #2109 a lane that is BUSY is not superseded either. A refusal that reaches a **hand-back** is `held(cap-refused)`, not `worker-unresumable` (§2.2). |
 | An idle reviewer or worker is reaped between rounds | Recoverable, but **not exempt**: `idle_reap_candidates` exempts exactly two things — the orchestrator/manager roles, and blocks whose `role_hint` is `liaison` — so a driver-spawned lane is reapable like any other agent wherever an operator sets `idle_kill_minutes`, and the driver's own waits — 60 minutes per lane and per fix, and hours in `review-wait` before `state-stalled` — are long enough to cross a typical threshold. Recovery leans on the generic resume machinery, not on anything drive-aware: the entry stores the **full** resolved session id, so the next round resumes it; if it no longer resolves, a **lane** respawns fresh by block id and a **worker** becomes `held(worker-unresumable)`. A fresh lane respawn does **not** consume a `review_rounds` increment — the counter counts rounds of *findings*, and a reaped reviewer produced none. No `notify_when` watch is held anywhere — watches die with their agent — so the tick polls the PR itself. |
 | A lane must be re-briefed while its own pane is still working | The re-brief is REFUSED, not doubled: `rd-lane-duplicate-refused` names the pane that holds the round and the tick backs off, so the delta lands in that pane the moment it goes idle and the reuse arm can reach it (#2109). Before this the reuse declined on readiness and the spawn minted a second pane on the same conversation — two paid reviews for one verdict slot, and two panes against the cap. Bounded by the clock the refusal does NOT re-arm: `spawned_ms` stays where the original brief put it, so a pane that never comes back is `held(lane-stalled)` naming it. Keyed on `(pr, block, head)`, so a **head change** still supersedes — there the recorded pane is reviewing a revision the drive has moved past. **"Still working" is the actual condition since #2162, not a description of one.** The refusal used to key on `briefed_head == head` plus liveness, which is as true of a pane that has FINISHED its turn as of one still writing — and a body-only fix cannot move the head, so every round of #1875's class arrived here. Composed with the readiness decline above it that is a hard deadlock, and the two are about ONE pane: the reuse arm only ever considers an **idle** pane, so an `rd-reuse-declined` row proves the pane was idle, and this refusal then called that same pane live-and-briefed-at-this-head. Too `unconfirmed` to reuse and too live to replace. Measured on PR #2140: 38 minutes with no lane open, the same three rows every tick, no notice, ended by a human killing the pane — and `lane-stalled` was structurally unreachable throughout, because that lane had answered. So the guard now also requires the pane to have no `idle_since_ms`: the reuse arm takes idle panes and this refusal takes busy ones, the two do not overlap, and #2109 loses nothing — its measured duplicate (`rev-1825`/`rev-1826`) was a pane mid-review. A declined idle pane is superseded into a new pane on its own session through `prior_agents`, exactly as a head change does. **The residual is unchanged** and is the busy case this still covers: a lane that answered here and whose pane then took other work retries and is bounded by `review-wait`'s state bound. `a_body_only_fix_round_re_opens_the_lane_whose_pane_went_idle` pins the fix, `a_block_that_already_has_a_live_pane_at_this_head_is_refused_a_second_lane` is its negative control (same body move, same head, the one difference being that pane is still working), and `an_answered_lane_whose_re_brief_is_refused_is_bounded_by_the_review_wait_state_bound` pins the residual and its exit. |
 | A lane's pane is killed or exits mid-round | **Observed on the next tick and the lane RE-OPENED** (#2163), not waited out. A pane exit was read only for the worker and only in `fix-wait`, on the argument that "`review-wait` has `lane-stalled` for its own panes" — true, and an hour away, anchored at the brief rather than at the death. Measured on PR #2140: a rev-final pane killed at 20:12 left the drive with no rd-* row for the PR for 25+ minutes, and it was killed on the driver's OWN advice, since a `cap-refused` notice tells an orchestrator to free a slot by killing an idle delegate and a lane that has finished its turn is on that list. `LaneFact::pane_dead` carries the fact into `decide`, the lane's session is resumed into a fresh pane, and `rd-lane-reopened` names the dead pane and `killed_by` (§5.4). Only a positive `AgentStatus::Dead` counts — an emptied agent map after a restart is "we could not check", the same asymmetry `forget_dead_panes` states — and a session that no longer resolves falls to the existing `rd-lane-resume-failed` → fresh-spawn path. **Bounded**: the stall arm is read FIRST and the replacement inherits `spawned_ms` (§5.2), so a pane that dies on every spawn reaches `held(lane-stalled)` at `lane_timeout_minutes` from the original brief instead of being replaced for ever. |

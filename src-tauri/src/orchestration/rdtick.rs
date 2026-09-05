@@ -314,6 +314,13 @@ struct RdOut {
     /// [`OrchRegistry::rd_drive_group_with`] for the property that makes both
     /// safe, and why "span the spawn" and #467/#468 do not actually conflict.
     kickback: Option<(String, String)>,
+    /// `(role, pane)` for every pane this tick RELEASED (#2501) — reported, not
+    /// performed here: the kill and the record write both happen under the state
+    /// lock in [`OrchRegistry::rd_step_entry`], because un-recording a pane the
+    /// registry has not yet marked dead would leave it live and unowned, which
+    /// is the §7 leak this record exists to close. What travels out is the fact,
+    /// for [`RdDriveReport`].
+    releases: Vec<(reviewdrive::DrivenRole, String)>,
     audits: Vec<(&'static str, Value)>,
     notices: Vec<String>,
     /// What refused, when this tick's hold is about a refusal (#1961) — the
@@ -370,6 +377,16 @@ pub struct RdDriveReport {
     /// delivery, so a pane that could not be reached costs the line rather than
     /// re-emitting on every later tick.
     pub kickbacks: Vec<(u64, String)>,
+    /// `(pr, role, pane)` for every pane this tick released (#2501).
+    ///
+    /// **Performed, not attempted** — the opposite of `kickbacks` above, and the
+    /// difference is real rather than a wording preference. A release is only
+    /// recorded once `release_driven_pane` has answered `Ok`, which means the
+    /// registry won the live→dead transition, so a row here says the slot is
+    /// free and the drive's record no longer names that pane. A pane the barrier
+    /// refused — still working, already gone, never bound to a terminal — is not
+    /// here and is not on the audit log either, because nothing happened.
+    pub released: Vec<(u64, reviewdrive::DrivenRole, String)>,
     /// The kick-back notices this tick **produced and attempted** — a hold's,
     /// and every terminal exit's.
     ///
@@ -846,6 +863,12 @@ impl OrchRegistry {
             }
             if let Some(a) = &o.handback {
                 report.handbacks.push((o.pr, a.clone()));
+            }
+            // #2501: already performed, under the state lock — see the release
+            // loop in `rd_step_entry` for why the kill cannot be deferred to
+            // here the way a delivery is.
+            for (role, agent) in &o.releases {
+                report.released.push((o.pr, role.clone(), agent.clone()));
             }
             // #1959: into the WORKER's pane, not the orchestrator's — the whole
             // point is that this costs the orchestrator no turn. Outside the
@@ -1561,14 +1584,22 @@ impl OrchRegistry {
     /// of the six idle. §3.1's other candidate fix was to kill the pane a new
     /// one supersedes, and this is chosen over it for two reasons.
     ///
-    /// It does not need §3.1 item 5 narrowed. "The driver never kills a pane"
-    /// stays a closed guarantee rather than becoming "never kills a pane it did
-    /// not open", which is a guarantee a reader has to hold a second fact to
-    /// evaluate — and the exception would have been useless for the pane that
-    /// actually squatted the cap in the measured incident: the ORIGINAL worker
-    /// pane, opened by the orchestrator, which a release-what-you-superseded
-    /// rule may not touch. Reuse takes that pane over on the first hand-back
-    /// and never creates the second one at all.
+    /// It does not need §3.1 item 5 narrowed the way that candidate would have —
+    /// into "never kills a pane it did not open", which is a guarantee a reader
+    /// has to hold a second fact to evaluate — and the exception would have been
+    /// useless for the pane that actually squatted the cap in the measured
+    /// incident: the ORIGINAL worker pane, opened by the orchestrator, which a
+    /// release-what-you-superseded rule may not touch. Reuse takes that pane over
+    /// on the first hand-back and never creates the second one at all.
+    ///
+    /// **#2501 did narrow item 5, and this argument is why it narrowed it on a
+    /// different axis.** The release rule is keyed on the pane's STATE in the
+    /// drive — a lane whose verdict is recorded at this head, a worker whose
+    /// report the drive consumed — never on who opened it, so it reaches that
+    /// same original worker pane and a reader evaluates it from the drive's own
+    /// record. Reuse and release are not alternatives now: reuse is what happens
+    /// while a pane is still needed, release is what happens when it is not, and
+    /// a released pane's session is what the next round resumes into.
     ///
     /// And it is what an orchestrator driving by hand does: it types the next
     /// instruction into the worker's pane. A drive whose worker is idle in a
@@ -2499,6 +2530,14 @@ impl OrchRegistry {
             }
         }
         let step = reviewdrive::decide(entry, &facts, limits);
+        // **Read BEFORE the arc is taken, applied after it** (#2501). Both
+        // halves matter. `releasable`'s worker rule is "this entry is in
+        // `fix-wait` and the report it was waiting for arrived", which stops
+        // being true the instant `entry.take` moves it to `ci-wait`; and the
+        // lane rule must not see a lane this very tick re-briefed, which the
+        // `OpenLane` arm below is about to do. Computed here, the answer is
+        // about the world the decision was made in.
+        let releases = reviewdrive::releasable(entry, &facts, &step);
         let on_behalf = entry.on_behalf_of.clone();
         // §2.1's `review-wait` row writes "the current lane index", and the
         // current lane is the DECIDING one — the first whose pass does not stand
@@ -2519,6 +2558,96 @@ impl OrchRegistry {
                     out.changed = true;
                 }
             }
+        }
+        // **The releases (#2501)** — §3.1 item 5's narrowing, performed.
+        //
+        // **BEFORE the step's own arm, and that placement is the whole of
+        // rev-final W1.** The obvious spot is below the `match`, after the arc
+        // has been taken; it is wrong, and wrong in exactly the case this
+        // feature exists for. On the `review-wait -> fix-wait` fail route the
+        // arm calls `rd_handback`, and since #2501 released the previous
+        // worker's pane there is usually no live pane to reuse — so it SPAWNS,
+        // under the live-delegate cap, while the lane pane this tick is about to
+        // release is still `status != Dead` and still counted. At the cap the
+        // spawn is refused, the arm parks the drive `held(cap-refused)` on a
+        // notice asking an orchestrator to free a slot, and only then would the
+        // release free one. A parked drive does not self-advance, so that is an
+        // orchestrator wake — the exact cost #2501 measured, reintroduced by
+        // #2501's own worker rule. Releasing first means `mark_dead` has already
+        // dropped the pane out of `live_delegate_count` before `rd_spawn` asks.
+        //
+        // Nothing else depends on the old order. The candidates were computed
+        // pre-arc either way (see `releasable` above); reading each pane id here
+        // reads the record BEFORE `rd_open_lane` could replace it, which is
+        // strictly safer than after; and the exit notices are still built below
+        // the whole `match`, off `entry.owned_panes()`, so they name what is
+        // actually left. The one thing that moves is the ordering against
+        // `entry.take`: a transition `take` refuses (unreachable through
+        // `decide`) would now follow a release rather than skip it, which is
+        // still correct — a lane that answered at this head is finished with
+        // this round whether or not the drive managed to move.
+        //
+        // Three things happen per candidate, in this order and for these
+        // reasons.
+        //
+        // **The session is resolved FIRST**, through `rd_lane_session`'s three
+        // sources, and an empty answer skips the candidate. The promise this
+        // whole mechanism rests on is that the conversation survives, and a lane
+        // whose session cannot be named is one whose conversation the kill would
+        // end. Failing closed here costs a slot; failing open costs the review.
+        //
+        // **Then the kill**, through the one capability the driver has for it.
+        // `release_driven_pane` is the barrier — idle, alive, bound to a
+        // terminal, not a manager — and it answers `Err` for every pane that is
+        // none of those, which is skipped rather than recorded.
+        //
+        // **Then the record**, and only on the kill having succeeded. The two
+        // are under ONE hold of `rd_state_lock`, which is what keeps the pane
+        // from ever being live and unowned: `mark_dead` has already made
+        // `resolve_token` refuse that caller by the time its id leaves the
+        // record, so §7 has no window to leak through. Doing the kill out in the
+        // caller's side-effect loop, the way a kick-back delivery is done, would
+        // open exactly that window — and a delivery is safe there because losing
+        // one costs a line, while losing this ordering costs an unowned pane.
+        //
+        // The audit row is written last, on the fact rather than the intent:
+        // §5.4 says a release row means a pane went, and a reader counting freed
+        // slots must be able to trust the count.
+        for cand in &releases {
+            let (agent, session) = match &cand.role {
+                reviewdrive::DrivenRole::Worker => {
+                    (entry.worker_agent.clone(), entry.worker_session.clone())
+                }
+                reviewdrive::DrivenRole::Lane(block) => {
+                    let rec = entry.lane(block);
+                    let agent = rec.map(|r| r.agent.clone()).unwrap_or_default();
+                    let session = self.rd_lane_session(group, rec).unwrap_or_default();
+                    (agent, session)
+                }
+            };
+            if agent.trim().is_empty() || session.trim().is_empty() {
+                continue;
+            }
+            if self.release_driven_pane(&agent).is_err() {
+                continue;
+            }
+            let Some(freed) = entry.release_pane(&cand.role, &session) else { continue };
+            out.changed = true;
+            let (action, mut detail) = match &cand.role {
+                reviewdrive::DrivenRole::Worker => (
+                    rddrive::audit_action::WORKER_RELEASED,
+                    json!({ "pr": pr, "agent": freed, "session": session,
+                            "reason": cand.reason.as_str() }),
+                ),
+                reviewdrive::DrivenRole::Lane(block) => (
+                    rddrive::audit_action::LANE_RELEASED,
+                    json!({ "pr": pr, "block": block, "agent": freed, "session": session,
+                            "reason": cand.reason.as_str() }),
+                ),
+            };
+            detail["head"] = Value::String(brief.head.clone());
+            out.audits.push((action, detail));
+            out.releases.push((cand.role.clone(), freed));
         }
         match &step {
             reviewdrive::DriveStep::Wait => {

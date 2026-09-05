@@ -511,6 +511,32 @@ pub mod audit_action {
     /// The row is written on the SPAWN succeeding, never on the intent: a
     /// re-open that the cap refuses has re-opened nothing.
     pub const LANE_REOPENED: &str = "rd-lane-reopened";
+    /// A reviewer lane's pane was **released** — killed by the driver, with the
+    /// lane's session kept resumable (#2501). Carries `pr`, `block`, the `agent`
+    /// that went, the `session` the next round will resume, and the closed
+    /// `reason` from [`crate::reviewdrive::ReleaseReason`].
+    ///
+    /// Its own action rather than a detail on anything else, for [`CI_RED`]'s
+    /// reason twice over. A reader counting what the driver freed must not have
+    /// to match the rows where it freed nothing — that count is the whole point
+    /// of the row, since #2501 is a measurement and its follow-up is another
+    /// one. And a release is emphatically not a [`LANE_REOPENED`]: that row
+    /// means the drive LOST a pane and had to replace it, and a reader who has
+    /// just killed an idle delegate reads it to find out whether they caused
+    /// that. Written on the release SUCCEEDING, never on the intent — a pane the
+    /// registry refused to release has been released by nobody.
+    pub const LANE_RELEASED: &str = "rd-lane-released";
+    /// The worker's pane was **released** — the same event on the other side
+    /// (#2501), after the drive consumed that worker's `report` and moved on.
+    /// Carries `pr`, `agent`, `session` and `reason`.
+    ///
+    /// A separate action from [`LANE_RELEASED`] rather than one action with a
+    /// `role`, on `mqdriver::audit_action`'s own rule and [`CI_RED`]'s: the two
+    /// sides are released for different reasons, are recovered differently (a
+    /// lane by `rd_open_lane`, a worker by `rd_handback`), and a scorecard
+    /// counting reviewer slots must not have to filter worker rows out of its
+    /// answer.
+    pub const WORKER_RELEASED: &str = "rd-worker-released";
     /// A lane's verdict was read at this revision.
     pub const VERDICT: &str = "rd-verdict";
     /// The worker's session was resumed with a hand-back brief.
@@ -977,8 +1003,9 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
         ),
         HeldReason::LaneStalled => format!(
             "HELD — lane {} ({}) recorded no verdict inside the lane timeout{at}. \
-             The driver never kills a pane: read that pane, then drive_review to \
-             resume or cancel_review_drive to stop.",
+             The driver does not release a lane that has not answered (#2501), so \
+             that pane is still there: read it, then drive_review to resume or \
+             cancel_review_drive to stop.",
             f.lane, pane_of(&f.lane_agent),
         ),
         // **Two shapes, because since #2168 E1 this hold has two sites and one
@@ -1090,7 +1117,8 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
         HeldReason::CapFull => format!(
             "HELD — this group's live-delegate cap has refused this drive's next \
              reviewer lane for the whole hold window{at}, so no lane is open and \
-             none can be.{refusal} The driver never kills a pane: free a slot \
+             none can be.{refusal} The driver never kills a pane to make room — \
+             it releases only ones it has finished with — so free a slot \
              (kill_agent on an idle delegate — list_agents shows which) and \
              drive_review resumes it, or cancel_review_drive stops it."
         ),
@@ -1177,11 +1205,28 @@ pub enum PaneStanding {
 /// **The panes a drive owns, named on the way out** — the clause every exit
 /// notice carries (#1871 B3).
 ///
-/// The driver kills none of them, and that is a decision rather than an
-/// omission: §3.1 item 5 already forbids it killing a pane, a worker mid-edit
-/// must not be killed, and "an idle reviewer lane" cannot be told from "a lane
-/// mid-review" without the LLM judgment §3 says the driver never makes. What was
-/// actually wrong was the SILENCE. A cancelled drive left three panes running —
+/// **Every pane in this list is one the drive still HOLDS at the exit, and none
+/// of them was killed by it.** That is a narrower sentence than it used to be:
+/// §3.1 item 5 forbade the driver killing a pane at all, and since #2501 it
+/// forbids all but two states — a lane whose verdict is recorded at the drive's
+/// current head, and a worker that reported and went idle after the drive
+/// consumed the report. A pane released that way is DEAD and its slot is already
+/// free, so [`crate::reviewdrive::DriveEntry::release_pane`] drops it from the
+/// record and it is not in this list at all. What is left is exactly what the
+/// two sentences below promise: panes that are still running, for the
+/// orchestrator to resume or dispose of. What keeps that true is the ORDER
+/// rather than a prohibition: every release this tick performed happened before
+/// the arm that writes these lines, and each one takes its pane out of
+/// [`DriveEntry::owned_panes`](crate::reviewdrive::DriveEntry::owned_panes), so
+/// the list is assembled from what is actually left.
+/// [`releasable`](crate::reviewdrive::releasable)'s first condition is about the
+/// proposed STEP and does not by itself promise this — a tick whose step was
+/// live can still park when the arm refuses (rev-final W1).
+///
+/// A worker mid-edit is still never killed, and "an idle reviewer lane" is still
+/// not told from "a lane mid-review" by any LLM judgment §3 forbids — the
+/// release reads `idle_since_ms` and a recorded verdict, both facts orrerix
+/// already holds. What was wrong before any of this was the SILENCE. A cancelled drive left three panes running —
 /// two worker panes and a reviewer lane, with the worker panes on ONE worktree
 /// and ONE session — and said nothing, so the orchestrator that owns the
 /// #338/#359 invariant had it broken by a mechanism it could not see. Naming
