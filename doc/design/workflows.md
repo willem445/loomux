@@ -2720,9 +2720,9 @@ fails when a row goes stale:
 
   Closing it means giving the three `default`-resolving sites a group, which is
   a change to `gh.rs`'s repo-scoped shape and not something an apply should have
-  smuggled in beside itself. It stays a residual, restated here rather than left
-  saying something that is no longer true, and the `RESIDUALS` row carries the
-  same correction.
+  smuggled in beside itself. It is **#2663**, a blocking prerequisite for slice
+  D2, and it stays a residual here — restated rather than left saying something
+  that is no longer true, with the `RESIDUALS` row carrying the same correction.
 
 The plan predicted two, and `orch_workflow_preview_sync` with no `name` was the
 second. It stopped being one in this same slice: gaining the optional `name`
