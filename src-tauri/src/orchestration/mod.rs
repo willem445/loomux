@@ -7433,7 +7433,7 @@ pub fn codex_profile_toml(
     s.push('\n');
 
     // ── tables ──
-    s.push_str("[sandbox_workspace_write]\nnetwork_access = true\n\n");
+    s.push_str("[sandbox_workspace_write]\nnetwork_access = false\n\n");
     s.push_str(&format!(
         "[projects.\"{}\"]\ntrust_level = \"trusted\"\n\n",
         toml_basic_escape(&cwd.display().to_string(), TomlNewlines::Escape)
