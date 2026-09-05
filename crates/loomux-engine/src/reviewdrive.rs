@@ -3705,9 +3705,6 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
     // grants is read back against an exact `(briefed_head, briefed_digest)`
     // pair, and a brief whose revision cannot be pinned grants nothing.
     let body_only = digest.is_some()
-        && entry
-            .lane(&lane.block)
-            .is_some_and(|r| !r.briefed_head.is_empty() && r.briefed_head == facts.head)
         && required
             .iter()
             .all(|l| l.verdict.as_ref().is_some_and(|v| v.reviewed(&facts.head)));
