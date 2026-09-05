@@ -29,6 +29,13 @@
 //! not find it. So this module emits forward only: no cursor movement, no
 //! erase, and no **bare** carriage return — a `CR` that is not part of a `CRLF`
 //! is the one that returns the cursor without advancing.
+//!
+//! That is true of the bytes loomux authors *and* of the bytes it passes
+//! through, which is the harder half: a model's own text, a tool's name and a
+//! rendered argument preview all reach the stream, and a JSON string carries
+//! `CR` and `ESC` perfectly well. [`Renderer::wrapped`] neutralizes every
+//! control character in them, at the one point all three cross — see its doc for
+//! why the filter is there and not at the call sites.
 //! [`no_output_can_rewrite_the_screen`] is the pin, and it bans that shape
 //! specifically; an earlier version banned every `CR`, which forbade the line
 //! ending this module is required to emit (see [`NEWLINE`]).
@@ -235,13 +242,40 @@ impl Renderer {
     /// word routinely arrives split across two events, so a word-wrapper would
     /// either hold text back (latency the human sees as stalling) or break in
     /// the wrong place anyway.
+    /// **Every byte that reaches this function is CONTENT, and content is
+    /// neutralized.** That is what makes the forward-only rule in this module's
+    /// header true rather than aspirational, and it is why the filter lives here
+    /// instead of at the call sites.
+    ///
+    /// Three callers feed this text loomux did not author: [`Self::text`] (a
+    /// `HarnessEvent::Text` delta, handed through by the decoder verbatim) and
+    /// [`Self::meta`]/[`Self::line`], whose format strings embed a tool's
+    /// `name`, a permission's `tool` and a rendered `preview`. A JSON string
+    /// carries `CR` and `ESC` perfectly well, so without this an agent's own
+    /// output reaches `term.write` unchanged and can repaint its line
+    /// (`…approved\rDENIED`), reach onto a line already drawn (`ESC[A`), or
+    /// **erase the whole pane** (`ESC[2J`) — loomux's own header line with it.
+    /// That is CLAUDE.md constraint 1's damage arriving by exactly the road the
+    /// design note's §5.2 says it cannot.
+    ///
+    /// loomux's own control bytes never pass through here: [`Self::meta`] pushes
+    /// `DIM`/`RESET` around this call, and [`NEWLINE`] is emitted by the wrap
+    /// below and by [`Self::newline`]. So the rule "everything this function
+    /// receives is untrusted" holds with no exception to remember, which a
+    /// per-call-site filter would not give — [`preview_input`] is the proof of
+    /// that: it stripped `CR`/`LF` from a tool's arguments and let `ESC`
+    /// through, and model text got neither.
+    ///
+    /// A control becomes a **space** rather than being dropped: the column
+    /// arithmetic below counts what it emits, and a dropped character would let
+    /// a line silently exceed `cols`.
     fn wrapped(&mut self, out: &mut String, s: &str) {
         for c in s.chars() {
             if self.col >= self.cols {
                 out.push_str(NEWLINE);
                 self.col = 0;
             }
-            out.push(c);
+            out.push(if c.is_control() { ' ' } else { c });
             self.col += 1;
         }
     }
@@ -345,6 +379,26 @@ mod tests {
                     turn: TurnId(0),
                     delta: "a very long line that certainly wraps past forty columns".into(),
                 },
+                // The subject the assertions below need, and without which this
+                // test's population could not violate any of them: text loomux
+                // did not author, carrying the three shapes it bans. Every
+                // event above is loomux-authored and contains no CR and no ESC,
+                // so the loops passed over a string that could not have held
+                // the shape — an absence assertion over the wrong population.
+                HarnessEvent::Text {
+                    turn: TurnId(0),
+                    delta: "approved\rDENIED \x1b[2m\x1b[A\x1b[2J\x1b[K done".into(),
+                },
+                // The same bytes by the OTHER route into `wrapped`: a tool's
+                // name and its rendered argument preview are interpolated into
+                // a loomux-authored line, so a filter applied only to `Text`
+                // would leave this one open.
+                HarnessEvent::ToolCall {
+                    turn: TurnId(0),
+                    id: ToolUseId("t2".into()),
+                    name: "Ba\x1b[Ash".into(),
+                    input: serde_json::json!({"command": "echo hi\rrm -rf /\x1b[2J"}),
+                },
                 HarnessEvent::ToolCall {
                     turn: TurnId(0),
                     id: ToolUseId("t".into()),
@@ -404,6 +458,20 @@ mod tests {
         // The positive control: it did emit SOMETHING, so the absences above are
         // about the content and not about an empty string.
         assert!(out.contains("git status"), "{out:?}");
+        // And the filter NEUTRALIZES rather than deletes: the pass-through text
+        // is still legible with its controls turned into spaces. An assertion
+        // that only checked the absences would pass just as well on a renderer
+        // that dropped the delta entirely.
+        assert!(
+            out.contains("approved DENIED"),
+            "a control must become a space, not vanish with its neighbours: {out:?}"
+        );
+        // `\x1b[Ash` is ESC + the printable `[Ash`, so only the ESC is
+        // neutralized — the bracket and letters are ordinary text and stay.
+        assert!(
+            out.contains("Ba [Ash("),
+            "the same rule applies to an interpolated tool name: {out:?}"
+        );
         // Every attribute it opens, it closes on the same pass.
         assert_eq!(
             out.matches(DIM).count(),
