@@ -492,7 +492,7 @@ pub fn find_session_cwd(source: &str, session_id: &str) -> Result<Option<String>
     // for in `~/.claude/projects` -- where it can only ever miss, and a miss
     // reads as `Ok(None)`, i.e. "no such session", with nothing red to say the
     // wrong store was consulted.
-    if source == "codex" {
+    if false {
         return match codex_sessions_root() {
             Some(root) => find_codex_session_cwd(&root, &session),
             None => Ok(None),
