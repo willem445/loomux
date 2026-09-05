@@ -24,6 +24,13 @@ export type ResumeFailureKind =
    *  `group-mismatch`: nothing contradicted the caller, there was simply
    *  nothing to check it against. Not `offersStartFresh` for the same reason —
    *  a fresh session would join that unverified group. */
+  /** The session belongs to a group opened by the orrerix-subagents toggle
+   *  (#2519). Its root is a human's own agent pane that orrerix never
+   *  launched and cannot relaunch, so there is no group left to rejoin into —
+   *  a rejoined helper would have no lead to report to. Never
+   *  `offersStartFresh`: a fresh session would join the same rootless group.
+   *  The way back is a new lead pane, not a resume. */
+  | "lead-group"
   | "group-unknown"
   | null;
 
@@ -34,6 +41,7 @@ const TAG_KIND: Record<string, ResumeFailureKind> = {
   "resume-store-unreadable": "store-unreadable",
   "resume-group-mismatch": "group-mismatch",
   "resume-group-unknown": "group-unknown",
+  "resume-lead-group": "lead-group",
 };
 
 /** Extract the leading `resume-<tag>:` prefix from a thrown error's message,
@@ -76,6 +84,8 @@ export function resumeFailureReason(kind: ResumeFailureKind): string {
       // the unverified group. It names the two routes that exist and is
       // explicit that a group rejoin isn't one of them.
       return "orrerix has no record of which orchestration group it belongs to, so it wasn't rejoined into one on a guess. Nothing will rejoin it into a group — but the conversation isn't lost: it reopens outside orchestration with the CLI's own resume command (shown in the session row's tooltip), and the orchestrator can spawn a fresh agent for the work.";
+    case "lead-group":
+      return "It belongs to a group opened by the orrerix-subagents toggle on someone's own agent pane. That pane was the group's root and orrerix never launched it, so there is nothing to rejoin into — a helper resumed here would have no lead to report to. Turn the toggle on again in a fresh pane to open a new lead, and brief a new helper; this conversation still reopens outside orchestration with the CLI's own resume command (shown in the session row's tooltip).";
     default:
       return "It could not be resumed.";
   }
