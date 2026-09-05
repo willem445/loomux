@@ -29724,8 +29724,7 @@ impl OrchRegistry {
         // map). That is deliberately conservative within a running process — a
         // dead agent's profile is already removed by `mark_dead` itself — and at
         // the startup call site the map is empty, which is the case that matters.
-        let agents_this_process_holds: HashSet<String> =
-            self.agents.lock_safe().values().map(|a| a.id.clone()).collect();
+        let agents_this_process_holds: HashSet<String> = HashSet::new();
         {
             if let Some(home) = self.codex_home_dir() {
                 // The one refusal that survives, and it is the half that was
