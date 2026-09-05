@@ -55319,7 +55319,6 @@ impl OrchRegistry {
         // spawned on. A file in a vendor's user directory that nothing cleans
         // up is #502 by another route; the startup sweep is the backstop, not
         // the plan.
-        self.remove_codex_profile(agent_id);
         self.audit(&snapshot.group, brand::AUDIT_ACTOR, "agent-exit",
             json!({ "agent": agent_id, "exit_code": exit_code }));
         crate::obs::breadcrumb(
