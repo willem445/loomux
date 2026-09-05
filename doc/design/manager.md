@@ -127,6 +127,29 @@ message vanish into an audit line, and an orchestrator that reached for
 `send_prompt` gets a redirect instead of a dead end. If either is ever relaxed,
 the property still holds.
 
+### The opposite pole: the lead pane (#2519)
+
+`Role::Lead` ([lead-pane.md](lead-pane.md)) is the other human-facing class, and
+it is worth naming here because it is the one that could be mistaken for a
+weakening of this guarantee. A lead is a human-driven pane that opens helper
+panes, and its children's `report`s **are** typed into it — the exact thing a
+manager's pane refuses. The difference is consent: a lead exists only because a
+human turned on a toggle whose stated effect is that their helpers report back
+where they are looking, while a manager pane is a conversation nobody opted into
+interrupting.
+
+Structurally the two are kept apart by two predicates that differ by exactly one
+class. `Role::is_fixture` (never docked, capped, reaped, nagged or released)
+covers orchestrator, manager and lead; `Role::is_root` — the lookup
+`deliver_relayed_to_root` performs to find a report's recipient — covers
+orchestrator and lead and **excludes the manager**. Folding either into the
+other, or deriving one from the other, is what would make a manager pane a
+report target, so `a_group_has_exactly_two_possible_roots_and_a_manager_is_not_one`
+asserts both sets and asserts that they differ. Nothing in #2519 touches this
+section's operands: the refusal still reads `Role::Manager` and
+`Delivery::permitted_into_manager_pane`, and the permitted set is still the
+three above.
+
 ## `mailbox.json` — the durable pull registry
 
 The mailbox is what makes the refusal survivable. It lives in the group dir

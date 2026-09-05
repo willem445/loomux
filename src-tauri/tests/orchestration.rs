@@ -6518,14 +6518,12 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
 /// of completeness; this is the claim being made checkable.)
 #[test]
 fn every_capability_class_pins_its_deny_tier() {
-    for role in [
-        Role::Orchestrator,
-        Role::Worker,
-        Role::Reviewer,
-        Role::Planner,
-        Role::Manager,
-        Role::Solo,
-    ] {
+    // #2519: the population is `Role::ALL`, not a hand-list. It was a literal
+    // array, which is the completeness claim this test's own doc makes being
+    // made by a list somebody had to remember to widen; `Role::ALL` is
+    // compiler-enforced complete (`Role::all_index`), so the enumeration below
+    // is the only thing left to write an arm in.
+    for role in Role::ALL {
         let want = match role {
             Role::Orchestrator | Role::Worker => Containment::None,
             Role::Reviewer => Containment::NoEdits,
@@ -6537,6 +6535,15 @@ fn every_capability_class_pins_its_deny_tier() {
             // that a human is sitting in front of it.
             Role::Manager => Containment::NoEdits,
             Role::Solo => Containment::None,
+            // #2519. The ORCHESTRATOR's arm, on the orchestrator's argument and
+            // not the solo pane's: a lead pane is a full working pane the human
+            // drives — it edits their code and runs their commands — so a deny
+            // tier here would take away the CLI they launched. Unlike
+            // `Role::Solo`'s arm this one IS reached: `build_agent_command`
+            // clamps a spawn loomux performs, and slice B opens a lead through
+            // it. What bounds the fan-out is the cap and the spawn-rate
+            // backstop, not containment.
+            Role::Lead => Containment::None,
         };
         assert_eq!(role.containment(), want, "{role:?} changed deny tier — was that deliberate?");
     }
@@ -15055,17 +15062,50 @@ fn tool_listing_is_role_filtered() {
     assert!(work.contains(&"report".to_string()));
 }
 
+/// A worker is refused every privileged tool, and the refusal says which
+/// classes DO hold it.
+///
+/// **The two gates are separate rows on purpose (#2519).** They were one list
+/// asserting one substring until `Role::Lead` arrived and the fleet-control six
+/// moved from `require_orchestrator` to `require_spawner`. Widening the
+/// assertion to whatever both messages happen to share — or dropping it to a
+/// bare `isError` — would have been repinning to fit the code; the fix is that
+/// each row asserts the sentence its own gate is now responsible for. The
+/// board-write tier still says "orchestrator-only" because it still IS, and
+/// that half going quiet would mean a lead had acquired `set_state`.
 #[test]
 fn workers_cannot_use_privileged_tools_even_if_they_try() {
     let (reg, _d, _co, cw) = setup_mcp();
-    for tool in ["spawn_agent", "send_prompt", "kill_agent", "rename_agent", "set_state", "get_output"] {
+    // (tool, the phrase its gate's refusal must carry)
+    let probes: [(&str, &str); 7] = [
+        // `require_spawner` — the orchestrator's OR a lead's. The refusal must
+        // name both, because "orchestrator-only" is now false of these six and
+        // a worker told it learns something untrue about the system it is in.
+        ("spawn_agent", "or a lead pane"),
+        ("send_prompt", "or a lead pane"),
+        ("get_output", "or a lead pane"),
+        ("kill_agent", "or a lead pane"),
+        ("focus_agent", "or a lead pane"),
+        ("rename_agent", "or a lead pane"),
+        // `require_orchestrator` — unchanged, and the control: if this row ever
+        // starts naming a lead, a lead has acquired the board-write tier.
+        ("set_state", "orchestrator-only"),
+    ];
+    for (tool, want) in probes {
         let r = dispatch(&reg, &cw, "tools/call",
             &json!({ "name": tool, "arguments": { "task": "x", "agent_id": "w-1", "text": "x", "name": "x", "state": "{}" } }))
             .unwrap();
         assert_eq!(r["isError"], true, "{tool} must be denied for workers");
+        let text = r["content"][0]["text"].as_str().unwrap();
+        // The gate's message is one paragraph produced by a `\`-continued Rust
+        // literal, so compare with the newline collapsed rather than pinning
+        // the wrap position.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let want_flat = want.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            r["content"][0]["text"].as_str().unwrap().contains("orchestrator-only"),
-            "{tool} denial must say why"
+            flat.contains(&want_flat),
+            "{tool} denial must say why, naming the classes that DO hold it — wanted \
+             {want_flat:?}, got {flat:?}"
         );
     }
 }
@@ -17119,14 +17159,34 @@ fn rename_agent_updates_roster_and_audits() {
     assert!(log.contains("agent-rename"), "rename must be audited");
 }
 
+/// A worker cannot rename a pane — and since #2519 the refusal names BOTH
+/// classes that can, because "orchestrator-only" stopped being true of it.
+///
+/// The test is renamed with the property rather than repinned to whatever the
+/// new message happens to share with the old: its old name asserted the claim
+/// in the one place an assertion cannot reach it. `rename_agent` moved from
+/// `require_orchestrator` to `require_spawner`, so a worker told this tool is
+/// orchestrator-only would be learning something untrue about the system it is
+/// in — the same correction `workers_cannot_use_privileged_tools_even_if_they_try`
+/// makes for the other five fleet tools, and the reason both had to move
+/// together is that they are one gate.
 #[test]
-fn rename_agent_is_orchestrator_only() {
+fn rename_agent_is_for_a_spawner_only() {
     let (reg, _d, _co, cw) = setup_mcp();
     let denied = dispatch(&reg, &cw, "tools/call",
         &json!({ "name": "rename_agent", "arguments": { "agent_id": cw.agent_id, "name": "x" } }))
         .unwrap();
     assert_eq!(denied["isError"], true, "workers must not rename");
-    assert!(denied["content"][0]["text"].as_str().unwrap().contains("orchestrator-only"));
+    let text = denied["content"][0]["text"].as_str().unwrap();
+    // Flattened, because the gate's message is one paragraph produced by a
+    // `\`-continued Rust literal: pinning the wrap position would be pinning
+    // the source layout rather than the sentence.
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("for an orchestrator, or a lead pane"),
+        "the refusal must name the classes that DO hold it, not a class that no longer \
+         exclusively does: {flat}"
+    );
 }
 
 #[test]
@@ -37623,6 +37683,14 @@ fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
         // construction", which is false of this file. The construction here is
         // the helper itself, which is exactly what this allowlist is for.
         ("reviewdrive.rs", 1),    // relaunch_registry (#1778 S3/S4) — see above
+        // #2519 slice A. Its own binary for `manager_lifecycle.rs`'s two
+        // reasons (one subject; off this file's end-of-file append-conflict
+        // surface), and therefore its own helper: helpers do not cross
+        // integration-test binaries. The helper applies all four agent/hook dir
+        // overrides — which is the property #464 is about — and the row is
+        // checked against that by this scan alone, so a reader re-checking it
+        // reads `lead.rs`'s `relaunch_registry` itself.
+        ("lead.rs", 1),           // relaunch_registry (#2519 slice A)
     ];
     let mut files = Vec::new();
     collect_rs_files(tests_dir, &mut files);

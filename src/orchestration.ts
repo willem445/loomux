@@ -1689,6 +1689,13 @@ export interface GroupSummary {
     reviewer: number;
     planner: number;
     manager: number;
+    /** #2519. Here for the same reason `manager` was: the backend's `match` on
+     *  `Role` is exhaustive, so the key exists the moment the class does, and a
+     *  type that omitted it would make this comment's own claim false. A lead
+     *  group's root is a lead rather than an orchestrator, so `roles.lead` is
+     *  where its 1 lives and `roles.orchestrator` is 0 — a panel reading only
+     *  the latter would report an empty group with a pane plainly running. */
+    lead: number;
   };
   /** Whether the roster this group is RUNNING declares a manager block at all
    *  (#1433). Beside `roles.manager`, which counts LIVE ones, because the

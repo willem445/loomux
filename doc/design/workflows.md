@@ -84,7 +84,7 @@ inert text or a choice from a value set loomux already ships:
 
 | Block field | What it can do | Why it's safe |
 |---|---|---|
-| `kind` | select a class from the closed set (`orchestrator`/`worker`/`reviewer`/`planner`/`manager`) | closed enum; unknown values are **rejected**, not coerced (see below) |
+| `kind` | select a class from the closed set (`orchestrator`/`worker`/`reviewer`/`planner`/`manager`) | closed enum; unknown values are **rejected**, not coerced (see below). The set is narrower than `Role`: `solo` and `lead` (#2519) are capability classes **no workflow file may name**, and that absence from `kind_from_str` is the enforcement, not a check — it is what stops a repo file handing a pane fleet control, and what makes "a lead may never open another lead" structural, since `spawn_agent` parses its `kind` through the same function. See [lead-pane.md](lead-pane.md) |
 | `cli` | select `claude` \| `copilot` \| `gemini` \| `opencode` | validated against `SUPPORTED_CLIS` at parse *and* at spawn — and, since #267, against `CLI_CAPS`: a CLI that cannot enforce the class's containment tier is refused at both ends too |
 | `model` | name a model | `sanitize_model` — the pre-existing allowlist filter |
 | `effort` | select a thinking level | closed enum (`low`/`medium`/`high`/`xhigh`/`max`); rejected outright if it isn't in the vocabulary, **and** if the block's `cli:` has no `effort_levels` in `CLI_CAPS` |

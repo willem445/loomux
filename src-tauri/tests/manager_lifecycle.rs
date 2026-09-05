@@ -999,6 +999,15 @@ fn role_named(variant: &str) -> Option<Role> {
         "Planner" => Role::Planner,
         "Manager" => Role::Manager,
         "Solo" => Role::Solo,
+        // #2519. Classified, and the answer to BOTH of this test's questions is
+        // NO: a lead is not declarable (`workflow::kind_from_str` has no `lead`
+        // arm — that absence is the no-recursion enforcement) and it does not
+        // spend a `max_agents` slot (`Role::is_fixture`). So the derived
+        // `counted` set below is unchanged, `templates/orchestrator.md`'s
+        // parenthetical needs no edit, and the `pre222` fixtures need no
+        // re-bless. Its CHILDREN are ordinary workers and are already named
+        // there. See doc/design/lead-pane.md.
+        "Lead" => Role::Lead,
         _ => return None,
     })
 }
@@ -1030,7 +1039,7 @@ fn the_orchestrators_counting_parenthetical_names_exactly_the_classes_that_count
         variants.len() >= 6,
         "the Role harvest found only {variants:?} — a scan that cannot see the enum enforces nothing"
     );
-    for expected in ["Worker", "Manager", "Solo"] {
+    for expected in ["Worker", "Manager", "Solo", "Lead"] {
         assert!(
             variants.iter().any(|v| v == expected),
             "the Role harvest missed `{expected}`: {variants:?}"
@@ -1121,6 +1130,24 @@ fn the_counting_pin_is_blind_to_a_class_no_workflow_file_can_name_and_that_is_bo
         None,
         "if `solo` became declarable the pin above starts reading it, and the template's \
          parenthetical has to name it"
+    );
+
+    // #2519: `Role::Lead` is the SECOND undeclarable class, and it sits outside
+    // the pin's population for TWO independent reasons rather than one. Both are
+    // asserted, because a residual that rests on two conditions and pins one is
+    // a residual that goes false silently the first time the other flips.
+    assert_eq!(
+        workflow::kind_from_str("lead"),
+        None,
+        "a lead is minted by the launcher toggle alone; `kind_from_str` gaining a `lead` arm \
+         would make it declarable AND would let an agent spawn one — see the arm-less comment \
+         there, and doc/design/lead-pane.md"
+    );
+    assert!(
+        !counts_against_max_agents(Role::Lead),
+        "a lead is the seat, not a helper — `Role::is_fixture`. If it ever started counting, \
+         the sentence above about it being outside this population for two reasons is down to \
+         one, and the guardrail table in doc/design/lead-pane.md is wrong"
     );
 
     // THE BOUND on that blindness: a class the workflow file cannot name also

@@ -796,6 +796,31 @@ pub const PLANNER_TPL: &str = include_str!("templates/planner.md");
 /// against.
 #[doc(hidden)]
 pub const MANAGER_TPL: &str = include_str!("templates/manager.md");
+/// The lead pane's role contract (#2519).
+///
+/// Like [`MANAGER_TPL`] it is outside `write_instruction_files`'s
+/// class-fallback loop — no built-in roster has a lead, and a `lead.md`
+/// appearing in every group dir would be a default-path change for a feature
+/// nobody turned on. It is written by the block loop, for the roster the
+/// launcher's toggle mints.
+///
+/// **Unlike `manager.md` it is NOT golden-pinned in this slice**, and that is a
+/// decision rather than an oversight. The pin (`tests/fixtures/pre222/` + the
+/// `LIVE` pairing in `tests/workflow.rs`) exists to make an accidental edit to
+/// bytes a shipped pane already reads fail loudly; nothing delivers this file
+/// yet — slice A ships the CLASS, and the launch path that pastes a kickoff is
+/// slice B — so there is no shipped reading to regress. `block.md` and
+/// `workflow.md` are unpinned on the same terms. It joins the pin in the slice
+/// that delivers it, when its per-CLI content is settled, rather than being
+/// blessed once here and re-blessed there — a fixture re-blessed per slice is
+/// one chance per slice to bless a mistake.
+///
+/// It carries `{{GROUP_ID}}` and `{{REPO}}` and no other placeholder: a lead
+/// may never carry a repo persona (`workflow::persona_allowed` is false for
+/// every `Role::is_fixture` class), it holds no locks, and there is no workflow
+/// file in a lead group for a `{{WORKFLOW}}` fragment to describe.
+#[doc(hidden)]
+pub const LEAD_TPL: &str = include_str!("templates/lead.md");
 /// Workflow-aware fragments (#222), substituted into the role templates above as
 /// `{{WORKFLOW}}` (orchestrator) and `{{BLOCK_NOTE}}` (worker/reviewer/planner).
 ///
@@ -840,6 +865,13 @@ pub(crate) fn role_template(role: Role) -> &'static str {
         // (the only caller of a role's template machinery) is never
         // invoked for `Role::Solo`.
         Role::Solo => unreachable!("solo panes have no role template"),
+        // #2519. A real template, not an `unreachable!`, and the reason is that
+        // this arm IS reachable from a public path: `write_instruction_files`'s
+        // block loop renders every block in a roster, so it runs the moment a
+        // lead block exists — which is before any lead pane is opened, and in a
+        // function whose failure mode would be a process abort rather than an
+        // error. See [`LEAD_TPL`] for why it is not golden-pinned in this slice.
+        Role::Lead => LEAD_TPL,
     }
 }
 
@@ -4370,6 +4402,11 @@ review gates do not loosen, and nothing you relay opens one."
         // A solo pane never gets a kickoff/persona — it's an arbitrary
         // human-launched CLI, not a orrerix delegate. Never reached.
         Role::Solo => unreachable!("solo panes have no mechanics core — they receive no kickoff"),
+        // #2519 slice A ships the class, not the kickoff — see `role_template`
+        // for why nothing in this slice can reach either.
+        Role::Lead => unreachable!(
+            "the lead's mechanics core lands with the launch path that delivers it (#2519 slice B)"
+        ),
     };
     // A role_hint (#250/#324/#891) addendum — the same non-overridable treatment as
     // the rest of this function, for the same reason: a `mode: replace` persona on an
@@ -7451,25 +7488,39 @@ pub fn spawn_request_expired(deadline_ms: u64, now_ms: u64) -> bool {
 /// manager is a conversation the human cannot see, in a class whose entire
 /// purpose is that they are in it. A minimized manager would also be the one
 /// pane a human could not tell apart from an absent one.
+///
+/// **The lead (#2519) is exempt on that same argument** — it is a pane the
+/// human types into, and a docked one is a conversation they cannot see. It is
+/// spelled through [`Role::is_fixture`] rather than as a third name here, so
+/// this rule and the six others that shared the old
+/// `Orchestrator | Manager` spelling cannot drift apart per class.
 pub fn spawn_opens_minimized(role: Role, group_opted_expanded: bool) -> bool {
-    !matches!(role, Role::Orchestrator | Role::Manager) && !group_opted_expanded
+    !role.is_fixture() && !group_opted_expanded
 }
 
 /// **Whether a live pane of this class consumes a `max_agents` slot** — the
 /// cap's exemption rule, as one pure predicate (#1161 M3, decision D3).
 ///
-/// `false` for [`Role::Orchestrator`] (as it always was) and for
-/// [`Role::Manager`]. The cap contains DELEGATE fan-out, which is the one axis
-/// an orchestrator controls; neither exempt class is a delegate it opens. A
-/// manager is declared in the repo's `.loomux/workflow.yml` and opened by
-/// loomux at launch for the human, so making it competable with a worker slot
-/// would let a cap the orchestrator itself can lower
-/// (`set_max_agents`) decide whether the human has an interface.
+/// `false` for every [`Role::is_fixture`] class — [`Role::Orchestrator`] (as it
+/// always was), [`Role::Manager`], and [`Role::Lead`] (#2519). The cap contains
+/// DELEGATE fan-out, which is the one axis a root agent controls; no exempt
+/// class is a delegate anyone opened. A manager is declared in the repo's
+/// `.orrerix/workflow.yml` and opened by loomux at launch for the human, so
+/// making it competable with a worker slot would let a cap the orchestrator
+/// itself can lower (`set_max_agents`) decide whether the human has an
+/// interface. A lead is the pane the human is *sitting in*, and a cap that
+/// counted it would spend one of their own helper slots on the seat.
+///
+/// **The lead's CHILDREN count, and that is the whole guardrail** (#2519): they
+/// are ordinary [`Role::Worker`] panes, so they take this predicate's `true`
+/// branch unchanged, and the launcher's "Max live agents" field is what bounds
+/// a lead's fan-out. Nothing about this class widens the cap; it only keeps the
+/// seat out of it.
 ///
 /// [`Role::Solo`] counts: a solo pane is not in an orchestration group at all
 /// (`__solo__`), so no group's cap is ever evaluated against one — reading
-/// `true` here keeps the predicate a statement about the two EXEMPT classes
-/// rather than a hand-list of the counted ones that a sixth class would join
+/// `true` here keeps the predicate a statement about the EXEMPT classes
+/// rather than a hand-list of the counted ones that a new class would join
 /// silently.
 ///
 /// Pure, and the one expression. **Every site that decides this question calls
@@ -7495,7 +7546,7 @@ pub fn spawn_opens_minimized(role: Role, group_opted_expanded: bool) -> bool {
 /// So a class cannot be exempt from the count, named in the refusal message,
 /// and omitted from the panel's total independently of each other.
 pub fn counts_against_max_agents(role: Role) -> bool {
-    !matches!(role, Role::Orchestrator | Role::Manager)
+    !role.is_fixture()
 }
 
 /// Whether this agent is a LIVE manager of `group` — the singleton rule, as one
@@ -25262,8 +25313,8 @@ fn reconstructs_to_end(rows: &[String], from: usize, line: &str, at: usize) -> O
 /// orchestrator-shaped (rev-163 B3).** An earlier version of this paragraph
 /// called the remainder a two-party case needing the author to induce the
 /// recipient. That is also too kind, for the same reason as before: the check
-/// [`OrchRegistry::deliver_relayed_to_orchestrator`] performs is CALLERSHIP
-/// (`from != orch`), not authorship. An orchestrator that tells a worker
+/// [`OrchRegistry::deliver_relayed_to_root`] performs is CALLERSHIP
+/// (`from != root`), not authorship. An orchestrator that tells a worker
 /// "report with this exact note" gets its own chosen text marked — `from` is
 /// the worker, so the check passes — and delivered into its OWN pane. The
 /// worker complying is ordinary compliance, not a compromise, and the
@@ -33806,8 +33857,14 @@ impl OrchRegistry {
             .lock_safe()
             .values()
             .filter(|a| {
-                !matches!(a.role, Role::Orchestrator | Role::Manager)
-                    && a.status == AgentStatus::Running
+                // #2519: `is_fixture`, which is the same set the hand-spelled
+                // `Orchestrator | Manager` named plus `Role::Lead`. A lead pane
+                // is silent exactly when its human is reading, so reaping one
+                // would close a human's own pane under them mid-thought — the
+                // manager's argument, on a pane the human is even more
+                // literally sitting in. Its CHILDREN are ordinary workers and
+                // are reaped unchanged.
+                !a.role.is_fixture() && a.status == AgentStatus::Running
             })
             .filter(|a| {
                 let Some((t, standing)) = policy.get(&a.group) else { return false };
@@ -34196,7 +34253,15 @@ impl OrchRegistry {
                 // manager is a false report either way — its silence means the
                 // human is reading, and the notice lands in a pane the human is
                 // not looking at, naming a pane they are.
-                if matches!(a.role, Role::Orchestrator | Role::Manager)
+                //
+                // #2519 folds `Role::Lead` into the same answer through
+                // `is_fixture`, and it needs the explicit-naming argument above
+                // even more than a manager does: a lead pane IS assigned work
+                // (the human's), so the idle clause would not skip it, and its
+                // quiet stretches are the human thinking. There is also nobody
+                // to notify — a lead group has no orchestrator — so a stall
+                // notice about one would be a false report with no recipient.
+                if a.role.is_fixture()
                     || a.status != AgentStatus::Running
                     || a.idle_since_ms.is_some()
                 {
@@ -42181,8 +42246,8 @@ impl OrchRegistry {
             .filter(|a| a.group == group && a.status != AgentStatus::Dead)
             .cloned()
             .collect();
-        let (mut orch, mut worker, mut reviewer, mut planner, mut manager) =
-            (0u32, 0u32, 0u32, 0u32, 0u32);
+        let (mut orch, mut worker, mut reviewer, mut planner, mut manager, mut lead) =
+            (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
         let mut earliest: Option<u64> = None;
         // Production bug fix (PR #329 round 7): same override this group's
         // escalation threshold uses (`agent_context_percents`) — one shared
@@ -42201,6 +42266,12 @@ impl OrchRegistry {
                     // group's summary — it lives in `__solo__` — but the
                     // match must stay exhaustive.
                     Role::Solo => {}
+                    // #2519. A lead IS in a real group (it is that group's
+                    // root), so it gets a tally rather than the solo pane's
+                    // no-op — and a `roles` object that silently omitted it
+                    // would tell the lifecycle panel a lead group has zero
+                    // agents in it while a pane is plainly running.
+                    Role::Lead => lead += 1,
                 }
                 earliest = Some(earliest.map_or(a.started_ms, |e| e.min(a.started_ms)));
                 json!({
@@ -42262,7 +42333,7 @@ impl OrchRegistry {
             // Derived through `counts_against_max_agents`, NOT by summing the
             // per-class tallies below (#1161 M3 review B1). The two spellings
             // agree today, and that is exactly why the hand-sum was wrong to
-            // keep: a sixth `Role` would force a new arm in the exhaustive
+            // keep: a new `Role` forces a new arm in the exhaustive
             // `match` above — the compiler sees to that — while
             // `worker + reviewer + planner` silently omitted it, so this panel
             // would under-report the number `spawn_agent_bound` enforces and
@@ -42279,7 +42350,7 @@ impl OrchRegistry {
             "live_delegates": live.iter().filter(|a| counts_against_max_agents(a.role)).count(),
             "paused": self.is_paused(group),
             "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
-            "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer, "planner": planner, "manager": manager },
+            "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer, "planner": planner, "manager": manager, "lead": lead },
             // Whether the roster this group is RUNNING declares a manager block
             // at all (#1433, #1161 M5). Beside `roles.manager`, which counts LIVE
             // ones, because the panel's question is the difference between the
@@ -48329,6 +48400,11 @@ impl OrchRegistry {
             // A solo pane never gets a kickoff (see `role_template`'s doc) —
             // `spawn_agent_ex`/`kickoff_prompt` are never called for one.
             Role::Solo => unreachable!("solo panes never receive a kickoff"),
+            // #2519 slice A ships the class, not the kickoff — see
+            // `role_template` for why nothing in this slice can reach either.
+            Role::Lead => unreachable!(
+                "the lead's kickoff lands with the launch path that delivers it (#2519 slice B)"
+            ),
         }
     }
 
@@ -50668,7 +50744,7 @@ impl OrchRegistry {
     /// into another pane's masked record — the injection surface the
     /// default-closed rule exists to keep shut — so the roster keeps the
     /// default, exactly as the queue notices next to it do
-    /// (`deliver_relayed_to_orchestrator`'s why-comment). The cost of not
+    /// (`deliver_relayed_to_root`'s why-comment). The cost of not
     /// opting in is a gate that holds slightly too long, never a release.
     /// Distinct, despite the shared vocabulary, from the single-line rule
     /// [`OrchNoticeInbox::park`] asserts: that is #576's pane-tail masking of
@@ -53042,9 +53118,31 @@ impl OrchRegistry {
     }
 
     /// `deliver_to_orchestrator` for a notice that relays ONE agent's own words
-    /// to the orchestrator — a `report` note, a `message_orchestrator` body
-    /// (#576 residual, rev-163 B1). Identical delivery; the difference is that
-    /// this one opts the notice into the question mask's delivery record.
+    /// to **this group's root** — a `report` note, a `message_orchestrator`
+    /// body (#576 residual, rev-163 B1). Identical delivery; the difference is
+    /// that this one opts the notice into the question mask's delivery record.
+    ///
+    /// **"The root", not "the orchestrator" (#2519).** A group has exactly one
+    /// root and its class says what kind of group it is: `Role::Orchestrator`
+    /// for an orchestration group, `Role::Lead` for one minted by the "orrerix
+    /// subagents" toggle. The lookup asks [`Role::is_root`] rather than naming
+    /// a class, so the `report` arm needs no branch on which kind of group it
+    /// is running in — a child of a lead reports into the lead's pane by
+    /// exactly the path a worker reports into an orchestrator's, with the same
+    /// scrub, the same maskable marking, and the same `Delivery::MidSession`
+    /// admission. The lead OPTED IN to that: receiving its children's reports
+    /// is the stated effect of the toggle the human turned on.
+    ///
+    /// **`Role::Manager` is not a root, and that is load-bearing.** This
+    /// function is the only thing that decides who a relayed line is addressed
+    /// to, so widening it to "the human's pane" rather than "the root" would
+    /// route a report at a manager — which `deliver_prompt` would then refuse,
+    /// correctly, but only after the report had been addressed to a pane that
+    /// can never receive one. [`Role::is_root`] and [`Role::is_fixture`] differ
+    /// by exactly that class; see their docs, `doc/design/manager.md` and
+    /// `doc/design/lead-pane.md`. Nothing here weakens the no-injection
+    /// guarantee — it keys on `Role::Manager` and the `Delivery` kind at the
+    /// door, and neither moves.
     ///
     /// **Why these two and not `deliver_to_orchestrator` generally.** The
     /// promise [`OrchRegistry::mark_notice_maskable`] wants is per FIELD, and
@@ -53062,27 +53160,29 @@ impl OrchRegistry {
     /// It does not — and cannot — close an orchestrator that instructs a worker
     /// to report words it chose: `from` is then the worker, the check passes,
     /// and the line lands in the orchestrator's own pane. Both call sites
-    /// target the orchestrator, so every claimable line in the system is
+    /// target the root, so every claimable line in the system is
     /// delivered to the pane of the one agent best placed to dictate its
     /// content. That is the accepted residual, argued in full at
     /// [`mask_loomux_notices_with_record`]; it is recorded here because this is
-    /// where the check that does not cover it lives.
+    /// where the check that does not cover it lives. It carries over to a lead
+    /// unchanged and reads the same way: the human driving that pane is the one
+    /// best placed to dictate what their own children say back to them.
     ///
     /// `message_orchestrator` refuses an orchestrator caller a layer up;
     /// `report` does not, which is why the check lives here rather than at
     /// either call site.
-    fn deliver_relayed_to_orchestrator(&self, group: &GroupId, text: &str, from: &str) -> Result<(), String> {
-        let orch = self
+    fn deliver_relayed_to_root(&self, group: &GroupId, text: &str, from: &str) -> Result<(), String> {
+        let root = self
             .agents
             .lock_safe()
             .values()
-            .find(|a| a.group == group && a.role == Role::Orchestrator && a.status != AgentStatus::Dead)
+            .find(|a| a.group == group && a.role.is_root() && a.status != AgentStatus::Dead)
             .map(|a| a.id.clone())
-            .ok_or("no live orchestrator in this group")?;
-        if from != orch {
-            self.mark_notice_maskable(&orch, text);
+            .ok_or("no live orchestrator or lead in this group")?;
+        if from != root {
+            self.mark_notice_maskable(&root, text);
         }
-        self.deliver_prompt(&orch, text, from, Delivery::MidSession)
+        self.deliver_prompt(&root, text, from, Delivery::MidSession)
     }
 
     /// `deliver_to_orchestrator` with a chosen admission reason — the one
@@ -53226,6 +53326,21 @@ impl OrchRegistry {
         if a.role == Role::Orchestrator {
             return Err("refusing to kill the orchestrator; close its pane instead".into());
         }
+        // #2519, and it is a hole THIS slice would otherwise open rather than a
+        // pre-existing one: `kill_agent` is on the lead's enumerated surface,
+        // `require_in_group` passes for the caller's own id, and nothing below
+        // this line distinguishes a pane from its opener — so without this a
+        // lead could end the human's own pane from inside it, with the human
+        // watching. Spelled as its own arm rather than folded into
+        // `Role::is_root` above so each class keeps the refusal that names it;
+        // the shape is `send_prompt`'s "cannot send a prompt to yourself",
+        // generalized from self-targeting to the whole class, because the pane
+        // is the human's whether the caller is the lead or one of its helpers.
+        if a.role == Role::Lead {
+            return Err("refusing to kill a lead pane; it is the human's own, and its helpers \
+                        are not its owner. Close the pane instead"
+                .into());
+        }
         // Checked BEFORE the app handle and before the stamp: with no pty
         // there is nothing to kill, so there is nothing to attribute either.
         let Some(pty) = a.pty_id else {
@@ -53329,7 +53444,11 @@ impl OrchRegistry {
         if a.status == AgentStatus::Dead {
             return Err(format!("agent {agent_id} is already gone"));
         }
-        if matches!(a.role, Role::Orchestrator | Role::Manager) {
+        // #2519: `is_fixture` — the same two classes plus `Role::Lead`, which
+        // is not a driven delegate for a reason stronger than the other two's:
+        // a lead group has no review driver at all (no board, no merge gate),
+        // so nothing in that subsystem has any business reaching one.
+        if a.role.is_fixture() {
             return Err(format!("refusing to release {agent_id}: it is not a driven delegate"));
         }
         if a.idle_since_ms.is_none() {

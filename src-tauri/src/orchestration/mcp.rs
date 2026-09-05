@@ -256,17 +256,18 @@ const GATING_HINTS: [Option<&str>; 3] = [None, Some("liaison"), Some("process")]
 /// them omitted the hint dimension — which is how `session_digest`
 /// (`Role::Worker` + `Some("process")`) came to be reported as a tool the
 /// surface does not list, twice, by two different guards.
+///
+/// **The role dimension is DERIVED from [`Role::ALL`] (#2519), not hand-listed
+/// here.** It was a literal array until this change, which is the same defect
+/// one rung up: a union that omits an input the callee branches on is not a
+/// union, and a capability class is exactly such an input. `Role::ALL` is
+/// compiler-enforced complete (`Role::all_index`), so a new class joins this
+/// matrix — and therefore every guard built on it — without anyone
+/// remembering to widen it.
 #[doc(hidden)]
 pub fn listing_matrix() -> Vec<(Role, Option<&'static str>)> {
     let mut out = Vec::new();
-    for role in [
-        Role::Orchestrator,
-        Role::Worker,
-        Role::Reviewer,
-        Role::Planner,
-        Role::Manager,
-        Role::Solo,
-    ] {
+    for role in Role::ALL {
         for hint in GATING_HINTS {
             out.push((role, hint));
         }
@@ -929,6 +930,92 @@ fn group_usage_tool() -> Value {
         }), &[])
 }
 
+/// **The five fleet-CONTROL tools, written once because two tiers list them**
+/// (#2519): the orchestrator's, and the lead's.
+///
+/// Shared for the reason [`group_usage_tool`] is shared and no other: these
+/// five descriptions say the same thing to both classes, word for word.
+/// "Type a prompt into an agent's CLI" and "Terminate an agent and close its
+/// pane" carry nothing orchestration-specific — no board, no review gate, no
+/// merge queue — so two copies would be two places for one sentence to drift.
+///
+/// **`spawn_agent` is deliberately NOT in here**, and that asymmetry is the
+/// design rather than an oversight. Its description is three screens of
+/// orchestrator-specific contract — reviewer and planner classes, board-task
+/// grounding, worktree rules for a class the lead cannot open — and a lead is
+/// refused every one of those. Advertising them to a lead would be the exact
+/// failure `workflow::is_spawnable_block`'s doc names: a surface that keeps
+/// telling an agent about a route the tool refuses, on every turn, re-grounding
+/// included. So the two classes get two definitions, and
+/// [`lead_spawn_agent_tool`] states the narrower contract in its own words.
+fn fleet_control_tool_defs() -> [Value; 5] {
+    [
+        tool("send_prompt",
+            "Type a prompt into an agent's CLI. The human sees it verbatim in that pane.",
+            json!({
+                "agent_id": { "type": "string" },
+                "text": { "type": "string" },
+            }),
+            &["agent_id", "text"]),
+        tool("get_output", "Read the last N lines of an agent's terminal AS RENDERED — the pane's output is replayed onto a composed screen, so a TUI's in-place redraws (spinner frames, cycling status verbs, a repainted input box) overwrite each other exactly as they do on a human's screen instead of piling up as text. N means N distinct content lines. Hard-capped at 8KB per call whatever N you ask for; if it binds, the reply says so and how many bytes were dropped.",
+            json!({
+                "agent_id": { "type": "string" },
+                "lines": { "type": "integer", "description": "default 60, max 500" },
+            }),
+            &["agent_id"]),
+        tool("kill_agent", "Terminate an agent and close its pane.",
+            json!({ "agent_id": { "type": "string" } }), &["agent_id"]),
+        tool("focus_agent", "Bring an agent's pane into focus for the human.",
+            json!({ "agent_id": { "type": "string" } }), &["agent_id"]),
+        tool("rename_agent",
+            "Rename an agent's pane title (and roster entry) to reflect the work it is doing — e.g. rename w-2 to \"w-2: gitwatch fix\" when you assign it that task. Keep it short. A human who later renames the pane themselves takes precedence: your rename will not override theirs.",
+            json!({
+                "agent_id": { "type": "string" },
+                "name": { "type": "string", "description": "New short display name for the pane" },
+            }),
+            &["agent_id", "name"]),
+    ]
+}
+
+/// **A lead's `spawn_agent`** (#2519) — the same tool name, a deliberately
+/// different description, for the reason [`fleet_control_tool_defs`] gives.
+///
+/// What it must NOT inherit from the orchestrator's copy is everything a lead
+/// is refused: the `reviewer`/`planner` kinds, `block` (a lead group runs the
+/// built-in roster and has no declared blocks), `task_id` (no board), and the
+/// resume machinery. The `kind` enum here is one value, and the tool's own
+/// `call_tool` arm refuses the rest with the reason quoted — the JSON schema is
+/// advertisement, never enforcement, which is why both exist.
+fn lead_spawn_agent_tool() -> Value {
+    tool("spawn_agent",
+        "Open a helper agent as a real orrerix pane in your group — a WORKER, and only a worker. \
+         Use this instead of your CLI's own subagent mechanism: the pane is visible to your human, \
+         they can watch it and type into it, it survives your own turn, and its output stays out of \
+         your context until you ask for it with `get_output`. \
+         \
+         Give it a full brief in `task` — it starts cold and knows only what you write there. It gets \
+         its own git worktree and branch by default, which is what keeps it out of the checkout your \
+         human is working in; pass `branch` to name that branch something meaningful. An empty `task` \
+         opens an idle pane you then drive with `send_prompt`. \
+         \
+         WHAT YOU MAY NOT OPEN: a reviewer or a planner (your group has no review gate and no task \
+         board for either to answer to — spawn a worker and brief it to read and report instead), \
+         another lead (helpers do not open helpers), an orchestrator, or a manager. Each is refused \
+         with the reason. \
+         \
+         Your helpers report back to you: when one calls `report(done|blocked)` the notice is typed \
+         into THIS pane. Guardrails apply — the live-agent cap and spawn-rate limit your human set at \
+         launch — and a helper that goes idle past the group's timeout is reaped.",
+        json!({
+            "name": { "type": "string", "description": "Short display name for the pane" },
+            "kind": { "type": "string", "enum": ["worker"], "description": "Capability class. `worker` is the only one you may open; anything else is refused with the reason. REQUIRED — there is no default, so omitting it is refused rather than silently treated as a worker (#544)." },
+            "task": { "type": "string", "description": "Full task brief; empty = an idle pane awaiting send_prompt." },
+            "branch": { "type": "string", "description": "Branch name for the helper's worktree (default agent/<id>)" },
+            "base": { "type": "string", "description": "Start-point for the worktree branch (default: the repo's default branch, fetched fresh from origin)." },
+        }),
+        &["task"])
+}
+
 /// `ask_human`'s definition, written once because TWO tiers list it: the
 /// orchestrator's, and the liaison's second hint-keyed widening (#1091 slice
 /// E). Shared for the reason [`group_usage_tool`] is — two copies of a
@@ -1233,6 +1320,65 @@ fn tool_defs(
         ]);
         return tools;
     }
+    // THE LEAD'S ENTIRE SURFACE (#2519) — a positive enumeration, on
+    // `Role::Manager`'s pattern above and for its reasons: built from the
+    // shared tier, narrowed to a named allow-list, then extended with what the
+    // class is FOR. **It is a filter, so it is DEFAULT-DENY**: a tool added to
+    // the shared tier by a later slice does not reach a lead unless someone
+    // puts its name in this array and argues for it.
+    //
+    // Placed HERE rather than in the `role == Role::Orchestrator` block below,
+    // even though the extension is a subset of that block's, because a lead is
+    // not an orchestrator with tools taken away — the whole of #222 is that
+    // capability is a closed enum and not a subtraction someone remembered to
+    // perform. A `retain` over the orchestrator's tier would have made every
+    // future orchestrator-only tool a lead tool by default.
+    //
+    // WHY EACH ONE, and why the withheld ones are withheld, is
+    // `doc/design/lead-pane.md`'s table. In one line each: the fleet-control
+    // five plus `spawn_agent` are the capability the toggle exists to grant;
+    // `list_agents` is how the pane knows what it opened; `group_usage` answers
+    // "what is this costing" in the pane the human is already asking in
+    // (the liaison's argument, inherited by construction: a read of an
+    // aggregate scoped to the caller's own group); `note_directive` and
+    // `request_compact` are self-scoped and reach no other pane.
+    //
+    // The three most load-bearing WITHHELDS, each argued in the note:
+    // `report` (a lead is nobody's delegate — there is no root above it to
+    // report TO, and its own arm refuses one), `message_orchestrator` (a lead
+    // group has no orchestrator; the human is right here), and the whole
+    // board/question/verdict/merge surface (no board, no gate, no queue —
+    // listing any of them would advertise a route that has nothing behind it).
+    //
+    // **`get_state` is WITHHELD, and it is the one grant this slice took back**
+    // (rev-final B1). The plan's enumerated surface listed it, and it survived
+    // into the first draft justified as "a durable scratchpad that survives the
+    // pane's own compact" — a capability this class does not have. The group's
+    // `state.json` has exactly ONE writer in the tree
+    // (`OrchRegistry::set_state`, reached only from the `set_state` arm below,
+    // which is `require_orchestrator`), and a lead group has no orchestrator BY
+    // DESIGN. So nothing can ever write that blob in a lead group, and
+    // `get_state` would return `"{}"` on every call, forever. Listing it is
+    // exactly the "advertise a route with nothing behind it" the board tools
+    // are withheld for — worse, in fact, since a dead READ fails silently while
+    // a dead write at least errors.
+    //
+    // The pair is granted together or not at all, which
+    // `the_group_state_pair_is_granted_together_or_not_at_all` pins: a later
+    // slice that wants a lead to hold durable state has to argue for the WRITE,
+    // and the read follows it. What serves the compact-survival need meanwhile
+    // is `note_directive` — granted, self-scoped, and replayed into the
+    // post-compact re-grounding notice, which is the mechanism that need
+    // actually has.
+    if role == Role::Lead {
+        const LEAD_SHARED: &[&str] = &["list_agents", "request_compact", "note_directive"];
+        tools.retain(|t| LEAD_SHARED.contains(&t["name"].as_str().unwrap_or_default()));
+        tools.push(lead_spawn_agent_tool());
+        tools.extend(fleet_control_tool_defs());
+        tools.extend(channel_tool_defs());
+        tools.push(group_usage_tool());
+        return tools;
+    }
     // Notification backend (#243): self-addressed — there is no `agent_id`
     // parameter, and a notice can only ever land in the caller's own pane, so
     // this belongs in the shared tier, not the orchestrator-only one. Denied
@@ -1319,6 +1465,7 @@ fn tool_defs(
         }
     }
     if role == Role::Orchestrator {
+        tools.extend(fleet_control_tool_defs());
         tools.extend([
             tool("spawn_agent",
                 "Open a new worker, reviewer, or planner agent pane in this group. A FRESH SPAWN MUST NAME ITS CAPABILITY CLASS: pass kind (worker | reviewer | planner) or block (a block id from this group's roster). Omitting both is REFUSED — there is no default class (#544). Before that refusal existed, forgetting `kind` handed you the MOST-privileged class: three reviewer-shaped briefs (\"review PR #536\", \"record your verdict\") were spawned as read-write worker panes, with edit tools and git commit/push, and nothing objected. A capability class is only ever acquired deliberately; the only spawn that may omit both is a resume_session, which INHERITS the resumed session's own block (see below) rather than defaulting to anything. Guardrails apply: live-agent cap and per-role pinned CLI + model. Give branch a meaningful name. Empty task spawns an idle agent awaiting prompts. A planner explores the codebase read-only and writes an implementation plan as a GitHub issue comment, then reports and exits. Its read-only contract is enforced structurally where the CLI allows it — it never gets a worktree, and its file-editing tools plus git commit/push are denied at the CLI level — so it cannot edit files or push code; not opening PRs is asked of it in its instructions (gh stays available so it can post the plan comment). WORKTREE DEFAULTS ON FOR WORKERS AND REVIEWERS AND CANNOT BE TURNED OFF (#338/#359): the main clone is the human's environment, and neither a worker (branching/committing there) nor a reviewer (contending on its checkout state with another reviewer or your own fetch/merge traffic — two concurrent reviewers colliding in the shared clone is the incident #359 names) may conflict with it — passing worktree=false for either (or a worker-/reviewer-kind block) is rejected outright, not silently coerced. A reviewer's own worktree is scratch space cut from the default branch, not a checkout of the PR it's reviewing (that branch may already be checked out in the worker's own worktree) — its kickoff note and reviewer.md cover the `gh pr checkout <n> --detach` convention for inspecting the PR's actual code locally. A planner is unaffected: it never gets one under any circumstance. For your OWN mechanical work (rebases, conflict fixes) that would otherwise mean checking out a branch in the main clone, use a staging worktree of your own instead of spawning a worker or reviewer just to get one. THE SAME GUARANTEE COVERS A FRESH SPAWN'S cwd, not just worktree: passing cwd on a worker or reviewer spawn with no resume_session is rejected too (it would override the worktree exactly like worktree=false would) — cwd only has a role once resume_session is set; a planner still honors an explicit cwd on a fresh spawn, unchanged. For a FOLLOW-UP on a finished task, pass resume_session (from list_agents/the task board) plus cwd (where that work happened) — the pane reopens that conversation with its context instead of cold-starting, and the worktree default/guard above does not apply (the resume's cwd is what governs its workspace). cwd is optional on a resume: omit it and orrerix INHERITS the session's recorded workspace from this group's roster (the same last-touched-record lookup the block inheritance below uses) rather than guessing — but if nothing is recorded for that session AND the resumed agent is a worker or reviewer, the spawn is a hard error rather than a silent fall-back into the main clone (#338/#359 again: neither's workspace is ever the human's own checkout). A planner is unaffected by that guard; pass cwd explicitly whenever you have it, which you almost always will. A resume with no kind/block INHERITS the resumed session's original block (and therefore its persona, model and capability class) from this group's roster — it never re-derives a default from `kind`, so a reviewer resumed bare comes back a reviewer, not a worker. An unrecognized session id with no block is a hard error, never a silent worker spawn. To deliberately re-role a resumed session into a different capability class, pass `block` explicitly — same as any other spawn, and audited the same way (the agent-spawn record always carries block + session + resume). GROUNDING (#1273): pass task_id (a board task id from list_tasks) to spawn this agent AGAINST that row. Its grounding links — the requirement, spec, design note, test case or doc recorded on the task — are composed into the agent's kickoff as a `Grounding (board task t-N):` section, so the delegate reads what governs the work before it starts instead of you pasting the same pointers into every brief. Reviewers get the section too (a test-case link is a review input). Record the links on the row with upsert_task first — a bound row with no links is legal and simply adds no section. An UNKNOWN id is refused outright rather than silently spawning with no grounding, so a typo fails where you can see it. The binding is context only: it assigns nothing, claims nothing, and does not set assignee (still your own upsert_task call).",
@@ -1335,30 +1482,6 @@ fn tool_defs(
                     "task_id": { "type": "string", "description": "Board task id (e.g. 't-42') to spawn this agent against (#1273). The row's grounding links are injected into the kickoff as a `Grounding (board task t-N):` section — same for a worker, a reviewer or a planner. Unknown id = the spawn is refused, never a silent spawn with no grounding. Omit for no binding, which is the kickoff exactly as it was before this existed. Context only: it does not assign the task, claim it, or set its assignee." },
                 }),
                 &["task"]),
-            tool("send_prompt",
-                "Type a prompt into an agent's CLI. The human sees it verbatim in that pane.",
-                json!({
-                    "agent_id": { "type": "string" },
-                    "text": { "type": "string" },
-                }),
-                &["agent_id", "text"]),
-            tool("get_output", "Read the last N lines of an agent's terminal AS RENDERED — the pane's output is replayed onto a composed screen, so a TUI's in-place redraws (spinner frames, cycling status verbs, a repainted input box) overwrite each other exactly as they do on a human's screen instead of piling up as text. N means N distinct content lines. Hard-capped at 8KB per call whatever N you ask for; if it binds, the reply says so and how many bytes were dropped.",
-                json!({
-                    "agent_id": { "type": "string" },
-                    "lines": { "type": "integer", "description": "default 60, max 500" },
-                }),
-                &["agent_id"]),
-            tool("kill_agent", "Terminate an agent and close its pane.",
-                json!({ "agent_id": { "type": "string" } }), &["agent_id"]),
-            tool("focus_agent", "Bring an agent's pane into focus for the human.",
-                json!({ "agent_id": { "type": "string" } }), &["agent_id"]),
-            tool("rename_agent",
-                "Rename an agent's pane title (and roster entry) to reflect the work it is doing — e.g. rename w-2 to \"w-2: gitwatch fix\" when you assign it that task. Keep it short. A human who later renames the pane themselves takes precedence: your rename will not override theirs.",
-                json!({
-                    "agent_id": { "type": "string" },
-                    "name": { "type": "string", "description": "New short display name for the pane" },
-                }),
-                &["agent_id", "name"]),
             tool("set_state",
                 "Persist the group's orchestration state (must be a valid JSON string). Call after every queue/plan change; this is your memory across sessions.",
                 json!({ "state": { "type": "string" } }), &["state"]),
@@ -1563,7 +1686,9 @@ fn tool_defs(
     // argument does not carry it.
     //
     // `group_usage` (#891 S2), which every other tier reaches only through
-    // `require_orchestrator`. "What is this group costing?" is one of the
+    // `require_orchestrator` — except `Role::Lead` (#2519), which holds it on
+    // this same argument, opted in at the arm rather than by widening the gate.
+    // "What is this group costing?" is one of the
     // questions the pane exists to answer, and the alternative is the human
     // asking the orchestrator to interrupt its own dispatch loop and relay a
     // number the registry already has. It is a READ of an aggregate scoped to
@@ -1635,6 +1760,13 @@ fn tool_defs(
 ///
 /// `Role::Solo`'s two-tool surface is in here too, deliberately: `channel_send`
 /// is as worth warning about as `report`.
+///
+/// The role dimension is [`Role::ALL`] (#2519) for the reason
+/// [`listing_matrix`] states: a hand-written list of classes is a place for the
+/// next class to be forgotten, and this set is also what
+/// `lead_cannot_dispatch_any_withheld_tool` subtracts a surface FROM — a
+/// population that missed a class would quietly shrink that guard rather than
+/// fail it.
 #[doc(hidden)] // pub for integration tests
 pub fn every_tool_name() -> std::collections::BTreeSet<String> {
     // One declared lock, so the lock tier renders; its NAME is loomux's
@@ -1642,15 +1774,8 @@ pub fn every_tool_name() -> std::collections::BTreeSet<String> {
     // value cannot leak into the set.
     let locks = [("sample".to_string(), workflow::ResourcePolicy::default())];
     let mut names = std::collections::BTreeSet::new();
-    for role in [
-        Role::Orchestrator,
-        Role::Worker,
-        Role::Reviewer,
-        Role::Planner,
-        Role::Manager,
-        Role::Solo,
-    ] {
-        for hint in [None, Some("liaison"), Some("process")] {
+    for role in Role::ALL {
+        for hint in GATING_HINTS {
             for manager in [false, true] {
                 for def in tool_defs(role, hint, &locks, manager) {
                     if let Some(n) = def.get("name").and_then(Value::as_str) {
@@ -1668,6 +1793,40 @@ fn require_orchestrator(caller: &Caller) -> Result<(), String> {
         Ok(())
     } else {
         Err("permission denied: this tool is orchestrator-only".into())
+    }
+}
+
+/// The gate for the six FLEET-CONTROL tools — `spawn_agent`, `send_prompt`,
+/// `get_output`, `kill_agent`, `focus_agent`, `rename_agent` (#2519).
+///
+/// **A SEPARATE function from [`require_orchestrator`], not a `Role::Lead` arm
+/// added inside it**, and for exactly the reason
+/// [`require_orchestrator_or_liaison`]'s doc gives for its own separation: that
+/// one gates roughly twenty tools — every board write, `set_state`, the whole
+/// merge queue, the review driver — and a widening written there would widen
+/// all of them at once. That is the accident a capability widening must not be
+/// one edit away from, and a lead is the class it would be an accident FOR: it
+/// has no board, no gate and no queue, so the tools it would silently acquire
+/// are the ones with nothing behind them.
+///
+/// **This function widens nothing on its own.** It is opted into six call sites
+/// by name; its blast radius is exactly those arms, which
+/// `a_lead_may_spawn_a_worker_and_nothing_else` and the gate/listing agreement
+/// test pin. A seventh is an edit to that arm, to the enumerated surface in
+/// [`tool_defs`], to `call_tool`'s lead gate, and to `doc/design/lead-pane.md`
+/// — four places, deliberately, so it cannot happen by reflex.
+///
+/// The refusal names both classes rather than saying "orchestrator-only",
+/// because after this change that sentence is false: a worker told a tool is
+/// orchestrator-only when a lead also holds it learns something untrue about
+/// the system it is in.
+fn require_spawner(caller: &Caller) -> Result<(), String> {
+    if matches!(caller.role, Role::Orchestrator | Role::Lead) {
+        Ok(())
+    } else {
+        Err("permission denied: opening and driving agent panes is for an orchestrator, or a \
+             lead pane (a human-driven pane launched with orrerix subagents on)"
+            .into())
     }
 }
 
@@ -1702,14 +1861,20 @@ fn caller_is_liaison(caller: &Caller) -> bool {
 /// rather than the hint alone.
 ///
 /// A SEPARATE function from [`require_orchestrator`] on purpose, not a hint arm
-/// added inside it: that one gates roughly twenty tools — `spawn_agent`,
-/// `send_prompt`, `kill_agent`, `set_state`, every board write, the whole merge
-/// queue — and a widening written there would widen all of them at once, which
-/// is precisely the accident a capability widening must not be one edit away
-/// from. **This function widens nothing on its own**: it is opted into one call
-/// site at a time, so its blast radius is exactly the arms that name it — two
-/// today, each argued in `doc/design/liaison.md` on its own terms. Adding a
-/// third is an edit to that arm and to that note, never to this function.
+/// added inside it: that one gates a dozen-odd tools — `set_state`, every board
+/// write, `withdraw_question`, the whole merge queue, the review driver — and a
+/// widening written there would widen all of them at once, which is precisely
+/// the accident a capability widening must not be one edit away from. (#2519
+/// moved the six fleet-control tools — `spawn_agent`, `send_prompt`,
+/// `get_output`, `kill_agent`, `focus_agent`, `rename_agent` — off that gate and
+/// onto [`require_spawner`], which is the same separation argument applied a
+/// second time, from the other direction.) **This function widens nothing on
+/// its own**: it is opted into one call site at a time, so its blast radius is
+/// exactly the arms that name it — two today, each argued in
+/// `doc/design/liaison.md` on its own terms. Adding a third is an edit to that
+/// arm and to that note, never to this function; `group_usage`'s own arm opts
+/// `Role::Lead` in beside it (#2519) for exactly that reason rather than
+/// widening this.
 ///
 /// `what` is the capability being refused, in the refusal's own words
 /// ("usage aggregation", "posing a question to the human"), because a shared
@@ -2102,6 +2267,44 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
              reach the orchestrator with message_orchestrator, you read your mail with \
              check_mail, and you put things to the human with ask_human / request_attention. \
              Everything else, including anything that moves work, is the orchestrator's"
+        ));
+    }
+    // THE LEAD'S DISPATCH GATE (#2519) — the real half of the double gate whose
+    // cosmetic half is `tool_defs`'s positive enumeration, on `Role::Manager`'s
+    // pattern directly above and for its reason with full force: most arms
+    // below have no role check of their own, so a lead token would otherwise
+    // reach every unchecked one — every board read, `list_verdicts`,
+    // `list_needs_you` — none of which exists in a lead group at all.
+    //
+    // The list is the same set `tool_defs` builds, spelled once more rather
+    // than shared, and the duplication is deliberate for the manager's reason:
+    // `the_gate_and_the_listing_agree_for_a_lead` asserts the two are equal, so
+    // they cannot drift, while a single shared constant would make one edit
+    // silently move both — precisely what a double gate exists to prevent.
+    if caller.role == Role::Lead
+        && !matches!(
+            name,
+            "list_agents"
+                | "request_compact"
+                | "note_directive"
+                | "spawn_agent"
+                | "send_prompt"
+                | "get_output"
+                | "kill_agent"
+                | "focus_agent"
+                | "rename_agent"
+                | "channel_send"
+                | "channel_status"
+                | "group_usage"
+        )
+    {
+        return Err(format!(
+            "permission denied: {name} is not on a lead pane's surface — you open and drive \
+             helper panes, and nothing else. Your group has no task board, no review gate and \
+             no merge queue, and it has no orchestrator to report to or message: your human is \
+             in this pane, so tell them. You spawn_agent / send_prompt / get_output / \
+             kill_agent / focus_agent / rename_agent / list_agents, you read group_usage, and \
+             your helpers report back to you"
         ));
     }
     match name {
@@ -2582,7 +2785,20 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // `record_verdict` has one: the registry function takes no caller
             // identity, because the only thing it could check is a group the
             // caller already is in.
-            require_orchestrator_or_liaison(caller, "usage aggregation")?;
+            //
+            // #2519: `Role::Lead` is the third class that may read this, and it
+            // is opted in HERE rather than by an arm inside
+            // `require_orchestrator_or_liaison` — that function's own doc says
+            // why. It ALSO gates `ask_human`, which a lead is not listed for
+            // and must not acquire as the side effect of an edit to a shared
+            // gate; a widening must be one call site at a time or it is not a
+            // widening, it is a hole. The liaison's own argument carries over
+            // unchanged: a read of an aggregate scoped to the caller's own
+            // group, settling nothing and writing nothing, answered in the pane
+            // where the human is already asking what this is costing.
+            if caller.role != Role::Lead {
+                require_orchestrator_or_liaison(caller, "usage aggregation")?;
+            }
             let detail = arg_bool(args, "detail")?;
             let full = reg.group_usage(&caller.group);
             let out = if detail {
@@ -2610,7 +2826,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         }
 
         "spawn_agent" => {
-            require_orchestrator(caller)?;
+            require_spawner(caller)?;
             // An unrecognized kind is REJECTED (#222). This used to be
             // `_ => Role::Worker` — so a typo'd or hallucinated kind silently
             // became a *worker*, complete with a worktree and write access. A
@@ -2950,6 +3166,53 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     ));
                 }
             }
+            // #2519 — A LEAD MAY OPEN A WORKER AND NOTHING ELSE.
+            //
+            // Placed HERE, below the block resolution and the inheritance
+            // above, and that position is the whole of it: this reads the
+            // EFFECTIVE class, which is the only reading all three spellings
+            // arrive at. The two manager refusals higher up needed three arms
+            // between them precisely because they check ARGUMENTS — `kind:`,
+            // then `block:`, then the effective block a bare resume inherits —
+            // and a caller-class rule written against `kind` alone would have
+            // the same three-way hole with only one of them plugged: a lead
+            // passing `block: "reviewer"` gets a reviewer, because a block's
+            // kind WINS over `kind:` at `spawn_agent_ex`.
+            //
+            // Why a lead may not open a reviewer or a planner: neither has
+            // anything to answer to here. A lead group has no merge gate for a
+            // verdict to open (`review_verdict` is not on any surface in it)
+            // and no task board for a plan to be recorded against, so both
+            // classes would arrive contained for a contract nothing enforces.
+            // A worker briefed to read and report is the same work with an
+            // honest posture.
+            //
+            // `kind: "lead"` gets NO ARM HERE, deliberately, and that absence
+            // is the no-recursion rule rather than a gap in it:
+            // `workflow::kind_from_str` has no `lead` vocabulary, so such a
+            // call was already refused as an unknown kind — by the parse, not
+            // by a check somebody remembered to write. An arm here would be
+            // unreachable code taking credit for a refusal it does not make.
+            // `a_lead_may_spawn_a_worker_and_nothing_else` asserts WHICH check
+            // said no, by the vocabulary each refusal quotes.
+            if caller.role == Role::Lead {
+                let declared = block.as_deref().and_then(|id| {
+                    reg.group(&caller.group).and_then(|g| g.guardrails.block(id).map(|b| b.kind))
+                });
+                let effective = declared.or(kind);
+                if effective != Some(Role::Worker) {
+                    return Err(format!(
+                        "kind must be worker — a lead pane opens helper workers and nothing \
+                         else. Your group has no review gate and no task board, so a reviewer \
+                         or a planner would have nothing to answer to: open a worker and brief \
+                         it to review or investigate and report back to you. (This spawn \
+                         resolves to {}.)",
+                        effective
+                            .map(|k| format!("kind {:?}", k.as_str()))
+                            .unwrap_or_else(|| "no capability class at all".to_string())
+                    ));
+                }
+            }
             // rev-13 finding on #345 (extended for #359 to cover reviewers too):
             // a worker/reviewer RESUME that omits `cwd` fell through silently to
             // `spawn_agent_ex`'s per-role default — the main clone for anything
@@ -3090,7 +3353,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             ))
         }
         "send_prompt" => {
-            require_orchestrator(caller)?;
+            require_spawner(caller)?;
             let target = arg_str(args, "agent_id").ok_or("agent_id required")?;
             let text = arg_str(args, "text").ok_or("text required")?;
             let a = require_in_group(reg, caller, target)?;
@@ -3123,28 +3386,28 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             Ok(format!("prompt delivered to {}", a.id))
         }
         "get_output" => {
-            require_orchestrator(caller)?;
+            require_spawner(caller)?;
             let target = arg_str(args, "agent_id").ok_or("agent_id required")?;
             let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(60) as usize;
             let a = require_in_group(reg, caller, target)?;
             reg.agent_output_tail(&a.id, lines)
         }
         "kill_agent" => {
-            require_orchestrator(caller)?;
+            require_spawner(caller)?;
             let target = arg_str(args, "agent_id").ok_or("agent_id required")?;
             let a = require_in_group(reg, caller, target)?;
             reg.kill_agent(&a.id)?;
             Ok(format!("kill signal sent to {}", a.id))
         }
         "focus_agent" => {
-            require_orchestrator(caller)?;
+            require_spawner(caller)?;
             let target = arg_str(args, "agent_id").ok_or("agent_id required")?;
             let a = require_in_group(reg, caller, target)?;
             reg.focus_agent(&a.id)?;
             Ok(format!("focused {}", a.id))
         }
         "rename_agent" => {
-            require_orchestrator(caller)?;
+            require_spawner(caller)?;
             let target = arg_str(args, "agent_id").ok_or("agent_id required")?;
             let name = arg_str(args, "name").ok_or("name required")?;
             // Scope to the caller's group; rename_agent enforces alive + the
@@ -3296,6 +3559,28 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             if caller.role == Role::Orchestrator {
                 return Err("report is for workers/reviewers; use send_prompt".into());
             }
+            // #2519. A lead is a ROOT, not a delegate: there is nothing above
+            // it to report to, and `deliver_relayed_to_root` would resolve the
+            // lead itself as the recipient — a pane relaying a status line to
+            // its own transcript, which is the shape #1169's "a class whose
+            // own instructions say it has no `report` could have dispatched
+            // one" describes.
+            //
+            // `report` is not on the lead's enumerated surface, so the gate at
+            // the top of this function already refuses it; this arm is the
+            // ERROR, not the enforcement, on `send_prompt`'s manager-refusal
+            // model. A lead that reached for `report` had something to say, and
+            // the answer is that the human is sitting in this pane: say it to
+            // them. Kept as its own arm rather than left to the gate so that a
+            // future edit to either half fails one test rather than none —
+            // `the_gate_and_the_listing_agree_for_a_lead` covers the pair.
+            if caller.role == Role::Lead {
+                return Err("report is for delegates — you are the root of this group, so there \
+                            is no one above you to report to. Your human is in this pane: tell \
+                            them. Your OWN helpers report to you, and their notices are typed \
+                            in here."
+                    .into());
+            }
             // #398: two report shapes share this one tool. `outcome` (new,
             // structured) is a superset of legacy `status` — it's what implies
             // status when the caller omits it, so a fully-structured report
@@ -3368,7 +3653,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // around the orchestrator.
             //
             // **This is the arm §7 warns is the one that gets missed**: it calls
-            // `deliver_relayed_to_orchestrator`, a different method from the one
+            // `deliver_relayed_to_root`, a different method from the one
             // `review_verdict` calls, and naming only the other would leave
             // `report` still delivering under a live drive.
             match reg.rd_owner(&caller.group, &caller.agent_id) {
@@ -3468,11 +3753,19 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 //
                 // #576 residual: the relay variant, which opts this notice into
                 // the question gate's delivery record — the note is the CALLER's
-                // words landing in the ORCHESTRATOR's pane, which is the
+                // words landing in the ROOT's pane, which is the
                 // cross-pane authorship the record requires. See
-                // `deliver_relayed_to_orchestrator`.
+                // `deliver_relayed_to_root`.
+                //
+                // #2519: "the root's pane", because in a lead group that is the
+                // LEAD's, and this arm needs no branch to say so. The
+                // `progress` arm below is unchanged and answers honestly there
+                // too: a lead group has no task board, so `report_task_note`
+                // finds no board to read and returns `NoteOutcome::Unreadable`
+                // rather than claiming a note it did not write — the same
+                // answer a board-less orchestration group already gave.
                 None if report::reaches_orchestrator_pane(status) => {
-                    reg.deliver_relayed_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
+                    reg.deliver_relayed_to_root(&caller.group, &message, &caller.agent_id)?;
                 }
                 None => {
                     note_outcome = reg.report_task_note(
@@ -3566,7 +3859,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             //
             // **Two delivery methods carry this traffic and interception has to
             // edit both**: this arm calls `deliver_to_orchestrator`, and the
-            // `report` arm calls `deliver_relayed_to_orchestrator`, a separate
+            // `report` arm calls `deliver_relayed_to_root`, a separate
             // method whose extra job is the #576 question-mask record. Naming
             // only one would leave the other still delivering under a drive.
             // The ROLE is deliberately not read here, and that is a statement
@@ -3876,7 +4169,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // speak into the orchestrator's directive ledger with the human's
             // standing. Same scrub as `channel_send` and `report`, one hop
             // before orrerix adds its own prefix.
-            reg.deliver_relayed_to_orchestrator(
+            reg.deliver_relayed_to_root(
                 &caller.group,
                 &format!(
                     "[orrerix] message from {}: {}",

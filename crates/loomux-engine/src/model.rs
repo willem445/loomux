@@ -96,7 +96,7 @@ use serde::{Deserialize, Serialize};
 /// (`build_agent_command`), the cwd rule (`spawn_agent_ex`) and the MCP tool
 /// scope (`mcp::tool_defs`) all key off this enum, and its values are a closed,
 /// hand-written list — five a workflow file may name ([`workflow::kind_from_str`](crate::workflow::kind_from_str))
-/// plus [`Role::Solo`], which no workflow can reach.
+/// plus [`Role::Solo`] and [`Role::Lead`], which no workflow can reach.
 ///
 /// What each class *is* varies, and the enum should not be read as promising more
 /// than it enforces — read [`Role::containment`] for the exact per-class tier. A
@@ -147,6 +147,36 @@ pub enum Role {
     /// traverses `spawn_agent_ex`/`build_agent_command` — it has no block, no
     /// persona, no role template.
     Solo,
+    /// **A human-driven pane that may open helper panes of its own** (#2519) —
+    /// the "orrerix subagents" toggle. An ordinary agent pane the human
+    /// configured and types into, given the fleet-control slice of the
+    /// orchestrator's surface (`spawn_agent`, `send_prompt`, `get_output`,
+    /// `kill_agent`, `focus_agent`, `rename_agent`, `list_agents`) so that "go
+    /// research X and Y in parallel" becomes two watchable orrerix panes
+    /// instead of two invisible harness subagents.
+    ///
+    /// A sixth capability class rather than an orchestrator with tools
+    /// stripped, and the reason is #222's own rule: stripping tools by
+    /// `role_hint` would make capability a function of *data*. It is also not a
+    /// widened [`Role::Solo`], whose contract is "zero group-scoped power" and
+    /// whose token every existing channel-tools pane already holds. What
+    /// distinguishes a lead is structural and no hint can express it: it holds
+    /// fleet tools, it is **not** a delegate (no `report`, no
+    /// `message_orchestrator` — there is no orchestrator), it is never reaped
+    /// and never counted against the delegate cap ([`Role::is_fixture`]), and
+    /// it IS a legitimate mid-session delivery target, because a child's report
+    /// is what the human turned the toggle on to receive.
+    ///
+    /// **Never nameable by a workflow file, and that is the no-recursion
+    /// enforcement.** [`workflow::kind_from_str`](crate::workflow::kind_from_str)
+    /// has no `lead` arm, so `kind: lead` in a `.orrerix/workflow.yml` is an
+    /// unknown kind (rejected, never coerced) and `spawn_agent`, which parses
+    /// its `kind` through that same function, cannot mint one either. A lead is
+    /// minted only by the launcher path that the human themselves toggled.
+    ///
+    /// The root of its group: a lead group has no orchestrator, and a lead pane
+    /// is what a child's `report` is typed into ([`Role::is_root`]).
+    Lead,
 }
 
 impl Role {
@@ -163,6 +193,9 @@ impl Role {
             // `<prefix>-<seq>`, and a prefix that reads as a word is what makes
             // `mgr-3` legible next to `w-7`/`rev-5` in a task board row.
             Role::Manager => "mgr",
+            // Same reasoning, and the word is already short: `lead-1` beside
+            // the `w-N` children it opened.
+            Role::Lead => "lead",
             // Solo panes mint their id as `solo-N` directly (see
             // `OrchRegistry::solo_prepare`), never through `block.prefix()` —
             // they have no block. Never reached in practice.
@@ -183,6 +216,7 @@ impl Role {
             Role::Planner => "planner",
             Role::Manager => "manager",
             Role::Solo => "solo",
+            Role::Lead => "lead",
         }
     }
     /// The **deny tier** this class launches its CLI under — the single place
@@ -221,6 +255,16 @@ impl Role {
             // only lends a channel identity to, so there is no spawn of ours to
             // clamp. Unreachable rather than a policy statement.
             Role::Solo => Containment::None,
+            // #2519. `None` for the ORCHESTRATOR's reason, not the solo pane's
+            // — and the distinction matters, because this arm IS reached. A
+            // lead pane is a full working pane the human drives: they type into
+            // it, it edits their code and runs their commands, and it opens
+            // helpers to do more of the same. Clamping it would deny the human
+            // their own CLI in their own pane, which is not something a toggle
+            // that ADDS a capability may do. What bounds the fan-out is the
+            // group's live-agent cap and the spawn-rate backstop, not a deny
+            // tier.
+            Role::Lead => Containment::None,
         }
     }
     /// The capability that used to be spelled `role == Role::Planner` inline at
@@ -236,6 +280,110 @@ impl Role {
     /// [`Self::containment`] keeps the two definitions from drifting apart.
     pub fn is_read_only(self) -> bool {
         self.containment().is_read_only()
+    }
+
+    /// **Whether this class is a pane opened FOR the human rather than a
+    /// delegate an orchestrator opened** — the exemption rule the guardrails
+    /// share, as one predicate (#2519).
+    ///
+    /// Before this there were seven hand-written copies of
+    /// `matches!(role, Role::Orchestrator | Role::Manager)` across two crates,
+    /// each answering the same question for a different guardrail: never
+    /// docked/minimized (`spawn_opens_minimized`), never counted against the
+    /// delegate cap (`counts_against_max_agents`), never idle-reaped
+    /// (`idle_reap_candidates`), never nagged by the watchdog, never released
+    /// by the review driver (`release_driven_pane`), never spawnable by
+    /// `spawn_agent` (`workflow::is_spawnable_block`) and never repo-personable
+    /// (`workflow::persona_allowed`). Seven copies is seven places for the
+    /// eighth class to be forgotten in six of them — and a class forgotten in
+    /// `idle_reap_candidates` alone is a human's own pane closed under them
+    /// while they were reading it.
+    ///
+    /// `Role::Lead` (#2519) belongs here on each of those grounds
+    /// independently, which is what makes ONE predicate honest rather than a
+    /// convenient bundle: it is the human's pane (so never docked, never
+    /// reaped, never nagged), it is not a delegate anyone opened (so it does
+    /// not spend a cap slot and no driver may release it), and it cannot be
+    /// named by a workflow file at all (so the two `workflow` readers can never
+    /// see one).
+    ///
+    /// **It is NOT "has fleet tools" and it is NOT "faces the human".** A
+    /// worker faces nobody and a manager holds no fleet tools; what all three
+    /// share is that orrerix opened the pane because a HUMAN asked for it, at
+    /// launch or by a toggle. `Role::Solo` is deliberately outside it and is
+    /// the control: a solo pane is human-launched too, but it is not in an
+    /// orchestration group at all, so every guardrail above is evaluated
+    /// against a group it is not a member of.
+    ///
+    /// Pinned as a SET (`the_fixture_classes_are_exactly_these_three`) so a
+    /// later class is a deliberate addition rather than a default.
+    pub fn is_fixture(self) -> bool {
+        matches!(self, Role::Orchestrator | Role::Manager | Role::Lead)
+    }
+
+    /// **Whether this class is the ROOT of its group** — the one agent a
+    /// delegate's `report` is typed into (#2519).
+    ///
+    /// A group has exactly one root, and which class it is says what kind of
+    /// group it is: `Role::Orchestrator` for an orchestration group,
+    /// `Role::Lead` for a group minted by the "orrerix subagents" toggle. It is
+    /// what `OrchRegistry::deliver_relayed_to_root` looks a group up by, so the
+    /// `report` arm needs no branch on which kind of group it is running in.
+    ///
+    /// **Narrower than [`Self::is_fixture`], and the difference is
+    /// `Role::Manager`.** A manager is the human's pane too, and it is
+    /// emphatically NOT a report target: the no-injection guarantee
+    /// ([`Delivery::permitted_into_manager_pane`]) refuses every mid-session
+    /// delivery into one, which is the whole of `doc/design/manager.md`. A
+    /// lead is the opposite pole — a human who turned on a toggle whose
+    /// stated effect is that children report into their pane — so the two
+    /// predicates must stay separate rather than one being derived from the
+    /// other. Nothing here weakens the manager's guarantee: that check keys on
+    /// `Role::Manager` and on the `Delivery` kind, and neither moves.
+    pub fn is_root(self) -> bool {
+        matches!(self, Role::Orchestrator | Role::Lead)
+    }
+
+    /// Every capability class, for the set assertions that pin the predicates
+    /// above (#2519).
+    ///
+    /// Hand-listed and therefore capable of going stale — so the one thing it
+    /// must not do is go stale **silently**. [`Role::all_index`] below is a
+    /// non-exhaustive-match tripwire that makes an eighth variant a compile
+    /// error until this array grows with it, which is what lets a test read
+    /// `ALL` and honestly claim to have covered every class. Exactly the idiom
+    /// [`Delivery::ALL`] already uses, and for the same reason: without it,
+    /// `is_fixture`'s and `is_root`'s set pins would be lists of the classes
+    /// somebody remembered.
+    pub const ALL: [Role; 7] = [
+        Role::Orchestrator,
+        Role::Worker,
+        Role::Reviewer,
+        Role::Planner,
+        Role::Manager,
+        Role::Solo,
+        Role::Lead,
+    ];
+
+    /// This variant's position in [`Role::ALL`] — a compile-time completeness
+    /// proof for that array, not a useful accessor.
+    ///
+    /// The `match` is exhaustive, so **adding a variant without an arm here
+    /// does not compile**; adding the arm forces an index, and the only correct
+    /// one is past the end of a seven-element array, so `ALL` must grow too.
+    /// `the_all_list_holds_every_capability_class_exactly_once` walks `ALL` and
+    /// asserts each row reports its own position, which catches the remaining
+    /// mistake — an arm given a duplicate or wrong index to make it compile.
+    pub const fn all_index(self) -> usize {
+        match self {
+            Role::Orchestrator => 0,
+            Role::Worker => 1,
+            Role::Reviewer => 2,
+            Role::Planner => 3,
+            Role::Manager => 4,
+            Role::Solo => 5,
+            Role::Lead => 6,
+        }
     }
 }
 
@@ -972,6 +1120,21 @@ pub fn default_model(cli: &str, role: Role) -> &'static str {
         // A solo pane's model is whatever the human picked in the launcher —
         // loomux never spawns or models it. Never reached.
         Role::Solo => unreachable!("solo panes are never spawned through the model-resolution path"),
+        // #2519: EMPTY, on the opencode/pi argument above and NOT the solo
+        // pane's `unreachable!`. A lead's model is what the human picked in
+        // their own launcher, so loomux has no default to offer — but this arm
+        // IS reached, which is what rules the panic out: `Guardrails::clamped`
+        // normalizes every block's effective model, so it runs the moment a
+        // lead block exists in a roster, before any pane is opened. An
+        // `unreachable!` there would be a public normalization path that
+        // aborts the process on a class the same crate defines.
+        //
+        // Empty means "no `--model` flag and no model suffix", i.e. the CLI's
+        // own default — which for a pane the human configured is the only
+        // answer that is not an override of a choice they already made. (Its
+        // CHILDREN are ordinary workers and resolve `Role::Worker` here, as
+        // they always did.)
+        Role::Lead => "",
     }
 }
 
@@ -1010,6 +1173,13 @@ pub fn sanitize_model_opt(m: &str) -> String {
 /// `a_manager_block_writes_the_managers_own_instructions_file` (declaring one
 /// and reading the group dir) and its bytes by the same live-vs-golden pairing
 /// the other four get in `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares`.
+///
+/// [`Role::Lead`] (#2519) is outside that pin for the manager's reason and is
+/// unpinned for a second one on top of it: no default group has a lead either,
+/// and nothing DELIVERS `lead.md` yet — slice A ships the class, the launch
+/// path that pastes a kickoff is slice B — so there is no shipped reading for a
+/// golden to protect. `orchestration::LEAD_TPL`'s doc carries the argument and
+/// names the slice its name and bytes get pinned in.
 pub fn role_instructions_file(role: Role) -> &'static str {
     match role {
         Role::Orchestrator => "orchestrator.md",
@@ -1018,6 +1188,10 @@ pub fn role_instructions_file(role: Role) -> &'static str {
         Role::Planner => "planner.md",
         Role::Manager => "manager.md",
         Role::Solo => unreachable!("solo panes have no instructions file"),
+        // #2519. Its bytes are `orchestration::LEAD_TPL`; this is the name they
+        // are written under in the group dir, and — like every other arm here —
+        // the name a kickoff or re-grounding notice tells the pane to read.
+        Role::Lead => "lead.md",
     }
 }
 
@@ -1252,18 +1426,19 @@ mod tests {
     ///
     /// Deriving the expectation from `as_str()` would pin `Serialize` to
     /// whatever `as_str` happens to say, and vice versa — the table has to be a
-    /// third party or neither test means anything. These six strings are a
+    /// third party or neither test means anything. These strings are a
     /// **persisted and cross-process contract**: they are what `agents.json`
     /// carries between app launches, what `list_agents`/`session_roles` hand
     /// the webview, and what the frontend matches on to decide a roster row's
     /// badge. Changing one is a breaking change to a state file, not a rename.
-    const WIRE_NAMES: [(Role, &str); 6] = [
+    const WIRE_NAMES: [(Role, &str); 7] = [
         (Role::Orchestrator, "orchestrator"),
         (Role::Worker, "worker"),
         (Role::Reviewer, "reviewer"),
         (Role::Planner, "planner"),
         (Role::Manager, "manager"),
         (Role::Solo, "solo"),
+        (Role::Lead, "lead"),
     ];
 
     /// `Role`'s serde form is `rename_all = "lowercase"`, and this states it
@@ -1322,6 +1497,98 @@ mod tests {
                 "{role:?}.as_str() drifted from the wire name its doc promises to match"
             );
         }
+    }
+
+    /// `ALL` really is every class — the tripwire's own test (#2519), on
+    /// `the_all_list_holds_every_delivery_kind_exactly_once`'s model.
+    ///
+    /// It also makes the two tables above honest. `WIRE_NAMES` is hand-written
+    /// on purpose (deriving it from `as_str` would pin `Serialize` to whatever
+    /// `as_str` says), and a hand-written table is exactly the thing a new
+    /// variant can be forgotten in — so its LENGTH is checked against `ALL`,
+    /// whose length the compiler enforces. Before this, an eighth class could
+    /// have been added with no wire-name test at all and nothing would have
+    /// said so.
+    #[test]
+    fn the_all_list_holds_every_capability_class_exactly_once() {
+        for (i, r) in Role::ALL.iter().enumerate() {
+            assert_eq!(r.all_index(), i, "{r:?} is not where ALL says it is");
+        }
+        assert_eq!(Role::ALL.len(), 7);
+        assert_eq!(
+            WIRE_NAMES.len(),
+            Role::ALL.len(),
+            "a class was added without a row in WIRE_NAMES — the two tests above then say \
+             nothing about it, and its serde form is a persisted contract"
+        );
+        for (role, _) in WIRE_NAMES {
+            assert!(Role::ALL.contains(&role), "{role:?} is in WIRE_NAMES but not in ALL");
+        }
+    }
+
+    /// **The fixture classes are exactly these three** (#2519) — the set
+    /// assertion behind [`Role::is_fixture`], which seven guardrails read.
+    ///
+    /// A SET over `Role::ALL`, not three `assert!`s, and the difference is the
+    /// point: the failure this pin exists to catch is a later class quietly
+    /// picking up the exemptions — never docked, never counted, never reaped,
+    /// never nagged, never released — because "the human opened it" felt true
+    /// of it too. Only a count catches that.
+    ///
+    /// `Role::Solo` is the NEGATIVE CONTROL, and it is not a technicality: a
+    /// solo pane is human-launched, so a predicate spelled "did a human ask for
+    /// this pane" would sweep it in. It is out because it is in no orchestration
+    /// group, so there is no cap, reaper or watchdog whose scope it is in —
+    /// `counts_against_max_agents(Solo)` is deliberately `true` and
+    /// `manager_lifecycle.rs` pins that separately.
+    #[test]
+    fn the_fixture_classes_are_exactly_these_three() {
+        let fixtures: Vec<Role> = Role::ALL.into_iter().filter(|r| r.is_fixture()).collect();
+        assert_eq!(
+            fixtures,
+            vec![Role::Orchestrator, Role::Manager, Role::Lead],
+            "is_fixture is the shared exemption rule for the dock, the cap, the reaper, the \
+             watchdog, the review driver, spawn_agent and persona ownership — see its doc"
+        );
+        assert!(
+            !Role::Solo.is_fixture(),
+            "a solo pane is human-launched and still not a fixture: it is in no orchestration \
+             group, so none of the guardrails is evaluated against it"
+        );
+    }
+
+    /// **A group has exactly two possible roots, and a manager is not one**
+    /// (#2519) — the set assertion behind [`Role::is_root`].
+    ///
+    /// The `Role::Manager` line is the one worth having. `is_root` and
+    /// `is_fixture` differ by exactly that class, and folding the two together
+    /// — or deriving one from the other — would make a manager pane a report
+    /// target, which is the no-injection guarantee inverted. That guarantee is
+    /// enforced elsewhere (`Delivery::permitted_into_manager_pane`, pinned by
+    /// `exactly_three_delivery_kinds_may_enter_a_manager_pane`); this is the
+    /// pin that stops the *lookup* from ever handing it a delivery to refuse.
+    #[test]
+    fn a_group_has_exactly_two_possible_roots_and_a_manager_is_not_one() {
+        let roots: Vec<Role> = Role::ALL.into_iter().filter(|r| r.is_root()).collect();
+        assert_eq!(
+            roots,
+            vec![Role::Orchestrator, Role::Lead],
+            "the root is what deliver_relayed_to_root looks a group up by — an orchestration \
+             group's orchestrator, or a lead group's lead"
+        );
+        assert!(
+            !Role::Manager.is_root(),
+            "a manager is the human's pane and takes NO mid-session delivery — see \
+             doc/design/manager.md; is_root must never become is_fixture"
+        );
+        // …and the two predicates really do differ, rather than agreeing today
+        // and being kept apart by convention. Without this, a later edit could
+        // define one as the other and every assertion above would still pass.
+        assert_ne!(
+            Role::ALL.into_iter().filter(|r| r.is_root()).collect::<Vec<_>>(),
+            Role::ALL.into_iter().filter(|r| r.is_fixture()).collect::<Vec<_>>(),
+            "is_root and is_fixture answer different questions and must not be one predicate"
+        );
     }
 
     // No containment-tier table test here, deliberately. One was written and

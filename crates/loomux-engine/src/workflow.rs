@@ -503,8 +503,11 @@ pub struct Block {
     /// it, for a short list of exceptions enumerated in
     /// `doc/design/liaison.md` — two narrow (`session_digest` to `process`,
     /// `review_verdict` away from `liaison`) and two widen toward that same
-    /// `liaison`, both otherwise orchestrator-only (`group_usage`; and
-    /// `ask_human`, the pose only). A repo still
+    /// `liaison`, both orchestrator-only for every other hint-carrying class
+    /// (`group_usage`; and `ask_human`, the pose only). `Role::Lead` also holds
+    /// `group_usage`, but through its own enumerated surface rather than
+    /// through any hint (#2519) — no hint can reach that class, since no
+    /// workflow file can name it. A repo still
     /// cannot grant itself anything by writing one: it picks from a closed set
     /// and loomux's code decides the effect.
     /// `None` is today's behavior, byte for byte.
@@ -2278,6 +2281,42 @@ pub fn kind_from_str(s: &str) -> Option<Role> {
         // roster: `spawn_agent` refuses it exactly as it refuses
         // `orchestrator`, and `builtin_roster` never synthesizes one.
         "manager" => Some(Role::Manager),
+        // NO `lead` ARM, AND THAT IS THE ENFORCEMENT (#2519), not an omission.
+        // `Role::Lead` is minted by one path only — the launcher toggle the
+        // human themselves flipped — and its absence from this vocabulary is
+        // what makes three separate refusals structural rather than three
+        // checks somebody remembered to write:
+        //
+        //  - a repo's `.orrerix/workflow.yml` cannot declare `kind: lead`, so a
+        //    repo file can never hand a pane fleet control;
+        //  - `spawn_agent` parses its `kind` argument through this very
+        //    function, so no agent can spawn a lead — which is the NO-RECURSION
+        //    rule ("a lead may never open another lead"), enforced by the
+        //    vocabulary rather than by an arm in the spawn tool that a later
+        //    edit could drop;
+        //  - a `resume_session` carrying a recorded `role: "lead"` and no block
+        //    id is refused rather than re-roled, by the same #544 "never guess a
+        //    capability class" path every unrecognized role takes — the
+        //    `owner_rec.block.trim().is_empty()` branch runs this function on
+        //    the recorded role and errors on `None`.
+        //
+        //    **A recorded row that DOES carry a block id takes the other
+        //    branch, and that branch is NOT a second structural refusal — do
+        //    not read it as one.** `kind` is `None` by construction on a bare
+        //    resume, so the lead caller's effective-class check reads the
+        //    recorded BLOCK: `Some(Role::Lead)` for the lead's own block, which
+        //    is refused as `resolves to kind "lead"`; `Some(Role::Worker)` for
+        //    a worker block, which is PERMITTED; and `None` only when the
+        //    recorded block id no longer resolves at all. What carries the
+        //    property on that branch is THIS FUNCTION'S MISSING `lead` ARM — no
+        //    block can have kind `Lead` while `kind_from_str` cannot name one,
+        //    so no resume of any shape yields a lead pane. (The first version
+        //    of this comment said "both routes refuse", which is false of the
+        //    corrupt-data subcase and, worse, pointed a reader at the wrong
+        //    invariant — rev-final N1 / rev-std round 2 on #2519.)
+        //
+        // Adding an arm here would silently undo all three at once. `Role::Solo`
+        // is absent for the identical reason and is the precedent.
         _ => None,
     }
 }
@@ -2377,8 +2416,14 @@ pub fn is_reviewing_block(b: &Block) -> bool {
 ///   `block`. What the orchestrator is told about a declared manager instead is
 ///   M4's `{{MANAGER_NOTE}}`; until that lands it is told nothing, which is the
 ///   honest state — this slice ships no channel to it.
+/// - **Lead** (#2519) — the human's own pane under the "orrerix subagents"
+///   toggle. It reaches this predicate only through [`Role::is_fixture`]'s
+///   shared answer and never through a real `Block`, because
+///   [`kind_from_str`] has no `lead` arm, so no workflow file can declare one.
+///   That is deliberate rather than an oversight: the class being unnameable
+///   here is exactly what makes "a lead may not spawn a lead" structural.
 pub fn is_spawnable_block(b: &Block) -> bool {
-    !matches!(b.kind, Role::Orchestrator | Role::Manager)
+    !b.kind.is_fixture()
 }
 
 /// The role hints a workflow file may name, for error messages.
@@ -3475,8 +3520,16 @@ pub fn workflow_file_exists(repo: &str) -> bool {
 /// Anything that merely *reports* on a block therefore has to ask this too, or it
 /// advertises a persona the spawn will deny (rev-11's preview nit). One predicate,
 /// so the report and the spawn cannot disagree.
+///
+/// **The lead block is loomux-owned on the same terms again** (#2519), and it
+/// answers `false` through [`Role::is_fixture`]'s shared answer without ever
+/// reaching this function with a real `Block` — [`kind_from_str`] has no `lead`
+/// arm, so a repo cannot declare one to give a persona to in the first place. A
+/// lead group runs the built-in roster and never a workflow file, which is the
+/// consent argument in `doc/design/lead-pane.md`: no roster preview, so no
+/// roster the human was shown and agreed to.
 pub fn persona_allowed(block: &Block) -> bool {
-    !matches!(block.kind, Role::Orchestrator | Role::Manager)
+    !block.kind.is_fixture()
 }
 
 /// Whether a roster carries anything a workflow file put there — a block outside
