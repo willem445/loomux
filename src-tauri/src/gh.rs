@@ -154,7 +154,7 @@ const FIXED_LABELS: [&str; 3] = ["agent-ready", "agent-investigation", "agent-ma
 fn hold_label(repo: &str, group: Option<&Guardrails>) -> String {
     let raw = match group {
         Some(rails) => Some(rails.intake.hold.clone()),
-        None => crate::orchestration::load_active_workflow(repo, &Guardrails::default())
+        None => loomux_engine::workflow::load_workflow(repo)
             .ok()
             .flatten()
             .map(|wf| wf.intake.hold),
