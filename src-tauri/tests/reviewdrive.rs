@@ -8963,8 +8963,19 @@ fn driven_one_short(
     (group, session)
 }
 
-/// A lane's blocking `fail`, through the real MCP arm — which is what writes the
-/// verdict file the next tick reads.
+/// A lane's blocking `fail` **and the report that ends its turn**, through the
+/// real MCP arm — the verdict file is what the next tick reads, and the report
+/// is what stamps `idle_since_ms`.
+///
+/// **The report is not decoration, and leaving it out is what a body-only round
+/// cannot survive.** A re-brief at an UNCHANGED head is refused as a duplicate
+/// while that lane's pane is still live (#2109), and the pane stops being live
+/// only when the lane has finished its turn — at which point the tick that
+/// routes its current `fail` RELEASES it (#2501) and the next round resumes the
+/// same session in a fresh pane. A code round never meets that refusal, because
+/// a moved head makes the brief a different revision; so a fixture that reported
+/// on one path and not the other would differ from its control in two ways
+/// instead of one.
 fn record_fail_for(reg: &OrchRegistry, group: &GroupId, agent: &str, summary: &str) {
     let caller = Caller {
         agent_id: agent.to_string(),
@@ -8980,6 +8991,14 @@ fn record_fail_for(reg: &OrchRegistry, group: &GroupId, agent: &str, summary: &s
             "pr": "1758", "verdict": "fail", "summary": summary } }),
     )
     .expect("the lane records its verdict");
+    dispatch(
+        reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "request_changes", "note": "see the PR", "ref": "#1758" } }),
+    )
+    .expect("the lane reports, which ends its turn");
 }
 
 /// The worker's `report(done)`, which is what takes arc 8 out of `fix-wait`.
