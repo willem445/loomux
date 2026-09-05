@@ -7706,6 +7706,7 @@ pub fn codex_profile_toml(
     if !effort.is_empty() {
         s.push_str(&format!("model_reasoning_effort = \"{effort}\"\n"));
     }
+    s.push_str("[sandbox_workspace_write]\nnetwork_access = true\n\n");
     if let Some(contract) = developer_instructions {
         // A multi-line basic string. TOML trims the newline immediately after
         // the opening delimiter, so the body starts exactly at `contract`'s
@@ -7718,7 +7719,6 @@ pub fn codex_profile_toml(
     s.push('\n');
 
     // ── tables ──
-    s.push_str("[sandbox_workspace_write]\nnetwork_access = true\n\n");
     s.push_str(&format!(
         "[projects.\"{}\"]\ntrust_level = \"trusted\"\n\n",
         toml_basic_escape(&cwd.display().to_string(), TomlNewlines::Escape)
